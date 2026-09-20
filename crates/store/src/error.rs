@@ -34,6 +34,10 @@ pub enum Error {
     #[error("blob deleted")]
     Deleted,
 
+    /// undelete 目标当前未处于已删除态(存活/已复活),不可复活。
+    #[error("blob not deleted")]
+    NotDeleted,
+
     /// key 存在但已过期(TTL)。
     #[error("blob expired")]
     Expired,

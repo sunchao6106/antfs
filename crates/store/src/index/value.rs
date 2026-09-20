@@ -9,8 +9,9 @@ pub const FLAG_UNDELETED: u8 = 1 << 2;
 /// 无过期时间。
 pub const NO_EXPIRATION: i64 = -1;
 
-/// 定长值大小(字节):offset(16) + size(8) + flags(1) + expiration(8) + op_time(8) + life_version(2)。
-pub const VALUE_SIZE: usize = 43;
+/// 定长值大小(字节):offset(16) + size(8) + flags(1) + expiration(8) + op_time(8)
+/// + life_version(2) + original_offset(16)。
+pub const VALUE_SIZE: usize = 59;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexValue {
@@ -20,6 +21,9 @@ pub struct IndexValue {
     pub expiration_ms: i64,
     pub operation_time_ms: u64,
     pub life_version: u16,
+    /// 承载 blob 数据的记录位置(读/复活取数据用)。PUT/UNDELETE 记录自带数据故 == `offset`;
+    /// DELETE 墓碑无数据,指向被删前的 PUT。
+    pub original_offset: LogOffset,
 }
 
 impl IndexValue {
@@ -31,11 +35,16 @@ impl IndexValue {
             expiration_ms: NO_EXPIRATION,
             operation_time_ms,
             life_version: 0,
+            original_offset: offset,
         }
     }
 
     pub fn is_deleted(&self) -> bool {
         self.flags & FLAG_DELETED != 0
+    }
+
+    pub fn is_undeleted(&self) -> bool {
+        self.flags & FLAG_UNDELETED != 0
     }
 
     pub fn to_bytes(&self) -> [u8; VALUE_SIZE] {
@@ -47,6 +56,8 @@ impl IndexValue {
         b[25..33].copy_from_slice(&self.expiration_ms.to_le_bytes());
         b[33..41].copy_from_slice(&self.operation_time_ms.to_le_bytes());
         b[41..43].copy_from_slice(&self.life_version.to_le_bytes());
+        b[43..51].copy_from_slice(&self.original_offset.segment.to_le_bytes());
+        b[51..59].copy_from_slice(&self.original_offset.offset.to_le_bytes());
         b
     }
 
@@ -64,6 +75,10 @@ impl IndexValue {
             expiration_ms: i64::from_le_bytes(b[25..33].try_into().unwrap()),
             operation_time_ms: u64::from_le_bytes(b[33..41].try_into().unwrap()),
             life_version: u16::from_le_bytes(b[41..43].try_into().unwrap()),
+            original_offset: LogOffset::new(
+                u64::from_le_bytes(b[43..51].try_into().unwrap()),
+                u64::from_le_bytes(b[51..59].try_into().unwrap()),
+            ),
         })
     }
 }
@@ -81,6 +96,7 @@ mod tests {
             expiration_ms: 1_700_000_000_000,
             operation_time_ms: 1_699_000_000_000,
             life_version: 2,
+            original_offset: LogOffset::new(1, 512),
         };
         let b = v.to_bytes();
         assert_eq!(b.len(), VALUE_SIZE);

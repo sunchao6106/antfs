@@ -6,23 +6,24 @@
 //!
 //! 记录布局(小端,crc 覆盖其前所有字节):
 //! ```text
-//! [ magic u16 | version u8 | flags u8 | key(32) | expiration i64 | op_time u64 | data_len u32 | data | crc u32 ]
+//! [ magic u16 | version u8 | flags u8 | key(32) | expiration i64 | op_time u64 | life_version u16 | data_len u32 | data | crc u32 ]
 //! ```
-//! `put` 写 `flags=0`;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑。expiration/op_time
-//! 落进记录,故从 log 重建索引时 TTL 不丢失。
+//! `put` 写 `flags=0`;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑;`undelete` 写
+//! `flags=FLAG_UNDELETED`、复制原数据的整记录并 `life_version+1`。expiration/op_time/life_version
+//! 落进记录,故从 log 重建索引时 TTL 与生命版本不丢失。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::index::value::{FLAG_DELETED, NO_EXPIRATION};
+use crate::index::value::{FLAG_DELETED, FLAG_UNDELETED, NO_EXPIRATION};
 use crate::index::{IndexValue, PersistentIndex};
 use crate::log::Log;
 use crate::log_segment::LogSegment;
 use crate::types::{LogOffset, LogSegmentName, StoreKey, KEY_SIZE};
 
 const REC_MAGIC: u16 = 0x424D; // "MB"
-const REC_VERSION: u8 = 2;
+const REC_VERSION: u8 = 3;
 
 mod rec {
     use super::KEY_SIZE;
@@ -32,7 +33,8 @@ mod rec {
     pub const KEY: usize = 4;
     pub const EXPIRATION: usize = KEY + KEY_SIZE; // i64
     pub const OP_TIME: usize = EXPIRATION + 8; // u64
-    pub const DATA_LEN: usize = OP_TIME + 8; // u32
+    pub const LIFE_VERSION: usize = OP_TIME + 8; // u16
+    pub const DATA_LEN: usize = LIFE_VERSION + 2; // u32
     pub const DATA: usize = DATA_LEN + 4;
     pub const CRC_LEN: usize = 4;
 }
@@ -52,6 +54,7 @@ fn encode_record(
     flags: u8,
     expiration_ms: i64,
     operation_time_ms: u64,
+    life_version: u16,
     data: &[u8],
 ) -> Vec<u8> {
     let total = RECORD_OVERHEAD + data.len();
@@ -62,6 +65,7 @@ fn encode_record(
     buf[rec::KEY..rec::KEY + KEY_SIZE].copy_from_slice(key.as_bytes());
     buf[rec::EXPIRATION..rec::EXPIRATION + 8].copy_from_slice(&expiration_ms.to_le_bytes());
     buf[rec::OP_TIME..rec::OP_TIME + 8].copy_from_slice(&operation_time_ms.to_le_bytes());
+    buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2].copy_from_slice(&life_version.to_le_bytes());
     buf[rec::DATA_LEN..rec::DATA_LEN + 4].copy_from_slice(&(data.len() as u32).to_le_bytes());
     buf[rec::DATA..rec::DATA + data.len()].copy_from_slice(data);
     let crc_at = rec::DATA + data.len();
@@ -75,6 +79,7 @@ struct DecodedRecord {
     key: StoreKey,
     expiration_ms: i64,
     operation_time_ms: u64,
+    life_version: u16,
     data: Vec<u8>,
 }
 
@@ -96,6 +101,7 @@ fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
     let key = StoreKey::from_slice(&buf[rec::KEY..rec::KEY + KEY_SIZE]).expect("key size fixed");
     let expiration_ms = i64::from_le_bytes(buf[rec::EXPIRATION..rec::EXPIRATION + 8].try_into().unwrap());
     let operation_time_ms = u64::from_le_bytes(buf[rec::OP_TIME..rec::OP_TIME + 8].try_into().unwrap());
+    let life_version = u16::from_le_bytes(buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2].try_into().unwrap());
     let data_len = u32::from_le_bytes(buf[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
     let crc_at = rec::DATA + data_len;
     if buf.len() != crc_at + rec::CRC_LEN {
@@ -117,6 +123,7 @@ fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
         key,
         expiration_ms,
         operation_time_ms,
+        life_version,
         data: buf[rec::DATA..crc_at].to_vec(),
     })
 }
@@ -250,7 +257,7 @@ impl BlobStore {
             return Err(Error::AlreadyExists);
         }
         let op_time = now_ms();
-        let record = encode_record(&key, 0, expiration_ms, op_time, data);
+        let record = encode_record(&key, 0, expiration_ms, op_time, 0, data);
         let offset = self.log.append(&record)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.expiration_ms = expiration_ms;
@@ -293,10 +300,12 @@ impl BlobStore {
             Some(v) => v,
         };
         let op_time = now_ms();
-        let record = encode_record(&key, FLAG_DELETED, NO_EXPIRATION, op_time, &[]);
+        let record = encode_record(&key, FLAG_DELETED, NO_EXPIRATION, op_time, old.life_version, &[]);
         let offset = self.log.append(&record)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_DELETED;
+        value.life_version = old.life_version;
+        value.original_offset = old.original_offset; // 墓碑无数据,指向被删前的 PUT
         self.index.add(key, value)?;
         // 墓碑成为新赢家(live);被取代的旧 PUT 转为该段的死数据。
         self.seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
@@ -304,6 +313,43 @@ impl BlobStore {
         e.live = e.live.saturating_sub(old.size);
         e.dead += old.size;
         Ok(())
+    }
+
+    /// 复活一个已删除对象(对齐 Ambry `undelete`):写一条 `FLAG_UNDELETED`、复制原数据、
+    /// `life_version+1` 的整记录并指回它自身,返回新的 life_version。
+    ///
+    /// 状态机:仅当当前为**已删除**才可复活;不存在报 [`NotFound`](crate::error::Error::NotFound),
+    /// 未删除(存活/已复活)报 [`NotDeleted`](crate::error::Error::NotDeleted)。若被删对象的 PUT
+    /// 已被 compaction 回收(数据不存在),报 [`NotFound`](crate::error::Error::NotFound)
+    /// (对齐 Ambry `IDDeletedPermanently`:PUT 被压走后不可复活)。
+    pub fn undelete(&mut self, key: StoreKey) -> Result<u16> {
+        let cur = match self.index.find(&key) {
+            None => return Err(Error::NotFound),
+            Some(v) if !v.is_deleted() => return Err(Error::NotDeleted),
+            Some(v) => v,
+        };
+        // 取原 PUT 数据(墓碑 original_offset 指向它)。被 compaction 回收则视为数据不存在。
+        let (put_raw, put) = read_full_record(&self.log, cur.original_offset)
+            .map_err(|_| Error::NotFound)?;
+        if put.key != key || put.flags & FLAG_DELETED != 0 {
+            return Err(Error::NotFound);
+        }
+        let _ = put_raw;
+        let new_life = cur.life_version + 1;
+        let op_time = now_ms();
+        let record = encode_record(&key, FLAG_UNDELETED, put.expiration_ms, op_time, new_life, &put.data);
+        let offset = self.log.append(&record)?;
+        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
+        value.flags = FLAG_UNDELETED;
+        value.expiration_ms = put.expiration_ms;
+        value.life_version = new_life;
+        self.index.add(key, value)?;
+        // 复活整记录成为新赢家(live);被取代的旧墓碑转死(原 PUT 早在 delete 时已计死)。
+        self.seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
+        let e = self.seg_bytes.entry(cur.offset.segment).or_default();
+        e.live = e.live.saturating_sub(cur.size);
+        e.dead += cur.size;
+        Ok(new_life)
     }
 
     /// 持久化:先落数据(fsync)再落索引,最后写持久化水位(= 当前 log 末尾)。
@@ -331,6 +377,11 @@ impl BlobStore {
     #[cfg(test)]
     fn log_segment_count_for_test(&self) -> usize {
         self.log.segment_count()
+    }
+
+    #[cfg(test)]
+    fn life_version_of(&self, key: &StoreKey) -> Option<u16> {
+        self.index.find(key).map(|v| v.life_version)
     }
 
     /// 返回全库存活/死亡字节统计(读增量计数,死 = 被更新版本取代/删除的旧记录)。
@@ -550,6 +601,17 @@ fn for_each_record(
     Ok(())
 }
 
+/// 读取 `at` 处一条完整记录(先读头拿 data_len,再读整条并校验 crc)。
+fn read_full_record(log: &Log, at: LogOffset) -> Result<(Vec<u8>, DecodedRecord)> {
+    let head = log.read(at, rec::DATA)?;
+    let data_len =
+        u32::from_le_bytes(head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
+    let total = RECORD_OVERHEAD + data_len;
+    let raw = log.read(at, total)?;
+    let decoded = decode_record(&raw)?;
+    Ok((raw, decoded))
+}
+
 /// 遍历单个段 `position` 内 `[0, data_end)` 的全部记录。
 fn scan_segment(
     log: &Log,
@@ -559,16 +621,32 @@ fn scan_segment(
 ) -> Result<()> {
     let mut off = 0u64;
     while off < data_end {
-        let head = log.read(LogOffset::new(position, off), rec::DATA)?;
-        let data_len =
-            u32::from_le_bytes(head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
-        let total = RECORD_OVERHEAD + data_len;
-        let raw = log.read(LogOffset::new(position, off), total)?;
-        let decoded = decode_record(&raw)?;
-        f(LogOffset::new(position, off), &raw, &decoded)?;
-        off += total as u64;
+        let at = LogOffset::new(position, off);
+        let (raw, decoded) = read_full_record(log, at)?;
+        off += raw.len() as u64;
+        f(at, &raw, &decoded)?;
     }
     Ok(())
+}
+
+/// 从一条记录构造索引值,继承 `life_version`;墓碑(无数据)的 `original_offset` 沿用该 key
+/// 已入索引的数据位置(扫描旧→新,PUT/UNDELETE 先入),否则指向自身。
+fn index_value_from_record(
+    index: &PersistentIndex,
+    off: LogOffset,
+    raw_len: usize,
+    decoded: &DecodedRecord,
+) -> IndexValue {
+    let mut value = IndexValue::put(off, raw_len as u64, decoded.operation_time_ms);
+    value.flags = decoded.flags;
+    value.expiration_ms = decoded.expiration_ms;
+    value.life_version = decoded.life_version;
+    value.original_offset = if decoded.flags & FLAG_DELETED != 0 {
+        index.find(&decoded.key).map(|v| v.original_offset).unwrap_or(off)
+    } else {
+        off
+    };
+    value
 }
 
 /// 全量扫 log 计算每段 `(live, dead)` 字节。冷路径:open/compact/rebuild 后重算,及测试对拍基准。
@@ -602,9 +680,7 @@ fn rebuild_index(log: &Log, index_dir: &Path, max_entries: usize) -> Result<Pers
     }
     let mut index = PersistentIndex::create(index_dir, max_entries)?;
     for_each_record(log, |off, raw, decoded| {
-        let mut value = IndexValue::put(off, raw.len() as u64, decoded.operation_time_ms);
-        value.flags = decoded.flags;
-        value.expiration_ms = decoded.expiration_ms;
+        let value = index_value_from_record(&index, off, raw.len(), decoded);
         index.add(decoded.key, value)?;
         Ok(())
     })?;
@@ -630,9 +706,7 @@ fn load_index_with_replay(
 fn replay_from(log: &Log, index: &mut PersistentIndex, watermark: LogOffset) -> Result<()> {
     for_each_record(log, |off, raw, decoded| {
         if off >= watermark {
-            let mut value = IndexValue::put(off, raw.len() as u64, decoded.operation_time_ms);
-            value.flags = decoded.flags;
-            value.expiration_ms = decoded.expiration_ms;
+            let value = index_value_from_record(index, off, raw.len(), decoded);
             index.add(decoded.key, value)?;
         }
         Ok(())
@@ -928,13 +1002,14 @@ mod tests {
     fn record_roundtrip_and_crc_guard() {
         let k = key(42);
         let data = b"payload".to_vec();
-        let mut buf = encode_record(&k, 0, 1_700_000_000_000, 1_699_000_000_000, &data);
+        let mut buf = encode_record(&k, 0, 1_700_000_000_000, 1_699_000_000_000, 7, &data);
         let d = decode_record(&buf).unwrap();
         assert_eq!(d.flags, 0);
         assert_eq!(d.key, k);
         assert_eq!(d.data, data);
         assert_eq!(d.expiration_ms, 1_700_000_000_000);
         assert_eq!(d.operation_time_ms, 1_699_000_000_000);
+        assert_eq!(d.life_version, 7);
 
         // 翻转一个数据字节,crc 必须失败。
         buf[rec::DATA] ^= 0xFF;
@@ -1160,6 +1235,102 @@ mod tests {
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
         assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after reopen recompute");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undelete_restores_deleted_blob_and_bumps_lifeversion() {
+        let dir = temp_dir("undel");
+        let seg = seg_cap(16);
+        let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        store.put(key(1), b"hello").unwrap();
+        store.delete(key(1)).unwrap();
+        assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
+
+        assert_eq!(store.undelete(key(1)).unwrap(), 1, "undelete bumps life_version to 1");
+        assert_eq!(store.get(&key(1)).unwrap(), b"hello".to_vec(), "data restored");
+        assert_eq!(store.life_version_of(&key(1)), Some(1));
+
+        // 复活后可再删、再复活,life_version 继续递增。
+        store.delete(key(1)).unwrap();
+        assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
+        assert_eq!(store.undelete(key(1)).unwrap(), 2);
+        assert_eq!(store.get(&key(1)).unwrap(), b"hello".to_vec());
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undelete_rejects_non_deleted_states() {
+        let dir = temp_dir("undel_rej");
+        let seg = seg_cap(16);
+        let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        assert!(matches!(store.undelete(key(1)), Err(Error::NotFound)), "absent");
+        store.put(key(1), b"v").unwrap();
+        assert!(matches!(store.undelete(key(1)), Err(Error::NotDeleted)), "live key");
+        store.delete(key(1)).unwrap();
+        store.undelete(key(1)).unwrap();
+        assert!(matches!(store.undelete(key(1)), Err(Error::NotDeleted)), "already undeleted");
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undelete_survives_reopen_and_rebuild() {
+        let dir = temp_dir("undel_reopen");
+        let seg = seg_cap(16);
+        {
+            let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+            for i in 0..10u64 {
+                store.put(key(i), format!("v-{i}").as_bytes()).unwrap();
+            }
+            store.delete(key(3)).unwrap();
+            store.undelete(key(3)).unwrap();
+            store.close().unwrap();
+        }
+        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        assert_eq!(store.get(&key(3)).unwrap(), b"v-3".to_vec(), "watermark replay keeps undelete");
+        assert_eq!(store.life_version_of(&key(3)), Some(1));
+        store.close().unwrap();
+        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
+        assert_eq!(store.get(&key(3)).unwrap(), b"v-3".to_vec(), "log rebuild keeps undelete");
+        assert_eq!(store.life_version_of(&key(3)), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undeleted_blob_survives_compaction() {
+        let dir = temp_dir("undel_compact");
+        let seg = seg_cap(2);
+        let mut store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
+        for i in 0..20u64 {
+            store.put(key(i), format!("data-{i}").as_bytes()).unwrap();
+        }
+        store.delete(key(5)).unwrap();
+        store.undelete(key(5)).unwrap();
+        store.compact().unwrap();
+        assert_eq!(store.get(&key(5)).unwrap(), b"data-5".to_vec(), "undeleted data survives compaction");
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
+        assert_eq!(store.get(&key(5)).unwrap(), b"data-5".to_vec());
+        assert_eq!(store.life_version_of(&key(5)), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undelete_after_put_reclaimed_by_compaction_is_permanent() {
+        let dir = temp_dir("undel_perm");
+        let seg = seg_cap(2);
+        let mut store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
+        for i in 0..30u64 {
+            store.put(key(i), &[b'x'; 200]).unwrap();
+        }
+        store.delete(key(0)).unwrap();
+        store.compact().unwrap(); // 回收死 PUT(含 key0 被删前的原 PUT)
+        assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
+        // 原 PUT 数据已被回收 → 不可复活(对齐 Ambry IDDeletedPermanently)。
+        assert!(matches!(store.undelete(key(0)), Err(Error::NotFound)));
+        store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

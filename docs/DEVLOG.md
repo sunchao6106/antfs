@@ -136,8 +136,23 @@
 - 不变式:增量计数须与全量扫一致。新增 `incremental_stats_match_full_scan`;参考模型每 seed 收尾额外对拍。
 - 验证:29 单测 + 崩溃属性 + smoke 全绿;clippy `-D warnings` 零告警。
 
+## 步骤 15:undelete / lifeVersion(复活已删除对象)
+
+- 记录格式 v3:头部加 `life_version u16`(在 op_time 与 data_len 之间),从 log 重建索引不丢生命版本。
+- `IndexValue` 加 `original_offset`(承载数据的记录位置):PUT/UNDELETE 自带数据故 == `offset`,
+  DELETE 墓碑指向被删前的 PUT(供复活取原数据)。`VALUE_SIZE` 43→59。
+- `undelete(key)`:仅当当前为已删除才可复活;读回原 PUT 数据、写一条 `FLAG_UNDELETED`+`life_version+1`
+  的**整记录**并成为新赢家,返回新 life_version。不存在→`NotFound`,未删除/已复活→`NotDeleted`。
+- delete 保留 `life_version`;undelete = 当前 +1(对齐 Ambry `undelete`)。
+- rebuild/replay 用统一 `index_value_from_record`:继承 life_version,墓碑 original_offset 沿用已入索引的数据位置。
+- **与 Ambry 的实现分歧**:Ambry 用「小 undelete 标记 + 每 key 多值索引」;本引擎是单值索引,故 undelete
+  **复制整条数据**成为赢家,保持 offset 相等的 compaction 存活判定/rebuild/seg_bytes 机制不变(代价:复活写放大,罕见)。
+- **限制(对齐 Ambry 保留期到期语义)**:被删对象的 PUT 一旦被 compaction 回收,即不可复活(`undelete`→`NotFound`,
+  对应 Ambry `IDDeletedPermanently`);本引擎暂无时间保留窗口。
+- 验证:新增 5 测(复活+lv 递增、拒非删态、重开/重建保留、复活数据过 compaction、PUT 回收后永久删);
+  共 34 单测 + 崩溃属性 + smoke 全绿;clippy 零告警。
+
 ## 待办
 
 - 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。
 - 并发/共享模型(D4):`&mut self` 单写者 → 共享实例 + `RwLock`/并发结构(运行时 tokio vs 手写线程池仍为 Open Question)。
-- undelete / lifeVersion:删除后复活对象的独立操作(对齐 Ambry `undelete`),普通 put 不再承担复活职责。
