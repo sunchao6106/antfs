@@ -165,6 +165,7 @@ impl BlobStore {
     ///
     /// 崩溃安全:加载已落盘索引后,按**持久化水位**回放 log 尾部——把「已落盘到 log 但
     /// 上次索引持久化未覆盖」的记录补进索引(对齐 Ambry `recover()`),避免加载到陈旧索引。
+    /// 索引文件损坏(`Corrupt`)时自动回退到全量扫 log 重建(数据 fsync 是持久边界,索引可重建)。
     pub fn open(
         dir: impl AsRef<Path>,
         total_capacity: u64,
@@ -175,9 +176,13 @@ impl BlobStore {
         recover_compaction(&dir, total_capacity, segment_capacity, max_index_entries_per_segment)?;
         let (log_dir, index_dir) = sub_dirs(&dir);
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
-        let mut index = PersistentIndex::open(&index_dir, max_index_entries_per_segment)?;
-        let watermark = read_watermark(&index_dir).unwrap_or(LogOffset::new(0, 0));
-        replay_from(&log, &mut index, watermark)?;
+        let index = match load_index_with_replay(&log, &index_dir, max_index_entries_per_segment) {
+            Ok(index) => index,
+            Err(Error::Corrupt(_)) => {
+                rebuild_index(&log, &index_dir, max_index_entries_per_segment)?
+            }
+            Err(e) => return Err(e),
+        };
         Ok(Self {
             dir,
             total_capacity,
@@ -569,6 +574,18 @@ fn rebuild_index(log: &Log, index_dir: &Path, max_entries: usize) -> Result<Pers
     Ok(index)
 }
 
+/// 加载已落盘索引并按水位回放 log 尾部(增量恢复,非全量重建);`Corrupt` 由调用方回退重建。
+fn load_index_with_replay(
+    log: &Log,
+    index_dir: &Path,
+    max_entries: usize,
+) -> Result<PersistentIndex> {
+    let mut index = PersistentIndex::open(index_dir, max_entries)?;
+    let watermark = read_watermark(index_dir).unwrap_or(LogOffset::new(0, 0));
+    replay_from(log, &mut index, watermark)?;
+    Ok(index)
+}
+
 /// 按持久化水位回放 log 尾部:把 offset ≥ watermark 的记录补进索引(旧→新,保 newest-wins)。
 fn replay_from(log: &Log, index: &mut PersistentIndex, watermark: LogOffset) -> Result<()> {
     for_each_record(log, |off, raw, decoded| {
@@ -824,6 +841,46 @@ mod tests {
         let store2 = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
         assert!(matches!(store2.get(&key(7)), Err(Error::Deleted)));
         drop(store2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_falls_back_to_rebuild_on_corrupt_index() {
+        let dir = temp_dir("corrupt_idx");
+        let seg = seg_cap(16);
+        {
+            let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+            for i in 0..20u64 {
+                store.put(key(i), format!("v-{i}").as_bytes()).unwrap();
+            }
+            store.delete(key(3)).unwrap();
+            store.close().unwrap();
+        }
+
+        // 损坏活跃索引段(`{seq}.idx` 且无配套 `{seq}.fuse`,open 时走 crc 校验的整段载入)。
+        let index_dir = dir.join("index");
+        let mut active_idx = None;
+        for ent in std::fs::read_dir(&index_dir).unwrap() {
+            let p = ent.unwrap().path();
+            let is_idx = p.extension().is_some_and(|e| e == "idx");
+            let has_fuse = p.with_extension("fuse").exists();
+            if is_idx && !has_fuse {
+                active_idx = Some(p);
+                break;
+            }
+        }
+        std::fs::write(active_idx.expect("active idx exists"), b"garbage").unwrap();
+
+        // open 检测到 Corrupt → 自动扫 log 重建;逻辑状态仍正确。
+        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        for i in 0..20u64 {
+            if i == 3 {
+                assert!(matches!(store.get(&key(3)), Err(Error::Deleted)), "key 3 stays deleted");
+                continue;
+            }
+            assert_eq!(store.get(&key(i)).unwrap(), format!("v-{i}").into_bytes(), "key {i} recovered");
+        }
+        store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
