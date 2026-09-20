@@ -98,7 +98,7 @@ macOS 宿主 + colima Linux VM(Ubuntu 24.04 / kernel 6.8 / io_uring)。源码在
 - [x] 崩溃一致性属性测试
 - [x] PersistentIndex(活跃内存段 + sealed 段 + Binary Fuse filter + IndexValue + add/find/recover)
 - [x] BlobStore(串起 Log + Index;自描述记录 + put/get/delete/flush/recover)
+- [x] 从 log 扫描重建索引(`open_rebuild_index`:索引丢失/损坏时的兜底)
 - [ ] 索引 mmap 化(当前 sealed 段全量载入内存;大规模需改 mmap 省 RAM)
 - [ ] 索引改走 io_uring(当前索引文件用同步 std::fs)
-- [ ] 从 log 扫描重建索引(索引文件损坏时的兜底)
 - [ ] 参考模型全量对拍

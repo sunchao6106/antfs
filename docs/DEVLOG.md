@@ -54,7 +54,17 @@
 - 验证:21 单测(新增 BlobStore 5:put/get、拒重复、删除+重写、重开恢复、记录 crc 守卫)
   + 崩溃属性测试通过;clippy `-D warnings` 零告警。
 
+## 步骤 6:从 Log 扫描重建索引(兜底)
+
+- `Log::segment_spans()` 暴露各段 `(position, data_end)`;`BlobStore::open_rebuild_index()`
+  打开 Log → 清掉旧 `.idx` → 顺序扫描全部自描述记录 → 按 Log 追加顺序(旧→新)重建索引 → flush。
+- 正确性:记录自描述(key/flags/crc),追加顺序插入天然满足 newest-wins;只扫到 flush
+  持久化边界,边界内无残记录(未落盘尾部对读不可见)。
+- 已知限制:记录暂不落 expiration/op_time,重建后归零(当前无 TTL 写入,不影响可见性)。
+- 验证:新增 `rebuild_index_from_log_scan`(put 25 + 删除+重写 → 抹掉索引 → 重建 → 全量校验 +
+  重建后普通 open 可读);共 22 单测 + 崩溃属性测试通过;clippy `-D warnings` 零告警。
+
 ## 待办
 
 - Log/Index 内存参考模型全量对拍。
-- 索引 mmap 化 + 改走 io_uring;从 log 扫描重建索引(兜底)。
+- 索引 mmap 化 + 改走 io_uring。

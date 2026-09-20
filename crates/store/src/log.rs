@@ -139,6 +139,14 @@ impl Log {
         self.entries.len()
     }
 
+    /// 所有段的 `(position, data_end)`,按位置升序。供上层顺序扫描全部记录用。
+    pub fn segment_spans(&self) -> Vec<(u64, u64)> {
+        self.entries
+            .iter()
+            .map(|e| (e.position, e.segment.data_end()))
+            .collect()
+    }
+
     pub fn total_capacity(&self) -> u64 {
         self.total_capacity
     }

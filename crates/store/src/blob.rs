@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::index::value::{FLAG_DELETED, NO_EXPIRATION};
 use crate::index::{IndexValue, PersistentIndex};
 use crate::log::Log;
-use crate::types::{StoreKey, KEY_SIZE};
+use crate::types::{LogOffset, StoreKey, KEY_SIZE};
 
 const REC_MAGIC: u16 = 0x424D; // "MB"
 const REC_VERSION: u8 = 1;
@@ -132,6 +132,54 @@ impl BlobStore {
         let (log_dir, index_dir) = sub_dirs(dir.as_ref());
         let log = Log::open(&log_dir, total_capacity, segment_capacity).await?;
         let index = PersistentIndex::open(&index_dir, max_index_entries_per_segment)?;
+        Ok(Self { log, index })
+    }
+
+    /// 索引损坏/丢失时的兜底:打开 Log,丢弃旧索引文件,顺序扫描全部记录重建索引。
+    ///
+    /// 记录自描述(含 key/flags),按 Log 追加顺序(旧→新)插入即天然满足 newest-wins。
+    /// 只重建到最近一次 flush 的持久化边界(未落盘尾部本就不可见,无残记录)。
+    /// 注意:记录目前不落 expiration/op_time,重建后这两项归零(当前无 TTL 写入,不影响可见性)。
+    pub async fn open_rebuild_index(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        segment_capacity: u64,
+        max_index_entries_per_segment: usize,
+    ) -> Result<Self> {
+        let (log_dir, index_dir) = sub_dirs(dir.as_ref());
+        let log = Log::open(&log_dir, total_capacity, segment_capacity).await?;
+
+        std::fs::create_dir_all(&index_dir)?;
+        for ent in std::fs::read_dir(&index_dir)? {
+            let ent = ent?;
+            if ent
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".idx"))
+            {
+                std::fs::remove_file(ent.path())?;
+            }
+        }
+
+        let mut index = PersistentIndex::create(&index_dir, max_index_entries_per_segment)?;
+        for (position, data_end) in log.segment_spans() {
+            let mut off = 0u64;
+            while off < data_end {
+                let head = log.read(LogOffset::new(position, off), rec::DATA).await?;
+                let data_len =
+                    u32::from_le_bytes(head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap())
+                        as usize;
+                let total = RECORD_OVERHEAD + data_len;
+                let raw = log.read(LogOffset::new(position, off), total).await?;
+                let decoded = decode_record(&raw)?;
+                let mut value =
+                    IndexValue::put(LogOffset::new(position, off), total as u64, now_ms());
+                value.flags = decoded.flags;
+                index.add(decoded.key, value)?;
+                off += total as u64;
+            }
+        }
+        index.flush()?;
         Ok(Self { log, index })
     }
 
@@ -306,6 +354,45 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[monoio::test]
+    async fn rebuild_index_from_log_scan() {
+        let dir = temp_dir("rebuild");
+        let seg = seg_cap(16);
+        {
+            let mut store = BlobStore::create(&dir, seg * 8, seg, 4).await.unwrap();
+            for i in 0..25u64 {
+                store.put(key(i), format!("v-{i}").as_bytes()).await.unwrap();
+            }
+            store.delete(key(7)).await.unwrap();
+            store.put(key(7), b"v2-after-delete").await.unwrap();
+            store.close().await.unwrap();
+        }
+
+        let index_dir = dir.join("index");
+        for ent in std::fs::read_dir(&index_dir).unwrap() {
+            let p = ent.unwrap().path();
+            if p.extension().is_some_and(|e| e == "idx") {
+                std::fs::remove_file(p).unwrap();
+            }
+        }
+
+        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).await.unwrap();
+        for i in 0..25u64 {
+            let want = if i == 7 {
+                b"v2-after-delete".to_vec()
+            } else {
+                format!("v-{i}").into_bytes()
+            };
+            assert_eq!(store.get(&key(i)).await.unwrap(), want, "key {i} after rebuild");
+        }
+        assert!(matches!(store.get(&key(999)).await, Err(Error::NotFound)));
+
+        drop(store);
+        let store2 = BlobStore::open(&dir, seg * 8, seg, 4).await.unwrap();
+        assert_eq!(store2.get(&key(7)).await.unwrap(), b"v2-after-delete".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
