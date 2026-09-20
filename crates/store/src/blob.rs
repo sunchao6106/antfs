@@ -1044,4 +1044,133 @@ mod tests {
         assert!(matches!(store.get(&key(5)), Err(Error::Deleted)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 差分对拍:纯内存模型记录每个 key 的期望状态,随机穿插 put/delete 与
+    /// flush/reopen/compact/compact_incremental,每步全量比对 `get()` 与模型。覆盖
+    /// newest-wins、墓碑、删后重写、跨段封存、compaction offset 重写、水位回放重开、
+    /// 扫 log 全量重建——把已实现的读写/持久化/压缩路径拧在一起验证一致性。
+    #[derive(Clone, PartialEq, Eq)]
+    enum ModelState {
+        Absent,
+        Live(Vec<u8>),
+        Deleted,
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn data_for(k: u64, ver: u64) -> Vec<u8> {
+        let len = 4 + (ver % 13) as usize;
+        let mut v = vec![0u8; len];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = (k.wrapping_mul(31).wrapping_add(ver).wrapping_add(i as u64) & 0xff) as u8;
+        }
+        v
+    }
+
+    fn verify_all(store: &BlobStore, model: &[ModelState], ctx: &str) {
+        for (k, state) in model.iter().enumerate() {
+            let got = store.get(&key(k as u64));
+            match state {
+                ModelState::Absent => {
+                    assert!(matches!(got, Err(Error::NotFound)), "{ctx}: key {k} expect NotFound, got {got:?}");
+                }
+                ModelState::Deleted => {
+                    assert!(matches!(got, Err(Error::Deleted)), "{ctx}: key {k} expect Deleted, got {got:?}");
+                }
+                ModelState::Live(data) => {
+                    let got = got.unwrap_or_else(|e| panic!("{ctx}: key {k} expect Live, got {e:?}"));
+                    assert_eq!(&got, data, "{ctx}: key {k} data mismatch");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reference_model_full_crosscheck() {
+        const KEYS: usize = 24;
+        let seg = seg_cap(2); // 小段 + 小封存阈值 → 频繁滚段/封存,吃满 mmap+fuse 封存路径与多段扫描
+        let total = seg * 256;
+        let max_idx = 8usize;
+
+        for &seed in &[0x1234_5678u64, 0xdead_beefu64, 0x0BAD_F00Du64] {
+            let dir = temp_dir(&format!("model_{seed:x}"));
+            let mut store = BlobStore::create(&dir, total, seg, max_idx).unwrap();
+            let mut model = vec![ModelState::Absent; KEYS];
+            let mut rng = Rng(seed);
+            let mut ver = 0u64;
+
+            for step in 0..400u64 {
+                match rng.below(100) {
+                    0..=44 => {
+                        let k = rng.below(KEYS as u64);
+                        ver += 1;
+                        let data = data_for(k, ver);
+                        let res = store.put(key(k), &data);
+                        match &model[k as usize] {
+                            ModelState::Live(_) => {
+                                assert!(matches!(res, Err(Error::AlreadyExists)), "step {step}: put live key {k} must reject");
+                            }
+                            _ => {
+                                res.unwrap_or_else(|e| panic!("step {step}: put key {k} failed: {e:?}"));
+                                model[k as usize] = ModelState::Live(data);
+                            }
+                        }
+                    }
+                    45..=64 => {
+                        let k = rng.below(KEYS as u64);
+                        let res = store.delete(key(k));
+                        match &model[k as usize] {
+                            ModelState::Absent => assert!(matches!(res, Err(Error::NotFound)), "step {step}: del absent key {k}"),
+                            ModelState::Deleted => assert!(matches!(res, Err(Error::Deleted)), "step {step}: del deleted key {k}"),
+                            ModelState::Live(_) => {
+                                res.unwrap_or_else(|e| panic!("step {step}: delete key {k} failed: {e:?}"));
+                                model[k as usize] = ModelState::Deleted;
+                            }
+                        }
+                    }
+                    65..=76 => store.flush().unwrap(),
+                    77..=86 => {
+                        store.close().unwrap();
+                        store = BlobStore::open(&dir, total, seg, max_idx).unwrap();
+                        verify_all(&store, &model, &format!("step {step} after reopen"));
+                    }
+                    87..=92 => {
+                        store.compact().unwrap();
+                        verify_all(&store, &model, &format!("step {step} after compact"));
+                    }
+                    _ => {
+                        store.compact_incremental(0.2).unwrap();
+                        verify_all(&store, &model, &format!("step {step} after compact_incremental"));
+                    }
+                }
+                verify_all(&store, &model, &format!("step {step}"));
+            }
+
+            verify_all(&store, &model, "final live");
+            store.close().unwrap();
+
+            let reopened = BlobStore::open(&dir, total, seg, max_idx).unwrap();
+            verify_all(&reopened, &model, "final reopen");
+            reopened.close().unwrap();
+
+            let rebuilt = BlobStore::open_rebuild_index(&dir, total, seg, max_idx).unwrap();
+            verify_all(&rebuilt, &model, "final rebuild-from-log");
+            rebuilt.close().unwrap();
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }

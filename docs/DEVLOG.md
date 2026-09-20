@@ -88,10 +88,30 @@
 - 验证:新增 3 测(回收+状态不变、阈值不触发、提交中崩溃修复);共 23 单测 + 崩溃属性 + smoke 全绿;clippy 零告警。
 - 已知简化:目前是 CompactAll(全库重写);Ambry 式按段区间的增量 StatsBased compaction 后续做。
 
+## 步骤 9:增量 compaction(按段死数据阈值触发)
+
+- `BlobStore::compact_incremental(threshold)`:只压缩死占比 ≥ 阈值的**非活跃**段(热/末段不动),
+  区别于 `compact()` 的全库重写(对齐 Ambry 按段区间 StatsBased,而非 CompactAll)。
+- 机制:被选中段的存活记录写入位置更高的新段(temp→fsync→rename)→ 删旧段 → 重建索引;
+  存活赢家搬到更高 offset 仍是该 key 最新记录,newest-wins 不变。
+- 配套:`segment_stats()`(每封存段 `(position, live, dead)` 字节);抽出 `scan_segment()` 单段遍历。
+- 崩溃安全:复用 `COMPACT_COMMIT` 标记;`recover_compaction` 两分支接入 `clean_tmp_segments()`
+  清理残留 `.tmp` 半成品新段,open 重建索引收敛。
+- 验证:新增 1 测(只回收高死老段、状态不变、重开一致);clippy 零告警。
+
+## 步骤 10:内存参考模型全量对拍
+
+- `reference_model_full_crosscheck`:确定性 PRNG(多 seed)随机穿插 put/delete +
+  flush/reopen/compact/compact_incremental,纯内存模型记录每 key 期望状态,每步全量比对 `get()`。
+- 覆盖 newest-wins、墓碑、删后重写、跨段封存(mmap+fuse)、compaction offset 重写、水位回放重开、
+  扫 log 全量重建三态收尾。
+- 验证:共 27 单测 + 崩溃属性 + smoke 全绿;clippy `-D warnings` 零告警。
+
 ## 待办
 
-- Log/Index 内存参考模型全量对拍。
-- 增量 compaction(按段死数据占比选区间,而非全库 CompactAll);死数据统计接入更精确来源。
+- **PUT-on-deleted 语义与 Ambry 的分歧**:Ambry `checkWriteSetStateInStore` 对 `EnumSet.of(PUT, DELETE)`
+  命中即 `COLLIDING/AlreadyExist`——**删除后的 key 不允许再 PUT**,复活走 `undelete`(带 lifeVersion)。
+  当前 rs 允许「删后重写」。待定:是否对齐 Ambry(拒绝再 PUT + 后续实现 undelete/lifeVersion)。
 - 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。
-- 记录落 expiration/op_time(当前 `从 log 重建`会丢 TTL 的缺口)。
-- 索引持久化水位回放替代「每次全量/损坏重建」(对齐 Ambry `recover()`)。
+- 并发/共享模型(D4):`&mut self` 单写者 → 共享实例 + `RwLock`/并发结构(运行时 tokio vs 手写线程池仍为 Open Question)。
+- 死数据统计接入更精确来源(增量维护而非每次全量扫 log)。
