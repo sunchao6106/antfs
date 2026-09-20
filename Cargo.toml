@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/smoke", "crates/store"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

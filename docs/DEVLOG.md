@@ -1,0 +1,60 @@
+# 开发日志(DEVLOG)
+
+按实现步骤记录:做了什么、关键决策、验证证据。
+
+---
+
+## 步骤 0:开发环境
+
+- macOS 宿主无 Rust/无法编译 monoio(Linux only)→ 起 colima Linux VM。
+- 环境:Ubuntu 24.04 / kernel 6.8 / io_uring 启用 / Rust 1.98 / O_DIRECT 可用(ext4)。
+- 源码经 virtiofs 挂载进 VM;`vm-cargo.sh` 把 cargo 转进 VM,target/数据落 ext4。
+- 冒烟:`crates/smoke` 用 monoio 真 io_uring 读写闭环通过。
+
+## 步骤 1:IO 层(AlignedBuf)
+
+- 决策:O_DIRECT 需对齐 → 自实现 `AlignedBuf`(4096 对齐、alloc_zeroed、实现 monoio IoBuf/IoBufMut)。
+- 核对 monoio 0.2.4 真实 API:`OpenOptionsExt::custom_flags` 设 O_DIRECT;`IoBuf{read_ptr,bytes_init}`、
+  `IoBufMut{write_ptr,bytes_total,set_init}`;`BufResult<T,B>=(io::Result<T>,B)`。
+
+## 步骤 2:LogSegment
+
+- monoio + io_uring + O_DIRECT 全链路。对齐暂存块 `tail` + 满块写盘 + flush 补零尾块 + fsync。
+- Header + crc32,`open()` 按 data_end 恢复。`posix_fallocate` 真实预分配。
+- 验证:7 单测通过(round-trip / 跨块 / 段满 / 重开恢复 / AlignedBuf)+ clippy `-D warnings` 零告警。
+
+## 步骤 3:Log(多段)
+
+- 多 LogSegment + rollover(旧段先 flush 再滚动)+ `LogOffset{segment,offset}` 全局地址。
+- 容量校验(total 为 segment 整数倍)、单记录不超段、段满 `SegmentFull`。
+- `open()` 扫描目录按位置排序恢复。
+- 单测:rollover / log 满 / 记录过大 / 重开恢复。
+
+## 步骤 3.5:崩溃一致性属性测试
+
+- `tests/crash_consistency.rs`:proptest 随机 Append/Flush → 崩溃(不 flush 关闭)+ 重开。
+- 不变式:恢复的 data_end == 最后 flush 的 data_end;边界内记录原样可读。
+- 另在打开态校验所有记录可读(覆盖 tail+disk 读路径拼接)。
+
+## 步骤 4:PersistentIndex
+
+- `StoreKey`(32B 定长)+ `IndexValue`(43B 定长)+ index 段(排序条目 + Binary Fuse 过滤器)。
+- 活跃段内存 BTreeMap;满阈值封存落盘 + 建过滤器;newest-wins 查找;删除走新条目。
+- 决策:索引文件用同步 std::fs(小元数据/非热路径),tmp+rename 原子写,header/body 双 crc;
+  过滤器不落盘、加载时重建。xorf `BinaryFuse8::try_from(&[u64])`,散列去重避免构造失败。
+- 验证:16 单测(index 5 + value 1 + log/segment/aligned)+ 崩溃属性测试通过;clippy `-D warnings` 零告警。
+
+## 步骤 5:BlobStore(串联)
+
+- 缝合 Log(数据,io_uring+O_DIRECT)+ PersistentIndex(索引,std::fs)成对象存储:put/get/delete。
+- 自描述日志记录 `magic|version|flags|key(32)|data_len|data|crc`:key/flags 也落 Log,
+  为将来"扫描 Log 重建索引"留出兜底路径;crc 覆盖记录全体,get 时校验并比对 key。
+- 语义对齐 Ambry:put 遇已存在且未删除的 key 报 `AlreadyExists`;delete 写墓碑记录 + 删除条目;
+  get 处理 NotFound/Deleted/Expired。flush 顺序先数据 fsync 再落索引,索引永不指向未落盘数据。
+- 验证:21 单测(新增 BlobStore 5:put/get、拒重复、删除+重写、重开恢复、记录 crc 守卫)
+  + 崩溃属性测试通过;clippy `-D warnings` 零告警。
+
+## 待办
+
+- Log/Index 内存参考模型全量对拍。
+- 索引 mmap 化 + 改走 io_uring;从 log 扫描重建索引(兜底)。

@@ -1,0 +1,10 @@
+# Rust build artifacts (target 实际放在 VM 的 /var/tmp,这里兜底忽略)
+/target
+target/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
