@@ -214,17 +214,19 @@ impl BlobStore {
         })
     }
 
-    /// 写入一个对象(无过期)。key 已存在且未删除则报 [`Error::AlreadyExists`](crate::error::Error::AlreadyExists)。
+    /// 写入一个对象(无过期)。key 已存在(含墓碑)则报 [`Error::AlreadyExists`](crate::error::Error::AlreadyExists)。
     pub fn put(&mut self, key: StoreKey, data: &[u8]) -> Result<()> {
         self.put_ttl(key, data, NO_EXPIRATION)
     }
 
     /// 写入一个对象并设定过期时间(`expiration_ms`,`NO_EXPIRATION` 表示不过期)。
+    ///
+    /// 对齐 Ambry:blob id 永久占用——命中任何已存在条目(PUT 或 DELETE 墓碑)一律
+    /// [`Error::AlreadyExists`](crate::error::Error::AlreadyExists);复活已删除对象须走
+    /// undelete/lifeVersion(后续实现),普通 put 不允许删后重写。
     pub fn put_ttl(&mut self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
-        if let Some(v) = self.index.find(&key) {
-            if !v.is_deleted() {
-                return Err(Error::AlreadyExists);
-            }
+        if self.index.find(&key).is_some() {
+            return Err(Error::AlreadyExists);
         }
         let op_time = now_ms();
         let record = encode_record(&key, 0, expiration_ms, op_time, data);
@@ -743,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_then_get_and_reput() {
+    fn delete_then_reput_rejected() {
         let dir = temp_dir("del");
         let seg = seg_cap(16);
         let mut store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
@@ -753,9 +755,9 @@ mod tests {
         assert!(matches!(store.delete(key(1)), Err(Error::Deleted)));
         assert!(matches!(store.delete(key(2)), Err(Error::NotFound)));
 
-        // 删除后允许重新 put(旧条目是 deleted)。
-        store.put(key(1), b"v2").unwrap();
-        assert_eq!(store.get(&key(1)).unwrap(), b"v2".to_vec());
+        // 对齐 Ambry:blob id 永久占用,删除后普通 put 仍报 AlreadyExists(复活须走 undelete)。
+        assert!(matches!(store.put(key(1), b"v2"), Err(Error::AlreadyExists)));
+        assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -796,8 +798,7 @@ mod tests {
             for i in 0..25u64 {
                 store.put(key(i), format!("v-{i}").as_bytes()).unwrap();
             }
-            store.delete(key(7)).unwrap();
-            store.put(key(7), b"v2-after-delete").unwrap();
+            store.delete(key(7)).unwrap(); // key 7:PUT + DELETE 墓碑 → newest-wins 应为 Deleted
             store.close().unwrap();
         }
 
@@ -811,18 +812,17 @@ mod tests {
 
         let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
         for i in 0..25u64 {
-            let want = if i == 7 {
-                b"v2-after-delete".to_vec()
-            } else {
-                format!("v-{i}").into_bytes()
-            };
-            assert_eq!(store.get(&key(i)).unwrap(), want, "key {i} after rebuild");
+            if i == 7 {
+                assert!(matches!(store.get(&key(7)), Err(Error::Deleted)), "key 7 tombstone after rebuild");
+                continue;
+            }
+            assert_eq!(store.get(&key(i)).unwrap(), format!("v-{i}").into_bytes(), "key {i} after rebuild");
         }
         assert!(matches!(store.get(&key(999)), Err(Error::NotFound)));
 
         drop(store);
         let store2 = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
-        assert_eq!(store2.get(&key(7)).unwrap(), b"v2-after-delete".to_vec());
+        assert!(matches!(store2.get(&key(7)), Err(Error::Deleted)));
         drop(store2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -881,16 +881,12 @@ mod tests {
         let seg = seg_cap(8);
         let mut store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
 
-        // 制造大量死数据:put 0..10,再 delete 一半、覆盖(删后重写)另一半。
+        // 死数据来源(Ambry 语义下无覆盖/无删后重写):delete 使原 PUT 变死,墓碑成为新赢家。
         for i in 0..10u64 {
             store.put(key(i), format!("original-value-{i}").as_bytes()).unwrap();
         }
         for i in 0..5u64 {
             store.delete(key(i)).unwrap(); // key 0..4 变墓碑(原 PUT 变死数据)
-        }
-        for i in 5..10u64 {
-            store.delete(key(i)).unwrap();
-            store.put(key(i), format!("rewritten-{i}").as_bytes()).unwrap(); // 覆盖:旧 PUT+DELETE 死
         }
 
         let before = store.stats().unwrap();
@@ -898,18 +894,18 @@ mod tests {
 
         let st = store.compact().unwrap();
         assert!(st.dead_bytes > 0);
-        // compact 后死数据应清零(全库只剩赢家)。
+        // compact 后死数据应清零(全库只剩赢家:5..9 的 PUT + 0..4 的墓碑)。
         let after = store.stats().unwrap();
         assert_eq!(after.dead_bytes, 0, "no dead data after compaction");
 
-        // 逻辑状态不变:0..4 已删,5..9 是重写值。
+        // 逻辑状态不变:0..4 已删,5..9 是原值。
         for i in 0..5u64 {
             assert!(matches!(store.get(&key(i)), Err(Error::Deleted)), "key {i} must stay deleted");
         }
         for i in 5..10u64 {
             assert_eq!(
                 store.get(&key(i)).unwrap(),
-                format!("rewritten-{i}").into_bytes(),
+                format!("original-value-{i}").into_bytes(),
                 "key {i} value must survive compaction"
             );
         }
@@ -918,7 +914,7 @@ mod tests {
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
         for i in 5..10u64 {
-            assert_eq!(store.get(&key(i)).unwrap(), format!("rewritten-{i}").into_bytes());
+            assert_eq!(store.get(&key(i)).unwrap(), format!("original-value-{i}").into_bytes());
         }
         assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1120,12 +1116,12 @@ mod tests {
                         let data = data_for(k, ver);
                         let res = store.put(key(k), &data);
                         match &model[k as usize] {
-                            ModelState::Live(_) => {
-                                assert!(matches!(res, Err(Error::AlreadyExists)), "step {step}: put live key {k} must reject");
+                            ModelState::Absent => {
+                                res.unwrap_or_else(|e| panic!("step {step}: put absent key {k} failed: {e:?}"));
+                                model[k as usize] = ModelState::Live(data);
                             }
                             _ => {
-                                res.unwrap_or_else(|e| panic!("step {step}: put key {k} failed: {e:?}"));
-                                model[k as usize] = ModelState::Live(data);
+                                assert!(matches!(res, Err(Error::AlreadyExists)), "step {step}: put existing key {k} must reject");
                             }
                         }
                     }

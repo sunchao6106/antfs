@@ -49,7 +49,7 @@
 - 缝合 Log(数据,io_uring+O_DIRECT)+ PersistentIndex(索引,std::fs)成对象存储:put/get/delete。
 - 自描述日志记录 `magic|version|flags|key(32)|data_len|data|crc`:key/flags 也落 Log,
   为将来"扫描 Log 重建索引"留出兜底路径;crc 覆盖记录全体,get 时校验并比对 key。
-- 语义对齐 Ambry:put 遇已存在且未删除的 key 报 `AlreadyExists`;delete 写墓碑记录 + 删除条目;
+- 语义对齐 Ambry:put 命中已存在条目(PUT 或 DELETE 墓碑)一律报 `AlreadyExists`(见步骤 11);delete 写墓碑记录 + 删除条目;
   get 处理 NotFound/Deleted/Expired。flush 顺序先数据 fsync 再落索引,索引永不指向未落盘数据。
 - 验证:21 单测(新增 BlobStore 5:put/get、拒重复、删除+重写、重开恢复、记录 crc 守卫)
   + 崩溃属性测试通过;clippy `-D warnings` 零告警。
@@ -103,15 +103,22 @@
 
 - `reference_model_full_crosscheck`:确定性 PRNG(多 seed)随机穿插 put/delete +
   flush/reopen/compact/compact_incremental,纯内存模型记录每 key 期望状态,每步全量比对 `get()`。
-- 覆盖 newest-wins、墓碑、删后重写、跨段封存(mmap+fuse)、compaction offset 重写、水位回放重开、
+- 覆盖 newest-wins、墓碑、跨段封存(mmap+fuse)、compaction offset 重写、水位回放重开、
   扫 log 全量重建三态收尾。
 - 验证:共 27 单测 + 崩溃属性 + smoke 全绿;clippy `-D warnings` 零告警。
 
+## 步骤 11:PUT-on-deleted 语义对齐 Ambry
+
+- 核对 Ambry `BlobStore.checkWriteSetStateInStore`:`index.findKey(..., EnumSet.of(PUT, DELETE))`
+  命中且非幂等重试即 `COLLIDING → AlreadyExist`——**blob id 永久占用,删除后普通 put 不允许复活**,
+  复活走独立 `undelete`(带 lifeVersion)。
+- 反转原 rs「删后允许重写」:`put_ttl` 改为命中任何已存在条目(PUT 或墓碑)一律 `AlreadyExists`。
+- 更新 `delete_then_reput_rejected`(原 `delete_then_get_and_reput`)与参考模型的 put 判定。
+- 验证:27 单测 + 崩溃属性 + smoke 全绿;clippy 零告警。
+
 ## 待办
 
-- **PUT-on-deleted 语义与 Ambry 的分歧**:Ambry `checkWriteSetStateInStore` 对 `EnumSet.of(PUT, DELETE)`
-  命中即 `COLLIDING/AlreadyExist`——**删除后的 key 不允许再 PUT**,复活走 `undelete`(带 lifeVersion)。
-  当前 rs 允许「删后重写」。待定:是否对齐 Ambry(拒绝再 PUT + 后续实现 undelete/lifeVersion)。
 - 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。
 - 并发/共享模型(D4):`&mut self` 单写者 → 共享实例 + `RwLock`/并发结构(运行时 tokio vs 手写线程池仍为 Open Question)。
+- undelete / lifeVersion:删除后复活对象的独立操作(对齐 Ambry `undelete`),普通 put 不再承担复活职责。
 - 死数据统计接入更精确来源(增量维护而非每次全量扫 log)。
