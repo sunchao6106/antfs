@@ -64,7 +64,22 @@
 - 验证:新增 `rebuild_index_from_log_scan`(put 25 + 删除+重写 → 抹掉索引 → 重建 → 全量校验 +
   重建后普通 open 可读);共 22 单测 + 崩溃属性测试通过;clippy `-D warnings` 零告警。
 
+## 步骤 7:去 monoio → 同步阻塞 IO(战略反转,对标 Ambry 路线乙)
+
+- **移除 monoio / io_uring / O_DIRECT 全栈**:`aligned.rs` 删除;`log_segment.rs`/`log.rs`/`blob.rs`
+  改写为 `std::fs::File` 同步阻塞(buffered)IO;`data_end` 只在 `flush()` 更新(fsync 点),
+  断电时恢复严格截断到持久边界;crash 测试改为直接断言该边界。
+- **索引**:活跃段 `BTreeMap` → `crossbeam-skiplist::SkipMap`(并发);封存段整段载入 RAM →
+  **`memmap2` mmap**(二分直接做在映射上);Fuse 过滤器**持久化为 `{seq}.fuse`**
+  (descriptor+fingerprints,`BinaryFuse8Ref` 零拷贝引用),启动不再全量重建;
+  索引段写入改「先 fsync 再 rename」。
+- 动机与决策详 `openspec/changes/io-index-design/`。定容上界、compaction 本轮未做。
+- 验证:20 单测 + 崩溃属性 + smoke 全绿;clippy `-D warnings` 零告警。
+
 ## 待办
 
 - Log/Index 内存参考模型全量对拍。
-- 索引 mmap 化 + 改走 io_uring。
+- compaction/GC(周期性定时 + 死数据阈值触发,log+index 协同回收;对齐 Ambry `BlobStoreCompactor`)。
+- 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。
+- 记录落 expiration/op_time(当前 `从 log 重建`会丢 TTL 的缺口)。
+- 索引持久化水位回放替代「每次全量/损坏重建」(对齐 Ambry `recover()`)。

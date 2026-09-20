@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-monoio = "0.2"
 thiserror = "1"
 crc32fast = "1"
 libc = "0.2"
 xorf = "0.13.0"
+memmap2 = "0.9"
+crossbeam-skiplist = "0.1"
 
 [dev-dependencies]
 proptest = "1"

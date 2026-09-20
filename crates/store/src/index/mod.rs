@@ -10,7 +10,7 @@
 pub mod value;
 mod segment;
 
-use std::collections::BTreeMap;
+use crossbeam_skiplist::SkipMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -18,14 +18,15 @@ use crate::types::StoreKey;
 
 pub use value::IndexValue;
 
-use segment::{read_segment_file, write_segment_file, SealedSegment};
+use segment::{read_segment_file, SealedSegment};
 
 pub struct PersistentIndex {
     dir: PathBuf,
     max_entries_per_segment: usize,
-    active: BTreeMap<StoreKey, IndexValue>,
-    active_seq: u64,
+    /// 活跃段:并发有序映射,写入即插入;无过滤器。
+    active: SkipMap<StoreKey, IndexValue>,
     sealed: Vec<SealedSegment>,
+    active_seq: u64,
     next_seq: u64,
 }
 
@@ -40,14 +41,14 @@ impl PersistentIndex {
         Ok(Self {
             dir,
             max_entries_per_segment,
-            active: BTreeMap::new(),
+            active: SkipMap::new(),
             active_seq: 0,
             sealed: Vec::new(),
             next_seq: 1,
         })
     }
 
-    /// 打开已有索引:扫描 `{seq}.idx` 恢复封存段与活跃段。
+    /// 打开已有索引:扫描 `{seq}.idx` + `{seq}.fuse` 恢复封存段与活跃段。
     pub fn open(dir: impl AsRef<Path>, max_entries_per_segment: usize) -> Result<Self> {
         if max_entries_per_segment == 0 {
             return Err(Error::BadArgument("max_entries_per_segment must be > 0".into()));
@@ -66,27 +67,31 @@ impl PersistentIndex {
         seqs.sort_unstable();
 
         let mut sealed = Vec::new();
-        let mut active = BTreeMap::new();
+        let active = SkipMap::new();
         let mut active_seq = 0u64;
         let mut max_seq = 0u64;
         let mut has_active = false;
 
-        for seq in seqs {
-            max_seq = max_seq.max(seq);
-            let path = dir.join(format!("{seq}.idx"));
-            let loaded = read_segment_file(&path)?;
-            if loaded.sealed {
-                sealed.push(SealedSegment::from_entries(seq, loaded.entries)?);
+        // 识别活跃段:活跃段落盘时也是 `{seq}.idx`,但最后一个 seq 若是活跃则无 `.fuse`。
+        // 约定:活跃段文件 `{seq}.idx` 但没有配套 `{seq}.fuse`。
+        for seq in &seqs {
+            max_seq = max_seq.max(*seq);
+            let has_fuse = dir.join(format!("{seq}.fuse")).exists();
+            if has_fuse {
+                sealed.push(SealedSegment::open(&dir, *seq)?);
             } else {
                 if has_active {
                     return Err(Error::Corrupt("multiple active (unsealed) index segments".into()));
                 }
                 has_active = true;
-                active_seq = seq;
-                active = loaded.entries.into_iter().collect();
+                active_seq = *seq;
+                let loaded = read_segment_file(&dir.join(format!("{seq}.idx")))?;
+                for (k, v) in loaded.entries {
+                    active.insert(k, v);
+                }
             }
         }
-
+        // 按 seq 升序,保证 newest-wins 扫描从尾部(最新)开始。
         sealed.sort_by_key(|s| s.seq());
 
         let (active_seq, next_seq) = if has_active {
@@ -100,13 +105,13 @@ impl PersistentIndex {
             dir,
             max_entries_per_segment,
             active,
-            active_seq,
             sealed,
+            active_seq,
             next_seq,
         })
     }
 
-    /// 写入一条索引(PUT/DELETE/TTL 都是往活跃段插入)。活跃段满则自动封存。
+    /// 写入一条索引。活跃段为并发映射;满阈值自动封存。
     pub fn add(&mut self, key: StoreKey, value: IndexValue) -> Result<()> {
         self.active.insert(key, value);
         if self.active.len() >= self.max_entries_per_segment {
@@ -118,7 +123,7 @@ impl PersistentIndex {
     /// 查找 key 的最新值(newest-wins):活跃段 → 封存段(新→旧)。
     pub fn find(&self, key: &StoreKey) -> Option<IndexValue> {
         if let Some(v) = self.active.get(key) {
-            return Some(*v);
+            return Some(*v.value());
         }
         for seg in self.sealed.iter().rev() {
             if let Some(v) = seg.find(key) {
@@ -128,25 +133,33 @@ impl PersistentIndex {
         None
     }
 
-    /// 持久化活跃段(以 sealed=0 落盘),使重启可恢复。
+    /// 持久化活跃段(以 `{seq}.idx` 落盘,无 `.fuse` 标识活跃),使重启可恢复。
     pub fn flush(&mut self) -> Result<()> {
         if self.active.is_empty() {
             return Ok(());
         }
-        let entries: Vec<_> = self.active.iter().map(|(k, v)| (*k, *v)).collect();
+        let entries: Vec<_> = self
+            .active
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
         let path = self.dir.join(format!("{}.idx", self.active_seq));
-        write_segment_file(&path, false, &entries)
+        segment::write_segment_file(&path, &entries)
     }
 
-    /// 封存当前活跃段:排序落盘(sealed=1)+ 构建过滤器 + 起一个新活跃段。
+    /// 封存当前活跃段:写 `.idx` + `.fuse`(mmap 载入)→ 起一个新活跃段。
     pub fn seal_active(&mut self) -> Result<()> {
         if self.active.is_empty() {
             return Ok(());
         }
-        let entries: Vec<_> = std::mem::take(&mut self.active).into_iter().collect();
-        let path = self.dir.join(format!("{}.idx", self.active_seq));
-        write_segment_file(&path, true, &entries)?;
-        self.sealed.push(SealedSegment::from_entries(self.active_seq, entries)?);
+        let entries: Vec<_> = self
+            .active
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
+        let sealed = SealedSegment::from_entries(&self.dir, self.active_seq, &entries)?;
+        self.sealed.push(sealed);
+        self.active.clear();
 
         self.active_seq = self.next_seq;
         self.next_seq += 1;
