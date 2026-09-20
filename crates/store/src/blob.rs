@@ -6,9 +6,10 @@
 //!
 //! 记录布局(小端,crc 覆盖其前所有字节):
 //! ```text
-//! [ magic u16 | version u8 | flags u8 | key(32) | data_len u32 | data[data_len] | crc u32 ]
+//! [ magic u16 | version u8 | flags u8 | key(32) | expiration i64 | op_time u64 | data_len u32 | data | crc u32 ]
 //! ```
-//! `put` 写 `flags=0` 的记录;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑记录。
+//! `put` 写 `flags=0`;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑。expiration/op_time
+//! 落进记录,故从 log 重建索引时 TTL 不丢失。
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +20,7 @@ use crate::log::Log;
 use crate::types::{LogOffset, StoreKey, KEY_SIZE};
 
 const REC_MAGIC: u16 = 0x424D; // "MB"
-const REC_VERSION: u8 = 1;
+const REC_VERSION: u8 = 2;
 
 mod rec {
     use super::KEY_SIZE;
@@ -27,7 +28,9 @@ mod rec {
     pub const VERSION: usize = 2;
     pub const FLAGS: usize = 3;
     pub const KEY: usize = 4;
-    pub const DATA_LEN: usize = KEY + KEY_SIZE;
+    pub const EXPIRATION: usize = KEY + KEY_SIZE; // i64
+    pub const OP_TIME: usize = EXPIRATION + 8; // u64
+    pub const DATA_LEN: usize = OP_TIME + 8; // u32
     pub const DATA: usize = DATA_LEN + 4;
     pub const CRC_LEN: usize = 4;
 }
@@ -42,13 +45,21 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn encode_record(key: &StoreKey, flags: u8, data: &[u8]) -> Vec<u8> {
+fn encode_record(
+    key: &StoreKey,
+    flags: u8,
+    expiration_ms: i64,
+    operation_time_ms: u64,
+    data: &[u8],
+) -> Vec<u8> {
     let total = RECORD_OVERHEAD + data.len();
     let mut buf = vec![0u8; total];
     buf[rec::MAGIC..rec::MAGIC + 2].copy_from_slice(&REC_MAGIC.to_le_bytes());
     buf[rec::VERSION] = REC_VERSION;
     buf[rec::FLAGS] = flags;
     buf[rec::KEY..rec::KEY + KEY_SIZE].copy_from_slice(key.as_bytes());
+    buf[rec::EXPIRATION..rec::EXPIRATION + 8].copy_from_slice(&expiration_ms.to_le_bytes());
+    buf[rec::OP_TIME..rec::OP_TIME + 8].copy_from_slice(&operation_time_ms.to_le_bytes());
     buf[rec::DATA_LEN..rec::DATA_LEN + 4].copy_from_slice(&(data.len() as u32).to_le_bytes());
     buf[rec::DATA..rec::DATA + data.len()].copy_from_slice(data);
     let crc_at = rec::DATA + data.len();
@@ -60,6 +71,8 @@ fn encode_record(key: &StoreKey, flags: u8, data: &[u8]) -> Vec<u8> {
 struct DecodedRecord {
     flags: u8,
     key: StoreKey,
+    expiration_ms: i64,
+    operation_time_ms: u64,
     data: Vec<u8>,
 }
 
@@ -79,6 +92,8 @@ fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
     }
     let flags = buf[rec::FLAGS];
     let key = StoreKey::from_slice(&buf[rec::KEY..rec::KEY + KEY_SIZE]).expect("key size fixed");
+    let expiration_ms = i64::from_le_bytes(buf[rec::EXPIRATION..rec::EXPIRATION + 8].try_into().unwrap());
+    let operation_time_ms = u64::from_le_bytes(buf[rec::OP_TIME..rec::OP_TIME + 8].try_into().unwrap());
     let data_len = u32::from_le_bytes(buf[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
     let crc_at = rec::DATA + data_len;
     if buf.len() != crc_at + rec::CRC_LEN {
@@ -98,6 +113,8 @@ fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
     Ok(DecodedRecord {
         flags,
         key,
+        expiration_ms,
+        operation_time_ms,
         data: buf[rec::DATA..crc_at].to_vec(),
     })
 }
@@ -144,6 +161,9 @@ impl BlobStore {
     }
 
     /// 打开已有库并恢复索引与日志;若有未完成的 compaction 提交标记,先修复。
+    ///
+    /// 崩溃安全:加载已落盘索引后,按**持久化水位**回放 log 尾部——把「已落盘到 log 但
+    /// 上次索引持久化未覆盖」的记录补进索引(对齐 Ambry `recover()`),避免加载到陈旧索引。
     pub fn open(
         dir: impl AsRef<Path>,
         total_capacity: u64,
@@ -154,7 +174,9 @@ impl BlobStore {
         recover_compaction(&dir, total_capacity, segment_capacity, max_index_entries_per_segment)?;
         let (log_dir, index_dir) = sub_dirs(&dir);
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
-        let index = PersistentIndex::open(&index_dir, max_index_entries_per_segment)?;
+        let mut index = PersistentIndex::open(&index_dir, max_index_entries_per_segment)?;
+        let watermark = read_watermark(&index_dir).unwrap_or(LogOffset::new(0, 0));
+        replay_from(&log, &mut index, watermark)?;
         Ok(Self {
             dir,
             total_capacity,
@@ -191,17 +213,24 @@ impl BlobStore {
         })
     }
 
-    /// 写入一个对象。key 已存在且未删除则报 [`Error::AlreadyExists`](crate::error::Error::AlreadyExists)。
+    /// 写入一个对象(无过期)。key 已存在且未删除则报 [`Error::AlreadyExists`](crate::error::Error::AlreadyExists)。
     pub fn put(&mut self, key: StoreKey, data: &[u8]) -> Result<()> {
+        self.put_ttl(key, data, NO_EXPIRATION)
+    }
+
+    /// 写入一个对象并设定过期时间(`expiration_ms`,`NO_EXPIRATION` 表示不过期)。
+    pub fn put_ttl(&mut self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
         if let Some(v) = self.index.find(&key) {
             if !v.is_deleted() {
                 return Err(Error::AlreadyExists);
             }
         }
-        let record = encode_record(&key, 0, data);
+        let op_time = now_ms();
+        let record = encode_record(&key, 0, expiration_ms, op_time, data);
         let offset = self.log.append(&record)?;
-        self.index
-            .add(key, IndexValue::put(offset, record.len() as u64, now_ms()))?;
+        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
+        value.expiration_ms = expiration_ms;
+        self.index.add(key, value)?;
         Ok(())
     }
 
@@ -238,18 +267,21 @@ impl BlobStore {
             Some(v) if v.is_deleted() => return Err(Error::Deleted),
             Some(_) => {}
         }
-        let record = encode_record(&key, FLAG_DELETED, &[]);
+        let op_time = now_ms();
+        let record = encode_record(&key, FLAG_DELETED, NO_EXPIRATION, op_time, &[]);
         let offset = self.log.append(&record)?;
-        let mut value = IndexValue::put(offset, record.len() as u64, now_ms());
+        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_DELETED;
         self.index.add(key, value)?;
         Ok(())
     }
 
-    /// 持久化:先落数据(fsync)再落索引,保证索引不指向未落盘的数据。
+    /// 持久化:先落数据(fsync)再落索引,最后写持久化水位(= 当前 log 末尾)。
     pub fn flush(&mut self) -> Result<()> {
         self.log.flush()?;
         self.index.flush()?;
+        let (_, index_dir) = sub_dirs(&self.dir);
+        write_watermark(&index_dir, self.log.end_offset())?;
         Ok(())
     }
 
@@ -257,6 +289,13 @@ impl BlobStore {
     pub fn close(mut self) -> Result<()> {
         self.flush()?;
         self.log.close()
+    }
+
+    /// 仅持久化数据日志(推进 log header 的 data_end),**不**落索引/水位。用于测试模拟
+    /// 「数据已落盘、索引仍停在旧水位」的崩溃前状态。
+    #[cfg(test)]
+    fn log_flush_only_for_test(&mut self) {
+        self.log.flush().unwrap();
     }
 
     /// 扫描全库,返回存活/死亡字节统计(死 = 被更新版本取代/删除的旧记录)。
@@ -383,13 +422,66 @@ fn rebuild_index(log: &Log, index_dir: &Path, max_entries: usize) -> Result<Pers
     }
     let mut index = PersistentIndex::create(index_dir, max_entries)?;
     for_each_record(log, |off, raw, decoded| {
-        let mut value = IndexValue::put(off, raw.len() as u64, now_ms());
+        let mut value = IndexValue::put(off, raw.len() as u64, decoded.operation_time_ms);
         value.flags = decoded.flags;
+        value.expiration_ms = decoded.expiration_ms;
         index.add(decoded.key, value)?;
         Ok(())
     })?;
     index.flush()?;
+    // 重建覆盖了整个 log,水位推进到当前末尾。
+    write_watermark(index_dir, log.end_offset())?;
     Ok(index)
+}
+
+/// 按持久化水位回放 log 尾部:把 offset ≥ watermark 的记录补进索引(旧→新,保 newest-wins)。
+fn replay_from(log: &Log, index: &mut PersistentIndex, watermark: LogOffset) -> Result<()> {
+    for_each_record(log, |off, raw, decoded| {
+        if off >= watermark {
+            let mut value = IndexValue::put(off, raw.len() as u64, decoded.operation_time_ms);
+            value.flags = decoded.flags;
+            value.expiration_ms = decoded.expiration_ms;
+            index.add(decoded.key, value)?;
+        }
+        Ok(())
+    })
+}
+
+const WATERMARK_FILE: &str = "WATERMARK";
+
+/// 写持久化水位(segment u64 + offset u64 + crc u32,tmp→fsync→rename)。
+fn write_watermark(index_dir: &Path, off: LogOffset) -> Result<()> {
+    std::fs::create_dir_all(index_dir)?;
+    let mut buf = [0u8; 20];
+    buf[0..8].copy_from_slice(&off.segment.to_le_bytes());
+    buf[8..16].copy_from_slice(&off.offset.to_le_bytes());
+    let crc = crc32fast::hash(&buf[0..16]);
+    buf[16..20].copy_from_slice(&crc.to_le_bytes());
+    let path = index_dir.join(WATERMARK_FILE);
+    let tmp = index_dir.join("WATERMARK.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// 读持久化水位;文件缺失或损坏返回 None(调用方回退到从 0 回放)。
+fn read_watermark(index_dir: &Path) -> Option<LogOffset> {
+    let buf = std::fs::read(index_dir.join(WATERMARK_FILE)).ok()?;
+    if buf.len() != 20 {
+        return None;
+    }
+    let crc = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+    if crc32fast::hash(&buf[0..16]) != crc {
+        return None;
+    }
+    let segment = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let offset = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    Some(LogOffset::new(segment, offset))
 }
 
 /// 打开前修复未完成的 compaction:依据 `COMPACT_COMMIT` 标记与 `log.new`/`log.old` 收敛到一致状态。
@@ -590,15 +682,48 @@ mod tests {
     fn record_roundtrip_and_crc_guard() {
         let k = key(42);
         let data = b"payload".to_vec();
-        let mut buf = encode_record(&k, 0, &data);
+        let mut buf = encode_record(&k, 0, 1_700_000_000_000, 1_699_000_000_000, &data);
         let d = decode_record(&buf).unwrap();
         assert_eq!(d.flags, 0);
         assert_eq!(d.key, k);
         assert_eq!(d.data, data);
+        assert_eq!(d.expiration_ms, 1_700_000_000_000);
+        assert_eq!(d.operation_time_ms, 1_699_000_000_000);
 
         // 翻转一个数据字节,crc 必须失败。
         buf[rec::DATA] ^= 0xFF;
         assert!(matches!(decode_record(&buf), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn ttl_survives_rebuild() {
+        let dir = temp_dir("ttl");
+        let seg = seg_cap(16);
+        let exp = now_ms() as i64 + 3_600_000; // 1h 后过期
+        {
+            let mut store = BlobStore::create(&dir, seg * 4, seg, 100).unwrap();
+            store.put_ttl(key(1), b"has-ttl", exp).unwrap();
+            store.put(key(2), b"no-ttl").unwrap();
+            store.close().unwrap();
+        }
+        // 抹掉索引,从 log 重建:expiration 应被保留。
+        let index_dir = dir.join("index");
+        for ent in std::fs::read_dir(&index_dir).unwrap() {
+            let p = ent.unwrap().path();
+            let _ = std::fs::remove_file(p);
+        }
+        let store = BlobStore::open_rebuild_index(&dir, seg * 4, seg, 100).unwrap();
+        assert_eq!(store.get(&key(1)).unwrap(), b"has-ttl".to_vec());
+        assert_eq!(store.get(&key(2)).unwrap(), b"no-ttl".to_vec());
+        // 用一个已过期的 TTL 再验证过期路径。
+        drop(store);
+        {
+            let mut s2 = BlobStore::open(&dir, seg * 4, seg, 100).unwrap();
+            s2.put_ttl(key(3), b"expired", 1).unwrap(); // expiration=1ms,早已过期
+            assert!(matches!(s2.get(&key(3)), Err(Error::Expired)));
+            s2.close().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -696,6 +821,31 @@ mod tests {
         for i in 0..4u64 {
             assert!(matches!(store.get(&key(i)), Err(Error::Deleted)));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watermark_replays_log_tail_beyond_persisted_index() {
+        // 模拟「索引持久化后又写了新数据但未再持久化,然后崩溃」:
+        // log 有尾部记录、索引文件停在旧水位。open 应按水位回放 log 尾部补回。
+        let dir = temp_dir("wm");
+        let seg = seg_cap(64);
+        {
+            let mut store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+            store.put(key(1), b"a").unwrap();
+            store.flush().unwrap(); // 索引 + 水位落到含 key(1)
+            // 之后再写 key(2)/key(3),只 flush 数据日志(不落索引、不推进水位),模拟崩溃前状态。
+            store.put(key(2), b"b").unwrap();
+            store.put(key(3), b"c").unwrap();
+            store.log_flush_only_for_test();
+            // 直接丢弃内存态(不走 close 的 flush),模拟进程崩溃。
+            std::mem::forget(store);
+        }
+        // 重开:水位=含 key(1) 处,回放 log 尾部应补回 key(2)/key(3)。
+        let store = BlobStore::open(&dir, seg * 4, seg, 1000).unwrap();
+        assert_eq!(store.get(&key(1)).unwrap(), b"a".to_vec());
+        assert_eq!(store.get(&key(2)).unwrap(), b"b".to_vec(), "tail key(2) recovered via replay");
+        assert_eq!(store.get(&key(3)).unwrap(), b"c".to_vec(), "tail key(3) recovered via replay");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
