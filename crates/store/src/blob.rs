@@ -332,14 +332,11 @@ impl BlobStore {
         })
     }
 
-    /// 死数据占比 ≥ `threshold`(0.0~1.0)才 compact;否则跳过。返回是否执行。
+    /// 周期性 GC 入口:对**每个非活跃段**按其死数据占比 ≥ `threshold` 增量压缩(热/末段不动),
+    /// 对齐 Ambry StatsBased 的按段触发,而非全库 CompactAll。无达阈段返回 `None`。
+    /// 需要全库重写时显式调用 [`compact`](Self::compact)。
     pub fn compact_if_needed(&mut self, threshold: f64) -> Result<Option<CompactionStats>> {
-        let s = self.stats()?;
-        let total = s.live_bytes + s.dead_bytes;
-        if total == 0 || (s.dead_bytes as f64 / total as f64) < threshold {
-            return Ok(None);
-        }
-        Ok(Some(self.compact()?))
+        self.compact_incremental(threshold)
     }
 
     /// CompactAll:重写整个 log 只保留存活记录(newest-wins 赢家),重建索引,原子换入。
