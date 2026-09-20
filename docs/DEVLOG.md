@@ -116,9 +116,28 @@
 - 更新 `delete_then_reput_rejected`(原 `delete_then_get_and_reput`)与参考模型的 put 判定。
 - 验证:27 单测 + 崩溃属性 + smoke 全绿;clippy 零告警。
 
+## 步骤 12:open() 索引损坏自动重建(对齐 recover())
+
+- 抽出 `load_index_with_replay`(加载已落盘索引 + 水位回放,增量恢复为主)。
+- `open()` 捕获 `Corrupt` → 自动 `rebuild_index` 兜底(数据 fsync 是持久边界,索引可重建),
+  不再要求手动 `open_rebuild_index`。
+- 新增测试:损坏活跃索引段后 open 自动重建、逻辑状态(含墓碑)仍正确。
+
+## 步骤 13:compact_if_needed 改为按段增量
+
+- 周期性 GC 入口从全库 CompactAll 改为委托 `compact_incremental(threshold)`:
+  只压死占比达阈的非活跃段(对齐 Ambry StatsBased 按段触发)。全库重写保留为显式 `compact()`。
+
+## 步骤 14:死数据统计增量维护
+
+- `BlobStore` 增 `seg_bytes: BTreeMap<u64, SegBytes{live,dead}>`:put 加 live、delete 把旧 PUT 转 dead + 墓碑计 live;
+  compaction/open/rebuild 用 `scan_seg_bytes` 全量重算。`stats`/`segment_stats` 读计数,免每次全量扫 log
+  (对齐 Ambry `BlobStoreStats` 增量维护)。
+- 不变式:增量计数须与全量扫一致。新增 `incremental_stats_match_full_scan`;参考模型每 seed 收尾额外对拍。
+- 验证:29 单测 + 崩溃属性 + smoke 全绿;clippy `-D warnings` 零告警。
+
 ## 待办
 
 - 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。
 - 并发/共享模型(D4):`&mut self` 单写者 → 共享实例 + `RwLock`/并发结构(运行时 tokio vs 手写线程池仍为 Open Question)。
 - undelete / lifeVersion:删除后复活对象的独立操作(对齐 Ambry `undelete`),普通 put 不再承担复活职责。
-- 死数据统计接入更精确来源(增量维护而非每次全量扫 log)。

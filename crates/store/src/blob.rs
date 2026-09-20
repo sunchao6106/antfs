@@ -11,6 +11,7 @@
 //! `put` 写 `flags=0`;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑。expiration/op_time
 //! 落进记录,故从 log 重建索引时 TTL 不丢失。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -128,6 +129,16 @@ pub struct BlobStore {
     max_index_entries_per_segment: usize,
     log: Log,
     index: PersistentIndex,
+    /// 每段存活/死亡字节的增量计数(put/delete 就地更新,compaction/open 全量重算),
+    /// 使 `stats`/`segment_stats` 免于每次全量扫 log(对齐 Ambry `BlobStoreStats` 增量维护)。
+    seg_bytes: BTreeMap<u64, SegBytes>,
+}
+
+/// 单个 log 段的存活/死亡字节。死 = 被更新版本取代/删除的旧记录(非当前索引赢家)。
+#[derive(Clone, Copy, Default)]
+struct SegBytes {
+    live: u64,
+    dead: u64,
 }
 
 /// compaction 结果统计。
@@ -158,6 +169,7 @@ impl BlobStore {
             max_index_entries_per_segment,
             log,
             index,
+            seg_bytes: BTreeMap::new(),
         })
     }
 
@@ -183,6 +195,7 @@ impl BlobStore {
             }
             Err(e) => return Err(e),
         };
+        let seg_bytes = scan_seg_bytes(&log, &index)?;
         Ok(Self {
             dir,
             total_capacity,
@@ -190,6 +203,7 @@ impl BlobStore {
             max_index_entries_per_segment,
             log,
             index,
+            seg_bytes,
         })
     }
 
@@ -209,6 +223,7 @@ impl BlobStore {
         let (log_dir, index_dir) = sub_dirs(&dir);
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
         let index = rebuild_index(&log, &index_dir, max_index_entries_per_segment)?;
+        let seg_bytes = scan_seg_bytes(&log, &index)?;
         Ok(Self {
             dir,
             total_capacity,
@@ -216,6 +231,7 @@ impl BlobStore {
             max_index_entries_per_segment,
             log,
             index,
+            seg_bytes,
         })
     }
 
@@ -239,6 +255,7 @@ impl BlobStore {
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.expiration_ms = expiration_ms;
         self.index.add(key, value)?;
+        self.seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
         Ok(())
     }
 
@@ -270,17 +287,22 @@ impl BlobStore {
 
     /// 删除一个对象:追加墓碑记录并在索引写入删除条目。不存在/已删除报错。
     pub fn delete(&mut self, key: StoreKey) -> Result<()> {
-        match self.index.find(&key) {
+        let old = match self.index.find(&key) {
             None => return Err(Error::NotFound),
             Some(v) if v.is_deleted() => return Err(Error::Deleted),
-            Some(_) => {}
-        }
+            Some(v) => v,
+        };
         let op_time = now_ms();
         let record = encode_record(&key, FLAG_DELETED, NO_EXPIRATION, op_time, &[]);
         let offset = self.log.append(&record)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_DELETED;
         self.index.add(key, value)?;
+        // 墓碑成为新赢家(live);被取代的旧 PUT 转为该段的死数据。
+        self.seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
+        let e = self.seg_bytes.entry(old.offset.segment).or_default();
+        e.live = e.live.saturating_sub(old.size);
+        e.dead += old.size;
         Ok(())
     }
 
@@ -311,25 +333,36 @@ impl BlobStore {
         self.log.segment_count()
     }
 
-    /// 扫描全库,返回存活/死亡字节统计(死 = 被更新版本取代/删除的旧记录)。
+    /// 返回全库存活/死亡字节统计(读增量计数,死 = 被更新版本取代/删除的旧记录)。
     pub fn stats(&self) -> Result<CompactionStats> {
         let mut live = 0u64;
         let mut dead = 0u64;
-        for_each_record(&self.log, |off, raw, decoded| {
-            let is_live = matches!(self.index.find(&decoded.key), Some(v) if v.offset == off);
-            if is_live {
-                live += raw.len() as u64;
-            } else {
-                dead += raw.len() as u64;
-            }
-            Ok(())
-        })?;
+        for v in self.seg_bytes.values() {
+            live += v.live;
+            dead += v.dead;
+        }
         Ok(CompactionStats {
             live_bytes: live,
             dead_bytes: dead,
             segments_before: self.log.segment_count(),
             segments_after: self.log.segment_count(),
         })
+    }
+
+    #[cfg(test)]
+    fn stats_by_scan(&self) -> CompactionStats {
+        let m = scan_seg_bytes(&self.log, &self.index).unwrap();
+        let (mut live, mut dead) = (0u64, 0u64);
+        for v in m.values() {
+            live += v.live;
+            dead += v.dead;
+        }
+        CompactionStats {
+            live_bytes: live,
+            dead_bytes: dead,
+            segments_before: self.log.segment_count(),
+            segments_after: self.log.segment_count(),
+        }
     }
 
     /// 周期性 GC 入口:对**每个非活跃段**按其死数据占比 ≥ `threshold` 增量压缩(热/末段不动),
@@ -381,6 +414,7 @@ impl BlobStore {
         // 重建索引(offset 已变)+ 收尾。
         self.log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
         self.index = rebuild_index(&self.log, &index_dir, self.max_index_entries_per_segment)?;
+        self.seg_bytes = scan_seg_bytes(&self.log, &self.index)?;
         let _ = std::fs::remove_file(&marker);
         rm_rf(&log_old)?;
 
@@ -392,25 +426,15 @@ impl BlobStore {
         })
     }
 
-    /// 每个封存段(不含活跃/末段)的 `(position, live_bytes, dead_bytes)`。
+    /// 每个封存段(不含活跃/末段)的 `(position, live_bytes, dead_bytes)`,读增量计数。
     pub fn segment_stats(&self) -> Result<Vec<(u64, u64, u64)>> {
-        let spans = self.log.segment_spans();
-        let active_pos = spans.last().map(|(p, _)| *p);
+        let active_pos = self.log.segment_spans().last().map(|(p, _)| *p);
         let mut out = Vec::new();
-        for (pos, data_end) in spans {
+        for (&pos, v) in &self.seg_bytes {
             if Some(pos) == active_pos {
                 continue;
             }
-            let (mut live, mut dead) = (0u64, 0u64);
-            scan_segment(&self.log, pos, data_end, |off, raw, decoded| {
-                if matches!(self.index.find(&decoded.key), Some(v) if v.offset == off) {
-                    live += raw.len() as u64;
-                } else {
-                    dead += raw.len() as u64;
-                }
-                Ok(())
-            })?;
-            out.push((pos, live, dead));
+            out.push((pos, v.live, v.dead));
         }
         Ok(out)
     }
@@ -499,6 +523,7 @@ impl BlobStore {
         let before = stats.len() + 1; // 含活跃段的粗略段数
         self.log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
         self.index = rebuild_index(&self.log, &index_dir, self.max_index_entries_per_segment)?;
+        self.seg_bytes = scan_seg_bytes(&self.log, &self.index)?;
         let _ = std::fs::remove_file(&marker);
 
         Ok(Some(CompactionStats {
@@ -544,6 +569,24 @@ fn scan_segment(
         off += total as u64;
     }
     Ok(())
+}
+
+/// 全量扫 log 计算每段 `(live, dead)` 字节。冷路径:open/compact/rebuild 后重算,及测试对拍基准。
+fn scan_seg_bytes(log: &Log, index: &PersistentIndex) -> Result<BTreeMap<u64, SegBytes>> {
+    let mut m: BTreeMap<u64, SegBytes> = BTreeMap::new();
+    for (pos, _) in log.segment_spans() {
+        m.entry(pos).or_default();
+    }
+    for_each_record(log, |off, raw, decoded| {
+        let e = m.entry(off.segment).or_default();
+        if matches!(index.find(&decoded.key), Some(v) if v.offset == off) {
+            e.live += raw.len() as u64;
+        } else {
+            e.dead += raw.len() as u64;
+        }
+        Ok(())
+    })?;
+    Ok(m)
 }
 
 /// 清空索引目录并顺序扫描 Log 重建索引(旧→新,天然 newest-wins)。
@@ -1095,6 +1138,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn incremental_stats_match_full_scan() {
+        let dir = temp_dir("stats_incr");
+        let seg = seg_cap(2);
+        let mut store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
+        for i in 0..40u64 {
+            store.put(key(i), format!("value-{i}").as_bytes()).unwrap();
+        }
+        for i in 0..15u64 {
+            store.delete(key(i)).unwrap();
+        }
+        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after put/delete");
+
+        store.compact_if_needed(0.3).unwrap();
+        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after incremental compaction");
+
+        store.compact().unwrap();
+        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after CompactAll");
+
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
+        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after reopen recompute");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 差分对拍:纯内存模型记录每个 key 的期望状态,随机穿插 put/delete 与
     /// flush/reopen/compact/compact_incremental,每步全量比对 `get()` 与模型。覆盖
     /// newest-wins、墓碑、删后重写、跨段封存、compaction offset 重写、水位回放重开、
@@ -1210,6 +1278,7 @@ mod tests {
             }
 
             verify_all(&store, &model, "final live");
+            assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "seg_bytes drift vs full scan");
             store.close().unwrap();
 
             let reopened = BlobStore::open(&dir, total, seg, max_idx).unwrap();
