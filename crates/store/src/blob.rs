@@ -17,7 +17,8 @@ use crate::error::{Error, Result};
 use crate::index::value::{FLAG_DELETED, NO_EXPIRATION};
 use crate::index::{IndexValue, PersistentIndex};
 use crate::log::Log;
-use crate::types::{LogOffset, StoreKey, KEY_SIZE};
+use crate::log_segment::LogSegment;
+use crate::types::{LogOffset, LogSegmentName, StoreKey, KEY_SIZE};
 
 const REC_MAGIC: u16 = 0x424D; // "MB"
 const REC_VERSION: u8 = 2;
@@ -298,6 +299,11 @@ impl BlobStore {
         self.log.flush().unwrap();
     }
 
+    #[cfg(test)]
+    fn log_segment_count_for_test(&self) -> usize {
+        self.log.segment_count()
+    }
+
     /// 扫描全库,返回存活/死亡字节统计(死 = 被更新版本取代/删除的旧记录)。
     pub fn stats(&self) -> Result<CompactionStats> {
         let mut live = 0u64;
@@ -381,6 +387,123 @@ impl BlobStore {
             segments_after: after,
         })
     }
+
+    /// 每个封存段(不含活跃/末段)的 `(position, live_bytes, dead_bytes)`。
+    pub fn segment_stats(&self) -> Result<Vec<(u64, u64, u64)>> {
+        let spans = self.log.segment_spans();
+        let active_pos = spans.last().map(|(p, _)| *p);
+        let mut out = Vec::new();
+        for (pos, data_end) in spans {
+            if Some(pos) == active_pos {
+                continue;
+            }
+            let (mut live, mut dead) = (0u64, 0u64);
+            scan_segment(&self.log, pos, data_end, |off, raw, decoded| {
+                if matches!(self.index.find(&decoded.key), Some(v) if v.offset == off) {
+                    live += raw.len() as u64;
+                } else {
+                    dead += raw.len() as u64;
+                }
+                Ok(())
+            })?;
+            out.push((pos, live, dead));
+        }
+        Ok(out)
+    }
+
+    /// 增量 compaction:只压缩死数据占比 ≥ `threshold` 的**非活跃**段(热/末段不动)。
+    ///
+    /// 机制:被选中段的存活记录写入位置更高的新段(temp→fsync→rename),删旧段,重建索引。
+    /// 只重写高死段、不碰热段(区别于 [`compact`](Self::compact) 的全库重写)。存活赢家搬到更高
+    /// 位置仍是其 key 的最新记录,newest-wins 不变。崩溃安全:复用 `COMPACT_COMMIT` 标记 +
+    /// open 重建索引;残留 `.tmp`/重复记录在重建时被忽略/收敛。返回 None 表示无段达阈值。
+    pub fn compact_incremental(&mut self, threshold: f64) -> Result<Option<CompactionStats>> {
+        self.flush()?;
+        let stats = self.segment_stats()?;
+        let selected: Vec<u64> = stats
+            .iter()
+            .filter(|(_, live, dead)| {
+                let total = live + dead;
+                total > 0 && (*dead as f64 / total as f64) >= threshold
+            })
+            .map(|(pos, _, _)| *pos)
+            .collect();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+
+        let (log_dir, index_dir) = sub_dirs(&self.dir);
+        let marker = self.dir.join("COMPACT_COMMIT");
+        write_marker(&marker)?;
+
+        let mut next_pos = self.log.segment_spans().iter().map(|(p, _)| *p).max().unwrap() + 1;
+        let mut live_bytes = 0u64;
+        let mut dead_bytes = 0u64;
+        let mut tmp_paths: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, final)
+        let mut cur: Option<LogSegment> = None;
+
+        for &pos in &selected {
+            let data_end = self
+                .log
+                .segment_spans()
+                .iter()
+                .find(|(p, _)| *p == pos)
+                .map(|(_, e)| *e)
+                .unwrap_or(0);
+            scan_segment(&self.log, pos, data_end, |off, raw, decoded| {
+                let is_live = matches!(self.index.find(&decoded.key), Some(v) if v.offset == off);
+                if !is_live {
+                    dead_bytes += raw.len() as u64;
+                    return Ok(());
+                }
+                live_bytes += raw.len() as u64;
+                let need = raw.len() as u64;
+                let fits = cur.as_ref().map(|c| c.remaining() >= need).unwrap_or(false);
+                if !fits {
+                    if let Some(c) = cur.take() {
+                        let mut c = c;
+                        c.flush()?;
+                        c.close()?;
+                    }
+                    let final_path = log_dir.join(LogSegmentName(next_pos).filename());
+                    let mut tmp = final_path.as_os_str().to_owned();
+                    tmp.push(".tmp");
+                    let tmp = PathBuf::from(tmp);
+                    next_pos += 1;
+                    cur = Some(LogSegment::create(&tmp, self.segment_capacity)?);
+                    tmp_paths.push((tmp, final_path));
+                }
+                cur.as_mut().unwrap().append(raw)?;
+                Ok(())
+            })?;
+        }
+        if let Some(c) = cur.take() {
+            let mut c = c;
+            c.flush()?;
+            c.close()?;
+        }
+
+        // temp 新段 → 正式名(atomic rename)。
+        for (tmp, final_path) in &tmp_paths {
+            std::fs::rename(tmp, final_path)?;
+        }
+        // 删被压缩的旧段。
+        for &pos in &selected {
+            let _ = std::fs::remove_file(log_dir.join(LogSegmentName(pos).filename()));
+        }
+
+        let before = stats.len() + 1; // 含活跃段的粗略段数
+        self.log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
+        self.index = rebuild_index(&self.log, &index_dir, self.max_index_entries_per_segment)?;
+        let _ = std::fs::remove_file(&marker);
+
+        Ok(Some(CompactionStats {
+            live_bytes,
+            dead_bytes,
+            segments_before: before,
+            segments_after: self.log.segment_count(),
+        }))
+    }
 }
 
 fn sub_dirs(dir: &Path) -> (PathBuf, PathBuf) {
@@ -393,18 +516,28 @@ fn for_each_record(
     mut f: impl FnMut(LogOffset, &[u8], &DecodedRecord) -> Result<()>,
 ) -> Result<()> {
     for (position, data_end) in log.segment_spans() {
-        let mut off = 0u64;
-        while off < data_end {
-            let head = log.read(LogOffset::new(position, off), rec::DATA)?;
-            let data_len =
-                u32::from_le_bytes(head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap())
-                    as usize;
-            let total = RECORD_OVERHEAD + data_len;
-            let raw = log.read(LogOffset::new(position, off), total)?;
-            let decoded = decode_record(&raw)?;
-            f(LogOffset::new(position, off), &raw, &decoded)?;
-            off += total as u64;
-        }
+        scan_segment(log, position, data_end, &mut f)?;
+    }
+    Ok(())
+}
+
+/// 遍历单个段 `position` 内 `[0, data_end)` 的全部记录。
+fn scan_segment(
+    log: &Log,
+    position: u64,
+    data_end: u64,
+    mut f: impl FnMut(LogOffset, &[u8], &DecodedRecord) -> Result<()>,
+) -> Result<()> {
+    let mut off = 0u64;
+    while off < data_end {
+        let head = log.read(LogOffset::new(position, off), rec::DATA)?;
+        let data_len =
+            u32::from_le_bytes(head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
+        let total = RECORD_OVERHEAD + data_len;
+        let raw = log.read(LogOffset::new(position, off), total)?;
+        let decoded = decode_record(&raw)?;
+        f(LogOffset::new(position, off), &raw, &decoded)?;
+        off += total as u64;
     }
     Ok(())
 }
@@ -499,20 +632,36 @@ fn recover_compaction(
     if marker.exists() {
         // 提交进行中:保证 log 是 compacted 的那份。
         if !log_dir.exists() && log_new.exists() {
-            // 崩在两次 rename 之间:log.new 尚未换入。
+            // 崩在两次 rename 之间(CompactAll):log.new 尚未换入。
             std::fs::rename(&log_new, &log_dir)?;
         }
         // 其余情况 log_dir 已是新 log(或 log.old 存旧份,丢弃)。
         rm_rf(&log_new)?;
         rm_rf(&log_old)?;
+        clean_tmp_segments(&log_dir)?; // 增量 compaction 崩溃遗留的 .tmp 新段
         // 索引可能是旧/半建的,统一重建。
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
         let _ = rebuild_index(&log, &index_dir, max_entries)?;
         std::fs::remove_file(&marker)?;
     } else {
-        // 无标记:COPY 阶段崩溃遗留的 log.new 直接丢弃(旧 log 完好)。
+        // 无标记:COPY 阶段崩溃遗留的 log.new / .tmp 直接丢弃(旧 log 完好)。
         rm_rf(&log_new)?;
         rm_rf(&log_old)?;
+        clean_tmp_segments(&log_dir)?;
+    }
+    Ok(())
+}
+
+/// 删除 log 目录下残留的 `*.tmp`(崩溃遗留的增量 compaction 半成品新段)。
+fn clean_tmp_segments(log_dir: &Path) -> Result<()> {
+    if !log_dir.exists() {
+        return Ok(());
+    }
+    for ent in std::fs::read_dir(log_dir)? {
+        let ent = ent?;
+        if ent.file_name().to_str().is_some_and(|n| n.ends_with(".tmp")) {
+            let _ = std::fs::remove_file(ent.path());
+        }
     }
     Ok(())
 }
@@ -846,6 +995,53 @@ mod tests {
         assert_eq!(store.get(&key(1)).unwrap(), b"a".to_vec());
         assert_eq!(store.get(&key(2)).unwrap(), b"b".to_vec(), "tail key(2) recovered via replay");
         assert_eq!(store.get(&key(3)).unwrap(), b"c".to_vec(), "tail key(3) recovered via replay");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_compaction_reclaims_only_dead_segments() {
+        let dir = temp_dir("incr");
+        let seg = seg_cap(1); // 每段数据容量 ~1KiB → 大记录会跨多段
+        let mut store = BlobStore::create(&dir, seg * 128, seg, 1000).unwrap();
+
+        let big = |tag: &str| -> Vec<u8> {
+            let mut v = vec![b'x'; 400];
+            v[..tag.len()].copy_from_slice(tag.as_bytes());
+            v
+        };
+
+        // 写 40 个大 key(跨很多段),再删前 30 个 → 老段变高死数据。
+        for i in 0..40u64 {
+            store.put(key(i), &big(&format!("v{i}"))).unwrap();
+        }
+        for i in 0..30u64 {
+            store.delete(key(i)).unwrap();
+        }
+        store.flush().unwrap();
+
+        let before_segs = store.log_segment_count_for_test();
+        assert!(before_segs > 2, "should span multiple segments");
+        let st = store.compact_incremental(0.5).unwrap();
+        assert!(st.is_some(), "high-dead old segments should be compacted");
+        let st = st.unwrap();
+        assert!(st.dead_bytes > 0);
+        assert!(st.segments_after <= before_segs, "segment count should not grow");
+
+        // 逻辑状态不变:0..29 已删,30..39 存活。
+        for i in 0..30u64 {
+            assert!(matches!(store.get(&key(i)), Err(Error::Deleted)), "key {i} deleted");
+        }
+        for i in 30..40u64 {
+            assert_eq!(store.get(&key(i)).unwrap(), big(&format!("v{i}")), "key {i} live");
+        }
+
+        // 重开一致。
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 128, seg, 1000).unwrap();
+        for i in 30..40u64 {
+            assert_eq!(store.get(&key(i)).unwrap(), big(&format!("v{i}")));
+        }
+        assert!(matches!(store.get(&key(5)), Err(Error::Deleted)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
