@@ -69,6 +69,38 @@
   5. **log/index 协同**:log 段按容量(定容)滚动,index 段按条目数封存——两者**非 1:1**。compaction 以 offset 区间为单位协同:选定一段 log + 落在其上的 index 条目,存活的重写到新区间,连带重建对应 index 段。
 - 是「回收空间」必要机制(删除/覆盖下无 GC 会耗尽磁盘与段数;定容 partition 全靠 GC 把写满的 partition 释放回可用)。
 
+#### 参考 Ambry 的具体机制(本地源码 `ambry-store`,实现时按此对齐)
+
+**触发(两级)**
+```
+后台线程 CompactionManager.CompactionExecutor 每周期轮询所有 store:
+  details = compactionPolicy.getCompactionDetails(...)   ← 决策
+  if (details != null) store.compact(details, buf)        ← 才执行
+触发器配置 storeCompactionTriggers ∈ {PERIODIC, ADMIN}:
+  PERIODIC 周期重排队;ADMIN 手工唤醒
+决策策略 StatsBasedCompactionPolicy(Hybrid 内部切换 CompactAllPolicy):
+  blobStoreStats 算出每段存活数据量;从两端收拢,取「首尾段存活% ≤ 阈值(默认 20%)」的
+  连续区间做 candidates → 无合格区间则返回 null(本轮不压)
+```
+- rs 对应:周期定时线程 + 每 store 用「死数据占比 ≥ 阈值(如 ≥80% 死=≤20% 存活)」判定是否进入 compaction;把「死数据统计」接入现有索引/日志统计(或入门版用段内已删条目占比近似)。
+
+**执行(四阶段循环,直至 `CompactionLog.Phase.DONE`)**
+```
+while (phase != DONE) switch (phase):
+  PREPARE : 落 CompactionLog,标记开始(崩溃可从此续跑)
+  COPY    : 用 IndexSegmentValidEntryFilter 过滤出存活条目
+            (去 deleted/expired/被新版本取代的重复 key)
+            → 拷进 temp log 段(swap space,名带 TEMP 后缀)
+  COMMIT  : renameLogSegments(temp→正式)
+            → addNewLogSegmentsToSrcLog(新段加进源 log 映射)
+            → updateSrcIndex(PersistentIndex.changeIndexSegments(),持 write lock 原子换索引段集合)
+  CLEANUP : waitTillRefCountZero() 等读旧段的 in-flight 请求释放
+            → 删旧 log 段 + 旧索引
+崩溃恢复:  CompactionLog 持久化当前 phase;启动 maybeResumeCompaction 从 phase 续跑,
+          不会留下半新半旧状态。
+```
+- rs 对应:持久化 compaction phase 进度;COPY 用索引过滤存活条目写 temp 段;COMMIT 按「fsync 新 log 段 → 写索引 → fsync → rename 换入 → 持写锁切索引段集合」原子完成;CLEANUP 等读旧段 refcount 归零再删(见 D4 锁作用域)。
+
 ### D6:索引持久化 / 恢复
 - **加载已落盘索引 + 水位回放**(对齐 Ambry 真实模型,非每次全量重建):
   - 后台 periodic persist 活跃索引段(先 fsync tmp **再 rename**,补现有 std::fs::write+rename 缺 fsync 的缺陷)。

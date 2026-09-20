@@ -10,7 +10,7 @@ pub mod log;
 pub mod log_segment;
 pub mod types;
 
-pub use blob::BlobStore;
+pub use blob::{BlobStore, CompactionStats};
 pub use error::{Error, Result};
 pub use index::{IndexValue, PersistentIndex};
 pub use log::Log;

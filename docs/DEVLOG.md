@@ -76,10 +76,22 @@
 - 动机与决策详 `openspec/changes/io-index-design/`。定容上界、compaction 本轮未做。
 - 验证:20 单测 + 崩溃属性 + smoke 全绿;clippy `-D warnings` 零告警。
 
+## 步骤 8:compaction / GC(CompactAll 首版)
+
+- `BlobStore::compact()`(CompactAll,对齐 Ambry `CompactAllPolicy`):重写整个 log 只保留**存活赢家**
+  记录(`index.find(key).offset == 该记录 offset`),丢弃被覆盖/删除的旧 PUT;重建索引;原子换入。
+- 存活判定天然处理:删除只留小墓碑(原 PUT 回收)、覆盖只留最新(旧 PUT+DELETE 回收)。
+- 崩溃安全:`log.new` 建好并 fsync → 写 `COMPACT_COMMIT` 标记 → 目录 rename 换入(log→log.old,
+  log.new→log)→ 重建索引 → 删标记与 log.old。`open()` 前 `recover_compaction` 依标记收敛:
+  有标记则保证 log 为 compacted 份并重建索引;无标记则丢弃残留 log.new(旧 log 完好)。
+- 配套:`stats()`(存活/死亡字节)、`compact_if_needed(threshold)`(死占比达阈值才压)。
+- 验证:新增 3 测(回收+状态不变、阈值不触发、提交中崩溃修复);共 23 单测 + 崩溃属性 + smoke 全绿;clippy 零告警。
+- 已知简化:目前是 CompactAll(全库重写);Ambry 式按段区间的增量 StatsBased compaction 后续做。
+
 ## 待办
 
 - Log/Index 内存参考模型全量对拍。
-- compaction/GC(周期性定时 + 死数据阈值触发,log+index 协同回收;对齐 Ambry `BlobStoreCompactor`)。
+- 增量 compaction(按段死数据占比选区间,而非全库 CompactAll);死数据统计接入更精确来源。
 - 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。
 - 记录落 expiration/op_time(当前 `从 log 重建`会丢 TTL 的缺口)。
 - 索引持久化水位回放替代「每次全量/损坏重建」(对齐 Ambry `recover()`)。

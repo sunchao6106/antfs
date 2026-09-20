@@ -95,7 +95,8 @@ macOS 宿主 + colima Linux VM(Ubuntu 24.04)。源码在宿主(编辑器可见),
 - [x] BlobStore(串起 Log + Index;自描述记录 + put/get/delete/flush/recover)
 - [x] 从 log 扫描重建索引(`open_rebuild_index`:索引丢失/损坏时的兜底)
 - [ ] （已废弃）monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销
-- [ ] compaction/GC(周期性定时 + 死数据阈值触发,log+index 协同回收;对齐 `BlobStoreCompactor`)
+- [x] compaction/GC(CompactAll 首版:全库重写留存活赢家 + 重建索引 + 标记式崩溃修复)
+- [ ] 增量 compaction(按段死数据占比选区间,对齐 `StatsBasedCompactionPolicy`)
 - [ ] 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)
 - [ ] 记录落 expiration/op_time(`从 log 重建`会丢 TTL 的缺口)
 - [ ] 索引持久化水位回放(对齐 Ambry `recover()`,替代每次全量/损坏重建)
