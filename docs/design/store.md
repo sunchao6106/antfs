@@ -178,14 +178,16 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] undelete / lifeVersion(复活已删除对象)
 - [x] updateTtl(设/移除过期时间,支持任意 expiration,一次性 + 已删/不存在守卫)
 - [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty / is_key_deleted)
-- [x] 有效数据字节(`valid_data_size(reference_time_ms)`,排除墓碑 + 到参考时刻已过期,对齐 Ambry `getValidDataSize`)
+- [x] 有效数据字节(`valid_data_size(reference_time_ms)`,排除墓碑 + 到参考时刻已过期,对齐 Ambry `getValidDataSize`;**增量核算**:`permanent` + 按过期时刻分桶,写路径 O(1) 维护、compaction/open 重算,全扫基准差分对拍守护)
 - [x] HardDeleter(软删对象数据就地清零,隐私擦除)
 - [x] 内存参考模型全量对拍
 - [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 简化:`FindToken` 仅 offset 游标,sessionId/incarnationId/resetKey(重启/compaction 失效重定位)属复制层职责,待其落地补
 - [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction/COW hard_delete 换入、无重试循环、不引 `arc-swap`;hard_delete 改 COW、删除就地 `overwrite_at` footgun;并发测试守护)
 - [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
-- [ ] 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓
+- [x] 每 Log 定容上界(store 层):`total_capacity`(per-replica 构造参数,对齐 Ambry `capacityInBytes`)+ 写满归一为 `Error::StoreFull` + 容量自省(`total_capacity`/`available_capacity`/`is_full`)。**「写满自动滚动新 partition」是集群/路由层职责,不在 store**
+- [x] 压测:`benchmark/store`(`bench-store` 二进制)—— 多线程共享 `Arc<BlobStore>` 压 PUT/GET,报吞吐(ops/s、MB/s)+ 延迟分位(p50/p99/max);`benchmark/` 下后续加 blob-server / S3 frontend 压测
+- [ ] **封存段 EC 冷层**(热副本→冷 EC,封存段级;转换/读/修复在服务层)——见 [`cluster.md` §5 (D5)](./cluster.md);store 侧需支持封存段的 EC 读路径(有整副本直读,否则读 k 分片重构)
 - [ ] (已废弃)monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销
 
 ## 10. 配置项清单(对齐 Ambry `StoreConfig`)

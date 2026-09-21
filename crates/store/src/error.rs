@@ -10,6 +10,11 @@ pub enum Error {
     #[error("log segment is full")]
     SegmentFull,
 
+    /// 整个 store(定容 replica)已写满,无法再接纳新记录(对齐 Ambry `Store_Full`)。
+    /// 上层据此把新写路由到其他 partition(滚动 partition 属集群层职责,不在 store)。
+    #[error("store is full")]
+    StoreFull,
+
     /// 读取范围超出已写入数据。
     #[error("read out of range: offset={offset} len={len} data_end={data_end}")]
     OutOfRange {

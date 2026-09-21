@@ -159,6 +159,8 @@ pub struct BlobStore {
     inner: RwLock<Arc<Inner>>,
     write_lock: Mutex<()>,
     seg_bytes: Mutex<BTreeMap<u64, SegBytes>>,
+    /// 有效数据字节的增量核算(排除墓碑 + 按过期时刻分桶),使 `valid_data_size` 免于每次全扫 log。
+    valid_stats: Mutex<ValidStats>,
     metrics: StoreMetricHandles,
 }
 
@@ -173,6 +175,54 @@ struct Inner {
 struct SegBytes {
     live: u64,
     dead: u64,
+}
+
+/// 有效数据字节的增量核算(对齐 Ambry `BlobStoreStats` 的 valid-size,避免每查全扫 log)。
+///
+/// 只统计**当前索引赢家中未删除**的记录:无过期的进 `permanent`,有过期的按 `expiration_ms`
+/// 进 `by_expiry` 桶。`valid_as_of(t)` = `permanent` + 所有「过期时刻 > t」的桶(即到 t 未过期)。
+/// 赢家变更(put/delete/undelete/update_ttl)时增量 add/remove;compaction/open 全量重算。
+#[derive(Default)]
+struct ValidStats {
+    permanent: u64,
+    by_expiry: BTreeMap<i64, u64>,
+}
+
+impl ValidStats {
+    fn add(&mut self, v: &IndexValue) {
+        if v.is_deleted() {
+            return;
+        }
+        if v.expiration_ms == NO_EXPIRATION {
+            self.permanent += v.size;
+        } else {
+            *self.by_expiry.entry(v.expiration_ms).or_default() += v.size;
+        }
+    }
+
+    fn remove(&mut self, v: &IndexValue) {
+        if v.is_deleted() {
+            return;
+        }
+        if v.expiration_ms == NO_EXPIRATION {
+            self.permanent = self.permanent.saturating_sub(v.size);
+        } else if let Some(bucket) = self.by_expiry.get_mut(&v.expiration_ms) {
+            *bucket = bucket.saturating_sub(v.size);
+            if *bucket == 0 {
+                self.by_expiry.remove(&v.expiration_ms);
+            }
+        }
+    }
+
+    fn valid_as_of(&self, reference_time_ms: i64) -> u64 {
+        use std::ops::Bound;
+        let future: u64 = self
+            .by_expiry
+            .range((Bound::Excluded(reference_time_ms), Bound::Unbounded))
+            .map(|(_, s)| *s)
+            .sum();
+        self.permanent + future
+    }
 }
 
 /// compaction 结果统计。
@@ -252,6 +302,7 @@ impl BlobStore {
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(BTreeMap::new()),
+            valid_stats: Mutex::new(ValidStats::default()),
             metrics: StoreMetricHandles::disabled(),
         })
     }
@@ -284,6 +335,7 @@ impl BlobStore {
             Err(e) => return Err(e),
         };
         let seg_bytes = scan_seg_bytes(&log, &index)?;
+        let valid_stats = compute_valid_stats(&log, &index)?;
         Ok(Self {
             dir,
             total_capacity,
@@ -292,6 +344,7 @@ impl BlobStore {
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(seg_bytes),
+            valid_stats: Mutex::new(valid_stats),
             metrics: StoreMetricHandles::disabled(),
         })
     }
@@ -318,6 +371,7 @@ impl BlobStore {
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
         let index = rebuild_index(&log, &index_dir, max_index_entries_per_segment)?;
         let seg_bytes = scan_seg_bytes(&log, &index)?;
+        let valid_stats = compute_valid_stats(&log, &index)?;
         Ok(Self {
             dir,
             total_capacity,
@@ -326,6 +380,7 @@ impl BlobStore {
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(seg_bytes),
+            valid_stats: Mutex::new(valid_stats),
             metrics: StoreMetricHandles::disabled(),
         })
     }
@@ -410,7 +465,7 @@ impl BlobStore {
         }
         let op_time = now_ms();
         let record = encode_record(&key, 0, expiration_ms, op_time, 0, data);
-        let offset = inner.log.append(&record)?;
+        let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.expiration_ms = expiration_ms;
         inner.index.add(key, value)?;
@@ -420,6 +475,10 @@ impl BlobStore {
             .entry(offset.segment)
             .or_default()
             .live += record.len() as u64;
+        self.valid_stats
+            .lock()
+            .expect("blob valid_stats poisoned")
+            .add(&value);
         Ok(())
     }
 
@@ -495,6 +554,22 @@ impl BlobStore {
     /// 库是否为空(尚无任何记录)。
     pub fn is_empty(&self) -> bool {
         self.size_in_bytes() == 0
+    }
+
+    /// 本 store(定容 replica)的容量上界(字节),= 构造时传入的 `total_capacity`。
+    pub fn total_capacity(&self) -> u64 {
+        self.total_capacity
+    }
+
+    /// 剩余可写字节的保守估计(总容量 − 已用),供上层判断是否该把新写路由到别处。
+    pub fn available_capacity(&self) -> u64 {
+        self.total_capacity.saturating_sub(self.size_in_bytes())
+    }
+
+    /// store 是否已写满:再放不下「一个段能容纳的最大记录」即视为满(对齐 Ambry 写满即只读、
+    /// 由集群层滚动到新 partition)。粗判用于路由;精确容量约束仍由 log 追加时强制。
+    pub fn is_full(&self) -> bool {
+        self.available_capacity() < self.segment_capacity
     }
 
     /// key 是否为已删除状态(对齐 Ambry `isKeyDeleted`);不存在报
@@ -575,7 +650,19 @@ impl BlobStore {
 
     /// 有效数据字节(对齐 Ambry `getValidDataSize`):索引赢家中「未删除且到 `reference_time_ms`
     /// 未过期」的记录 `size` 之和。墓碑(已删除赢家)与过期记录不计入,故 ≠ `stats` 的 live 字节。
-    pub fn valid_data_size(&self, reference_time_ms: i64) -> Result<u64> {
+    ///
+    /// 走增量核算 [`ValidStats`](Self)(`O(过期桶)`),避免每查全扫 log;正确性由 `#[cfg(test)]`
+    /// 的全扫基准 `valid_data_size_by_scan` 差分对拍守护。
+    pub fn valid_data_size(&self, reference_time_ms: i64) -> u64 {
+        self.valid_stats
+            .lock()
+            .expect("blob valid_stats poisoned")
+            .valid_as_of(reference_time_ms)
+    }
+
+    /// 全扫 log 的有效数据字节基准(对拍 `valid_data_size` 的增量核算)。
+    #[cfg(test)]
+    fn valid_data_size_by_scan(&self, reference_time_ms: i64) -> u64 {
         let inner = self.inner();
         let mut total = 0u64;
         for_each_record(&inner.log, |off, _raw, decoded| {
@@ -587,8 +674,9 @@ impl BlobStore {
                 }
             }
             Ok(())
-        })?;
-        Ok(total)
+        })
+        .unwrap();
+        total
     }
 
     /// 硬删除:把已软删(墓碑)对象的原 PUT 数据字节**就地清零**(对齐 Ambry `HardDeleter` 的隐私擦除),
@@ -669,7 +757,9 @@ impl BlobStore {
         let new_log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
         let new_index = rebuild_index(&new_log, &index_dir, self.max_index_entries_per_segment)?;
         let new_seg_bytes = scan_seg_bytes(&new_log, &new_index)?;
+        let new_valid = compute_valid_stats(&new_log, &new_index)?;
         *self.seg_bytes.lock().expect("blob seg_bytes poisoned") = new_seg_bytes;
+        *self.valid_stats.lock().expect("blob valid_stats poisoned") = new_valid;
         *self.inner.write().expect("blob inner poisoned") = Arc::new(Inner {
             log: new_log,
             index: new_index,
@@ -698,7 +788,7 @@ impl BlobStore {
             old.life_version,
             &[],
         );
-        let offset = inner.log.append(&record)?;
+        let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_DELETED;
         value.life_version = old.life_version;
@@ -710,6 +800,10 @@ impl BlobStore {
         let e = seg_bytes.entry(old.offset.segment).or_default();
         e.live = e.live.saturating_sub(old.size);
         e.dead += old.size;
+        // 有效数据:旧赢家(未删)移除,新墓碑不计。
+        let mut vs = self.valid_stats.lock().expect("blob valid_stats poisoned");
+        vs.remove(&old);
+        vs.add(&value);
         Ok(())
     }
 
@@ -746,7 +840,7 @@ impl BlobStore {
             new_life,
             &put.data,
         );
-        let offset = inner.log.append(&record)?;
+        let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_UNDELETED;
         value.expiration_ms = put.expiration_ms;
@@ -758,6 +852,10 @@ impl BlobStore {
         let e = seg_bytes.entry(cur.offset.segment).or_default();
         e.live = e.live.saturating_sub(cur.size);
         e.dead += cur.size;
+        // 有效数据:旧墓碑(不计)移除,新复活赢家计入。
+        let mut vs = self.valid_stats.lock().expect("blob valid_stats poisoned");
+        vs.remove(&cur);
+        vs.add(&value);
         Ok(new_life)
     }
 
@@ -789,7 +887,7 @@ impl BlobStore {
             cur.life_version,
             &rec.data,
         );
-        let offset = inner.log.append(&record)?;
+        let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = flags;
         value.expiration_ms = expiration_ms;
@@ -800,6 +898,10 @@ impl BlobStore {
         let e = seg_bytes.entry(cur.offset.segment).or_default();
         e.live = e.live.saturating_sub(cur.size);
         e.dead += cur.size;
+        // 有效数据:旧赢家移除,新 TTL 赢家(可能改了过期时刻)计入对应桶。
+        let mut vs = self.valid_stats.lock().expect("blob valid_stats poisoned");
+        vs.remove(&cur);
+        vs.add(&value);
         Ok(())
     }
 
@@ -951,7 +1053,9 @@ impl BlobStore {
         let new_log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
         let new_index = rebuild_index(&new_log, &index_dir, self.max_index_entries_per_segment)?;
         let new_seg_bytes = scan_seg_bytes(&new_log, &new_index)?;
+        let new_valid = compute_valid_stats(&new_log, &new_index)?;
         *self.seg_bytes.lock().expect("blob seg_bytes poisoned") = new_seg_bytes;
+        *self.valid_stats.lock().expect("blob valid_stats poisoned") = new_valid;
         *self.inner.write().expect("blob inner poisoned") = Arc::new(Inner {
             log: new_log,
             index: new_index,
@@ -1148,8 +1252,10 @@ impl BlobStore {
         let new_log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
         let new_index = rebuild_index(&new_log, &index_dir, self.max_index_entries_per_segment)?;
         let new_seg_bytes = scan_seg_bytes(&new_log, &new_index)?;
+        let new_valid = compute_valid_stats(&new_log, &new_index)?;
         let segments_after = new_log.segment_count();
         *self.seg_bytes.lock().expect("blob seg_bytes poisoned") = new_seg_bytes;
+        *self.valid_stats.lock().expect("blob valid_stats poisoned") = new_valid;
         *self.inner.write().expect("blob inner poisoned") = Arc::new(Inner {
             log: new_log,
             index: new_index,
@@ -1167,6 +1273,14 @@ impl BlobStore {
 
 fn sub_dirs(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join("log"), dir.join("index"))
+}
+
+/// 写路径把「log 追加因段用尽/无法滚动」的 `SegmentFull` 归一为面向调用方的 `StoreFull`;其余原样。
+fn to_store_full(e: Error) -> Error {
+    match e {
+        Error::SegmentFull => Error::StoreFull,
+        other => other,
+    }
 }
 
 /// 顺序遍历 Log 全部记录,回调 `(offset, 完整记录字节, 解码结果)`。
@@ -1303,6 +1417,21 @@ fn scan_seg_bytes(log: &Log, index: &PersistentIndex) -> Result<BTreeMap<u64, Se
         Ok(())
     })?;
     Ok(m)
+}
+
+/// 全量扫 log 重算有效数据核算([`ValidStats`]):对每个索引赢家记录累加。冷路径:open/compact/
+/// rebuild/hard_delete 后重建,及测试对拍基准。
+fn compute_valid_stats(log: &Log, index: &PersistentIndex) -> Result<ValidStats> {
+    let mut stats = ValidStats::default();
+    for_each_record(log, |off, _raw, decoded| {
+        if let Some(v) = index.find(&decoded.key) {
+            if v.offset == off {
+                stats.add(&v);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(stats)
 }
 
 /// 清空索引目录并顺序扫描 Log 重建索引(旧→新,天然 newest-wins)。
@@ -2721,17 +2850,73 @@ mod tests {
         let rec2 = store.stat(&key(2)).unwrap().data_len + RECORD_OVERHEAD as u64;
 
         // 参考时刻 500(未到 key2 过期):key1 + key2 有效,key3 不计。
+        assert_eq!(store.valid_data_size(500), rec1 + rec2, "before expiry");
         assert_eq!(
-            store.valid_data_size(500).unwrap(),
+            store.valid_data_size_by_scan(500),
             rec1 + rec2,
-            "before expiry"
+            "scan agrees @500"
         );
         // 参考时刻 1000(key2 到期):仅 key1。
+        assert_eq!(store.valid_data_size(1000), rec1, "after key2 expiry");
         assert_eq!(
-            store.valid_data_size(1000).unwrap(),
+            store.valid_data_size_by_scan(1000),
             rec1,
-            "after key2 expiry"
+            "scan agrees @1000"
         );
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_data_size_incremental_matches_scan_under_mixed_ops() {
+        let dir = temp_dir("valid_diff");
+        let seg = seg_cap(16);
+        let store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
+        let mut rng = Rng(0x51ED_C0DE);
+        let ref_times: [i64; 4] = [0, 500, 1500, i64::MAX];
+
+        // 混合 put(部分带 TTL)/delete/undelete/update_ttl,穿插 compaction,
+        // 每步后增量核算须与全扫基准在多个参考时刻逐一相等。
+        for step in 0..300u64 {
+            let k = rng.below(40);
+            match rng.below(5) {
+                0 => {
+                    let ttl = if k % 2 == 0 { 1000 } else { NO_EXPIRATION };
+                    let _ = store.put_ttl(key(k), &data_for(k, step), ttl);
+                }
+                1 => {
+                    let _ = store.delete(key(k));
+                }
+                2 => {
+                    let _ = store.undelete(key(k));
+                }
+                3 => {
+                    let _ = store.update_ttl(key(k), NO_EXPIRATION);
+                }
+                _ => {
+                    if step % 40 == 39 {
+                        store.compact().unwrap();
+                    }
+                }
+            }
+            for &t in &ref_times {
+                assert_eq!(
+                    store.valid_data_size(t),
+                    store.valid_data_size_by_scan(t),
+                    "step {step} ref_time {t}: incremental != scan"
+                );
+            }
+        }
+        // 重开后(全量重算)仍一致。
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
+        for &t in &ref_times {
+            assert_eq!(
+                store.valid_data_size(t),
+                store.valid_data_size_by_scan(t),
+                "reopen ref {t}"
+            );
+        }
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2754,6 +2939,32 @@ mod tests {
             store.update_ttl(key(1), NO_EXPIRATION),
             Err(Error::AlreadyUpdated)
         ));
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_full_when_capacity_exhausted() {
+        let dir = temp_dir("store_full");
+        let seg = seg_cap(2); // 小段:数据区约 2KiB
+        let store = BlobStore::create(&dir, seg * 2, seg, 1000).unwrap(); // 仅 2 段
+        assert_eq!(store.total_capacity(), seg * 2);
+
+        let value = vec![0u8; 500];
+        let mut n = 0u64;
+        let full_err = loop {
+            match store.put(key(n), &value) {
+                Ok(()) => n += 1,
+                Err(e) => break e,
+            }
+            assert!(n < 1000, "should hit StoreFull well before 1000 puts");
+        };
+        assert!(matches!(full_err, Error::StoreFull), "got {full_err:?}");
+        assert!(n > 0, "some puts succeeded before full");
+        assert!(store.is_full(), "is_full() true once StoreFull hit");
+        assert!(store.available_capacity() < seg, "under one segment free");
+        // 已写入的对象仍可读。
+        assert_eq!(store.get(&key(0)).unwrap(), value);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
