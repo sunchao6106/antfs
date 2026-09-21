@@ -61,7 +61,7 @@ message NodeBeat {
 
 // 一个副本的实然态上报(M3)。
 message ReplicaBeat {
-  uint64 partition_id = 1;
+  uint32 partition_id = 1;
   string disk_id = 2;
   string current_state = 3; // OFFLINE/BOOTSTRAP/ACTIVE/INACTIVE/ERROR ...
   uint64 lag_bytes = 4;
@@ -69,7 +69,7 @@ message ReplicaBeat {
 
 // master → 节点:把某副本推向目标态(M3)。
 message Transition {
-  uint64 partition_id = 1;
+  uint32 partition_id = 1;
   string disk_id = 2;
   string target_state = 3;
 }
@@ -77,7 +77,7 @@ message Transition {
 // master → 节点:后台任务提示(M3:再复制)。
 message Task {
   string kind = 1;          // "rereplicate" ...
-  uint64 partition_id = 2;
+  uint32 partition_id = 2;
 }
 
 message MasterDirective {
@@ -110,7 +110,7 @@ message ClusterState {
   optional uint64 leader = 3;
   uint64 term = 4;
   uint64 registered_nodes = 5;
-  uint64 next_partition_id = 6;
+  uint32 next_partition_id = 6;
 }
 
 // openraft 请求/响应经 JSON 序列化放进 payload,避免在 proto 里镜像 openraft 内部类型演进。
@@ -131,7 +131,7 @@ message CreatePartitionsResponse {
   bool ok = 2;
   string leader_addr = 3;        // 非 leader 时回填
   string error = 4;
-  repeated uint64 partition_ids = 5;
+  repeated uint32 partition_ids = 5;
 }
 
 // 一个副本的定位(读路由用):节点 + 盘 + 目标态 + 存活。
@@ -145,12 +145,12 @@ message ReplicaLoc {
 
 message LookupRequest {
   uint32 version = 1;
-  uint64 partition_id = 2;
+  uint32 partition_id = 2;
 }
 
 message PartitionLocations {
   uint32 version = 1;
-  uint64 partition_id = 2;
+  uint32 partition_id = 2;
   string state = 3;              // RW / RO / SEALED
   repeated ReplicaLoc replicas = 4;
 }
@@ -162,7 +162,7 @@ message AssignRequest {
 message AssignResponse {
   uint32 version = 1;
   bool ok = 2;
-  uint64 partition_id = 3;
+  uint32 partition_id = 3;
   repeated ReplicaLoc replicas = 4;
   string error = 5;
 }
@@ -195,7 +195,7 @@ message ReplicaCurrent {
 
 // 一个分区的全量视图(admin dashboard 用):hard placement + soft current。
 message PartitionEntry {
-  uint64 partition_id = 1;
+  uint32 partition_id = 1;
   string state = 2;              // RW / RO / SEALED
   uint32 replication_factor = 3;
   repeated ReplicaLoc replicas = 4;      // node/addr/disk/target_state/up
@@ -211,7 +211,7 @@ message ListPartitionsResponse {
 message SetPartitionStateRequest {
   uint32 version = 1;
   string cluster_secret = 2;
-  uint64 partition_id = 3;
+  uint32 partition_id = 3;
   string state = 4; // RW / RO / SEALED
 }
 

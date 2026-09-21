@@ -235,7 +235,7 @@ fn print_summary(
     grpc_addr: &str,
     store_addrs: &[String],
     admin_addr: &str,
-    partitions: &[u64],
+    partitions: &[u32],
 ) {
     println!("\n========================================================");
     println!("  ambry-rs 本地集群已就绪 (数据目录 {})", args.dir.display());

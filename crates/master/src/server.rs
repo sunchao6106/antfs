@@ -32,7 +32,7 @@ use crate::placement::{select_disks, DiskFree};
 use crate::reconcile::{plan_evacuation, plan_rereplication, plan_transitions, EvacAction};
 use crate::soft::{DiskUsage, SoftState};
 use crate::store::{open, StateMachineData};
-use crate::types::{DiskSpec, MasterCommand, NodeId, NodeInfo, PartitionState, TypeConfig};
+use crate::types::{DiskSpec, MasterCommand, NodeId, NodeInfo, PartitionId, PartitionState, TypeConfig};
 
 const PROTO_VERSION: u32 = 1;
 
@@ -213,7 +213,7 @@ impl MasterNode {
                 // 补副本目标:失联再复制(M3)∪ 下线 evacuation 的"先补"(M4)。动作相同,合并去重。
                 let evac = plan_evacuation(&partitions, &decom, &up);
                 let errored = soft.errored_replicas();
-                let mut add_targets: std::collections::BTreeSet<NodeId> =
+                let mut add_targets: std::collections::BTreeSet<PartitionId> =
                     plan_rereplication(&partitions, &up, &errored).into_iter().collect();
                 for a in &evac {
                     if let EvacAction::Add(pid) = a {
@@ -442,7 +442,7 @@ impl Master for MasterService {
                 soft.record_beat(beat.node_id, disks);
 
                 // M3:记录副本实然态,算出该节点待下发的转移(current != target)。
-                let reported: BTreeMap<u64, String> =
+                let reported: BTreeMap<PartitionId, String> =
                     beat.replicas.iter().map(|r| (r.partition_id, r.current_state.clone())).collect();
                 soft.record_replicas(
                     beat.node_id,

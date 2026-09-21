@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 /// 集群节点 id(openraft `NodeId`,取默认 `u64`)。
 pub type NodeId = u64;
 /// 分区 id(自带定位,D3;单调分配,永不复用)。
-pub type PartitionId = u64;
+///
+/// **u32**:blobId 高 32bit 即此 id(低 32bit 为 objectId),见 blobid-master-assign D8。
+pub type PartitionId = u32;
 /// 磁盘 id(节点内唯一,通常是盘的挂载标识)。
 pub type DiskId = String;
 

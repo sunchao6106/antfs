@@ -184,7 +184,7 @@ struct SetStateBody {
 
 async fn post_partition_state(
     State(st): State<AppState>,
-    Path(id): Path<u64>,
+    Path(id): Path<u32>,
     Json(body): Json<SetStateBody>,
 ) -> Response {
     st.metrics.api_requests.inc();
@@ -242,7 +242,7 @@ mod tests {
             Ok(vec![])
         }
         async fn partitions(&self, offset: u64, limit: u32) -> crate::error::Result<(Vec<PartitionDto>, u64)> {
-            let all: Vec<PartitionDto> = (0..5u64)
+            let all: Vec<PartitionDto> = (0..5u32)
                 .map(|i| PartitionDto {
                     partition_id: i,
                     state: "RW".into(),
@@ -254,13 +254,13 @@ mod tests {
             let page = all.iter().skip(offset as usize).take(take).cloned().collect();
             Ok((page, all.len() as u64))
         }
-        async fn create_partitions(&self, count: u32, _rf: u32) -> crate::error::Result<Vec<u64>> {
-            Ok((0..count as u64).collect())
+        async fn create_partitions(&self, count: u32, _rf: u32) -> crate::error::Result<Vec<u32>> {
+            Ok((0..count).collect())
         }
         async fn decommission(&self, _node_id: u64) -> crate::error::Result<()> {
             Ok(())
         }
-        async fn set_partition_state(&self, _id: u64, _state: &str) -> crate::error::Result<()> {
+        async fn set_partition_state(&self, _id: u32, _state: &str) -> crate::error::Result<()> {
             Ok(())
         }
     }

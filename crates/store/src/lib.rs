@@ -15,8 +15,8 @@ pub mod replication;
 pub mod server;
 pub mod worker;
 
-/// 分区 id(与 master 侧一致;blobId 自带定位,D3)。
-pub type PartitionId = u64;
+/// 分区 id(与 master 侧一致 u32;blobId 高 32bit,D3/D8)。
+pub type PartitionId = u32;
 
 pub use config::StoreServerConfig;
 pub use error::{Error, Result};

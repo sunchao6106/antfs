@@ -129,7 +129,7 @@ mod tests {
     fn transition_when_current_differs_or_missing() {
         let parts = BTreeMap::from([(0, part(2, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE")]))]);
         // node1 上报 BOOTSTRAP(≠ACTIVE)→ 需转移;node1 无 pid1 上报(缺失)→ 也需转移(但无此分区)。
-        let reported = BTreeMap::from([(0u64, "BOOTSTRAP".to_string())]);
+        let reported = BTreeMap::from([(0u32, "BOOTSTRAP".to_string())]);
         let t = plan_transitions(1, &parts, &reported);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].target_state, "ACTIVE");
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn no_transition_when_current_matches() {
         let parts = BTreeMap::from([(0, part(1, &[(1, "d0", "ACTIVE")]))]);
-        let reported = BTreeMap::from([(0u64, "ACTIVE".to_string())]);
+        let reported = BTreeMap::from([(0u32, "ACTIVE".to_string())]);
         assert!(plan_transitions(1, &parts, &reported).is_empty());
     }
 
@@ -177,7 +177,7 @@ mod tests {
             part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE")]),
         )]);
         let up = HashSet::from([1, 2, 3]); // 全存活
-        let errored = HashSet::from([(0u64, 3u64)]); // 但 node3 的 replica 上报 ERROR
+        let errored = HashSet::from([(0u32, 3u64)]); // 但 node3 的 replica 上报 ERROR
         assert_eq!(
             plan_rereplication(&parts, &up, &errored),
             vec![0],

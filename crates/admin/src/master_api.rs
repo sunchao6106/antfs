@@ -22,7 +22,7 @@ pub struct ClusterDto {
     pub leader: Option<u64>,
     pub term: u64,
     pub registered_nodes: u64,
-    pub next_partition_id: u64,
+    pub next_partition_id: u32,
 }
 
 /// 一块盘(节点视图内)。
@@ -60,7 +60,7 @@ pub struct ReplicaDto {
 /// 一个分区(`GET /api/partitions`)。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PartitionDto {
-    pub partition_id: u64,
+    pub partition_id: u32,
     pub state: String,
     pub replication_factor: u32,
     pub replicas: Vec<ReplicaDto>,
@@ -73,9 +73,9 @@ pub trait MasterApi: Send + Sync {
     async fn nodes(&self) -> Result<Vec<NodeDto>>;
     /// 分页列分区,返回 `(本页, 总数)`;`limit=0` 表示不限。
     async fn partitions(&self, offset: u64, limit: u32) -> Result<(Vec<PartitionDto>, u64)>;
-    async fn create_partitions(&self, count: u32, replication_factor: u32) -> Result<Vec<u64>>;
+    async fn create_partitions(&self, count: u32, replication_factor: u32) -> Result<Vec<u32>>;
     async fn decommission(&self, node_id: u64) -> Result<()>;
-    async fn set_partition_state(&self, partition_id: u64, state: &str) -> Result<()>;
+    async fn set_partition_state(&self, partition_id: u32, state: &str) -> Result<()>;
 }
 
 /// 基于 tonic 的 `MasterApi` 实现。持有一个 `Channel`,每次调用克隆客户端(共享连接池)。
@@ -181,7 +181,7 @@ impl MasterApi for GrpcMasterApi {
         Ok((items, total))
     }
 
-    async fn create_partitions(&self, count: u32, replication_factor: u32) -> Result<Vec<u64>> {
+    async fn create_partitions(&self, count: u32, replication_factor: u32) -> Result<Vec<u32>> {
         let mut c = self.client.clone();
         let resp = c
             .create_partitions(CreatePartitionsRequest {
@@ -224,7 +224,7 @@ impl MasterApi for GrpcMasterApi {
         Ok(())
     }
 
-    async fn set_partition_state(&self, partition_id: u64, state: &str) -> Result<()> {
+    async fn set_partition_state(&self, partition_id: u32, state: &str) -> Result<()> {
         let mut c = self.client.clone();
         let resp = c
             .set_partition_state(SetPartitionStateRequest {
