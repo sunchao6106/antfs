@@ -303,9 +303,9 @@ fn main() {
     report(&get);
 
     println!(
-        "store: used={}MiB valid-now={}MiB full={}",
+        "store: used={}MiB valid={}MiB full={}",
         store.size_in_bytes() / (1024 * 1024),
-        store.valid_data_size(i64::MAX) / (1024 * 1024),
+        store.valid_data_size() / (1024 * 1024),
         store.is_full(),
     );
 

@@ -177,51 +177,27 @@ struct SegBytes {
     dead: u64,
 }
 
-/// 有效数据字节的增量核算(对齐 Ambry `BlobStoreStats` 的 valid-size,避免每查全扫 log)。
+/// 有效数据字节的增量核算:当前索引赢家中**未删除**记录的 `size` 之和(墓碑不计)。
 ///
-/// 只统计**当前索引赢家中未删除**的记录:无过期的进 `permanent`,有过期的按 `expiration_ms`
-/// 进 `by_expiry` 桶。`valid_as_of(t)` = `permanent` + 所有「过期时刻 > t」的桶(即到 t 未过期)。
-/// 赢家变更(put/delete/undelete/update_ttl)时增量 add/remove;compaction/open 全量重算。
+/// 简化取舍:**不区分过期**——过期但尚未被 compaction 回收的对象仍占盘,故计入(避免按过期
+/// 时刻分桶的复杂度)。赢家变更(put/delete/undelete/update_ttl)时增量 add/remove,
+/// compaction/open 全量重算。
 #[derive(Default)]
 struct ValidStats {
-    permanent: u64,
-    by_expiry: BTreeMap<i64, u64>,
+    bytes: u64,
 }
 
 impl ValidStats {
     fn add(&mut self, v: &IndexValue) {
-        if v.is_deleted() {
-            return;
-        }
-        if v.expiration_ms == NO_EXPIRATION {
-            self.permanent += v.size;
-        } else {
-            *self.by_expiry.entry(v.expiration_ms).or_default() += v.size;
+        if !v.is_deleted() {
+            self.bytes += v.size;
         }
     }
 
     fn remove(&mut self, v: &IndexValue) {
-        if v.is_deleted() {
-            return;
+        if !v.is_deleted() {
+            self.bytes = self.bytes.saturating_sub(v.size);
         }
-        if v.expiration_ms == NO_EXPIRATION {
-            self.permanent = self.permanent.saturating_sub(v.size);
-        } else if let Some(bucket) = self.by_expiry.get_mut(&v.expiration_ms) {
-            *bucket = bucket.saturating_sub(v.size);
-            if *bucket == 0 {
-                self.by_expiry.remove(&v.expiration_ms);
-            }
-        }
-    }
-
-    fn valid_as_of(&self, reference_time_ms: i64) -> u64 {
-        use std::ops::Bound;
-        let future: u64 = self
-            .by_expiry
-            .range((Bound::Excluded(reference_time_ms), Bound::Unbounded))
-            .map(|(_, s)| *s)
-            .sum();
-        self.permanent + future
     }
 }
 
@@ -648,28 +624,24 @@ impl BlobStore {
         })
     }
 
-    /// 有效数据字节(对齐 Ambry `getValidDataSize`):索引赢家中「未删除且到 `reference_time_ms`
-    /// 未过期」的记录 `size` 之和。墓碑(已删除赢家)与过期记录不计入,故 ≠ `stats` 的 live 字节。
-    ///
-    /// 走增量核算 [`ValidStats`](Self)(`O(过期桶)`),避免每查全扫 log;正确性由 `#[cfg(test)]`
-    /// 的全扫基准 `valid_data_size_by_scan` 差分对拍守护。
-    pub fn valid_data_size(&self, reference_time_ms: i64) -> u64 {
+    /// 有效数据字节:索引赢家中**未删除**记录的 `size` 之和(墓碑不计)。**不区分过期**(过期但
+    /// 未回收对象仍占盘,故计入),故 ≠ `stats` 的 live 字节(后者含墓碑)。走增量计数,`O(1)` 查询;
+    /// 正确性由 `#[cfg(test)]` 全扫基准 `valid_data_size_by_scan` 差分对拍守护。
+    pub fn valid_data_size(&self) -> u64 {
         self.valid_stats
             .lock()
             .expect("blob valid_stats poisoned")
-            .valid_as_of(reference_time_ms)
+            .bytes
     }
 
-    /// 全扫 log 的有效数据字节基准(对拍 `valid_data_size` 的增量核算)。
+    /// 全扫 log 的有效数据字节基准(对拍 `valid_data_size` 的增量计数)。
     #[cfg(test)]
-    fn valid_data_size_by_scan(&self, reference_time_ms: i64) -> u64 {
+    fn valid_data_size_by_scan(&self) -> u64 {
         let inner = self.inner();
         let mut total = 0u64;
         for_each_record(&inner.log, |off, _raw, decoded| {
             if let Some(v) = inner.index.find(&decoded.key) {
-                let expired =
-                    v.expiration_ms != NO_EXPIRATION && reference_time_ms >= v.expiration_ms;
-                if v.offset == off && !v.is_deleted() && !expired {
+                if v.offset == off && !v.is_deleted() {
                     total += v.size;
                 }
             }
@@ -2833,14 +2805,14 @@ mod tests {
     }
 
     #[test]
-    fn valid_data_size_excludes_deleted_and_expired() {
+    fn valid_data_size_excludes_deleted_but_counts_unexpired_and_expired() {
         let dir = temp_dir("valid");
         let seg = seg_cap(16);
         let store = BlobStore::create(&dir, seg * 8, seg, 100).unwrap();
         // 永久 blob。
         store.put(key(1), b"keep-1").unwrap();
         let live1 = store.stat(&key(1)).unwrap();
-        // 过期时刻 = 1000 的 blob。
+        // 带过期时刻的 blob:未删除 → 计入(不区分过期)。
         store.put_ttl(key(2), b"expiring", 1000).unwrap();
         // put 后删除 → 墓碑赢家 + 死 PUT,均不计有效。
         store.put(key(3), b"gone").unwrap();
@@ -2849,20 +2821,9 @@ mod tests {
         let rec1 = live1.data_len + RECORD_OVERHEAD as u64;
         let rec2 = store.stat(&key(2)).unwrap().data_len + RECORD_OVERHEAD as u64;
 
-        // 参考时刻 500(未到 key2 过期):key1 + key2 有效,key3 不计。
-        assert_eq!(store.valid_data_size(500), rec1 + rec2, "before expiry");
-        assert_eq!(
-            store.valid_data_size_by_scan(500),
-            rec1 + rec2,
-            "scan agrees @500"
-        );
-        // 参考时刻 1000(key2 到期):仅 key1。
-        assert_eq!(store.valid_data_size(1000), rec1, "after key2 expiry");
-        assert_eq!(
-            store.valid_data_size_by_scan(1000),
-            rec1,
-            "scan agrees @1000"
-        );
+        // 未删除的 key1 + key2 计入(含带过期的 key2);已删除 key3 不计。
+        assert_eq!(store.valid_data_size(), rec1 + rec2);
+        assert_eq!(store.valid_data_size_by_scan(), rec1 + rec2, "scan agrees");
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2873,10 +2834,9 @@ mod tests {
         let seg = seg_cap(16);
         let store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
         let mut rng = Rng(0x51ED_C0DE);
-        let ref_times: [i64; 4] = [0, 500, 1500, i64::MAX];
 
         // 混合 put(部分带 TTL)/delete/undelete/update_ttl,穿插 compaction,
-        // 每步后增量核算须与全扫基准在多个参考时刻逐一相等。
+        // 每步后增量计数须与全扫基准相等。
         for step in 0..300u64 {
             let k = rng.below(40);
             match rng.below(5) {
@@ -2899,24 +2859,20 @@ mod tests {
                     }
                 }
             }
-            for &t in &ref_times {
-                assert_eq!(
-                    store.valid_data_size(t),
-                    store.valid_data_size_by_scan(t),
-                    "step {step} ref_time {t}: incremental != scan"
-                );
-            }
+            assert_eq!(
+                store.valid_data_size(),
+                store.valid_data_size_by_scan(),
+                "step {step}: incremental != scan"
+            );
         }
         // 重开后(全量重算)仍一致。
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
-        for &t in &ref_times {
-            assert_eq!(
-                store.valid_data_size(t),
-                store.valid_data_size_by_scan(t),
-                "reopen ref {t}"
-            );
-        }
+        assert_eq!(
+            store.valid_data_size(),
+            store.valid_data_size_by_scan(),
+            "reopen"
+        );
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

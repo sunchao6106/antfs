@@ -178,7 +178,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] undelete / lifeVersion(复活已删除对象)
 - [x] updateTtl(设/移除过期时间,支持任意 expiration,一次性 + 已删/不存在守卫)
 - [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty / is_key_deleted)
-- [x] 有效数据字节(`valid_data_size(reference_time_ms)`,排除墓碑 + 到参考时刻已过期,对齐 Ambry `getValidDataSize`;**增量核算**:`permanent` + 按过期时刻分桶,写路径 O(1) 维护、compaction/open 重算,全扫基准差分对拍守护)
+- [x] 有效数据字节(`valid_data_size()`:未删除赢家 size 之和,墓碑不计;**不区分过期**——过期但未回收对象仍占盘故计入,避免按过期时刻分桶的复杂度)。增量计数 O(1) 查询,写路径维护、compaction/open 重算,全扫基准差分对拍守护
 - [x] HardDeleter(软删对象数据就地清零,隐私擦除)
 - [x] 内存参考模型全量对拍
 - [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 简化:`FindToken` 仅 offset 游标,sessionId/incarnationId/resetKey(重启/compaction 失效重定位)属复制层职责,待其落地补
