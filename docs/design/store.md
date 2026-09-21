@@ -1,6 +1,6 @@
-# ambry-store 设计:单机存储引擎
+# store 设计:单机存储引擎
 
-本文档为 **ambry-store**(单机存储引擎)的设计;跨模块战略方向、系统层级、开发环境见 [README.md](./README.md)。
+本文档为 **`store`** crate(单机存储引擎,对标 Ambry `ambry-store` 模块)的设计;跨模块战略方向、系统层级、开发环境见 [README.md](./README.md)。
 
 组件:`Log` / `LogSegment`(数据)+ `PersistentIndex`(索引)+ `BlobStore`(串联对象存储)。
 

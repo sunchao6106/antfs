@@ -9,10 +9,10 @@
 
 | 模块 | 说明 | 状态 |
 |---|---|---|
-| ambry-store | 单机存储引擎:`Log` / `LogSegment` / `PersistentIndex` / `BlobStore`(put/get/delete/undelete/updateTtl/compaction/hard_delete/恢复) | 进行中 |
+| store | 单机存储引擎:`Log` / `LogSegment` / `PersistentIndex` / `BlobStore`(put/get/delete/undelete/updateTtl/compaction/hard_delete/恢复);对标 Ambry `ambry-store` | 进行中 |
 | frontend / S3 网关、复制、集群等 | 其余 Ambry 模块 | 规划中 |
 
-ambry-store 当前要点:
+store 当前要点:
 - IO:**同步阻塞 `std::fs` + buffered(OS page cache)**,对齐 Ambry 原版
 - 索引:并发活跃段 + **mmap 封存段 + 持久化 Binary Fuse 过滤器**
 

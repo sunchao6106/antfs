@@ -12,8 +12,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ambry_store::LogSegment;
 use proptest::prelude::*;
+use store::LogSegment;
 
 #[derive(Debug, Clone)]
 enum Op {

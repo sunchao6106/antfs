@@ -8,7 +8,7 @@
 
 | 模块 | 文档 | 状态 |
 |---|---|---|
-| ambry-store(单机存储引擎:Log / LogSegment / PersistentIndex / BlobStore) | [store.md](./store.md) | 进行中 |
+| store(单机存储引擎:Log / LogSegment / PersistentIndex / BlobStore;对标 Ambry `ambry-store`) | [store.md](./store.md) | 进行中 |
 | frontend / S3 网关(对象接口层) | *(待添加)* | 规划中 |
 
 > 决策档案(含被否决方案与理由)见 `openspec/changes/`。

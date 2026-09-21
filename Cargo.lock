@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "ambry-store"
-version = "0.0.0"
-dependencies = [
- "crc32fast",
- "crossbeam-skiplist",
- "libc",
- "memmap2",
- "proptest",
- "thiserror",
- "xorf",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -346,6 +333,19 @@ dependencies = [
 [[package]]
 name = "smoke"
 version = "0.0.0"
+
+[[package]]
+name = "store"
+version = "0.0.0"
+dependencies = [
+ "crc32fast",
+ "crossbeam-skiplist",
+ "libc",
+ "memmap2",
+ "proptest",
+ "thiserror",
+ "xorf",
+]
 
 [[package]]
 name = "syn"

@@ -34,7 +34,7 @@ cargo run -p smoke
 `.run/` 下提供了通过 [`vm-cargo.sh`](../vm-cargo.sh) 转进 VM 的 Shell 运行配置(build / test / clippy / smoke),不写死 SSH 端口、可提交共享。也可直接命令行:
 ```bash
 ./vm-cargo.sh build
-./vm-cargo.sh test -p ambry-store
+./vm-cargo.sh test -p store
 ```
 
 ### 2.2 IDE 代码洞察走 VM(JetBrains Gateway)
