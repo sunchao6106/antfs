@@ -176,12 +176,162 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] compaction/GC:CompactAll + 按段增量(死占比阈值触发)+ 标记式崩溃修复
 - [x] 死数据统计增量维护(seg_bytes,对齐 `BlobStoreStats`)
 - [x] undelete / lifeVersion(复活已删除对象)
-- [x] updateTtl(移除过期时间)
-- [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty)
+- [x] updateTtl(设/移除过期时间,支持任意 expiration,一次性 + 已删/不存在守卫)
+- [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty / is_key_deleted)
+- [x] 有效数据字节(`valid_data_size(reference_time_ms)`,排除墓碑 + 到参考时刻已过期,对齐 Ambry `getValidDataSize`)
 - [x] HardDeleter(软删对象数据就地清零,隐私擦除)
 - [x] 内存参考模型全量对拍
+- [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 简化:`FindToken` 仅 offset 游标,sessionId/incarnationId/resetKey(重启/compaction 失效重定位)属复制层职责,待其落地补
 - [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction/COW hard_delete 换入、无重试循环、不引 `arc-swap`;hard_delete 改 COW、删除就地 `overwrite_at` footgun;并发测试守护)
 - [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [ ] 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓
 - [ ] (已废弃)monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销
+
+## 10. 配置项清单(对齐 Ambry `StoreConfig`)
+
+> **状态:部分接入**。[`StoreConfig`](../../crates/store/src/config.rs) 已落地 `[store]` 组的 `segment_size_bytes`
+> 与 `index_max_inmem_elements`(serde + `Default` + `Validate`),经 `BlobStore::create_with/open_with`
+> 依赖注入(对齐 Ambry `StorageManager`→`BlobStore`)。`total_capacity` 是 per-replica 属性(对齐 Ambry
+> `capacityInBytes`),仍作构造参数显式传入,不在 config。**其余各组仍为规划**,待对应行为实现时逐项接入。
+> 范式见 [`common.md` §1](./common.md)。默认值/范围以 Ambry `StoreConfig` **构造函数**为准。
+
+### 10.1 `[store]` 核心 / 索引 / Log
+| key(TOML 路径) | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store.data_flush_interval_seconds` | u64 | 60 | ≥1 | 数据周期 flush 间隔 | `store.data.flush.interval.seconds` |
+| `store.data_flush_delay_seconds` | u64 | 5 | ≥0 | 启动后首次 flush 延迟 | `store.data.flush.delay.seconds` |
+| `store.index_max_memory_size_bytes` | u64 | 20971520 | ≥1 | 活跃索引常驻内存上限(触发封存) | `store.index.max.memory.size.bytes` |
+| `store.index_max_inmem_elements` | u64 | 10000 | ≥1 | 活跃索引内存条目上限 | `store.index.max.number.of.inmem.elements` |
+| `store.max_journal_entries_to_return` | u32 | 5000 | 1–10000 | journal 单次返回上限 | `store.max.number.of.entries.to.return.from.journal` |
+| `store.index_persisted_entry_min_bytes` | u32 | 115 | ≥1 | 索引条目持久化最小字节(注:Rust `IndexValue` 定长 59B,值需按实际布局重定) | `store.index.persisted.entry.min.bytes` |
+| `store.segment_size_bytes` | u64 | **待定** | ≥1 | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;ambry-rs 需按"每 Log 定容上界"设计锚点定具体值) | `store.segment.size.in.bytes` |
+| `store.index_mem_state` | enum | `mmap_without_force_load` | 枚举 | 索引内存策略 | `store.index.mem.state` |
+
+### 10.2 `[store.compaction]`
+| key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store.compaction.triggers` | Vec\<String\> | `[]` | ⊆{periodic,admin} | 触发器,空=禁用 | `store.compaction.triggers` |
+| `store.compaction.check_frequency_hours` | u32 | 168 | 1–8760 | 检查可否 compaction 频率 | `store.compaction.check.frequency.in.hours` |
+| `store.compaction.min_used_capacity_to_trigger_percentage` | u8 | 50 | 0–100 | 触发的最小已用容量占比 | `store.min.used.capacity.to.trigger.compaction.in.percentage` |
+| `store.compaction.min_log_segment_count_to_reclaim` | u32 | 1 | 1–1000 | 触发所需最小可回收段数 | `store.min.log.segment.count.to.reclaim.to.trigger.compaction` |
+| `store.compaction.max_valid_data_percentage_to_qualify` | f64 | 0.30 | 0.0–1.0 | 段有效数据占比 ≤ 此值才够格 | `store.max.log.segment.valid.data.percentage.to.qualify.compaction` |
+| `store.compaction.stats_min_cost_percentage` | f64 | 0.06 | 0.0–1.0 | stats 策略单段最小成本 | `store.stats.based.compaction.min.cost.in.percentage` |
+| `store.compaction.stats_weight_on_benefit` | bool | false | — | 更看重收益而非 IO 成本 | `store.stats.based.weight.on.benefit.enabled` |
+| `store.compaction.policy_switch_timestamp_days` | u32 | 6 | 1–14 | Hybrid 切 CompactAll 周期 | `store.compaction.policy.switch.timestamp.days` |
+| `store.compaction.operations_bytes_per_sec` | u64 | 1048576 | ≥1 | compaction IO 限速 | `store.compaction.operations.bytes.per.sec` |
+| `store.compaction.min_operations_bytes_per_sec` | u64 | 524288 | ≥1 | compaction 最小 IO 速率 | `store.compaction.min.operations.bytes.per.sec` |
+| `store.compaction.operations_adjust_k` | f64 | 1.0 | -100.0–100.0 | 期望拷贝速率调节系数 | `store.compaction.operations.adjust.k` |
+| `store.compaction.io_per_mb_read_latency_threshold_ms` | u32 | 20 | ≥0 | 归一化读延迟阈值(超则降速) | `store.compaction.io.per.mb.read.latency.threshold.ms` |
+| `store.compaction.io_per_mb_write_latency_threshold_ms` | u32 | 20 | ≥0 | 归一化写延迟阈值 | `store.compaction.io.per.mb.write.latency.threshold.ms` |
+| `store.compaction.min_buffer_size_bytes` | u64 | 10485760 | ≥0 | copy 阶段最小缓冲 | `store.compaction.min.buffer.size` |
+| `store.compaction.purge_delete_tombstone` | bool | false | — | 清除过期删除墓碑 | `store.compaction.purge.delete.tombstone` |
+
+> Ambry 的 `store.compaction.enable.direct.io` / `direct.io.buffer.size` / `throttler.check.interval.ms` / `filter` 与本项目路线乙(buffered IO)不匹配或实现细节化,**暂不纳入**。
+
+### 10.3 `[store.stats]`(死数据统计,对齐 `BlobStoreStats`)
+| key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store.stats.bucket_count` | u32 | 0 | 0–10000 | 分桶数(0=禁用 bucketing) | `store.stats.bucket.count` |
+| `store.stats.bucket_span_minutes` | u64 | 60 | 1–10000 | 每桶时间跨度 | `store.stats.bucket.span.in.minutes` |
+| `store.stats.recent_entry_processing_interval_minutes` | u64 | 2 | 1–60 | 队列处理器频率 | `store.stats.recent.entry.processing.interval.in.minutes` |
+| `store.stats.valid_size_interval_secs` | u64 | 120 | 1–3600 | validDataSize 采集频率 | `store.get.valid.size.interval.in.secs` |
+| `store.stats.wait_timeout_secs` | u64 | 120 | 0–1800 | 等待分桶构建上限 | `store.stats.wait.timeout.in.secs` |
+| `store.stats.index_entries_per_second` | u32 | 240000 | ≥1 | stats 扫描限速 | `store.stats.index.entries.per.second` |
+
+### 10.4 `[store.hard_delete]` / TTL / 保留期
+| key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store.hard_delete.enabled` | bool | false | — | 是否启用硬删(数据擦除) | `store.enable.hard.delete` |
+| `store.hard_delete.operations_bytes_per_sec` | u64 | 102400 | ≥1 | 硬删 IO 限速 | `store.hard.delete.operations.bytes.per.sec` |
+| `store.hard_delete.deleted_message_retention_minutes` | u64 | 10080 | ≥1 | 软删后多久可硬删(Ambry 默认 168h) | `store.deleted.message.retention.hours/minutes` |
+| `store.hard_delete.ttl_update_buffer_seconds` | u32 | 86400 | ≥0 | TTL 更新须早于过期的缓冲 | `store.ttl.update.buffer.time.seconds` |
+
+### 10.5 `[store.filter]`(存在性过滤器;ambry-rs 用 Binary Fuse 替 Bloom)
+| key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store.filter.rebuild_on_startup` | bool | false | — | 启动时重建 `.fuse`(损坏兜底) | `store.index.rebuild.bloom.filter.enabled` |
+
+> Ambry 的 `bloom.max.false.positive.probability` / `uuid.based.bloom.filter.enabled` / `bloom.filter.maximum.page.count` 是 Bloom 专属参数;Binary Fuse 的假阳率与体积由构造固定(~1.08 B/key),**无对应项**。
+
+### 10.6 `[store.files]`(权限 / IO 错误 / 部分恢复)
+| key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store.files.set_permission_enabled` | bool | false | — | 是否设置文件权限 | `store.set.file.permission.enabled` |
+| `store.files.data_file_permission` | String | `rw-rw----` | POSIX 权限串 | 数据文件权限 | `store.data.file.permission` |
+| `store.files.operation_file_permission` | String | `rw-rw-r--` | POSIX 权限串 | 运维文件权限 | `store.operation.file.permission` |
+| `store.files.io_error_count_to_trigger_shutdown` | u32 | u32::MAX | ≥1 | 触发 store 关闭的 IO 错误阈值 | `store.io.error.count.to.trigger.shutdown` |
+| `store.files.partial_log_segment_recovery_enabled` | bool | false | — | 尾段部分损坏时截断续恢复 | `store.enable.partial.log.segment.recovery` |
+| `store.files.partial_log_segment_recovery_remaining_threshold_bytes` | u64 | 5242880 | 0–1GiB | 上者剩余数据阈值 | `store.partial.log.segment.recovery.remaining.data.size.threshold` |
+
+## 11. 监控项清单(对齐 Ambry `StoreMetrics`)
+
+> **状态:部分接入**。[`StoreMetrics`](../../crates/store/src/metrics.rs) 已落地 **BlobStore 层子集**,经
+> `BlobStore::create_with/open_with` 注入,按 `store="<id>"` label 区分多实例(见 [`common.md` §2.2](./common.md))。
+> **已接入**:`store_request_duration_seconds{store,op}`(op = put/get/delete/undelete/ttl_update/flush)、
+> `store_already_exists_total`、`store_compaction_reclaimed_bytes_total`、`store_compaction_duration_seconds`、
+> `store_hard_delete_total`、`store_hard_delete_duration_seconds`、`store_log_used_capacity_bytes`、
+> `store_log_invalid_data_bytes`、`store_log_segment_count`。
+> **仍规划**:Log 的 overflow、PersistentIndex 的 recovery/find/flush 计时与 token 计数、封存段/Fuse 过滤器命中、
+> BlobStoreStats 扫描等——这些打点在 `Log`/`PersistentIndex`/`IndexSegment` 内部,需把 handle 透传进这些模块后接入。
+> 命名规范见 [`common.md` §2](./common.md)。裸构造器(`create`/`open`)用一个丢弃的私有 Registry(打点不导出),仅测试/无监控场景。
+
+### 11.1 BlobStore(顶层操作)
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_request_duration_seconds` | histogram | `store`,`op`(get/put/delete/undelete/ttl_update/find_key…) | 秒 | 各操作耗时(合并 Ambry 的分操作 Timer) | `Store{Op}Response` 系列 |
+| `store_start_duration_seconds` | histogram | `store` | 秒 | 启动耗时 | `StoreStartTime` |
+| `store_shutdown_duration_seconds` | histogram | `store` | 秒 | 关闭耗时 | `StoreShutdownTimeInMs` |
+| `store_start_failure_total` | counter | `store` | 次 | 启动失败 | `StoreStartFailure` |
+| `store_io_error_shutdown_total` | counter | `store` | 次 | IO 错误触发关闭 | `StoreIoErrorTriggeredShutdownCount` |
+| `store_already_exists_total` | counter | `store` | 次 | put 命中已存在 key | `IdenticalPutAttemptCount` |
+
+### 11.2 Log(数据层)
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_log_used_capacity_bytes` | gauge | `store` | 字节 | 已用容量 | `CurrentCapacityUsed` |
+| `store_log_used_capacity_ratio` | gauge | `store` | 比例 | 已用占比 | `PercentageUsedCapacity` |
+| `store_log_segment_count` | gauge | `store` | 个 | 段数 | `CurrentSegmentCount` |
+| `store_log_invalid_data_bytes` | gauge | `store` | 字节 | 死数据量(seg_bytes 推导) | `CurrentInvalidDataSize` |
+| `store_log_overflow_error_total` | counter | `store`,`kind`(read/write) | 次 | 读/写越界错误 | `OverflowReadError`/`OverflowWriteError` |
+
+### 11.3 PersistentIndex(索引)
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_index_recovery_duration_seconds` | histogram | `store` | 秒 | 恢复耗时 | `IndexRecoveryTime` |
+| `store_index_find_duration_seconds` | histogram | `store` | 秒 | 查找耗时 | `IndexFindTime` |
+| `store_index_flush_duration_seconds` | histogram | `store` | 秒 | 索引落盘耗时 | `IndexFlushTime` |
+| `store_index_nonzero_message_recovery_total` | counter | `store` | 次 | 恢复出非零消息 | `NonZeroMessageRecovery` |
+
+### 11.4 封存段 / Fuse 过滤器(对齐 Ambry `IndexSegment` Bloom 打点)
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_filter_query_total` | counter | `store`,`result`(hit/miss) | 次 | 过滤器查询命中/未命中 | `BloomAccessedCount`/`BloomPositiveCount` |
+| `store_filter_false_positive_total` | counter | `store` | 次 | 假阳(过滤器过、段内无) | `BloomFalsePositiveCount` |
+| `store_filter_crc_failure_total` | counter | `store` | 次 | `.fuse` CRC 校验失败 | `BloomCRCValidationFailureCount` |
+| `store_filter_rebuild_total` | counter | `store` | 次 | 加载失败触发重建 | `BloomRebuildOnLoadFailureCount` |
+| `store_sealed_segment_mmap_loaded_total` | counter | `store`,`loaded`(yes/no) | 次 | 查找时封存段是否已 mmap 载入 | `MappedSegmentIsLoaded/NotLoadedDuringFindCount` |
+| `store_segments_accessed_per_blob` | histogram | `store` | 个 | 每次查找访问的段数 | `SegmentsAccessedPerBlobCount` |
+
+### 11.5 HardDeleter
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_hard_delete_duration_seconds` | histogram | `store` | 秒 | 硬删耗时 | `HardDeleteTime` |
+| `store_hard_delete_total` | counter | `store`,`result`(done/failed) | 次 | 硬删完成/失败 | `HardDeleteDoneCount`/`HardDeleteFailedCount` |
+| `store_hard_delete_progress_bytes` | gauge | `store` | 字节 | 硬删进度 | `CurrentHardDeleteProgress` |
+
+### 11.6 Compaction(对齐 Ambry `BlobStoreCompactor`)
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_compaction_in_progress` | gauge | `store` | 0/1 | 是否正在 compaction | `CompactionInProgress` |
+| `store_compaction_copied_bytes_total` | counter | `store` | 字节 | 累计拷贝字节 | `CopyRateInBytes`(Meter→counter,速率查询端算) |
+| `store_compaction_reclaimed_bytes_total` | counter | `store` | 字节 | 累计回收字节 | `CompactionBytesReclaimedCount` |
+| `store_compaction_duration_seconds` | histogram | `store`,`kind`(full/partial) | 秒 | 单次 compaction 耗时 | `CompactionFinishedForAStoreTimeInMs`/`PartialRange…` |
+| `store_compaction_cost` / `store_compaction_benefit` | gauge | `store` | — | 选段 cost/benefit | `CompactionCost`/`CompactionBenefit` |
+
+### 11.7 BlobStoreStats(死数据扫描)
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_stats_scan_duration_seconds` | histogram | `store`,`kind`(on_demand/bucketing) | 秒 | 扫描耗时 | `StatsOnDemandScanTotalTimeMs`/`StatsBucketingScanTotalTimeMs` |
+| `store_stats_scan_error_total` | counter | `store`,`kind`(scanner/queue) | 次 | 扫描/队列错误 | `BlobStoreStatsIndexScannerErrorCount`/`…QueueProcessorErrorCount` |
+| `store_stats_forward_scan_entries` | histogram | `store` | 个 | 前向扫描条目数 | `StatsForwardScanEntryCount` |

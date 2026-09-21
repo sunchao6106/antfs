@@ -7,20 +7,26 @@
 //!
 //! 段文件名 `{seq}.idx`;活跃段以 `sealed=0` 落盘、封存时原地改写为 `sealed=1`。
 
+mod journal;
 mod segment;
 pub mod value;
 
 use crossbeam_skiplist::SkipMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use crate::error::{Error, Result};
-use crate::types::StoreKey;
+use crate::types::{LogOffset, StoreKey};
 
 pub use value::IndexValue;
 
+use journal::Journal;
 use segment::{read_segment_file, SealedSegment};
+
+/// journal 容量相对 `max_entries_per_segment` 的倍数:journal 覆盖「最近若干段」的复制拉取窗口。
+/// 暂以段大小的倍数近似(对齐 Ambry 独立配置的 journal 尺寸,待专门配置项时再解耦)。
+const JOURNAL_CAPACITY_FACTOR: usize = 4;
 
 pub struct PersistentIndex {
     dir: PathBuf,
@@ -29,6 +35,8 @@ pub struct PersistentIndex {
     active: SkipMap<StoreKey, IndexValue>,
     /// 封存段:`RwLock` 保护(读锁扫描、封存时写锁 push);内部可变以支持 `&self` 写路径。
     sealed: RwLock<Vec<SealedSegment>>,
+    /// 近期记录的 offset→key 游标(复制增量拉取用);写路径 `add` 喂入,`&self` 下用 `Mutex`。
+    journal: Mutex<Journal>,
     active_seq: AtomicU64,
     next_seq: AtomicU64,
 }
@@ -49,6 +57,9 @@ impl PersistentIndex {
             active: SkipMap::new(),
             active_seq: AtomicU64::new(0),
             sealed: RwLock::new(Vec::new()),
+            journal: Mutex::new(Journal::new(
+                max_entries_per_segment.saturating_mul(JOURNAL_CAPACITY_FACTOR),
+            )),
             next_seq: AtomicU64::new(1),
         })
     }
@@ -113,19 +124,32 @@ impl PersistentIndex {
             (s, s + 1)
         };
 
+        // 重建 journal:从活跃段(最新一段、已在内存)喂入近期 offset→key;更旧的封存段不触碰
+        // (保持 mmap 惰性),复制若拉取到更旧游标则回退扫 log。
+        let mut journal =
+            Journal::new(max_entries_per_segment.saturating_mul(JOURNAL_CAPACITY_FACTOR));
+        for e in active.iter() {
+            journal.add(e.value().offset, *e.key());
+        }
+
         Ok(Self {
             dir,
             max_entries_per_segment,
             active,
             sealed: RwLock::new(sealed),
+            journal: Mutex::new(journal),
             active_seq: AtomicU64::new(active_seq),
             next_seq: AtomicU64::new(next_seq),
         })
     }
 
-    /// 写入一条索引。活跃段为并发映射;满阈值自动封存。
+    /// 写入一条索引。活跃段为并发映射;满阈值自动封存。同时喂入 journal(复制游标)。
     pub fn add(&self, key: StoreKey, value: IndexValue) -> Result<()> {
         self.active.insert(key, value);
+        self.journal
+            .lock()
+            .expect("index journal poisoned")
+            .add(value.offset, key);
         if self.active.len() >= self.max_entries_per_segment {
             self.seal_active()?;
         }
@@ -182,6 +206,27 @@ impl PersistentIndex {
 
     pub fn active_len(&self) -> usize {
         self.active.len()
+    }
+
+    /// journal 覆盖的最旧 offset(无则 `None`);供 `find_entries_since` 判断能否走 journal 快路径。
+    pub fn journal_first_offset(&self) -> Option<LogOffset> {
+        self.journal
+            .lock()
+            .expect("index journal poisoned")
+            .first_offset()
+    }
+
+    /// journal 中 offset ≥ `from` 的 `(offset, key)`(按序);`from` 越出 journal 覆盖范围返回 `None`
+    /// ——调用方回退扫 log。见 [`journal::Journal::entries_since`]。
+    pub fn journal_entries_since(
+        &self,
+        from: LogOffset,
+        inclusive: bool,
+    ) -> Option<Vec<(LogOffset, StoreKey)>> {
+        self.journal
+            .lock()
+            .expect("index journal poisoned")
+            .entries_since(from, inclusive)
     }
 }
 

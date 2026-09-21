@@ -11,6 +11,11 @@ libc = "0.2"
 xorf = "0.13.0"
 memmap2 = "0.9"
 crossbeam-skiplist = "0.1"
+config = { path = "../common/config" }
+metric = { path = "../common/metric" }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1"
+config = { path = "../common/config" }
+metric = { path = "../common/metric" }

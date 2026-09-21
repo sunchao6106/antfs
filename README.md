@@ -9,6 +9,7 @@
 
 | 模块 | 说明 | 状态 |
 |---|---|---|
+| common | 公共库:`config`(`serde`+`config` 分层配置)、`metric`(`prometheus` 统计打点);对标 Ambry `config` 包 + Dropwizard `MetricRegistry` | 进行中 |
 | store | 单机存储引擎:`Log` / `LogSegment` / `PersistentIndex` / `BlobStore`(put/get/delete/undelete/updateTtl/compaction/hard_delete/恢复);对标 Ambry `ambry-store` | 进行中 |
 | frontend / S3 网关、复制、集群等 | 其余 Ambry 模块 | 规划中 |
 

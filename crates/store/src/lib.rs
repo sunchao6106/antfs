@@ -4,15 +4,19 @@
 //! 已实现:`LogSegment` / `Log` / `PersistentIndex` / `BlobStore`。
 
 pub mod blob;
+pub mod config;
 pub mod error;
 pub mod index;
 pub mod log;
 pub mod log_segment;
+pub mod metrics;
 pub mod types;
 
-pub use blob::{BlobStore, CompactionStats};
+pub use blob::{BlobStore, CompactionStats, FindInfo, FindToken, MessageInfo};
+pub use config::StoreConfig;
 pub use error::{Error, Result};
 pub use index::{IndexValue, PersistentIndex};
 pub use log::Log;
 pub use log_segment::LogSegment;
+pub use metrics::{StoreMetricHandles, StoreMetrics};
 pub use types::{LogOffset, LogSegmentName, StoreKey, KEY_SIZE};

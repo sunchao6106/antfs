@@ -8,6 +8,7 @@
 
 | 模块 | 文档 | 状态 |
 |---|---|---|
+| common(公共库:`config` 分层配置 + `metric` 统计打点) | [common.md](./common.md) | 进行中 |
 | store(单机存储引擎:Log / LogSegment / PersistentIndex / BlobStore;对标 Ambry `ambry-store`) | [store.md](./store.md) | 进行中 |
 | frontend / S3 网关(对象接口层) | *(待添加)* | 规划中 |
 
