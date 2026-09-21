@@ -47,6 +47,10 @@ impl IndexValue {
         self.flags & FLAG_UNDELETED != 0
     }
 
+    pub fn is_ttl_updated(&self) -> bool {
+        self.flags & FLAG_TTL_UPDATED != 0
+    }
+
     pub fn to_bytes(&self) -> [u8; VALUE_SIZE] {
         let mut b = [0u8; VALUE_SIZE];
         b[0..8].copy_from_slice(&self.offset.segment.to_le_bytes());

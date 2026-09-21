@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::index::value::{FLAG_DELETED, FLAG_UNDELETED, NO_EXPIRATION};
+use crate::index::value::{FLAG_DELETED, FLAG_TTL_UPDATED, FLAG_UNDELETED, NO_EXPIRATION};
 use crate::index::{IndexValue, PersistentIndex};
 use crate::log::Log;
 use crate::log_segment::LogSegment;
@@ -352,6 +352,36 @@ impl BlobStore {
         Ok(new_life)
     }
 
+    /// 移除已存在对象的过期时间(置为永久),对齐 Ambry `updateTtl`(仅支持移除 TTL)。
+    ///
+    /// 写一条 `FLAG_TTL_UPDATED`、复制原数据、`expiration=NO_EXPIRATION`、`life_version` 不变的
+    /// 整记录成为新赢家。不存在→[`NotFound`](crate::error::Error::NotFound);已删除→
+    /// [`Deleted`](crate::error::Error::Deleted);TTL 已更新→[`AlreadyUpdated`](crate::error::Error::AlreadyUpdated)。
+    pub fn update_ttl(&mut self, key: StoreKey) -> Result<()> {
+        let cur = match self.index.find(&key) {
+            None => return Err(Error::NotFound),
+            Some(v) if v.is_deleted() => return Err(Error::Deleted),
+            Some(v) if v.is_ttl_updated() => return Err(Error::AlreadyUpdated),
+            Some(v) => v,
+        };
+        // 未删除的赢家(PUT/UNDELETE)自带数据,从其 offset 读回原数据。
+        let (_, rec) = read_full_record(&self.log, cur.offset)?;
+        let op_time = now_ms();
+        let flags = (cur.flags | FLAG_TTL_UPDATED) & !FLAG_DELETED;
+        let record = encode_record(&key, flags, NO_EXPIRATION, op_time, cur.life_version, &rec.data);
+        let offset = self.log.append(&record)?;
+        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
+        value.flags = flags;
+        value.expiration_ms = NO_EXPIRATION;
+        value.life_version = cur.life_version;
+        self.index.add(key, value)?;
+        self.seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
+        let e = self.seg_bytes.entry(cur.offset.segment).or_default();
+        e.live = e.live.saturating_sub(cur.size);
+        e.dead += cur.size;
+        Ok(())
+    }
+
     /// 持久化:先落数据(fsync)再落索引,最后写持久化水位(= 当前 log 末尾)。
     pub fn flush(&mut self) -> Result<()> {
         self.log.flush()?;
@@ -382,6 +412,11 @@ impl BlobStore {
     #[cfg(test)]
     fn life_version_of(&self, key: &StoreKey) -> Option<u16> {
         self.index.find(key).map(|v| v.life_version)
+    }
+
+    #[cfg(test)]
+    fn expiration_of(&self, key: &StoreKey) -> Option<i64> {
+        self.index.find(key).map(|v| v.expiration_ms)
     }
 
     /// 返回全库存活/死亡字节统计(读增量计数,死 = 被更新版本取代/删除的旧记录)。
@@ -1330,6 +1365,46 @@ mod tests {
         assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
         // 原 PUT 数据已被回收 → 不可复活(对齐 Ambry IDDeletedPermanently)。
         assert!(matches!(store.undelete(key(0)), Err(Error::NotFound)));
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_ttl_removes_expiration() {
+        let dir = temp_dir("ttl_upd");
+        let seg = seg_cap(16);
+        let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        // 过期时间设在过去 → get 立即 Expired。
+        store.put_ttl(key(1), b"payload", 1).unwrap();
+        assert!(matches!(store.get(&key(1)), Err(Error::Expired)));
+
+        store.update_ttl(key(1)).unwrap();
+        assert_eq!(store.get(&key(1)).unwrap(), b"payload".to_vec(), "TTL removed → readable");
+        assert_eq!(store.expiration_of(&key(1)), Some(NO_EXPIRATION));
+
+        // 幂等冲突:再次更新报 AlreadyUpdated。
+        assert!(matches!(store.update_ttl(key(1)), Err(Error::AlreadyUpdated)));
+
+        // 重开 + 扫 log 重建都保留永久 TTL。
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        assert_eq!(store.get(&key(1)).unwrap(), b"payload".to_vec());
+        assert_eq!(store.expiration_of(&key(1)), Some(NO_EXPIRATION));
+        store.close().unwrap();
+        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
+        assert_eq!(store.expiration_of(&key(1)), Some(NO_EXPIRATION));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_ttl_rejects_absent_and_deleted() {
+        let dir = temp_dir("ttl_rej");
+        let seg = seg_cap(16);
+        let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        assert!(matches!(store.update_ttl(key(1)), Err(Error::NotFound)), "absent");
+        store.put(key(1), b"v").unwrap();
+        store.delete(key(1)).unwrap();
+        assert!(matches!(store.update_ttl(key(1)), Err(Error::Deleted)), "deleted");
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
