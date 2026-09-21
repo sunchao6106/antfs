@@ -157,6 +157,18 @@ pub struct CompactionStats {
     pub segments_after: usize,
 }
 
+/// blob 元数据(不读数据体):状态标志 + TTL + 生命版本 + 数据长度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobMeta {
+    pub deleted: bool,
+    pub undeleted: bool,
+    pub ttl_updated: bool,
+    pub expired: bool,
+    pub expiration_ms: i64,
+    pub life_version: u16,
+    pub data_len: u64,
+}
+
 impl BlobStore {
     /// 在 `dir` 下创建新库:数据在 `dir/log`,索引在 `dir/index`。
     pub fn create(
@@ -268,28 +280,65 @@ impl BlobStore {
 
     /// 读取一个对象。不存在/已删除/已过期分别返回对应错误。
     pub fn get(&self, key: &StoreKey) -> Result<Vec<u8>> {
+        self.get_with_options(key, false, false)
+    }
+
+    /// `get` 的可选版本(对齐 Ambry `StoreGetOptions`):`include_deleted`/`include_expired`
+    /// 为真时分别返回已删除/已过期对象的数据。已删除对象的数据从其原 PUT 读取,若 PUT 已被
+    /// compaction 回收则报 [`NotFound`](crate::error::Error::NotFound)。
+    pub fn get_with_options(
+        &self,
+        key: &StoreKey,
+        include_deleted: bool,
+        include_expired: bool,
+    ) -> Result<Vec<u8>> {
         let value = self.index.find(key).ok_or(Error::NotFound)?;
-        if value.is_deleted() {
+        if value.is_deleted() && !include_deleted {
             return Err(Error::Deleted);
         }
-        if value.expiration_ms != NO_EXPIRATION && now_ms() as i64 >= value.expiration_ms {
+        if value.expiration_ms != NO_EXPIRATION
+            && now_ms() as i64 >= value.expiration_ms
+            && !include_expired
+        {
             return Err(Error::Expired);
         }
-        let raw = self.log.read(value.offset, value.size as usize)?;
-        let decoded = decode_record(&raw)?;
+        // 墓碑无数据,取原 PUT 位置;其余赢家(PUT/UNDELETE/TTL_UPDATE)自带数据。
+        let data_off = if value.is_deleted() { value.original_offset } else { value.offset };
+        let (_, decoded) = read_full_record(&self.log, data_off).map_err(|_| Error::NotFound)?;
         if &decoded.key != key {
-            return Err(Error::Corrupt(format!(
-                "record key mismatch at {}",
-                value.offset
-            )));
+            return Err(Error::Corrupt(format!("record key mismatch at {data_off}")));
         }
-        if decoded.flags & FLAG_DELETED != 0 {
+        if !value.is_deleted() && decoded.flags & FLAG_DELETED != 0 {
             return Err(Error::Corrupt(format!(
-                "live index points at a tombstone record at {}",
-                value.offset
+                "live index points at a tombstone record at {data_off}"
             )));
         }
         Ok(decoded.data)
+    }
+
+    /// 查询 blob 元数据(状态/TTL/生命版本/数据长度),**不读数据体**(对齐 Ambry `findKey`)。
+    /// key 不存在报 [`NotFound`](crate::error::Error::NotFound);已删除/已过期仍返回其元数据。
+    pub fn stat(&self, key: &StoreKey) -> Result<BlobMeta> {
+        let v = self.index.find(key).ok_or(Error::NotFound)?;
+        Ok(BlobMeta {
+            deleted: v.is_deleted(),
+            undeleted: v.is_undeleted(),
+            ttl_updated: v.is_ttl_updated(),
+            expired: v.expiration_ms != NO_EXPIRATION && now_ms() as i64 >= v.expiration_ms,
+            expiration_ms: v.expiration_ms,
+            life_version: v.life_version,
+            data_len: v.size.saturating_sub(RECORD_OVERHEAD as u64),
+        })
+    }
+
+    /// 已用日志字节(存活 + 死亡),对齐 Ambry `getSizeInBytes`。
+    pub fn size_in_bytes(&self) -> u64 {
+        self.seg_bytes.values().map(|v| v.live + v.dead).sum()
+    }
+
+    /// 库是否为空(尚无任何记录)。
+    pub fn is_empty(&self) -> bool {
+        self.size_in_bytes() == 0
     }
 
     /// 删除一个对象:追加墓碑记录并在索引写入删除条目。不存在/已删除报错。
@@ -1405,6 +1454,35 @@ mod tests {
         store.put(key(1), b"v").unwrap();
         store.delete(key(1)).unwrap();
         assert!(matches!(store.update_ttl(key(1)), Err(Error::Deleted)), "deleted");
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_get_options_and_introspection() {
+        let dir = temp_dir("stat");
+        let seg = seg_cap(16);
+        let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        assert!(store.is_empty());
+        assert!(matches!(store.stat(&key(1)), Err(Error::NotFound)));
+
+        store.put(key(1), b"hello").unwrap();
+        let m = store.stat(&key(1)).unwrap();
+        assert!(!m.deleted && !m.expired && m.life_version == 0);
+        assert_eq!(m.data_len, 5, "payload length reported without reading data");
+        assert!(!store.is_empty() && store.size_in_bytes() > 0);
+
+        // 删除后 stat 仍可查状态;get 默认拒,include_deleted 从原 PUT 读回数据。
+        store.delete(key(1)).unwrap();
+        assert!(store.stat(&key(1)).unwrap().deleted);
+        assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
+        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), b"hello".to_vec());
+
+        // 过期对象:stat 标记 expired;include_expired 可读。
+        store.put_ttl(key(2), b"temp", 1).unwrap();
+        assert!(store.stat(&key(2)).unwrap().expired);
+        assert!(matches!(store.get(&key(2)), Err(Error::Expired)));
+        assert_eq!(store.get_with_options(&key(2), false, true).unwrap(), b"temp".to_vec());
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
