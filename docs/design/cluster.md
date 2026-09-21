@@ -202,6 +202,8 @@ RoutingIndex   map<PartitionId, [ 存活副本位置 ]>                         
 ```
 master **只决策、只下发任务**,不亲自搬数据(D1);执行在 server/scheduler(P1)。
 
+**启动/切主稳定期(防再复制风暴)**:软状态(节点存活)靠 store 心跳**从零重建**、初始为空(不像 Ambry/SDFS 把存活放 ZK)。故 leader 上任后先静默 `reconcile_startup_grace_secs`(默认 15s),期内不做失败驱动的再复制——否则重启/切主瞬间会误判全体失联、给每个分区触发补副本(RF=节点数时更是永远补不上、刷屏)。数据面读写不受影响(D2/D3 解耦):稳定期只推迟"补副本"这一后台修复,store 节点照常服务。对齐 CubeFS「加载即 `ReportTime=now` 隐式宽限」的效果。
+
 **容量感知放置(重要,解决"固定容量容器 vs 磁盘余量"矛盾)**:
 - partition 是**段级懒增长 + 定容上界**(不预留整块;对齐 store.md"定容上界 + 写满滚动新 partition"),空间不浪费——长到上界或盘满即封存(RO)。
 - **副本尺寸受最小盘拖累**:一个 partition 的 N 副本装同一批对象,有效容量 = 各副本盘余量的**最小值**;若余量悬殊,大盘空间被小盘拖累浪费。
@@ -299,6 +301,7 @@ message MasterDirective {
 | `master.auto_grow_interval_secs` | u64 | 30 | ≥1 | 扩容检查周期,兼作限速节拍 |
 | `master.auto_grow_batch` | u64 | 4 | ≥1 | 单周期建分区上限(限速护栏) |
 | `master.reconcile_interval_secs` | u64 | 5 | ≥1 | 调谐/失联检测周期(M3) |
+| `master.reconcile_startup_grace_secs` | u64 | 15 | ≥0 | 成为 leader 后调谐稳定期:期内不做失败驱动再复制,等心跳重建软状态(防重启/切主再复制风暴;0=关) |
 
 > openraft 内部的 `heartbeat_interval`/`election_timeout`(M1 内置 250ms / 500–1000ms 常量)尚未暴露为配置项,M2 再提升为 `[master.raft]` 子表。
 

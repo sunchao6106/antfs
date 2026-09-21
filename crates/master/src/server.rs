@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
@@ -196,9 +196,17 @@ impl MasterNode {
             let mut tick =
                 tokio::time::interval(Duration::from_secs(config.reconcile_interval_secs));
             let timeout = Duration::from_secs(config.heartbeat_timeout_secs);
+            let grace = Duration::from_secs(config.reconcile_startup_grace_secs);
+            let mut leader_since: Option<Instant> = None;
             loop {
                 tick.tick().await;
                 if raft.metrics().borrow().current_leader != Some(config.node_id) {
+                    leader_since = None; // 卸任 leader:下次重新计稳定期
+                    continue;
+                }
+                // 启动/切主稳定期:软状态靠心跳从零重建,期内不据"暂无心跳"误判失联(防再复制风暴)。
+                let since = *leader_since.get_or_insert_with(Instant::now);
+                if !crate::reconcile::reconcile_ready(since.elapsed(), grace) {
                     continue;
                 }
                 let up = soft.up_nodes(timeout);

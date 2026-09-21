@@ -41,6 +41,9 @@ pub struct MasterConfig {
     pub auto_grow_batch: u64,
     /// 调谐 / 失联检测周期(秒,M3)。
     pub reconcile_interval_secs: u64,
+    /// 成为 leader 后的调谐稳定期(秒):期内不做失败驱动的再复制,等 store 心跳重建软状态,
+    /// 避免重启/切主时误判全体失联触发再复制风暴(0 = 关闭宽限,立即调谐)。
+    pub reconcile_startup_grace_secs: u64,
 }
 
 impl Default for MasterConfig {
@@ -61,6 +64,7 @@ impl Default for MasterConfig {
             auto_grow_interval_secs: 30,
             auto_grow_batch: 4,
             reconcile_interval_secs: 5,
+            reconcile_startup_grace_secs: 15,
         }
     }
 }

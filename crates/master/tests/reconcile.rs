@@ -35,6 +35,7 @@ fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
         auto_grow_interval_secs: 30,
         auto_grow_batch: 4,
         reconcile_interval_secs: 1, // 快速调谐,便于测试
+        reconcile_startup_grace_secs: 0, // 测试免宽限,立即调谐
     }
 }
 

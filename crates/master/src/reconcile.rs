@@ -4,8 +4,16 @@
 //! store server(后续)。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::Duration;
 
 use crate::types::{NodeId, PartitionId, PartitionInfo};
+
+/// 调谐稳定期判定(承 §7.3):master 启动或切主后,软状态(节点存活/副本实然态)靠 store 心跳
+/// **从零重建**;重建前"暂无心跳"不等于"失联",据此触发再复制会引发切主/重启后的再复制风暴。
+/// 返回 `true` 表示自成为 leader 起已 ≥ `grace`,可执行失败驱动的调谐。
+pub fn reconcile_ready(leader_elapsed: Duration, grace: Duration) -> bool {
+    leader_elapsed >= grace
+}
 
 /// 一条状态转移指令:把某分区在某盘上的副本推向 `target_state`。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,5 +225,14 @@ mod tests {
         let parts = BTreeMap::from([(0, part(2, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE")]))]);
         let up = HashSet::from([1, 2]);
         assert!(plan_evacuation(&parts, &BTreeSet::new(), &up).is_empty());
+    }
+
+    #[test]
+    fn reconcile_gated_until_grace_elapsed() {
+        let grace = Duration::from_secs(15);
+        assert!(!reconcile_ready(Duration::from_secs(0), grace), "just became leader: hold off");
+        assert!(!reconcile_ready(Duration::from_secs(14), grace), "still within grace");
+        assert!(reconcile_ready(Duration::from_secs(15), grace), "grace elapsed: reconcile");
+        assert!(reconcile_ready(Duration::from_secs(60), grace));
     }
 }

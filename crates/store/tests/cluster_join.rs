@@ -65,6 +65,7 @@ async fn store_server_joins_master_and_serves_directed_replica() {
         auto_grow_interval_secs: 30,
         auto_grow_batch: 4,
         reconcile_interval_secs: 60, // 慢,避免干扰
+        reconcile_startup_grace_secs: 0,
     };
     let mreg = metric::Registry::new();
     let master = MasterNode::start(mcfg.clone(), &mreg).await.expect("master start");

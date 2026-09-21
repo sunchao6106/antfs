@@ -36,6 +36,7 @@ fn node_config(id: u64, dir: &std::path::Path, raft_port: u16, grpc_port: u16) -
         auto_grow_interval_secs: 30,
         auto_grow_batch: 4,
         reconcile_interval_secs: 5,
+        reconcile_startup_grace_secs: 0,
     }
 }
 

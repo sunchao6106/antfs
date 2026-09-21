@@ -122,9 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mreg = metric::Registry::new();
     let master = MasterNode::start(mcfg.clone(), &mreg).await?;
     master.serve()?;
-    let members = BTreeMap::from([(1u64, BasicNode::new(raft_addr.clone()))]);
-    if let Err(e) = master.initialize(members).await {
-        tracing::info!(error = %e, "master initialize skipped (already initialized?)");
+    // 仅首次(未初始化)才 bootstrap;重启时集群已在 redb 里初始化,再调 initialize 会被 openraft
+    // 拒绝并打一条 ERROR。先查 is_initialized 跳过,启动日志就干净了。
+    if !master.raft.is_initialized().await.unwrap_or(false) {
+        let members = BTreeMap::from([(1u64, BasicNode::new(raft_addr.clone()))]);
+        if let Err(e) = master.initialize(members).await {
+            tracing::warn!(error = %e, "master bootstrap initialize failed");
+        }
     }
     master
         .raft
