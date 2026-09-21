@@ -154,7 +154,10 @@ pub(crate) fn write_segment_file(path: &Path, entries: &[(StoreKey, IndexValue)]
 pub(crate) fn read_segment_file(path: &Path) -> Result<LoadedSegment> {
     let buf = std::fs::read(path)?;
     if buf.len() < IDX_HEADER_SIZE {
-        return Err(Error::Corrupt(format!("index file too short: {}", path.display())));
+        return Err(Error::Corrupt(format!(
+            "index file too short: {}",
+            path.display()
+        )));
     }
 
     let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -178,7 +181,10 @@ pub(crate) fn read_segment_file(path: &Path) -> Result<LoadedSegment> {
 
     let body_len = count * ENTRY_SIZE;
     if buf.len() < IDX_HEADER_SIZE + body_len {
-        return Err(Error::Corrupt(format!("index body truncated: {}", path.display())));
+        return Err(Error::Corrupt(format!(
+            "index body truncated: {}",
+            path.display()
+        )));
     }
     let body = &buf[IDX_HEADER_SIZE..IDX_HEADER_SIZE + body_len];
     if crc32fast::hash(body) != body_crc {

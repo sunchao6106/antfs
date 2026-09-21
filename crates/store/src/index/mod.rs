@@ -7,8 +7,8 @@
 //!
 //! 段文件名 `{seq}.idx`;活跃段以 `sealed=0` 落盘、封存时原地改写为 `sealed=1`。
 
-pub mod value;
 mod segment;
+pub mod value;
 
 use crossbeam_skiplist::SkipMap;
 use std::path::{Path, PathBuf};
@@ -34,7 +34,9 @@ impl PersistentIndex {
     /// 在空目录创建新索引。
     pub fn create(dir: impl AsRef<Path>, max_entries_per_segment: usize) -> Result<Self> {
         if max_entries_per_segment == 0 {
-            return Err(Error::BadArgument("max_entries_per_segment must be > 0".into()));
+            return Err(Error::BadArgument(
+                "max_entries_per_segment must be > 0".into(),
+            ));
         }
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -51,7 +53,9 @@ impl PersistentIndex {
     /// 打开已有索引:扫描 `{seq}.idx` + `{seq}.fuse` 恢复封存段与活跃段。
     pub fn open(dir: impl AsRef<Path>, max_entries_per_segment: usize) -> Result<Self> {
         if max_entries_per_segment == 0 {
-            return Err(Error::BadArgument("max_entries_per_segment must be > 0".into()));
+            return Err(Error::BadArgument(
+                "max_entries_per_segment must be > 0".into(),
+            ));
         }
         let dir = dir.as_ref().to_path_buf();
 
@@ -59,7 +63,10 @@ impl PersistentIndex {
         for ent in std::fs::read_dir(&dir)? {
             let ent = ent?;
             if let Some(name) = ent.file_name().to_str() {
-                if let Some(seq) = name.strip_suffix(".idx").and_then(|s| s.parse::<u64>().ok()) {
+                if let Some(seq) = name
+                    .strip_suffix(".idx")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     seqs.push(seq);
                 }
             }
@@ -81,7 +88,9 @@ impl PersistentIndex {
                 sealed.push(SealedSegment::open(&dir, *seq)?);
             } else {
                 if has_active {
-                    return Err(Error::Corrupt("multiple active (unsealed) index segments".into()));
+                    return Err(Error::Corrupt(
+                        "multiple active (unsealed) index segments".into(),
+                    ));
                 }
                 has_active = true;
                 active_seq = *seq;
@@ -138,11 +147,7 @@ impl PersistentIndex {
         if self.active.is_empty() {
             return Ok(());
         }
-        let entries: Vec<_> = self
-            .active
-            .iter()
-            .map(|e| (*e.key(), *e.value()))
-            .collect();
+        let entries: Vec<_> = self.active.iter().map(|e| (*e.key(), *e.value())).collect();
         let path = self.dir.join(format!("{}.idx", self.active_seq));
         segment::write_segment_file(&path, &entries)
     }
@@ -152,11 +157,7 @@ impl PersistentIndex {
         if self.active.is_empty() {
             return Ok(());
         }
-        let entries: Vec<_> = self
-            .active
-            .iter()
-            .map(|e| (*e.key(), *e.value()))
-            .collect();
+        let entries: Vec<_> = self.active.iter().map(|e| (*e.key(), *e.value())).collect();
         let sealed = SealedSegment::from_entries(&self.dir, self.active_seq, &entries)?;
         self.sealed.push(sealed);
         self.active.clear();
@@ -220,9 +221,15 @@ mod tests {
         for i in 0..10u64 {
             idx.add(key(i), put(0, i * 100)).unwrap();
         }
-        assert!(idx.sealed_segment_count() >= 2, "should have sealed segments");
+        assert!(
+            idx.sealed_segment_count() >= 2,
+            "should have sealed segments"
+        );
         for i in 0..10u64 {
-            assert_eq!(idx.find(&key(i)).unwrap().offset, LogOffset::new(0, i * 100));
+            assert_eq!(
+                idx.find(&key(i)).unwrap().offset,
+                LogOffset::new(0, i * 100)
+            );
         }
         assert!(idx.find(&key(12345)).is_none());
         let _ = std::fs::remove_dir_all(&dir);

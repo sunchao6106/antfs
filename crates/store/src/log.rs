@@ -25,7 +25,11 @@ pub struct Log {
 
 impl Log {
     /// 在空目录创建新日志,并预建第一个段。
-    pub fn create(dir: impl AsRef<Path>, total_capacity: u64, segment_capacity: u64) -> Result<Self> {
+    pub fn create(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        segment_capacity: u64,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         validate_capacities(total_capacity, segment_capacity)?;
         std::fs::create_dir_all(&dir)?;

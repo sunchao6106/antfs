@@ -101,10 +101,20 @@ fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
     }
     let flags = buf[rec::FLAGS];
     let key = StoreKey::from_slice(&buf[rec::KEY..rec::KEY + KEY_SIZE]).expect("key size fixed");
-    let expiration_ms = i64::from_le_bytes(buf[rec::EXPIRATION..rec::EXPIRATION + 8].try_into().unwrap());
-    let operation_time_ms = u64::from_le_bytes(buf[rec::OP_TIME..rec::OP_TIME + 8].try_into().unwrap());
-    let life_version = u16::from_le_bytes(buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2].try_into().unwrap());
-    let data_len = u32::from_le_bytes(buf[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
+    let expiration_ms = i64::from_le_bytes(
+        buf[rec::EXPIRATION..rec::EXPIRATION + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let operation_time_ms =
+        u64::from_le_bytes(buf[rec::OP_TIME..rec::OP_TIME + 8].try_into().unwrap());
+    let life_version = u16::from_le_bytes(
+        buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2]
+            .try_into()
+            .unwrap(),
+    );
+    let data_len =
+        u32::from_le_bytes(buf[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
     let crc_at = rec::DATA + data_len;
     if buf.len() != crc_at + rec::CRC_LEN {
         return Err(Error::Corrupt(format!(
@@ -206,7 +216,12 @@ impl BlobStore {
         max_index_entries_per_segment: usize,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        recover_compaction(&dir, total_capacity, segment_capacity, max_index_entries_per_segment)?;
+        recover_compaction(
+            &dir,
+            total_capacity,
+            segment_capacity,
+            max_index_entries_per_segment,
+        )?;
         let (log_dir, index_dir) = sub_dirs(&dir);
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
         let index = match load_index_with_replay(&log, &index_dir, max_index_entries_per_segment) {
@@ -240,7 +255,12 @@ impl BlobStore {
         max_index_entries_per_segment: usize,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        recover_compaction(&dir, total_capacity, segment_capacity, max_index_entries_per_segment)?;
+        recover_compaction(
+            &dir,
+            total_capacity,
+            segment_capacity,
+            max_index_entries_per_segment,
+        )?;
         let (log_dir, index_dir) = sub_dirs(&dir);
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
         let index = rebuild_index(&log, &index_dir, max_index_entries_per_segment)?;
@@ -305,7 +325,11 @@ impl BlobStore {
             return Err(Error::Expired);
         }
         // 墓碑无数据,取原 PUT 位置;其余赢家(PUT/UNDELETE/TTL_UPDATE)自带数据。
-        let data_off = if value.is_deleted() { value.original_offset } else { value.offset };
+        let data_off = if value.is_deleted() {
+            value.original_offset
+        } else {
+            value.offset
+        };
         let (_, decoded) = read_full_record(&self.log, data_off).map_err(|_| Error::NotFound)?;
         if &decoded.key != key {
             return Err(Error::Corrupt(format!("record key mismatch at {data_off}")));
@@ -398,7 +422,14 @@ impl BlobStore {
             Some(v) => v,
         };
         let op_time = now_ms();
-        let record = encode_record(&key, FLAG_DELETED, NO_EXPIRATION, op_time, old.life_version, &[]);
+        let record = encode_record(
+            &key,
+            FLAG_DELETED,
+            NO_EXPIRATION,
+            op_time,
+            old.life_version,
+            &[],
+        );
         let offset = self.log.append(&record)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_DELETED;
@@ -427,15 +458,22 @@ impl BlobStore {
             Some(v) => v,
         };
         // 取原 PUT 数据(墓碑 original_offset 指向它)。被 compaction 回收则视为数据不存在。
-        let (put_raw, put) = read_full_record(&self.log, cur.original_offset)
-            .map_err(|_| Error::NotFound)?;
+        let (put_raw, put) =
+            read_full_record(&self.log, cur.original_offset).map_err(|_| Error::NotFound)?;
         if put.key != key || put.flags & FLAG_DELETED != 0 {
             return Err(Error::NotFound);
         }
         let _ = put_raw;
         let new_life = cur.life_version + 1;
         let op_time = now_ms();
-        let record = encode_record(&key, FLAG_UNDELETED, put.expiration_ms, op_time, new_life, &put.data);
+        let record = encode_record(
+            &key,
+            FLAG_UNDELETED,
+            put.expiration_ms,
+            op_time,
+            new_life,
+            &put.data,
+        );
         let offset = self.log.append(&record)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_UNDELETED;
@@ -466,7 +504,14 @@ impl BlobStore {
         let (_, rec) = read_full_record(&self.log, cur.offset)?;
         let op_time = now_ms();
         let flags = (cur.flags | FLAG_TTL_UPDATED) & !FLAG_DELETED;
-        let record = encode_record(&key, flags, NO_EXPIRATION, op_time, cur.life_version, &rec.data);
+        let record = encode_record(
+            &key,
+            flags,
+            NO_EXPIRATION,
+            op_time,
+            cur.life_version,
+            &rec.data,
+        );
         let offset = self.log.append(&record)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = flags;
@@ -648,7 +693,14 @@ impl BlobStore {
         let marker = self.dir.join("COMPACT_COMMIT");
         write_marker(&marker)?;
 
-        let mut next_pos = self.log.segment_spans().iter().map(|(p, _)| *p).max().unwrap() + 1;
+        let mut next_pos = self
+            .log
+            .segment_spans()
+            .iter()
+            .map(|(p, _)| *p)
+            .max()
+            .unwrap()
+            + 1;
         let mut live_bytes = 0u64;
         let mut dead_bytes = 0u64;
         let mut tmp_paths: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, final)
@@ -775,7 +827,10 @@ fn index_value_from_record(
     value.expiration_ms = decoded.expiration_ms;
     value.life_version = decoded.life_version;
     value.original_offset = if decoded.flags & FLAG_DELETED != 0 {
-        index.find(&decoded.key).map(|v| v.original_offset).unwrap_or(off)
+        index
+            .find(&decoded.key)
+            .map(|v| v.original_offset)
+            .unwrap_or(off)
     } else {
         off
     };
@@ -905,7 +960,7 @@ fn recover_compaction(
         rm_rf(&log_new)?;
         rm_rf(&log_old)?;
         clean_tmp_segments(&log_dir)?; // 增量 compaction 崩溃遗留的 .tmp 新段
-        // 索引可能是旧/半建的,统一重建。
+                                       // 索引可能是旧/半建的,统一重建。
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
         let _ = rebuild_index(&log, &index_dir, max_entries)?;
         std::fs::remove_file(&marker)?;
@@ -925,7 +980,11 @@ fn clean_tmp_segments(log_dir: &Path) -> Result<()> {
     }
     for ent in std::fs::read_dir(log_dir)? {
         let ent = ent?;
-        if ent.file_name().to_str().is_some_and(|n| n.ends_with(".tmp")) {
+        if ent
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(".tmp"))
+        {
             let _ = std::fs::remove_file(ent.path());
         }
     }
@@ -988,7 +1047,9 @@ mod tests {
         store.put(key(1), &data).unwrap();
         assert_eq!(store.get(&key(1)).unwrap(), data);
 
-        let big: Vec<u8> = (0..(BLOCK * 3 + 77) as usize).map(|i| (i % 251) as u8).collect();
+        let big: Vec<u8> = (0..(BLOCK * 3 + 77) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
         store.put(key(2), &big).unwrap();
         assert_eq!(store.get(&key(2)).unwrap(), big);
 
@@ -1020,7 +1081,10 @@ mod tests {
         assert!(matches!(store.delete(key(2)), Err(Error::NotFound)));
 
         // 对齐 Ambry:blob id 永久占用,删除后普通 put 仍报 AlreadyExists(复活须走 undelete)。
-        assert!(matches!(store.put(key(1), b"v2"), Err(Error::AlreadyExists)));
+        assert!(matches!(
+            store.put(key(1), b"v2"),
+            Err(Error::AlreadyExists)
+        ));
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1077,10 +1141,17 @@ mod tests {
         let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
         for i in 0..25u64 {
             if i == 7 {
-                assert!(matches!(store.get(&key(7)), Err(Error::Deleted)), "key 7 tombstone after rebuild");
+                assert!(
+                    matches!(store.get(&key(7)), Err(Error::Deleted)),
+                    "key 7 tombstone after rebuild"
+                );
                 continue;
             }
-            assert_eq!(store.get(&key(i)).unwrap(), format!("v-{i}").into_bytes(), "key {i} after rebuild");
+            assert_eq!(
+                store.get(&key(i)).unwrap(),
+                format!("v-{i}").into_bytes(),
+                "key {i} after rebuild"
+            );
         }
         assert!(matches!(store.get(&key(999)), Err(Error::NotFound)));
 
@@ -1122,10 +1193,17 @@ mod tests {
         let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
         for i in 0..20u64 {
             if i == 3 {
-                assert!(matches!(store.get(&key(3)), Err(Error::Deleted)), "key 3 stays deleted");
+                assert!(
+                    matches!(store.get(&key(3)), Err(Error::Deleted)),
+                    "key 3 stays deleted"
+                );
                 continue;
             }
-            assert_eq!(store.get(&key(i)).unwrap(), format!("v-{i}").into_bytes(), "key {i} recovered");
+            assert_eq!(
+                store.get(&key(i)).unwrap(),
+                format!("v-{i}").into_bytes(),
+                "key {i} recovered"
+            );
         }
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1188,7 +1266,9 @@ mod tests {
 
         // 死数据来源(Ambry 语义下无覆盖/无删后重写):delete 使原 PUT 变死,墓碑成为新赢家。
         for i in 0..10u64 {
-            store.put(key(i), format!("original-value-{i}").as_bytes()).unwrap();
+            store
+                .put(key(i), format!("original-value-{i}").as_bytes())
+                .unwrap();
         }
         for i in 0..5u64 {
             store.delete(key(i)).unwrap(); // key 0..4 变墓碑(原 PUT 变死数据)
@@ -1205,7 +1285,10 @@ mod tests {
 
         // 逻辑状态不变:0..4 已删,5..9 是原值。
         for i in 0..5u64 {
-            assert!(matches!(store.get(&key(i)), Err(Error::Deleted)), "key {i} must stay deleted");
+            assert!(
+                matches!(store.get(&key(i)), Err(Error::Deleted)),
+                "key {i} must stay deleted"
+            );
         }
         for i in 5..10u64 {
             assert_eq!(
@@ -1219,7 +1302,10 @@ mod tests {
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
         for i in 5..10u64 {
-            assert_eq!(store.get(&key(i)).unwrap(), format!("original-value-{i}").into_bytes());
+            assert_eq!(
+                store.get(&key(i)).unwrap(),
+                format!("original-value-{i}").into_bytes()
+            );
         }
         assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1284,7 +1370,7 @@ mod tests {
             let mut store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
             store.put(key(1), b"a").unwrap();
             store.flush().unwrap(); // 索引 + 水位落到含 key(1)
-            // 之后再写 key(2)/key(3),只 flush 数据日志(不落索引、不推进水位),模拟崩溃前状态。
+                                    // 之后再写 key(2)/key(3),只 flush 数据日志(不落索引、不推进水位),模拟崩溃前状态。
             store.put(key(2), b"b").unwrap();
             store.put(key(3), b"c").unwrap();
             store.log_flush_only_for_test();
@@ -1294,8 +1380,16 @@ mod tests {
         // 重开:水位=含 key(1) 处,回放 log 尾部应补回 key(2)/key(3)。
         let store = BlobStore::open(&dir, seg * 4, seg, 1000).unwrap();
         assert_eq!(store.get(&key(1)).unwrap(), b"a".to_vec());
-        assert_eq!(store.get(&key(2)).unwrap(), b"b".to_vec(), "tail key(2) recovered via replay");
-        assert_eq!(store.get(&key(3)).unwrap(), b"c".to_vec(), "tail key(3) recovered via replay");
+        assert_eq!(
+            store.get(&key(2)).unwrap(),
+            b"b".to_vec(),
+            "tail key(2) recovered via replay"
+        );
+        assert_eq!(
+            store.get(&key(3)).unwrap(),
+            b"c".to_vec(),
+            "tail key(3) recovered via replay"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1326,14 +1420,24 @@ mod tests {
         assert!(st.is_some(), "high-dead old segments should be compacted");
         let st = st.unwrap();
         assert!(st.dead_bytes > 0);
-        assert!(st.segments_after <= before_segs, "segment count should not grow");
+        assert!(
+            st.segments_after <= before_segs,
+            "segment count should not grow"
+        );
 
         // 逻辑状态不变:0..29 已删,30..39 存活。
         for i in 0..30u64 {
-            assert!(matches!(store.get(&key(i)), Err(Error::Deleted)), "key {i} deleted");
+            assert!(
+                matches!(store.get(&key(i)), Err(Error::Deleted)),
+                "key {i} deleted"
+            );
         }
         for i in 30..40u64 {
-            assert_eq!(store.get(&key(i)).unwrap(), big(&format!("v{i}")), "key {i} live");
+            assert_eq!(
+                store.get(&key(i)).unwrap(),
+                big(&format!("v{i}")),
+                "key {i} live"
+            );
         }
 
         // 重开一致。
@@ -1357,17 +1461,33 @@ mod tests {
         for i in 0..15u64 {
             store.delete(key(i)).unwrap();
         }
-        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after put/delete");
+        assert_eq!(
+            store.stats().unwrap(),
+            store.stats_by_scan(),
+            "after put/delete"
+        );
 
         store.compact_if_needed(0.3).unwrap();
-        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after incremental compaction");
+        assert_eq!(
+            store.stats().unwrap(),
+            store.stats_by_scan(),
+            "after incremental compaction"
+        );
 
         store.compact().unwrap();
-        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after CompactAll");
+        assert_eq!(
+            store.stats().unwrap(),
+            store.stats_by_scan(),
+            "after CompactAll"
+        );
 
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
-        assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "after reopen recompute");
+        assert_eq!(
+            store.stats().unwrap(),
+            store.stats_by_scan(),
+            "after reopen recompute"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1380,8 +1500,16 @@ mod tests {
         store.delete(key(1)).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
 
-        assert_eq!(store.undelete(key(1)).unwrap(), 1, "undelete bumps life_version to 1");
-        assert_eq!(store.get(&key(1)).unwrap(), b"hello".to_vec(), "data restored");
+        assert_eq!(
+            store.undelete(key(1)).unwrap(),
+            1,
+            "undelete bumps life_version to 1"
+        );
+        assert_eq!(
+            store.get(&key(1)).unwrap(),
+            b"hello".to_vec(),
+            "data restored"
+        );
         assert_eq!(store.life_version_of(&key(1)), Some(1));
 
         // 复活后可再删、再复活,life_version 继续递增。
@@ -1398,12 +1526,21 @@ mod tests {
         let dir = temp_dir("undel_rej");
         let seg = seg_cap(16);
         let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
-        assert!(matches!(store.undelete(key(1)), Err(Error::NotFound)), "absent");
+        assert!(
+            matches!(store.undelete(key(1)), Err(Error::NotFound)),
+            "absent"
+        );
         store.put(key(1), b"v").unwrap();
-        assert!(matches!(store.undelete(key(1)), Err(Error::NotDeleted)), "live key");
+        assert!(
+            matches!(store.undelete(key(1)), Err(Error::NotDeleted)),
+            "live key"
+        );
         store.delete(key(1)).unwrap();
         store.undelete(key(1)).unwrap();
-        assert!(matches!(store.undelete(key(1)), Err(Error::NotDeleted)), "already undeleted");
+        assert!(
+            matches!(store.undelete(key(1)), Err(Error::NotDeleted)),
+            "already undeleted"
+        );
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1422,11 +1559,19 @@ mod tests {
             store.close().unwrap();
         }
         let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
-        assert_eq!(store.get(&key(3)).unwrap(), b"v-3".to_vec(), "watermark replay keeps undelete");
+        assert_eq!(
+            store.get(&key(3)).unwrap(),
+            b"v-3".to_vec(),
+            "watermark replay keeps undelete"
+        );
         assert_eq!(store.life_version_of(&key(3)), Some(1));
         store.close().unwrap();
         let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
-        assert_eq!(store.get(&key(3)).unwrap(), b"v-3".to_vec(), "log rebuild keeps undelete");
+        assert_eq!(
+            store.get(&key(3)).unwrap(),
+            b"v-3".to_vec(),
+            "log rebuild keeps undelete"
+        );
         assert_eq!(store.life_version_of(&key(3)), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1442,7 +1587,11 @@ mod tests {
         store.delete(key(5)).unwrap();
         store.undelete(key(5)).unwrap();
         store.compact().unwrap();
-        assert_eq!(store.get(&key(5)).unwrap(), b"data-5".to_vec(), "undeleted data survives compaction");
+        assert_eq!(
+            store.get(&key(5)).unwrap(),
+            b"data-5".to_vec(),
+            "undeleted data survives compaction"
+        );
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
         assert_eq!(store.get(&key(5)).unwrap(), b"data-5".to_vec());
@@ -1477,11 +1626,18 @@ mod tests {
         assert!(matches!(store.get(&key(1)), Err(Error::Expired)));
 
         store.update_ttl(key(1)).unwrap();
-        assert_eq!(store.get(&key(1)).unwrap(), b"payload".to_vec(), "TTL removed → readable");
+        assert_eq!(
+            store.get(&key(1)).unwrap(),
+            b"payload".to_vec(),
+            "TTL removed → readable"
+        );
         assert_eq!(store.expiration_of(&key(1)), Some(NO_EXPIRATION));
 
         // 幂等冲突:再次更新报 AlreadyUpdated。
-        assert!(matches!(store.update_ttl(key(1)), Err(Error::AlreadyUpdated)));
+        assert!(matches!(
+            store.update_ttl(key(1)),
+            Err(Error::AlreadyUpdated)
+        ));
 
         // 重开 + 扫 log 重建都保留永久 TTL。
         store.close().unwrap();
@@ -1499,10 +1655,16 @@ mod tests {
         let dir = temp_dir("ttl_rej");
         let seg = seg_cap(16);
         let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
-        assert!(matches!(store.update_ttl(key(1)), Err(Error::NotFound)), "absent");
+        assert!(
+            matches!(store.update_ttl(key(1)), Err(Error::NotFound)),
+            "absent"
+        );
         store.put(key(1), b"v").unwrap();
         store.delete(key(1)).unwrap();
-        assert!(matches!(store.update_ttl(key(1)), Err(Error::Deleted)), "deleted");
+        assert!(
+            matches!(store.update_ttl(key(1)), Err(Error::Deleted)),
+            "deleted"
+        );
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1518,20 +1680,29 @@ mod tests {
         store.put(key(1), b"hello").unwrap();
         let m = store.stat(&key(1)).unwrap();
         assert!(!m.deleted && !m.expired && m.life_version == 0);
-        assert_eq!(m.data_len, 5, "payload length reported without reading data");
+        assert_eq!(
+            m.data_len, 5,
+            "payload length reported without reading data"
+        );
         assert!(!store.is_empty() && store.size_in_bytes() > 0);
 
         // 删除后 stat 仍可查状态;get 默认拒,include_deleted 从原 PUT 读回数据。
         store.delete(key(1)).unwrap();
         assert!(store.stat(&key(1)).unwrap().deleted);
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
-        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), b"hello".to_vec());
+        assert_eq!(
+            store.get_with_options(&key(1), true, false).unwrap(),
+            b"hello".to_vec()
+        );
 
         // 过期对象:stat 标记 expired;include_expired 可读。
         store.put_ttl(key(2), b"temp", 1).unwrap();
         assert!(store.stat(&key(2)).unwrap().expired);
         assert!(matches!(store.get(&key(2)), Err(Error::Expired)));
-        assert_eq!(store.get_with_options(&key(2), false, true).unwrap(), b"temp".to_vec());
+        assert_eq!(
+            store.get_with_options(&key(2), false, true).unwrap(),
+            b"temp".to_vec()
+        );
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1545,18 +1716,27 @@ mod tests {
         store.put(key(2), b"keep-this").unwrap();
         store.delete(key(1)).unwrap();
         // 删除后 include_deleted 仍能读到明文。
-        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), b"secret-data".to_vec());
+        assert_eq!(
+            store.get_with_options(&key(1), true, false).unwrap(),
+            b"secret-data".to_vec()
+        );
 
         assert_eq!(store.hard_delete().unwrap(), 1, "one deleted blob scrubbed");
         // 原数据被清零;未删除的 key(2) 不受影响;幂等。
-        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), vec![0u8; 11]);
+        assert_eq!(
+            store.get_with_options(&key(1), true, false).unwrap(),
+            vec![0u8; 11]
+        );
         assert_eq!(store.get(&key(2)).unwrap(), b"keep-this".to_vec());
         assert_eq!(store.hard_delete().unwrap(), 0, "idempotent");
 
         // 重开后擦除持久。
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
-        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), vec![0u8; 11]);
+        assert_eq!(
+            store.get_with_options(&key(1), true, false).unwrap(),
+            vec![0u8; 11]
+        );
         assert_eq!(store.get(&key(2)).unwrap(), b"keep-this".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1601,13 +1781,20 @@ mod tests {
             let got = store.get(&key(k as u64));
             match state {
                 ModelState::Absent => {
-                    assert!(matches!(got, Err(Error::NotFound)), "{ctx}: key {k} expect NotFound, got {got:?}");
+                    assert!(
+                        matches!(got, Err(Error::NotFound)),
+                        "{ctx}: key {k} expect NotFound, got {got:?}"
+                    );
                 }
                 ModelState::Deleted => {
-                    assert!(matches!(got, Err(Error::Deleted)), "{ctx}: key {k} expect Deleted, got {got:?}");
+                    assert!(
+                        matches!(got, Err(Error::Deleted)),
+                        "{ctx}: key {k} expect Deleted, got {got:?}"
+                    );
                 }
                 ModelState::Live(data) => {
-                    let got = got.unwrap_or_else(|e| panic!("{ctx}: key {k} expect Live, got {e:?}"));
+                    let got =
+                        got.unwrap_or_else(|e| panic!("{ctx}: key {k} expect Live, got {e:?}"));
                     assert_eq!(&got, data, "{ctx}: key {k} data mismatch");
                 }
             }
@@ -1637,11 +1824,16 @@ mod tests {
                         let res = store.put(key(k), &data);
                         match &model[k as usize] {
                             ModelState::Absent => {
-                                res.unwrap_or_else(|e| panic!("step {step}: put absent key {k} failed: {e:?}"));
+                                res.unwrap_or_else(|e| {
+                                    panic!("step {step}: put absent key {k} failed: {e:?}")
+                                });
                                 model[k as usize] = ModelState::Live(data);
                             }
                             _ => {
-                                assert!(matches!(res, Err(Error::AlreadyExists)), "step {step}: put existing key {k} must reject");
+                                assert!(
+                                    matches!(res, Err(Error::AlreadyExists)),
+                                    "step {step}: put existing key {k} must reject"
+                                );
                             }
                         }
                     }
@@ -1649,10 +1841,18 @@ mod tests {
                         let k = rng.below(KEYS as u64);
                         let res = store.delete(key(k));
                         match &model[k as usize] {
-                            ModelState::Absent => assert!(matches!(res, Err(Error::NotFound)), "step {step}: del absent key {k}"),
-                            ModelState::Deleted => assert!(matches!(res, Err(Error::Deleted)), "step {step}: del deleted key {k}"),
+                            ModelState::Absent => assert!(
+                                matches!(res, Err(Error::NotFound)),
+                                "step {step}: del absent key {k}"
+                            ),
+                            ModelState::Deleted => assert!(
+                                matches!(res, Err(Error::Deleted)),
+                                "step {step}: del deleted key {k}"
+                            ),
                             ModelState::Live(_) => {
-                                res.unwrap_or_else(|e| panic!("step {step}: delete key {k} failed: {e:?}"));
+                                res.unwrap_or_else(|e| {
+                                    panic!("step {step}: delete key {k} failed: {e:?}")
+                                });
                                 model[k as usize] = ModelState::Deleted;
                             }
                         }
@@ -1669,14 +1869,22 @@ mod tests {
                     }
                     _ => {
                         store.compact_incremental(0.2).unwrap();
-                        verify_all(&store, &model, &format!("step {step} after compact_incremental"));
+                        verify_all(
+                            &store,
+                            &model,
+                            &format!("step {step} after compact_incremental"),
+                        );
                     }
                 }
                 verify_all(&store, &model, &format!("step {step}"));
             }
 
             verify_all(&store, &model, "final live");
-            assert_eq!(store.stats().unwrap(), store.stats_by_scan(), "seg_bytes drift vs full scan");
+            assert_eq!(
+                store.stats().unwrap(),
+                store.stats_by_scan(),
+                "seg_bytes drift vs full scan"
+            );
             store.close().unwrap();
 
             let reopened = BlobStore::open(&dir, total, seg, max_idx).unwrap();
