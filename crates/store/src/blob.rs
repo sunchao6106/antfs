@@ -669,15 +669,11 @@ impl BlobStore {
     }
 
     /// 增量 compaction:只压缩死数据占比 ≥ `threshold` 的**非活跃**段(热/末段不动)。
-    ///
-    /// 机制:被选中段的存活记录写入位置更高的新段(temp→fsync→rename),删旧段,重建索引。
-    /// 只重写高死段、不碰热段(区别于 [`compact`](Self::compact) 的全库重写)。存活赢家搬到更高
-    /// 位置仍是其 key 的最新记录,newest-wins 不变。崩溃安全:复用 `COMPACT_COMMIT` 标记 +
-    /// open 重建索引;残留 `.tmp`/重复记录在重建时被忽略/收敛。返回 None 表示无段达阈值。
+    /// 执行机制与崩溃安全见 [`compact_segments`](Self::compact_segments)。无达阈段返回 `None`。
     pub fn compact_incremental(&mut self, threshold: f64) -> Result<Option<CompactionStats>> {
         self.flush()?;
-        let stats = self.segment_stats()?;
-        let selected: Vec<u64> = stats
+        let selected: Vec<u64> = self
+            .segment_stats()?
             .iter()
             .filter(|(_, live, dead)| {
                 let total = live + dead;
@@ -688,7 +684,64 @@ impl BlobStore {
         if selected.is_empty() {
             return Ok(None);
         }
+        Ok(Some(self.compact_segments(&selected)?))
+    }
 
+    /// cost-benefit compaction(对齐 Ambry `StatsBasedCompactionPolicy`):在非活跃段的**连续区间**里,
+    /// 按「cost = 存活字节、benefit = 回收段数 = 源段数 − ceil(cost/段容量)」选 cost/benefit 最优
+    /// 且 `benefit ≥ min_reclaim` 的区间压缩。无合格区间返回 `None`。
+    pub fn compact_cost_benefit(&mut self, min_reclaim: usize) -> Result<Option<CompactionStats>> {
+        self.flush()?;
+        let selected = self.best_compaction_range(min_reclaim.max(1));
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.compact_segments(&selected)?))
+    }
+
+    /// 在非活跃段的连续区间中选 cost/benefit 最优区间(`benefit ≥ min_reclaim`),返回段位置列表。
+    fn best_compaction_range(&self, min_reclaim: usize) -> Vec<u64> {
+        let active = self.log.segment_spans().last().map(|(p, _)| *p);
+        let segs: Vec<(u64, u64)> = self
+            .seg_bytes
+            .iter()
+            .filter(|(p, _)| Some(**p) != active)
+            .map(|(p, v)| (*p, v.live))
+            .collect();
+        let cap = self.segment_capacity.max(1);
+        let mut best: Option<(f64, usize, usize, usize)> = None; // (ratio, benefit, i, j)
+        for i in 0..segs.len() {
+            let mut cost = 0u64;
+            for (j, seg) in segs.iter().enumerate().skip(i) {
+                cost += seg.1;
+                let source = j - i + 1;
+                let target = cost.div_ceil(cap) as usize;
+                if source <= target {
+                    continue;
+                }
+                let benefit = source - target;
+                if benefit < min_reclaim {
+                    continue;
+                }
+                let ratio = cost as f64 / benefit as f64;
+                let better =
+                    best.is_none_or(|(br, bb, _, _)| ratio < br || (ratio == br && benefit > bb));
+                if better {
+                    best = Some((ratio, benefit, i, j));
+                }
+            }
+        }
+        match best {
+            Some((_, _, i, j)) => segs[i..=j].iter().map(|(p, _)| *p).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 压缩给定**非活跃段**集合 `selected`:存活记录写入位置更高的新段(temp→fsync→rename),
+    /// 删旧段,重建索引。存活赢家搬到更高位置仍是其 key 最新记录,newest-wins 不变。崩溃安全:
+    /// 复用 `COMPACT_COMMIT` 标记 + open 重建索引;残留 `.tmp`/重复记录在重建时被忽略/收敛。
+    fn compact_segments(&mut self, selected: &[u64]) -> Result<CompactionStats> {
+        let before = self.log.segment_count();
         let (log_dir, index_dir) = sub_dirs(&self.dir);
         let marker = self.dir.join("COMPACT_COMMIT");
         write_marker(&marker)?;
@@ -706,7 +759,7 @@ impl BlobStore {
         let mut tmp_paths: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, final)
         let mut cur: Option<LogSegment> = None;
 
-        for &pos in &selected {
+        for &pos in selected {
             let data_end = self
                 .log
                 .segment_spans()
@@ -752,22 +805,21 @@ impl BlobStore {
             std::fs::rename(tmp, final_path)?;
         }
         // 删被压缩的旧段。
-        for &pos in &selected {
+        for &pos in selected {
             let _ = std::fs::remove_file(log_dir.join(LogSegmentName(pos).filename()));
         }
 
-        let before = stats.len() + 1; // 含活跃段的粗略段数
         self.log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
         self.index = rebuild_index(&self.log, &index_dir, self.max_index_entries_per_segment)?;
         self.seg_bytes = scan_seg_bytes(&self.log, &self.index)?;
         let _ = std::fs::remove_file(&marker);
 
-        Ok(Some(CompactionStats {
+        Ok(CompactionStats {
             live_bytes,
             dead_bytes,
             segments_before: before,
             segments_after: self.log.segment_count(),
-        }))
+        })
     }
 }
 
@@ -1447,6 +1499,74 @@ mod tests {
             assert_eq!(store.get(&key(i)).unwrap(), big(&format!("v{i}")));
         }
         assert!(matches!(store.get(&key(5)), Err(Error::Deleted)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cost_benefit_compaction_reclaims_and_preserves_state() {
+        let dir = temp_dir("costben");
+        let seg = seg_cap(1); // ~1KiB 数据容量,400B 记录 → 每段约 2 条,跨很多段
+        let mut store = BlobStore::create(&dir, seg * 128, seg, 1000).unwrap();
+        let big = |tag: &str| -> Vec<u8> {
+            let mut v = vec![b'y'; 400];
+            v[..tag.len()].copy_from_slice(tag.as_bytes());
+            v
+        };
+        for i in 0..40u64 {
+            store.put(key(i), &big(&format!("v{i}"))).unwrap();
+        }
+        for i in 0..35u64 {
+            store.delete(key(i)).unwrap(); // 大量高死老段
+        }
+        store.flush().unwrap();
+
+        let before = store.log_segment_count_for_test();
+        let st = store
+            .compact_cost_benefit(1)
+            .unwrap()
+            .expect("high-dead range should be picked");
+        assert!(
+            st.segments_after < before,
+            "cost-benefit compaction reclaims ≥1 segment"
+        );
+        assert_eq!(
+            store.stats().unwrap(),
+            store.stats_by_scan(),
+            "stats consistent after compaction"
+        );
+
+        for i in 0..35u64 {
+            assert!(
+                matches!(store.get(&key(i)), Err(Error::Deleted)),
+                "key {i} stays deleted"
+            );
+        }
+        for i in 35..40u64 {
+            assert_eq!(
+                store.get(&key(i)).unwrap(),
+                big(&format!("v{i}")),
+                "key {i} live"
+            );
+        }
+
+        // 全存活库无可回收区间 → None。
+        let dir2 = temp_dir("costben2");
+        let mut fresh = BlobStore::create(&dir2, seg * 128, seg, 1000).unwrap();
+        for i in 0..6u64 {
+            fresh.put(key(i), &big(&format!("v{i}"))).unwrap();
+        }
+        assert!(
+            fresh.compact_cost_benefit(1).unwrap().is_none(),
+            "no dead data → no candidate"
+        );
+        fresh.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir2);
+
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 128, seg, 1000).unwrap();
+        for i in 35..40u64 {
+            assert_eq!(store.get(&key(i)).unwrap(), big(&format!("v{i}")));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
