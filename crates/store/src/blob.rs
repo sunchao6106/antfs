@@ -916,7 +916,7 @@ fn rebuild_index(log: &Log, index_dir: &Path, max_entries: usize) -> Result<Pers
             }
         }
     }
-    let mut index = PersistentIndex::create(index_dir, max_entries)?;
+    let index = PersistentIndex::create(index_dir, max_entries)?;
     for_each_record(log, |off, raw, decoded| {
         let value = index_value_from_record(&index, off, raw.len(), decoded);
         index.add(decoded.key, value)?;
@@ -934,14 +934,14 @@ fn load_index_with_replay(
     index_dir: &Path,
     max_entries: usize,
 ) -> Result<PersistentIndex> {
-    let mut index = PersistentIndex::open(index_dir, max_entries)?;
+    let index = PersistentIndex::open(index_dir, max_entries)?;
     let watermark = read_watermark(index_dir).unwrap_or(LogOffset::new(0, 0));
-    replay_from(log, &mut index, watermark)?;
+    replay_from(log, &index, watermark)?;
     Ok(index)
 }
 
 /// 按持久化水位回放 log 尾部:把 offset ≥ watermark 的记录补进索引(旧→新,保 newest-wins)。
-fn replay_from(log: &Log, index: &mut PersistentIndex, watermark: LogOffset) -> Result<()> {
+fn replay_from(log: &Log, index: &PersistentIndex, watermark: LogOffset) -> Result<()> {
     for_each_record(log, |off, raw, decoded| {
         if off >= watermark {
             let value = index_value_from_record(index, off, raw.len(), decoded);

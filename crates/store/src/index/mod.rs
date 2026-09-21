@@ -12,6 +12,8 @@ pub mod value;
 
 use crossbeam_skiplist::SkipMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::types::StoreKey;
@@ -25,9 +27,10 @@ pub struct PersistentIndex {
     max_entries_per_segment: usize,
     /// 活跃段:并发有序映射,写入即插入;无过滤器。
     active: SkipMap<StoreKey, IndexValue>,
-    sealed: Vec<SealedSegment>,
-    active_seq: u64,
-    next_seq: u64,
+    /// 封存段:`RwLock` 保护(读锁扫描、封存时写锁 push);内部可变以支持 `&self` 写路径。
+    sealed: RwLock<Vec<SealedSegment>>,
+    active_seq: AtomicU64,
+    next_seq: AtomicU64,
 }
 
 impl PersistentIndex {
@@ -44,9 +47,9 @@ impl PersistentIndex {
             dir,
             max_entries_per_segment,
             active: SkipMap::new(),
-            active_seq: 0,
-            sealed: Vec::new(),
-            next_seq: 1,
+            active_seq: AtomicU64::new(0),
+            sealed: RwLock::new(Vec::new()),
+            next_seq: AtomicU64::new(1),
         })
     }
 
@@ -114,14 +117,14 @@ impl PersistentIndex {
             dir,
             max_entries_per_segment,
             active,
-            sealed,
-            active_seq,
-            next_seq,
+            sealed: RwLock::new(sealed),
+            active_seq: AtomicU64::new(active_seq),
+            next_seq: AtomicU64::new(next_seq),
         })
     }
 
     /// 写入一条索引。活跃段为并发映射;满阈值自动封存。
-    pub fn add(&mut self, key: StoreKey, value: IndexValue) -> Result<()> {
+    pub fn add(&self, key: StoreKey, value: IndexValue) -> Result<()> {
         self.active.insert(key, value);
         if self.active.len() >= self.max_entries_per_segment {
             self.seal_active()?;
@@ -134,7 +137,7 @@ impl PersistentIndex {
         if let Some(v) = self.active.get(key) {
             return Some(*v.value());
         }
-        for seg in self.sealed.iter().rev() {
+        for seg in self.sealed.read().unwrap().iter().rev() {
             if let Some(v) = seg.find(key) {
                 return Some(v);
             }
@@ -143,32 +146,38 @@ impl PersistentIndex {
     }
 
     /// 持久化活跃段(以 `{seq}.idx` 落盘,无 `.fuse` 标识活跃),使重启可恢复。
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         if self.active.is_empty() {
             return Ok(());
         }
         let entries: Vec<_> = self.active.iter().map(|e| (*e.key(), *e.value())).collect();
-        let path = self.dir.join(format!("{}.idx", self.active_seq));
+        let path = self
+            .dir
+            .join(format!("{}.idx", self.active_seq.load(Ordering::Acquire)));
         segment::write_segment_file(&path, &entries)
     }
 
     /// 封存当前活跃段:写 `.idx` + `.fuse`(mmap 载入)→ 起一个新活跃段。
-    pub fn seal_active(&mut self) -> Result<()> {
+    ///
+    /// 顺序关键:**先把封存段 push 进 sealed(写锁)再 clear 活跃段**,保证并发读者不会在
+    /// 「活跃段已清、封存段未入」的窗口丢失条目(D4 无锁读的正确性前提)。
+    pub fn seal_active(&self) -> Result<()> {
         if self.active.is_empty() {
             return Ok(());
         }
         let entries: Vec<_> = self.active.iter().map(|e| (*e.key(), *e.value())).collect();
-        let sealed = SealedSegment::from_entries(&self.dir, self.active_seq, &entries)?;
-        self.sealed.push(sealed);
+        let active_seq = self.active_seq.load(Ordering::Acquire);
+        let sealed = SealedSegment::from_entries(&self.dir, active_seq, &entries)?;
+        self.sealed.write().unwrap().push(sealed);
         self.active.clear();
 
-        self.active_seq = self.next_seq;
-        self.next_seq += 1;
+        let new_active = self.next_seq.fetch_add(1, Ordering::AcqRel);
+        self.active_seq.store(new_active, Ordering::Release);
         Ok(())
     }
 
     pub fn sealed_segment_count(&self) -> usize {
-        self.sealed.len()
+        self.sealed.read().unwrap().len()
     }
 
     pub fn active_len(&self) -> usize {
@@ -205,7 +214,7 @@ mod tests {
     #[test]
     fn add_and_find_active() {
         let dir = temp_dir("active");
-        let mut idx = PersistentIndex::create(&dir, 1000).unwrap();
+        let idx = PersistentIndex::create(&dir, 1000).unwrap();
         idx.add(key(1), put(0, 0)).unwrap();
         idx.add(key(2), put(0, 100)).unwrap();
         assert_eq!(idx.find(&key(1)).unwrap().offset, LogOffset::new(0, 0));
@@ -217,7 +226,7 @@ mod tests {
     #[test]
     fn seals_and_finds_across_segments() {
         let dir = temp_dir("seal");
-        let mut idx = PersistentIndex::create(&dir, 4).unwrap();
+        let idx = PersistentIndex::create(&dir, 4).unwrap();
         for i in 0..10u64 {
             idx.add(key(i), put(0, i * 100)).unwrap();
         }
@@ -238,7 +247,7 @@ mod tests {
     #[test]
     fn newest_wins_delete_after_put() {
         let dir = temp_dir("delete");
-        let mut idx = PersistentIndex::create(&dir, 4).unwrap();
+        let idx = PersistentIndex::create(&dir, 4).unwrap();
         idx.add(key(1), put(0, 0)).unwrap();
         for i in 2..6u64 {
             idx.add(key(i), put(0, i * 100)).unwrap(); // 触发封存,key(1) 进 sealed
@@ -257,7 +266,7 @@ mod tests {
     fn reopen_recovers_sealed_and_active() {
         let dir = temp_dir("reopen");
         {
-            let mut idx = PersistentIndex::create(&dir, 4).unwrap();
+            let idx = PersistentIndex::create(&dir, 4).unwrap();
             for i in 0..10u64 {
                 idx.add(key(i), put(0, i * 100)).unwrap();
             }
