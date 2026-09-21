@@ -37,6 +37,34 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// 预分配段文件到 `capacity` 字节:Linux `posix_fallocate` 真实占盘、macOS `F_PREALLOCATE`,
+/// 失败或其他平台回退 `set_len`(仅设逻辑长度)。保证段文件恒为固定大小,避免碎片。
+fn preallocate(file: &std::fs::File, capacity: u64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, capacity as libc::off_t) };
+        if ret == 0 {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: capacity as libc::off_t,
+            fst_bytesalloc: 0,
+        };
+        // F_PREALLOCATE 只预留空间、不改逻辑大小,失败也无妨——下面 set_len 兜底。
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &store) };
+    }
+    file.set_len(capacity)?;
+    Ok(())
+}
+
 /// 一个只追加的日志段。非并发安全:单写者(`&mut self`),但 `read` 可并发。
 pub struct LogSegment {
     file: std::fs::File,
@@ -56,7 +84,7 @@ impl std::fmt::Debug for LogSegment {
 }
 
 impl LogSegment {
-    /// 创建新段:std 预分配(`posix_fallocate`)→ 写 header → fsync。
+    /// 创建新段:预分配容量(跨平台)→ 写 header → fsync。
     pub fn create(path: impl AsRef<Path>, capacity: u64) -> Result<Self> {
         if capacity <= HEADER_SIZE as u64 {
             return Err(Error::BadArgument(format!(
@@ -72,14 +100,7 @@ impl LogSegment {
             .truncate(true)
             .open(path)?;
 
-        // 真实预分配,避免碎片;失败不致命(略过,文件仍可用)。
-        {
-            use std::os::unix::io::AsRawFd;
-            let ret = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, capacity as libc::off_t) };
-            if ret != 0 {
-                return Err(Error::Io(std::io::Error::from_raw_os_error(ret)));
-            }
-        }
+        preallocate(&file, capacity)?;
 
         let mut seg = Self {
             file,
@@ -201,7 +222,8 @@ impl LogSegment {
             });
         }
         let mut out = vec![0u8; len];
-        self.file.read_exact_at(&mut out, HEADER_SIZE as u64 + offset)?;
+        self.file
+            .read_exact_at(&mut out, HEADER_SIZE as u64 + offset)?;
         Ok(out)
     }
 
@@ -328,7 +350,11 @@ mod tests {
         }
         let seg = LogSegment::open(&path).unwrap();
         // 恢复出的 data_end 只反映最后一次 flush 的边界。
-        assert_eq!(seg.data_end(), flushed_end, "durability boundary == last flush");
+        assert_eq!(
+            seg.data_end(),
+            flushed_end,
+            "durability boundary == last flush"
+        );
         seg.close().unwrap();
         let _ = std::fs::remove_file(&path);
     }
