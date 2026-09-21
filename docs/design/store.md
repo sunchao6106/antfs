@@ -120,6 +120,35 @@ snap.log.read(v.offset, len)     // 老快照 Arc 还活着,老文件就还在
 - 承载阻塞 IO 的运行时:纯线程池 vs `tokio` + `spawn_blocking` vs 分片锁(sharded store)?按读写比与争用实测定。
 - 段 refcount 用 `Arc<Segment>` 隐式,还是显式计数 + 手动 `waitTillRefCountZero`(对齐 Ambry)?倾向前者(Rust 原生、无需手写宽限期)。
 
+### 8.7 实现方案与分阶段计划(经 Oracle 论证)
+
+**目标结构**:
+```rust
+struct BlobStore {
+    inner: ArcSwap<Inner>,          // {log, index};仅 rollover(廉价)与 compaction 换入
+    write_lock: Mutex<()>,          // 串行化写者 + compaction
+    seg_bytes: Mutex<BTreeMap<u64, SegBytes>>,  // 仅统计,【不在 Inner】(否则每写都要换 Inner)
+}
+struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
+```
+
+**对 §8.1–8.6 的关键修正**:
+1. **seg_bytes 不放 Inner**:它每写都变、但只被 stats 读,放 Inner 会逼每写换 Inner。用独立 `Mutex`,不在 get 路径上。
+2. **reader 必须有重试循环(§8.2 遗漏的最关键一点)**:活跃段 SkipMap 跨 Inner 版本共享,可能返回一条指向「比 reader 快照更新的段」的条目(rollover 竞态)→ 读取时该段不在快照 → **重载快照重试**(罕见,仍无锁)。compaction 因换的是**全新 index**(offset 全变、非共享 SkipMap),老 index+老段 / 新 index+新段各自自洽,**不需重试**。
+3. **活跃段共享 + `AtomicU64` data_end**:活跃段不随每写换 Inner;`append/flush/overwrite_at` 改 `&self`(`write_all_at` 本就是 `&self`),data_end 用 `AtomicU64`(reader acquire-load、writer release-store,配合 write_at 系统调用形成 happens-before,读 offset<data_end 安全无撕裂)。
+4. **索引封存也需内部可变**:`sealed: ArcSwap<Vec<SealedSegment>>` + `active_seq/next_seq: AtomicU64`;`seal_active` 必须**先 swap sealed 再 clear active**(否则 reader 丢条目)。`add/find` 改 `&self`。
+5. **compaction 持 `write_lock`**:期间无并发写 → §8.4 的「并发写边界」问题消失,reader 全程不阻塞。是**简化选择**(Ambry 允许写中 compaction),写中可 compaction 留作 P4+。
+6. **hard_delete 必须 COW**(非可选):就地改与无锁读并发 → 撕裂读(crc mismatch 误报 Corrupt)。改为「拷段→擦除→写新段→swap」。隐私注记:RCU 下老快照/page cache 仍可能读到擦前数据,保证是**最终**擦除。
+7. **compaction 放弃目录 rename**:改同目录建新段 + 段 `Drop` 时 `unlink`(容忍 ENOENT);`COMPACT_COMMIT` 恢复相应改写。`LogSegment` 需记 `path`(供 Drop-unlink)。
+8. reader 用 `ArcSwap::load_full()`(持真 Arc,避免跨 syscall 钉住 slot)。
+
+**分阶段(先易后难,每阶段全测试绿)**:
+- **P1 内部可变性重构(无语义变更,现有测试即验收)**:`LogSegment` data_end→`AtomicU64`、`append/flush/overwrite_at`→`&self`、记 `path`;`PersistentIndex` `sealed`→`ArcSwap`、seqs→`AtomicU64`、`add/find`→`&self`(先 swap 后 clear)。`BlobStore` 仍 `&mut self`。
+- **P2 并发读写**:引入 `Inner`+`ArcSwap<Inner>`+`write_lock`+`seg_bytes: Mutex`;`BlobStore` 方法→`&self`;writer 走写锁(rollover 时先 `inner.store` 再 `index.add`),reader 走重试循环。
+- **P3 COW compaction + hard_delete**:compaction 持写锁、同目录建新段 + fresh index + `inner.store` + 段 Drop-unlink;重做 `COMPACT_COMMIT` 恢复;hard_delete 改 COW。
+- **P4 后台调度器 + 性能**:周期 flush/compaction 线程 + stress/loom 测试 + 基准。
+
+
 ## 9. 路线图
 
 - [x] LogSegment(同步阻塞 IO + buffered + fsync 持久边界)
@@ -137,8 +166,8 @@ snap.log.read(v.offset, len)     // 老快照 Arc 还活着,老文件就还在
 - [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty)
 - [x] HardDeleter(软删对象数据就地清零,隐私擦除)
 - [x] 内存参考模型全量对拍
-- [ ] **并发模型 D4**(见 §8:ArcSwap 快照式无锁读 + COW compaction + 段级 refcount)
-- [ ] 后台调度器(周期 compaction + 定时 persist 线程;依赖 D4)
-- [ ] compaction 策略细化(cost-benefit / 连续区间,对齐 `StatsBasedCompactionPolicy`;依赖 D4)
+- [ ] **并发模型 D4**(见 §8;分阶段 P1 内部可变性 → P2 ArcSwap+写锁+&self → P3 COW compaction → P4 后台调度)
+- [ ] 后台调度器(周期 compaction + 定时 persist 线程;D4 P4)
+- [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [ ] 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓
 - [ ] (已废弃)monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销

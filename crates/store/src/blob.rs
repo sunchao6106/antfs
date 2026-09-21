@@ -778,7 +778,6 @@ impl BlobStore {
                 let fits = cur.as_ref().map(|c| c.remaining() >= need).unwrap_or(false);
                 if !fits {
                     if let Some(c) = cur.take() {
-                        let mut c = c;
                         c.flush()?;
                         c.close()?;
                     }
@@ -795,7 +794,6 @@ impl BlobStore {
             })?;
         }
         if let Some(c) = cur.take() {
-            let mut c = c;
             c.flush()?;
             c.close()?;
         }

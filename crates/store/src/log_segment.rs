@@ -10,6 +10,7 @@
 
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
@@ -70,7 +71,7 @@ pub struct LogSegment {
     file: std::fs::File,
     capacity: u64,
     data_capacity: u64,
-    data_end: u64,
+    data_end: AtomicU64,
     created_ns: u64,
 }
 
@@ -78,7 +79,7 @@ impl std::fmt::Debug for LogSegment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogSegment")
             .field("capacity", &self.capacity)
-            .field("data_end", &self.data_end)
+            .field("data_end", &self.data_end.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -102,11 +103,11 @@ impl LogSegment {
 
         preallocate(&file, capacity)?;
 
-        let mut seg = Self {
+        let seg = Self {
             file,
             capacity,
             data_capacity: capacity - HEADER_SIZE as u64,
-            data_end: 0,
+            data_end: AtomicU64::new(0),
             created_ns: now_ns(),
         };
         seg.write_header()?;
@@ -146,7 +147,7 @@ impl LogSegment {
             file,
             capacity,
             data_capacity: capacity - HEADER_SIZE as u64,
-            data_end,
+            data_end: AtomicU64::new(data_end),
             created_ns,
         })
     }
@@ -154,7 +155,7 @@ impl LogSegment {
     /// 当前逻辑数据末尾(字节粒度,含未 flush 的追加)。
     #[inline]
     pub fn data_end(&self) -> u64 {
-        self.data_end
+        self.data_end.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -170,7 +171,7 @@ impl LogSegment {
 
     #[inline]
     pub fn remaining(&self) -> u64 {
-        self.data_capacity - self.data_end
+        self.data_capacity - self.data_end.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -179,18 +180,22 @@ impl LogSegment {
     }
 
     /// 追加一条记录,返回数据区逻辑起始 offset。**未 fsync**,持久化需 [`flush`](Self::flush)。
-    pub fn append(&mut self, record: &[u8]) -> Result<u64> {
-        let start = self.data_end;
+    ///
+    /// `&self` + `AtomicU64` data_end:写者(D4 下由 write_lock 串行)release-store data_end,
+    /// 读者 acquire-load 后按 offset<data_end 定位读,配合 `write_at` 系统调用形成 happens-before。
+    pub fn append(&self, record: &[u8]) -> Result<u64> {
+        let start = self.data_end.load(Ordering::Acquire);
         if start + record.len() as u64 > self.data_capacity {
             return Err(Error::SegmentFull);
         }
         self.file.write_all_at(record, HEADER_SIZE as u64 + start)?;
-        self.data_end += record.len() as u64;
+        self.data_end
+            .store(start + record.len() as u64, Ordering::Release);
         Ok(start)
     }
 
     /// 持久化:写入 header(data_end)→ `sync_all`(fsync)。成为持久化边界。
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         self.write_header()?;
         self.file.sync_all()?;
         Ok(())
@@ -198,13 +203,14 @@ impl LogSegment {
 
     /// 就地覆盖已写入区间 `[offset, offset+bytes.len())` 的字节(不改 data_end)。
     /// 用于硬删除等原地擦除;越出已写数据末尾则拒绝。**未 fsync**,持久化需 [`flush`](Self::flush)。
-    pub fn overwrite_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+    pub fn overwrite_at(&self, offset: u64, bytes: &[u8]) -> Result<()> {
         let end = offset + bytes.len() as u64;
-        if end > self.data_end {
+        let data_end = self.data_end.load(Ordering::Acquire);
+        if end > data_end {
             return Err(Error::OutOfRange {
                 offset,
                 len: bytes.len(),
-                data_end: self.data_end,
+                data_end,
             });
         }
         self.file.write_all_at(bytes, HEADER_SIZE as u64 + offset)?;
@@ -214,11 +220,12 @@ impl LogSegment {
     /// 读取 `[offset, offset+len)` 字节。
     pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let end = offset + len as u64;
-        if end > self.data_end {
+        let data_end = self.data_end.load(Ordering::Acquire);
+        if end > data_end {
             return Err(Error::OutOfRange {
                 offset,
                 len,
-                data_end: self.data_end,
+                data_end,
             });
         }
         let mut out = vec![0u8; len];
@@ -233,12 +240,13 @@ impl LogSegment {
         Ok(())
     }
 
-    fn write_header(&mut self) -> Result<()> {
+    fn write_header(&self) -> Result<()> {
         let mut s = [0u8; hdr::HEADER_LEN];
         s[hdr::MAGIC..hdr::MAGIC + 4].copy_from_slice(&HEADER_MAGIC.to_le_bytes());
         s[hdr::VERSION..hdr::VERSION + 2].copy_from_slice(&HEADER_VERSION.to_le_bytes());
         s[hdr::CAPACITY..hdr::CAPACITY + 8].copy_from_slice(&self.capacity.to_le_bytes());
-        s[hdr::DATA_END..hdr::DATA_END + 8].copy_from_slice(&self.data_end.to_le_bytes());
+        s[hdr::DATA_END..hdr::DATA_END + 8]
+            .copy_from_slice(&self.data_end.load(Ordering::Acquire).to_le_bytes());
         s[hdr::CREATED_NS..hdr::CREATED_NS + 8].copy_from_slice(&self.created_ns.to_le_bytes());
         let crc = crc32fast::hash(&s[0..hdr::COVERED]);
         s[hdr::CRC..hdr::CRC + 4].copy_from_slice(&crc.to_le_bytes());
@@ -265,7 +273,7 @@ mod tests {
     #[test]
     fn roundtrip_before_and_after_flush() {
         let path = temp_path("rt");
-        let mut seg = LogSegment::create(&path, cap(64)).unwrap();
+        let seg = LogSegment::create(&path, cap(64)).unwrap();
 
         let a = b"hello".to_vec();
         let b = vec![7u8; 100];
@@ -291,7 +299,7 @@ mod tests {
     #[test]
     fn oversized_record_rejected() {
         let path = temp_path("big");
-        let mut seg = LogSegment::create(&path, cap(2)).unwrap();
+        let seg = LogSegment::create(&path, cap(2)).unwrap();
         let big = vec![0u8; (cap(2) - HEADER_SIZE as u64) as usize + 1];
         match seg.append(&big) {
             Err(Error::SegmentFull) => {}
@@ -320,7 +328,7 @@ mod tests {
         let b = b"tail-record".to_vec();
         let (oa, ob, data_end);
         {
-            let mut seg = LogSegment::create(&path, cap(64)).unwrap();
+            let seg = LogSegment::create(&path, cap(64)).unwrap();
             oa = seg.append(&a).unwrap();
             ob = seg.append(&b).unwrap();
             seg.flush().unwrap();
@@ -340,7 +348,7 @@ mod tests {
         let path = temp_path("unflush");
         let flushed_end;
         {
-            let mut seg = LogSegment::create(&path, cap(64)).unwrap();
+            let seg = LogSegment::create(&path, cap(64)).unwrap();
             seg.append(b"aaa").unwrap();
             seg.flush().unwrap();
             flushed_end = seg.data_end();
