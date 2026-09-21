@@ -201,22 +201,6 @@ impl LogSegment {
         Ok(())
     }
 
-    /// 就地覆盖已写入区间 `[offset, offset+bytes.len())` 的字节(不改 data_end)。
-    /// 用于硬删除等原地擦除;越出已写数据末尾则拒绝。**未 fsync**,持久化需 [`flush`](Self::flush)。
-    pub fn overwrite_at(&self, offset: u64, bytes: &[u8]) -> Result<()> {
-        let end = offset + bytes.len() as u64;
-        let data_end = self.data_end.load(Ordering::Acquire);
-        if end > data_end {
-            return Err(Error::OutOfRange {
-                offset,
-                len: bytes.len(),
-                data_end,
-            });
-        }
-        self.file.write_all_at(bytes, HEADER_SIZE as u64 + offset)?;
-        Ok(())
-    }
-
     /// 读取 `[offset, offset+len)` 字节。
     pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let end = offset + len as u64;

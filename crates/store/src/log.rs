@@ -127,16 +127,6 @@ impl Log {
         segment.read(at.offset, len)
     }
 
-    /// 就地覆盖 `at` 起的已写字节(不改 data_end,不得跨段)。用于硬删除原地擦除。
-    pub fn overwrite_at(&self, at: LogOffset, bytes: &[u8]) -> Result<()> {
-        let segment = self.segment_at(at.segment).ok_or(Error::OutOfRange {
-            offset: at.offset,
-            len: bytes.len(),
-            data_end: 0,
-        })?;
-        segment.overwrite_at(at.offset, bytes)
-    }
-
     /// 持久化所有段(硬删除擦除多段后统一 fsync)。
     pub fn flush_all(&self) -> Result<()> {
         let segments: Vec<Arc<LogSegment>> = {

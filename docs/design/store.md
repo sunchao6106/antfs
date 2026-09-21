@@ -146,17 +146,20 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - **P1 内部可变性重构(无语义变更,现有测试即验收)**:`LogSegment` data_end→`AtomicU64`、`append/flush/overwrite_at`→`&self`、记 `path`;`PersistentIndex` `sealed`→`ArcSwap`、seqs→`AtomicU64`、`add/find`→`&self`(先 swap 后 clear)。`BlobStore` 仍 `&mut self`。
 - **P2 并发读写**:引入 `Inner`+`ArcSwap<Inner>`+`write_lock`+`seg_bytes: Mutex`;`BlobStore` 方法→`&self`;writer 走写锁(rollover 时先 `inner.store` 再 `index.add`),reader 走重试循环。
 - **P3 COW compaction + hard_delete**:compaction 持写锁、同目录建新段 + fresh index + `inner.store` + 段 Drop-unlink;重做 `COMPACT_COMMIT` 恢复;hard_delete 改 COW。
-- **P4 后台调度器 + 性能**:周期 flush/compaction 线程 + stress/loom 测试 + 基准。
+- **~~P4 后台调度器 + 性能~~(移出 store 层)**:见下「P4 归属」。
 
-**实现落地对上述计划的偏差(Option B,已实现 P1 + P2,较原案更简)**:
+**实现落地对上述计划的偏差(Option B,已实现 P1 + P2 + P3,较原案更简)**:
 
 原案(P2 上面)让 `Inner` 每次 rollover 也换、活跃段 SkipMap 跨版本共享,故需 reader 重试循环(修正 2);并依赖 `arc-swap` crate。落地改为等价但更简的 **Option B**:
 
 1. **`Log` 段表自带内部锁**:`entries: RwLock<Vec<Arc<LogSegment>>>`;`append/read/flush/roll_over/…` 全 `&self`。rollover 在**写正常记录之前**就把新段 push 进共享段表(写锁),故读者一旦经索引看到某条目,其目标段必已在段表 → **无需重试循环**(消解修正 2)。段内可见性仍由 `LogSegment` 的 `AtomicU64` data_end 保证(修正 3)。
-2. **`Inner` 仅 compaction 换**(非每 rollover):正常写经**当前** `Inner` 的内部可变 `log`/`index` 就地改,不换 `Inner`。`Inner{log, index}` 整体只在 compaction 时构建新的并原子换入,读者不见「新 log + 旧 index」撕裂态。
-3. **不引 `arc-swap`**:`inner: RwLock<Arc<Inner>>`,读者取读锁**仅克隆 `Arc`**(纳秒级)后即释放、无锁读;写者/compaction 取写锁换 `Arc`。避免动共享 `Cargo.toml`/`Cargo.lock`;真无锁的 `arc-swap` 留作 P4 按压测决定。`PersistentIndex.sealed` 同理用 std `RwLock`(非 `ArcSwap`)。
+2. **`Inner` 仅 compaction/hard_delete 换**(非每 rollover):正常写经**当前** `Inner` 的内部可变 `log`/`index` 就地改,不换 `Inner`。`Inner{log, index}` 整体只在 compaction / COW hard_delete 时构建新的并原子换入,读者不见「新 log + 旧 index」撕裂态。
+3. **不引 `arc-swap`**:`inner: RwLock<Arc<Inner>>`,读者取读锁**仅克隆 `Arc`**(纳秒级)后即释放、无锁读;写者/compaction 取写锁换 `Arc`。避免动共享 `Cargo.toml`/`Cargo.lock`;真无锁的 `arc-swap` 留作后续按压测决定。`PersistentIndex.sealed` 同理用 std `RwLock`(非 `ArcSwap`)。
 4. **compaction 用 RCU + Unix open-fd 语义**(替代修正 7 的 Drop-unlink):持 `write_lock`,建新段/rename/`remove_file` 旧段后原子换 `Inner`。老读者持有的旧 `Arc<Inner>` 握有旧段 fd,Unix 下 rename/unlink 不影响其读,末次释放后 inode 才回收。CompactAll 保留目录 rename,增量 compaction 同目录建新段。
-5. **hard_delete 仍就地擦除、暂未 COW**(修正 6 留 P3):`&self` + `write_lock` 使其与其他**写者**互斥,但与无锁**读者**并发时仍可能撕裂读(get_with_options include_deleted 偶报 `Corrupt`)。擦除的是已软删数据,**不涉持久性/数据丢失**;P3 改 COW 消解。并发正确性由 `blob.rs` 的 `concurrent_shared_access_*` 测试(多写者 + 无锁读者 + 并发 CompactAll)守护。
+5. **hard_delete 改 COW(P3 已完成,修正 6 消解)**:逐个受影响段重写为「目标 PUT 数据清零 + `FLAG_HARD_DELETED`」的新段(tmp→fsync→原子 rename 覆盖,段位置/记录偏移不变),再原子换 `Inner`——**不再就地 `overwrite_at`**(该原语已从 `Log`/`LogSegment` 删除,杜绝与无锁读并发的撕裂读footgun)。老读者经旧 Inner 的旧段 fd 仍读到擦前明文(Unix open-fd),故保证是**最终**擦除。幂等(已擦记录带 `FLAG_HARD_DELETED`,重入跳过)。并发正确性由 `blob.rs` 的 `concurrent_shared_access_*` 与 `concurrent_hard_delete_never_torn_reads` 测试守护。
+
+**P4 归属:后台调度移出 store 层 → 抽象 blob-server 角色**(对齐 Ambry:`BlobStore` 只提供 compaction 机制,`CompactionManager`/`StorageManager` 才做调度)。`store::BlobStore` 层**只需暴露 compact/flush 能力**(已具备:`compact` / `compact_incremental` / `compact_cost_benefit` / `flush`,均 `&self` 可被后台线程调用);**周期 flush/compaction 线程、触发策略、多 store 编排** 属上层 blob-server 组件(待建),不在 store crate 内实现。故 **D4 在 store 层到 P3 即完成**;stress/loom/基准随 blob-server 或后续性能阶段再做。
+
 
 
 
@@ -177,8 +180,8 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty)
 - [x] HardDeleter(软删对象数据就地清零,隐私擦除)
 - [x] 内存参考模型全量对拍
-- [ ] **并发模型 D4**(见 §8;分阶段 P1 内部可变性 → P2 `&self`+写锁+无锁读 → P3 COW compaction/hard_delete → P4 后台调度):**P1、P2 已完成**(Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction 换入、无重试循环、不引 `arc-swap`;并发测试守护);**P3/P4 待做**
-- [ ] 后台调度器(周期 compaction + 定时 persist 线程;D4 P4)
+- [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction/COW hard_delete 换入、无重试循环、不引 `arc-swap`;hard_delete 改 COW、删除就地 `overwrite_at` footgun;并发测试守护)
+- [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [ ] 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓
 - [ ] (已废弃)monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销

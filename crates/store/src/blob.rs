@@ -399,29 +399,86 @@ impl BlobStore {
 
     /// 硬删除:把已软删(墓碑)对象的原 PUT 数据字节**就地清零**(对齐 Ambry `HardDeleter` 的隐私擦除),
     /// 在 compaction 回收前即抹除明文。返回被擦除的对象数;幂等(已擦除的跳过)。
+    /// 硬删除:把已软删(墓碑)对象的原 PUT 数据字节**清零**(对齐 Ambry `HardDeleter` 的隐私擦除),
+    /// 在 compaction 回收前即抹除明文。返回被擦除的对象数;幂等(已擦除的跳过)。
+    ///
+    /// COW(非就地改):逐个受影响段重写为「目标 PUT 数据清零 + `FLAG_HARD_DELETED`」的新段
+    /// (tmp→fsync→原子 rename 覆盖,段位置/记录偏移不变),再原子换入新 Inner。避免就地
+    /// `overwrite_at` 与无锁读者并发导致撕裂读(crc mismatch 误报 `Corrupt`)。老读者持有的旧
+    /// Inner 经旧段 fd 仍读到擦前明文(Unix open-fd 语义),故保证是**最终**擦除。
     pub fn hard_delete(&self) -> Result<usize> {
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
-        let inner = self.inner();
-        let mut puts: Vec<LogOffset> = Vec::new();
-        for_each_record(&inner.log, |off, _raw, decoded| {
+        let old = self.inner();
+
+        // 收集需擦除的原 PUT 位置(其墓碑为当前索引赢家、原 PUT 存在且未擦),按段分组。
+        let mut targets: BTreeMap<u64, std::collections::HashSet<u64>> = BTreeMap::new();
+        for_each_record(&old.log, |off, _raw, decoded| {
             if decoded.flags & FLAG_DELETED != 0 {
-                if let Some(v) = inner.index.find(&decoded.key) {
+                if let Some(v) = old.index.find(&decoded.key) {
                     if v.is_deleted() && v.offset == off {
-                        puts.push(v.original_offset);
+                        if let Ok((_, put)) = read_full_record(&old.log, v.original_offset) {
+                            if put.flags & (FLAG_DELETED | FLAG_HARD_DELETED) == 0 {
+                                targets
+                                    .entry(v.original_offset.segment)
+                                    .or_default()
+                                    .insert(v.original_offset.offset);
+                            }
+                        }
                     }
                 }
             }
             Ok(())
         })?;
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let (log_dir, index_dir) = sub_dirs(&self.dir);
+        let spans = old.log.segment_spans();
         let mut scrubbed = 0usize;
-        for po in puts {
-            if scrub_put(&inner.log, po)? {
-                scrubbed += 1;
-            }
+        for (&pos, scrub) in &targets {
+            let data_end = spans
+                .iter()
+                .find(|(p, _)| *p == pos)
+                .map(|(_, e)| *e)
+                .unwrap_or(0);
+            let final_path = log_dir.join(LogSegmentName(pos).filename());
+            let mut tmp = final_path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            let seg = LogSegment::create(&tmp, self.segment_capacity)?;
+            scan_segment(&old.log, pos, data_end, |off, raw, decoded| {
+                let mut rec = raw.to_vec();
+                if scrub.contains(&off.offset)
+                    && decoded.flags & (FLAG_DELETED | FLAG_HARD_DELETED) == 0
+                {
+                    let crc_at = rec::DATA + decoded.data.len();
+                    for b in rec[rec::DATA..crc_at].iter_mut() {
+                        *b = 0;
+                    }
+                    rec[rec::FLAGS] |= FLAG_HARD_DELETED;
+                    let crc = crc32fast::hash(&rec[..crc_at]);
+                    rec[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+                    scrubbed += 1;
+                }
+                seg.append(&rec)?;
+                Ok(())
+            })?;
+            seg.flush()?;
+            seg.close()?;
+            // 原子 rename 覆盖原段(偏移不变);老 Inner 读者的旧 fd 仍指向擦前 inode(Unix)。
+            std::fs::rename(&tmp, &final_path)?;
         }
-        if scrubbed > 0 {
-            inner.log.flush_all()?;
-        }
+
+        // 重开 log(新 fd 指向已擦除文件)+ 重建索引(偏移不变)+ 原子换入新 Inner。
+        let new_log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
+        let new_index = rebuild_index(&new_log, &index_dir, self.max_index_entries_per_segment)?;
+        let new_seg_bytes = scan_seg_bytes(&new_log, &new_index)?;
+        *self.seg_bytes.lock().expect("blob seg_bytes poisoned") = new_seg_bytes;
+        *self.inner.write().expect("blob inner poisoned") = Arc::new(Inner {
+            log: new_log,
+            index: new_index,
+        });
         Ok(scrubbed)
     }
 
@@ -913,27 +970,6 @@ fn read_full_record(log: &Log, at: LogOffset) -> Result<(Vec<u8>, DecodedRecord)
     let raw = log.read(at, total)?;
     let decoded = decode_record(&raw)?;
     Ok((raw, decoded))
-}
-
-/// 把 `at` 处 PUT 记录的数据清零、置 `FLAG_HARD_DELETED` 并重算 crc,整条写回。
-/// PUT 已被回收/非 PUT/已擦除则跳过。返回是否实际擦除。
-fn scrub_put(log: &Log, at: LogOffset) -> Result<bool> {
-    let (mut raw, decoded) = match read_full_record(log, at) {
-        Ok(x) => x,
-        Err(_) => return Ok(false),
-    };
-    if decoded.flags & (FLAG_DELETED | FLAG_HARD_DELETED) != 0 {
-        return Ok(false);
-    }
-    let crc_at = rec::DATA + decoded.data.len();
-    for b in raw[rec::DATA..crc_at].iter_mut() {
-        *b = 0;
-    }
-    raw[rec::FLAGS] |= FLAG_HARD_DELETED;
-    let crc = crc32fast::hash(&raw[..crc_at]);
-    raw[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
-    log.overwrite_at(at, &raw)?;
-    Ok(true)
 }
 
 /// 遍历单个段 `position` 内 `[0, data_end)` 的全部记录。
@@ -2204,6 +2240,82 @@ mod tests {
                 "end victim {k} must be deleted"
             );
         }
+
+        Arc::into_inner(store).unwrap().close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // D4 P3:并发 hard_delete(COW)与无锁读者——软删对象带 include_deleted 读其原 PUT,
+    // 全程只见「擦前明文」或「擦后全零」,绝不撕裂读(旧就地 overwrite_at 会偶发 NotFound/半擦)。
+    #[test]
+    fn concurrent_hard_delete_never_torn_reads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = temp_dir("hard_concurrent");
+        let seg = seg_cap(8);
+        let store = Arc::new(BlobStore::create(&dir, seg * 128, seg, 1000).unwrap());
+
+        const KEPT: u64 = 100;
+        const VICTIMS: u64 = 100;
+        for k in 0..KEPT {
+            store.put(key(k), &data_for(k, 0)).unwrap();
+        }
+        let victim_data = vec![7u8; 64]; // 非零,便于区分「擦前明文 / 擦后全零」
+        for k in KEPT..(KEPT + VICTIMS) {
+            store.put(key(k), &victim_data).unwrap();
+            store.delete(key(k)).unwrap();
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let zeroed = vec![0u8; victim_data.len()];
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let store = Arc::clone(&store);
+                let done = Arc::clone(&done);
+                let victim_data = victim_data.clone();
+                let zeroed = zeroed.clone();
+                s.spawn(move || {
+                    while !done.load(Ordering::Acquire) {
+                        for k in 0..KEPT {
+                            assert_eq!(store.get(&key(k)).unwrap(), data_for(k, 0), "kept {k}");
+                        }
+                        for k in KEPT..(KEPT + VICTIMS) {
+                            let got = store.get_with_options(&key(k), true, false).unwrap();
+                            assert!(
+                                got == victim_data || got == zeroed,
+                                "victim {k} torn read: {got:?}"
+                            );
+                        }
+                    }
+                });
+            }
+            {
+                let store = Arc::clone(&store);
+                let done = Arc::clone(&done);
+                s.spawn(move || {
+                    let n = store.hard_delete().unwrap();
+                    assert_eq!(n, VICTIMS as usize, "all victims scrubbed");
+                    done.store(true, Ordering::Release);
+                });
+            }
+        });
+
+        for k in KEPT..(KEPT + VICTIMS) {
+            assert_eq!(
+                store.get_with_options(&key(k), true, false).unwrap(),
+                zeroed,
+                "final victim {k} zeroed"
+            );
+        }
+        for k in 0..KEPT {
+            assert_eq!(
+                store.get(&key(k)).unwrap(),
+                data_for(k, 0),
+                "final kept {k}"
+            );
+        }
+        assert_eq!(store.hard_delete().unwrap(), 0, "idempotent hard_delete");
 
         Arc::into_inner(store).unwrap().close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
