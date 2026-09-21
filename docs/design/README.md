@@ -10,6 +10,7 @@
 |---|---|---|
 | common(公共库:`config` 分层配置 + `metric` 统计打点) | [common.md](./common.md) | 进行中 |
 | store(单机存储引擎:Log / LogSegment / PersistentIndex / BlobStore;对标 Ambry `ambry-store`) | [store.md](./store.md) | 进行中 |
+| cluster(集群/服务层:master / server / frontend 角色 + 传输选型;锁定架构目标) | [cluster.md](./cluster.md) | 选型已定,实现规划中 |
 | frontend / S3 网关(对象接口层) | *(待添加)* | 规划中 |
 
 > 决策档案(含被否决方案与理由)见 `openspec/changes/`。

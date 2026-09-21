@@ -6,6 +6,7 @@
 - 设计总览:[`docs/design/README.md`](docs/design/README.md);各模块设计见 `docs/design/*.md`。
 - 决策档案(含被否决方案):`openspec/changes/`。
 - 工程为 Cargo workspace,crate 位于 `crates/`(公共能力在 `crates/common/`)。
+- **集群/服务层实现必须紧跟已锁架构目标**:见 [`docs/design/cluster.md` §6](docs/design/cluster.md)(D1 内建 Raft master / D2 控制面 gRPC + 数据面 HTTP 流式、禁自研二进制协议 / D3 blobId 自带定位、无中心每对象元数据 / D4 数据异步+拉复制、Raft 只用于 master / D5 EC 冷层=封存段级、热副本冷 EC、先落 EC 冗余再删副本)。偏离须先改该文档 + 记 `openspec/changes/`,不得在代码里就地另选。
 
 > 本文档移植自 Ambry 原版 `CLAUDE.md` 的可复用部分,已 Rust 化;Java/Netty/Jackson 等专属条目已剔除或改写。
 
