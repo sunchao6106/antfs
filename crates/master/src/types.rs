@@ -17,6 +17,8 @@ pub type NodeId = u64;
 ///
 /// **u32**:blobId 高 32bit 即此 id(低 32bit 为 objectId),见 blobid-master-assign D8。
 pub type PartitionId = u32;
+/// 对象 id(blobId 低 32bit;master 按 partition 单调发号,永不复用,见 blobid-master-assign)。
+pub type ObjectId = u32;
 /// 磁盘 id(节点内唯一,通常是盘的挂载标识)。
 pub type DiskId = String;
 
@@ -93,6 +95,12 @@ impl Default for Policy {
 pub struct MasterState {
     /// 单调 partition id 分配器(类 SeaweedFS `MaxVolumeId`)。
     pub next_partition_id: PartitionId,
+    /// per-partition objectId 高水位:下一个可发放的 objectId(号段发放的已提交上界)。
+    ///
+    /// blobid-master-assign 正确性骨架:抬高水位 SHALL 先提交进 Raft 再据此发号;切主后新主从
+    /// 已提交水位续发,永不复用越过水位的号;水位与实际发放间未用的号允许成为空洞。缺省(不在表中)
+    /// 即该 partition 尚未发过号,从 0 起。
+    pub object_next: BTreeMap<PartitionId, ObjectId>,
     /// 自注册固化的节点身份 + 容量。
     pub nodes: BTreeMap<NodeId, NodeInfo>,
     /// 分区放置(应然)。M1 空。
@@ -114,6 +122,17 @@ impl MasterState {
                 let id = self.next_partition_id;
                 self.next_partition_id += 1;
                 MasterResponse::PartitionId(id)
+            }
+            MasterCommand::AllocateObjectId { partition_id, count } => {
+                let start = self.object_next.get(partition_id).copied().unwrap_or(0);
+                // checked_add 兜住 u32 空间耗尽:宁可少发最顶端不足一段的号,绝不回绕复用(持久性红线)。
+                match start.checked_add(*count) {
+                    Some(end) => {
+                        self.object_next.insert(*partition_id, end);
+                        MasterResponse::ObjectIdRange { partition_id: *partition_id, start, count: *count }
+                    }
+                    None => MasterResponse::ObjectIdExhausted { partition_id: *partition_id },
+                }
             }
             MasterCommand::RegisterNode { node_id, info } => {
                 // 幂等覆盖:同 node_id 再注册以最新上报为准,不产生重复记录。
@@ -172,6 +191,9 @@ impl MasterState {
 pub enum MasterCommand {
     /// 分配一个单调 partition id。
     AllocatePartitionId,
+    /// 为某 partition 预留一段 objectId `[start, start+count)`:先经 Raft 提交抬高水位,再由 leader
+    /// 切成号段发给 client(两层批处理见 blobid-master-assign)。
+    AllocateObjectId { partition_id: PartitionId, count: u32 },
     /// 固化(或覆盖)一个节点的身份 + 容量。
     RegisterNode { node_id: NodeId, info: NodeInfo },
     /// 建分区:分配 id + 写入已选定的副本放置(选盘在 leader 侧先算,见 `placement`)。
@@ -194,6 +216,10 @@ pub enum MasterCommand {
 pub enum MasterResponse {
     /// `AllocatePartitionId` 分得的 id。
     PartitionId(PartitionId),
+    /// `AllocateObjectId` 预留的 objectId 号段 `[start, start+count)`(已提交进水位)。
+    ObjectIdRange { partition_id: PartitionId, start: ObjectId, count: u32 },
+    /// `AllocateObjectId` 时该 partition 的 u32 objectId 空间已耗尽(应改为封存该 partition,不复用)。
+    ObjectIdExhausted { partition_id: PartitionId },
     /// `RegisterNode` 成功。
     Registered,
     /// 非应用 entry(membership / blank)。
@@ -220,6 +246,41 @@ mod tests {
         assert_eq!(s.apply_command(&MasterCommand::AllocatePartitionId), MasterResponse::PartitionId(1));
         assert_eq!(s.apply_command(&MasterCommand::AllocatePartitionId), MasterResponse::PartitionId(2));
         assert_eq!(s.next_partition_id, 3);
+    }
+
+    #[test]
+    fn allocate_object_id_is_monotonic_and_partition_scoped() {
+        let mut s = MasterState::default();
+        let alloc = |s: &mut MasterState, pid, n| {
+            s.apply_command(&MasterCommand::AllocateObjectId { partition_id: pid, count: n })
+        };
+        assert_eq!(
+            alloc(&mut s, 7, 1024),
+            MasterResponse::ObjectIdRange { partition_id: 7, start: 0, count: 1024 }
+        );
+        assert_eq!(
+            alloc(&mut s, 7, 512),
+            MasterResponse::ObjectIdRange { partition_id: 7, start: 1024, count: 512 }
+        );
+        // 另一 partition 独立从 0 起,互不干扰。
+        assert_eq!(
+            alloc(&mut s, 9, 100),
+            MasterResponse::ObjectIdRange { partition_id: 9, start: 0, count: 100 }
+        );
+        assert_eq!(s.object_next[&7], 1536);
+        assert_eq!(s.object_next[&9], 100);
+    }
+
+    #[test]
+    fn allocate_object_id_guards_u32_overflow_without_wrapping() {
+        let mut s = MasterState::default();
+        s.object_next.insert(3, u32::MAX - 10);
+        // 越界申请 → 报耗尽,水位不动(绝不回绕复用)。
+        assert_eq!(
+            s.apply_command(&MasterCommand::AllocateObjectId { partition_id: 3, count: 100 }),
+            MasterResponse::ObjectIdExhausted { partition_id: 3 }
+        );
+        assert_eq!(s.object_next[&3], u32::MAX - 10, "exhausted alloc must not advance watermark");
     }
 
     #[test]

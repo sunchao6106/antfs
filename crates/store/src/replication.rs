@@ -388,7 +388,7 @@ mod tests {
     }
 
     fn hex_key(n: u8) -> String {
-        let mut b = [0u8; 32];
+        let mut b = [0u8; 8];
         b[0] = n;
         hex::encode(b)
     }

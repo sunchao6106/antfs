@@ -37,7 +37,7 @@ async fn put_get_roundtrip_and_error_codes() {
     let create = Request::post("/admin/partitions/0").body(Body::empty()).unwrap();
     assert_eq!(status_of(&router, create).await, StatusCode::CREATED);
 
-    let key = "01".repeat(32); // 32 字节 → 64 hex
+    let key = "01".repeat(8); // 8 字节 → 16 hex
     let data = b"hello ambry data plane".to_vec();
 
     // PUT。
@@ -60,12 +60,12 @@ async fn put_get_roundtrip_and_error_codes() {
     assert_eq!(status_of(&router, dup).await, StatusCode::CONFLICT);
 
     // 未知 key GET → 404。
-    let missing = "ab".repeat(32);
+    let missing = "ab".repeat(8);
     let get_missing =
         Request::get(format!("/partitions/0/blobs/{missing}")).body(Body::empty()).unwrap();
     assert_eq!(status_of(&router, get_missing).await, StatusCode::NOT_FOUND);
 
-    // 非法 key(非 32 字节)→ 400。
+    // 非法 key(非 8 字节)→ 400。
     let bad = Request::get("/partitions/0/blobs/zz").body(Body::empty()).unwrap();
     assert_eq!(status_of(&router, bad).await, StatusCode::BAD_REQUEST);
 
@@ -84,7 +84,7 @@ async fn mutations_delete_undelete_ttl() {
     let create = Request::post("/admin/partitions/0").body(Body::empty()).unwrap();
     assert_eq!(status_of(&router, create).await, StatusCode::CREATED);
 
-    let key = "07".repeat(32);
+    let key = "07".repeat(8);
     let data = b"mutable blob".to_vec();
 
     // put

@@ -111,7 +111,7 @@ mod tests {
     use crate::disk::DiskManager;
 
     fn key(n: u8) -> StoreKey {
-        StoreKey::new([n; 32])
+        StoreKey::new([n; 8])
     }
 
     fn manager(dir: &std::path::Path) -> ReplicaManager {

@@ -44,16 +44,27 @@ impl fmt::Display for LogOffset {
     }
 }
 
-/// 对象键长度(紧凑 BlobId,如 version+flags+dc+account+container+partition+uuid ≈ 32B)。
-pub const KEY_SIZE: usize = 32;
+/// 对象键长度 = blobId 定长 8B(64bit)。见 blobid-master-assign D8:高 32bit `partitionId`
+/// + 低 32bit `objectId`,无 version 位(D7,布局永久冻结)。
+pub const KEY_SIZE: usize = 8;
 
-/// 定长对象键(索引的 key)。写后不改,天然适合排序段 + Binary Fuse 过滤器。
+/// 定长对象键 = blobId(索引的 key)。写后不改,天然适合排序段 + Binary Fuse 过滤器。
+///
+/// **字节序=大端**(blobid-master-assign D8/D11 不变量):8 字节按大端存 `u64`,故
+/// 字节字典序 == 数值序 == `(partitionId, objectId)` 序 —— 同一 partition 的 key 按 objectId
+/// 排序,索引最大 key 的低 32bit 即该 partition 已用最大 objectId(D11 灾备回填水位所依赖)。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StoreKey([u8; KEY_SIZE]);
 
 impl StoreKey {
     pub fn new(bytes: [u8; KEY_SIZE]) -> Self {
         Self(bytes)
+    }
+
+    /// 由 `(partitionId, objectId)` 组合 blobId:`(partition as u64) << 32 | object`,大端落盘。
+    pub fn from_parts(partition_id: u32, object_id: u32) -> Self {
+        let v = ((partition_id as u64) << 32) | (object_id as u64);
+        Self(v.to_be_bytes())
     }
 
     pub fn from_slice(s: &[u8]) -> Option<Self> {
@@ -66,6 +77,21 @@ impl StoreKey {
 
     pub fn as_bytes(&self) -> &[u8; KEY_SIZE] {
         &self.0
+    }
+
+    /// blobId 的 64bit 数值视图(大端解码)。
+    pub fn as_u64(&self) -> u64 {
+        u64::from_be_bytes(self.0)
+    }
+
+    /// 高 32bit:定位用的 `partitionId`(自带定位,D3)。
+    pub fn partition_id(&self) -> u32 {
+        (self.as_u64() >> 32) as u32
+    }
+
+    /// 低 32bit:partition 内单调发放的 `objectId`。
+    pub fn object_id(&self) -> u32 {
+        (self.as_u64() & 0xFFFF_FFFF) as u32
     }
 
     /// FNV-1a 64 位散列,供 Binary Fuse 过滤器使用(进程内一致即可)。
@@ -88,5 +114,49 @@ impl fmt::Debug for StoreKey {
             write!(f, "{b:02x}")?;
         }
         write!(f, ")")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blobid_codec_roundtrips_parts() {
+        let k = StoreKey::from_parts(0x0102_0304, 0x0A0B_0C0D);
+        assert_eq!(k.partition_id(), 0x0102_0304);
+        assert_eq!(k.object_id(), 0x0A0B_0C0D);
+        assert_eq!(k.as_u64(), 0x0102_0304_0A0B_0C0D);
+    }
+
+    #[test]
+    fn blobid_big_endian_layout() {
+        let k = StoreKey::from_parts(1, 2);
+        assert_eq!(k.as_bytes(), &[0, 0, 0, 1, 0, 0, 0, 2]);
+    }
+
+    #[test]
+    fn blobid_extremes() {
+        let k = StoreKey::from_parts(u32::MAX, u32::MAX);
+        assert_eq!(k.partition_id(), u32::MAX);
+        assert_eq!(k.object_id(), u32::MAX);
+        assert_eq!(k.as_u64(), u64::MAX);
+    }
+
+    #[test]
+    fn byte_order_equals_partition_then_object_order() {
+        // D11 不变量:字节字典序 == (partitionId, objectId) 数值序。
+        let same_part_lo = StoreKey::from_parts(5, 10);
+        let same_part_hi = StoreKey::from_parts(5, 11);
+        let next_part = StoreKey::from_parts(6, 0);
+        assert!(same_part_lo < same_part_hi);
+        assert!(same_part_hi < next_part);
+    }
+
+    #[test]
+    fn from_slice_enforces_key_size() {
+        assert!(StoreKey::from_slice(&[0u8; KEY_SIZE]).is_some());
+        assert!(StoreKey::from_slice(&[0u8; KEY_SIZE - 1]).is_none());
+        assert!(StoreKey::from_slice(&[0u8; KEY_SIZE + 1]).is_none());
     }
 }

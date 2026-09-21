@@ -193,7 +193,7 @@ async fn put_blob(
     body: Bytes,
 ) -> Response {
     let Some(key) = parse_key(&key_hex) else {
-        return (StatusCode::BAD_REQUEST, "key must be 32 bytes (64 hex)").into_response();
+        return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
     };
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
@@ -221,7 +221,7 @@ async fn get_blob(
     Query(params): Query<GetParams>,
 ) -> Response {
     let Some(key) = parse_key(&key_hex) else {
-        return (StatusCode::BAD_REQUEST, "key must be 32 bytes (64 hex)").into_response();
+        return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
     };
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
@@ -301,7 +301,7 @@ async fn delete_blob(
     Path((pid, key_hex)): Path<(PartitionId, String)>,
 ) -> Response {
     let Some(key) = parse_key(&key_hex) else {
-        return (StatusCode::BAD_REQUEST, "key must be 32 bytes (64 hex)").into_response();
+        return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
     };
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
@@ -328,7 +328,7 @@ async fn undelete_blob(
     Path((pid, key_hex)): Path<(PartitionId, String)>,
 ) -> Response {
     let Some(key) = parse_key(&key_hex) else {
-        return (StatusCode::BAD_REQUEST, "key must be 32 bytes (64 hex)").into_response();
+        return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
     };
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
@@ -356,7 +356,7 @@ async fn update_ttl_blob(
     Query(params): Query<TtlParams>,
 ) -> Response {
     let Some(key) = parse_key(&key_hex) else {
-        return (StatusCode::BAD_REQUEST, "key must be 32 bytes (64 hex)").into_response();
+        return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
     };
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();

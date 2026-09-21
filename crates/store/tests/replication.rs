@@ -17,7 +17,7 @@ fn small_store_config() -> blob::StoreConfig {
 }
 
 fn key(n: u8) -> StoreKey {
-    let mut b = [0u8; 32];
+    let mut b = [0u8; 8];
     b[0] = n;
     StoreKey::from_slice(&b).unwrap()
 }

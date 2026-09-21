@@ -1828,10 +1828,7 @@ mod tests {
     }
 
     fn key(n: u64) -> StoreKey {
-        let mut b = [0u8; KEY_SIZE];
-        b[0..8].copy_from_slice(&n.to_le_bytes());
-        b[24..32].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
-        StoreKey::new(b)
+        StoreKey::new(n.to_be_bytes())
     }
 
     #[test]

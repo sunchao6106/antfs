@@ -20,6 +20,8 @@ fn normal_ent(index: u64, cmd: MasterCommand) -> Entry<TypeConfig> {
 fn arb_cmd() -> impl Strategy<Value = MasterCommand> {
     prop_oneof![
         Just(MasterCommand::AllocatePartitionId),
+        (0u32..4, 1u32..1000)
+            .prop_map(|(partition_id, count)| MasterCommand::AllocateObjectId { partition_id, count }),
         (0u64..8, 1u64..1000).prop_map(|(node_id, cap)| MasterCommand::RegisterNode {
             node_id,
             info: NodeInfo {
@@ -46,7 +48,7 @@ proptest! {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("master.redb");
 
-            let (applied_before, nodes_before, next_pid_before) = {
+            let (applied_before, nodes_before, next_pid_before, object_next_before) = {
                 let (_ls, mut sm) = open(&path, MasterMetrics::disabled()).unwrap();
                 let entries: Vec<_> = cmds
                     .iter()
@@ -59,7 +61,7 @@ proptest! {
                 let (applied, _mem) = sm.applied_state().await.unwrap();
                 let data = sm.shared_data();
                 let g = data.read().unwrap();
-                (applied, g.state.nodes.clone(), g.state.next_partition_id)
+                (applied, g.state.nodes.clone(), g.state.next_partition_id, g.state.object_next.clone())
             };
 
             // 重开:模拟进程重启后从 redb 恢复。
@@ -71,6 +73,7 @@ proptest! {
             prop_assert_eq!(applied_after, applied_before, "last_applied must survive reopen");
             prop_assert_eq!(&g2.state.nodes, &nodes_before, "node registry must survive reopen");
             prop_assert_eq!(g2.state.next_partition_id, next_pid_before, "id allocator must survive reopen");
+            prop_assert_eq!(&g2.state.object_next, &object_next_before, "objectId watermark must survive reopen");
             Ok(())
         })?;
     }

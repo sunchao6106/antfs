@@ -62,9 +62,7 @@ mod tests {
     use super::*;
 
     fn key(n: u64) -> StoreKey {
-        let mut b = [0u8; 32];
-        b[0..8].copy_from_slice(&n.to_le_bytes());
-        StoreKey::new(b)
+        StoreKey::new(n.to_be_bytes())
     }
 
     fn off(n: u64) -> LogOffset {

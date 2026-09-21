@@ -139,7 +139,7 @@ async fn store_server_joins_master_and_serves_directed_replica() {
 
     // 经数据面 HTTP put/get(oneshot 命中同一 ReplicaManager)。
     let router = ss.router();
-    let key = "0f".repeat(32);
+    let key = "0f".repeat(8);
     let data = b"s2 end-to-end blob".to_vec();
     let put = Request::put(format!("/partitions/{pid}/blobs/{key}"))
         .body(Body::from(data.clone()))

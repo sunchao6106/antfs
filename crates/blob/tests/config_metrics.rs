@@ -25,7 +25,7 @@ fn unique_dir() -> std::path::PathBuf {
 }
 
 fn key(n: u8) -> StoreKey {
-    StoreKey::new([n; 32])
+    StoreKey::new([n; 8])
 }
 
 #[test]

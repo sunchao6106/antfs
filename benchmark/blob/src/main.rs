@@ -89,12 +89,9 @@ fn print_help() {
     );
 }
 
-/// 由序号生成 32 字节 key(前 8 字节小端序号,后 8 字节散列扰动,避免键分布退化)。
+/// 由序号生成 8 字节 key(黄金比奇常数乘法散列;u64 上的双射,保唯一且分布均匀,避免键分布退化)。
 fn make_key(n: u64) -> StoreKey {
-    let mut b = [0u8; 32];
-    b[0..8].copy_from_slice(&n.to_le_bytes());
-    b[24..32].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
-    StoreKey::new(b)
+    StoreKey::new(n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes())
 }
 
 /// xorshift64*,无依赖的确定性伪随机(GET 阶段选 key)。
