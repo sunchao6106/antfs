@@ -5,6 +5,8 @@ use crate::types::LogOffset;
 pub const FLAG_DELETED: u8 = 1 << 0;
 pub const FLAG_TTL_UPDATED: u8 = 1 << 1;
 pub const FLAG_UNDELETED: u8 = 1 << 2;
+/// 记录的数据体已被硬删除清零(隐私擦除),用于幂等跳过已擦除记录。
+pub const FLAG_HARD_DELETED: u8 = 1 << 3;
 
 /// 无过期时间。
 pub const NO_EXPIRATION: i64 = -1;

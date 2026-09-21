@@ -152,6 +152,26 @@
 - 验证:新增 5 测(复活+lv 递增、拒非删态、重开/重建保留、复活数据过 compaction、PUT 回收后永久删);
   共 34 单测 + 崩溃属性 + smoke 全绿;clippy 零告警。
 
+## 步骤 16:updateTtl(移除过期时间)
+
+- `update_ttl(key)`:对齐 Ambry「仅支持移除 TTL(置永久)」;写 `FLAG_TTL_UPDATED`、复制原数据、
+  `expiration=NO_EXPIRATION`、`life_version` 不变的整记录成为赢家(数据重写模式,同 undelete)。
+- 校验:不存在→`NotFound`,已删除→`Deleted`,TTL 已更新→`AlreadyUpdated`(新增 Error);启用此前未用的 `FLAG_TTL_UPDATED`。
+
+## 步骤 17:只读查询与自省(对齐 Store 契约)
+
+- `stat(key)→BlobMeta`:不读数据体拿状态(deleted/undeleted/ttl_updated/expired)+ expiration + life_version + data_len
+  (对齐 Ambry `findKey`/`isKeyDeleted`)。
+- `get_with_options(key, include_deleted, include_expired)`(对齐 `StoreGetOptions`):已删对象数据从原 PUT 读回。
+- `size_in_bytes()`/`is_empty()`(对齐 `getSizeInBytes`/`isEmpty`)。
+
+## 步骤 18:HardDeleter(隐私擦除)
+
+- `hard_delete()`:扫墓碑对象,把其原 PUT 数据字节**就地清零** + 置 `FLAG_HARD_DELETED` + 重算 crc 整条写回,
+  在 compaction 回收前抹除明文(对齐 Ambry `HardDeleter`)。幂等、多段末尾统一 fsync。
+- 新增 `LogSegment::overwrite_at`/`Log::overwrite_at`/`Log::flush_all`(就地覆盖已写区间,不改 data_end)。
+- 验证:新增 updateTtl 2 测 + 只读查询 1 测 + 硬删除 1 测;共 38 单测 + 崩溃属性 + smoke 全绿;clippy 零告警。
+
 ## 待办
 
 - 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。

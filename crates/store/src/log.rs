@@ -116,6 +116,28 @@ impl Log {
         entry.segment.read(at.offset, len)
     }
 
+    /// 就地覆盖 `at` 起的已写字节(不改 data_end,不得跨段)。用于硬删除原地擦除。
+    pub fn overwrite_at(&mut self, at: LogOffset, bytes: &[u8]) -> Result<()> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.position == at.segment)
+            .ok_or(Error::OutOfRange {
+                offset: at.offset,
+                len: bytes.len(),
+                data_end: 0,
+            })?;
+        entry.segment.overwrite_at(at.offset, bytes)
+    }
+
+    /// 持久化所有段(硬删除擦除多段后统一 fsync)。
+    pub fn flush_all(&mut self) -> Result<()> {
+        for e in self.entries.iter_mut() {
+            e.segment.flush()?;
+        }
+        Ok(())
+    }
+
     /// 持久化活跃段(已滚动的旧段在滚动时已 flush)。
     pub fn flush(&mut self) -> Result<()> {
         self.active_mut().segment.flush()

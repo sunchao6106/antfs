@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::index::value::{FLAG_DELETED, FLAG_TTL_UPDATED, FLAG_UNDELETED, NO_EXPIRATION};
+use crate::index::value::{
+    FLAG_DELETED, FLAG_HARD_DELETED, FLAG_TTL_UPDATED, FLAG_UNDELETED, NO_EXPIRATION,
+};
 use crate::index::{IndexValue, PersistentIndex};
 use crate::log::Log;
 use crate::log_segment::LogSegment;
@@ -339,6 +341,53 @@ impl BlobStore {
     /// 库是否为空(尚无任何记录)。
     pub fn is_empty(&self) -> bool {
         self.size_in_bytes() == 0
+    }
+
+    /// 硬删除:把已软删(墓碑)对象的原 PUT 数据字节**就地清零**(对齐 Ambry `HardDeleter` 的隐私擦除),
+    /// 在 compaction 回收前即抹除明文。返回被擦除的对象数;幂等(已擦除的跳过)。
+    pub fn hard_delete(&mut self) -> Result<usize> {
+        let mut puts: Vec<LogOffset> = Vec::new();
+        for_each_record(&self.log, |off, _raw, decoded| {
+            if decoded.flags & FLAG_DELETED != 0 {
+                if let Some(v) = self.index.find(&decoded.key) {
+                    if v.is_deleted() && v.offset == off {
+                        puts.push(v.original_offset);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        let mut scrubbed = 0usize;
+        for po in puts {
+            if self.scrub_put(po)? {
+                scrubbed += 1;
+            }
+        }
+        if scrubbed > 0 {
+            self.log.flush_all()?;
+        }
+        Ok(scrubbed)
+    }
+
+    /// 把 `at` 处 PUT 记录的数据清零、置 `FLAG_HARD_DELETED` 并重算 crc,整条写回。
+    /// PUT 已被回收/非 PUT/已擦除则跳过。返回是否实际擦除。
+    fn scrub_put(&mut self, at: LogOffset) -> Result<bool> {
+        let (mut raw, decoded) = match read_full_record(&self.log, at) {
+            Ok(x) => x,
+            Err(_) => return Ok(false),
+        };
+        if decoded.flags & (FLAG_DELETED | FLAG_HARD_DELETED) != 0 {
+            return Ok(false);
+        }
+        let crc_at = rec::DATA + decoded.data.len();
+        for b in raw[rec::DATA..crc_at].iter_mut() {
+            *b = 0;
+        }
+        raw[rec::FLAGS] |= FLAG_HARD_DELETED;
+        let crc = crc32fast::hash(&raw[..crc_at]);
+        raw[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        self.log.overwrite_at(at, &raw)?;
+        Ok(true)
     }
 
     /// 删除一个对象:追加墓碑记录并在索引写入删除条目。不存在/已删除报错。
@@ -1484,6 +1533,31 @@ mod tests {
         assert!(matches!(store.get(&key(2)), Err(Error::Expired)));
         assert_eq!(store.get_with_options(&key(2), false, true).unwrap(), b"temp".to_vec());
         store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hard_delete_scrubs_deleted_blob_data() {
+        let dir = temp_dir("hard");
+        let seg = seg_cap(16);
+        let mut store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        store.put(key(1), b"secret-data").unwrap();
+        store.put(key(2), b"keep-this").unwrap();
+        store.delete(key(1)).unwrap();
+        // 删除后 include_deleted 仍能读到明文。
+        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), b"secret-data".to_vec());
+
+        assert_eq!(store.hard_delete().unwrap(), 1, "one deleted blob scrubbed");
+        // 原数据被清零;未删除的 key(2) 不受影响;幂等。
+        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), vec![0u8; 11]);
+        assert_eq!(store.get(&key(2)).unwrap(), b"keep-this".to_vec());
+        assert_eq!(store.hard_delete().unwrap(), 0, "idempotent");
+
+        // 重开后擦除持久。
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        assert_eq!(store.get_with_options(&key(1), true, false).unwrap(), vec![0u8; 11]);
+        assert_eq!(store.get(&key(2)).unwrap(), b"keep-this".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
