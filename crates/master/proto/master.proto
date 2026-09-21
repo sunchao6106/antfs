@@ -1,0 +1,224 @@
+syntax = "proto3";
+
+// master 控制面 + Raft 内部传输(D2:控制面 gRPC)。所有消息带 `version` 字段以保前后兼容(§3.4)。
+// blob 数据面走裸 HTTP 流式,不在此 proto(D2)。
+package master.v1;
+
+// 控制面:数据节点 ↔ master。写请求(RegisterNode)只有 leader 能提交,follower 返回 leader 地址重定向。
+service Master {
+  rpc RegisterNode(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(stream NodeBeat) returns (stream MasterDirective);
+  rpc ListNodes(ListNodesRequest) returns (NodeList);
+  rpc GetClusterState(ClusterStateRequest) returns (ClusterState);
+  rpc CreatePartitions(CreatePartitionsRequest) returns (CreatePartitionsResponse);
+  rpc LookupPartition(LookupRequest) returns (PartitionLocations);
+  rpc AssignPartition(AssignRequest) returns (AssignResponse);
+  rpc DecommissionNode(DecommissionRequest) returns (DecommissionResponse);
+  rpc ListPartitions(ListPartitionsRequest) returns (ListPartitionsResponse);
+  rpc SetPartitionState(SetPartitionStateRequest) returns (SetPartitionStateResponse);
+}
+
+// Raft 内部 RPC:master ↔ master(openraft 消息以序列化字节承载,避免逐字段镜像 openraft 内部类型)。
+service RaftInternal {
+  rpc AppendEntries(RaftMessage) returns (RaftMessage);
+  rpc Vote(RaftMessage) returns (RaftMessage);
+  rpc InstallSnapshot(RaftMessage) returns (RaftMessage);
+}
+
+message DiskBeat {
+  string disk_id = 1;
+  uint64 capacity_bytes = 2;
+  uint64 free_bytes = 3;
+  reserved 4; // 原 tag(hdd/ssd),已移除;保留字段号防复用(§3.4)
+  string health = 5; // 主动探测结果(HEALTHY / WRITE_TIMEOUT / ...),S2
+}
+
+message RegisterRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;   // 准入校验(Q1 安全点)
+  uint64 node_id = 3;
+  string dc = 4;
+  string rack = 5;
+  string addr = 6;
+  repeated DiskBeat disks = 7;
+}
+
+message RegisterResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;      // 非 leader 时回填,供 client 重定向
+  string error = 4;
+}
+
+message NodeBeat {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint64 node_id = 3;
+  repeated DiskBeat disks = 4; // 各盘实时余量(软状态)
+  bool full_report = 5;
+  repeated ReplicaBeat replicas = 6; // 本节点承载副本的 current_state(M3)
+}
+
+// 一个副本的实然态上报(M3)。
+message ReplicaBeat {
+  uint64 partition_id = 1;
+  string disk_id = 2;
+  string current_state = 3; // OFFLINE/BOOTSTRAP/ACTIVE/INACTIVE/ERROR ...
+  uint64 lag_bytes = 4;
+}
+
+// master → 节点:把某副本推向目标态(M3)。
+message Transition {
+  uint64 partition_id = 1;
+  string disk_id = 2;
+  string target_state = 3;
+}
+
+// master → 节点:后台任务提示(M3:再复制)。
+message Task {
+  string kind = 1;          // "rereplicate" ...
+  uint64 partition_id = 2;
+}
+
+message MasterDirective {
+  uint32 version = 1;
+  repeated Transition transitions = 2; // current!=target 的副本转移指令
+  repeated Task tasks = 3;             // 再复制等任务提示
+}
+
+message ListNodesRequest { uint32 version = 1; }
+
+message NodeEntry {
+  uint64 node_id = 1;
+  string dc = 2;
+  string rack = 3;
+  string addr = 4;
+  bool up = 5;
+  repeated DiskBeat disks = 6;
+}
+
+message NodeList {
+  uint32 version = 1;
+  repeated NodeEntry nodes = 2;
+}
+
+message ClusterStateRequest { uint32 version = 1; }
+
+message ClusterState {
+  uint32 version = 1;
+  uint64 this_node = 2;
+  optional uint64 leader = 3;
+  uint64 term = 4;
+  uint64 registered_nodes = 5;
+  uint64 next_partition_id = 6;
+}
+
+// openraft 请求/响应经 JSON 序列化放进 payload,避免在 proto 里镜像 openraft 内部类型演进。
+message RaftMessage {
+  uint32 version = 1;
+  bytes payload = 2;
+}
+
+message CreatePartitionsRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint32 count = 3;              // 建多少个分区
+  uint32 replication_factor = 4; // 0 = 用集群默认策略
+}
+
+message CreatePartitionsResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;        // 非 leader 时回填
+  string error = 4;
+  repeated uint64 partition_ids = 5;
+}
+
+// 一个副本的定位(读路由用):节点 + 盘 + 目标态 + 存活。
+message ReplicaLoc {
+  uint64 node_id = 1;
+  string addr = 2;
+  string disk_id = 3;
+  string target_state = 4;
+  bool up = 5;
+}
+
+message LookupRequest {
+  uint32 version = 1;
+  uint64 partition_id = 2;
+}
+
+message PartitionLocations {
+  uint32 version = 1;
+  uint64 partition_id = 2;
+  string state = 3;              // RW / RO / SEALED
+  repeated ReplicaLoc replicas = 4;
+}
+
+message AssignRequest {
+  uint32 version = 1;
+}
+
+message AssignResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  uint64 partition_id = 3;
+  repeated ReplicaLoc replicas = 4;
+  string error = 5;
+}
+
+message DecommissionRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint64 node_id = 3;
+}
+
+message DecommissionResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;
+  string error = 4;
+}
+
+message ListPartitionsRequest {
+  uint32 version = 1;
+  uint64 offset = 2; // 分页起始(按 partition_id 升序)
+  uint32 limit = 3;  // 0 = 不限(返回全部)
+}
+
+// 一个副本的实然态(软状态,心跳上报)。
+message ReplicaCurrent {
+  uint64 node_id = 1;
+  string current_state = 2; // OFFLINE/BOOTSTRAP/ACTIVE/INACTIVE/ERROR ...
+  uint64 lag_bytes = 3;
+}
+
+// 一个分区的全量视图(admin dashboard 用):hard placement + soft current。
+message PartitionEntry {
+  uint64 partition_id = 1;
+  string state = 2;              // RW / RO / SEALED
+  uint32 replication_factor = 3;
+  repeated ReplicaLoc replicas = 4;      // node/addr/disk/target_state/up
+  repeated ReplicaCurrent currents = 5;  // partition×node 的实然态
+}
+
+message ListPartitionsResponse {
+  uint32 version = 1;
+  repeated PartitionEntry partitions = 2;
+  uint64 total = 3; // 分区总数(分页用)
+}
+
+message SetPartitionStateRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint64 partition_id = 3;
+  string state = 4; // RW / RO / SEALED
+}
+
+message SetPartitionStateResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;
+  string error = 4;
+}
+

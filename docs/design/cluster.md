@@ -6,25 +6,31 @@
 ## 1. 角色划分(目标形态)
 
 ```
-                 ┌──────────────────────────┐
-   client ──S3──▶│  frontend / S3 网关       │  无状态门面,内嵌 Router:分块/选副本/写 quorum
-                 └───────────┬──────────────┘
-             控制面 gRPC      │ 数据面 HTTP 流式
-        (assign/lookup)       ▼
-   ┌──────────┐  心跳/放置  ┌──────────────────┐   拉式复制(anti-entropy)
-   │  master  │◀──gRPC────▶│  server/DataNode  │◀──────────────────▶ 其它 server
-   │ 内建Raft │  状态转移   │  store 引擎 + 复制 │  gRPC(ReplicaMetadata)+ HTTP(拉 blob)
-   └──────────┘            └──────────────────┘
+  app + client SDK ──gRPC(lookup/assign)──▶ master     (Router 逻辑内嵌 SDK,无独立 frontend)
+       │  ──HTTP 数据面(put W=2 / get R=1)──▶ store server  ← 直连,无中间跳
+       ▼
+  [可选] gateway(S3/REST 翻译 + auth;内嵌同一 client SDK;仅外部/多租户需要)
+
+  master ◀─心跳/放置(gRPC)─▶ store server ◀─拉复制(gRPC ReplicaMetadata + HTTP 拉 blob)─▶ 其它 store server
    集群大脑:partition→replica 放置、节点状态机、故障处置(取代 Ambry 的 Helix+ZK)
 ```
 
 | 角色 | 职责 | 状态 |
 |---|---|---|
-| **server / DataNode** | 承载 [`store`](./store.md) 引擎,服务 CRUD,跑副本复制 | 引擎已成型,服务层规划中 |
-| **master** | partition→replica 放置、节点/副本状态机、故障处置;**内建 Raft**(自包含,不依赖外部协调器) | 规划 |
-| **frontend / S3 网关** | 无状态门面,内嵌 Router:分块、选副本、写 quorum、读切副本 | 规划 |
-| **scheduler**(待定) | compaction / 修复 / 均衡 / GC 的独立调度角色 | 待定(见 §4) |
-| **EC 冷层**(待定) | 老数据纠删码降本 | 待定(见 §4) |
+| **store server**(数据节点) | 承载 [`store`](./store.md) 引擎(挂 N disk、每 disk 一堆 BlobStore),服务 put/get,跑副本复制 | 引擎已成型,服务层规划(见 §9) |
+| **master** | partition→replica 放置、节点/副本状态机、故障处置;**内建 Raft**(自包含,不依赖外部协调器) | 规划(见 §7) |
+| **client SDK**(取代 frontend) | Router 逻辑做成**库**、链接进客户端 app:缓存拓扑/可写分区、拼 blobId(objectId 用 master 号段发的号)、直连 store server 做 W/R、重试切副本。**无独立 frontend 集群** | 规划 |
+| **gateway**(可选) | S3/REST 翻译 + auth/quota;内嵌同一 client SDK;**仅外部/多租户需要** | 可选 |
+| **scheduler**(待定 P1) | 集群级 compaction 编排 / 再复制 / 均衡 / EC 调度 | 待定(见 §4) |
+| **admin web**(独立服务) | 运维操作(经 master admin gRPC)+ 控制面状态 dashboard(拓扑/节点/盘/分区/副本);指标时序复用 Prometheus+Grafana;需 operator 鉴权 | 规划 |
+| **EC 冷层**(D5) | 老数据纠删码降本 | 已锁(见 §5) |
+
+> **去掉 frontend 的连带**:① 鉴权归属——MVP 内部可信 SDK 先不做细粒度,需要时由可选 gateway / store server 粗校验承担(对齐 §8 B 不编 account/container、多租户推后);② S3/外部 → 可选 gateway(复用 SDK),非必需角色。
+
+> **两种接入模式(并存,复用同一套 SDK / blobId / 数据面)**:
+> - **① 直连模式(SeaweedFS blob 式)**:app 内嵌 client SDK,直接 gRPC 问 master(lookup/assign)+ HTTP 直连 store server 读写,**无中间跳**,低延迟高吞吐;适合**内部可信服务**。blobId 即取件凭证(对齐 SeaweedFS fid 直连 volume 的裸用姿势)。
+> - **② 网关模式(REST / S3)**:app 走 **gateway**(内嵌同一 SDK)做 S3/REST 协议翻译 + auth/quota;适合**外部 / 多租户 / 标准 S3 客户端**。
+> - 关系:gateway 只是在**同一 SDK 之上**叠"协议翻译 + 鉴权"层,底层 blobId、发号、W/R 数据面完全一致;两模式非互斥,可同集群并存。
 
 ## 2. 已定选型(locked)
 
@@ -142,7 +148,7 @@ active(副本) ──写满 rollover──▶ sealed(副本) ──静默 ≥ ec
 ```
 IdAllocator   { next_partition_id: u64 }                         // 单调,类 SeaweedFS MaxVolumeId
 Nodes         map<NodeId, { dc, rack, addr, disks: map<DiskId,   // 自注册后固化的身份+容量
-                  { capacity_bytes, tag }>, registered_at }>
+                  { capacity_bytes }>, registered_at }>
 Partitions    map<PartitionId, {
                   replication_factor,
                   state: RW | RO | SEALED,                       // 分区级写入闸门
@@ -192,6 +198,7 @@ RoutingIndex   map<PartitionId, [ 存活副本位置 ]>                         
     if current_state != target_state:  下发 MasterDirective.transition(target_state)
     if 节点失联(last_beat 超时):        标 ERROR → 选新盘 → 追加 replica(target=BOOTSTRAP)→ 产"再复制任务"
     if 磁盘将满/不均衡:                  产"再平衡任务"(P1 scheduler 执行)
+    if 可写容量/可写分区 < 水位(Q5):    自动 CreatePartitions(rack-aware+容量感知放置)——需防抖/限速/上限
 ```
 master **只决策、只下发任务**,不亲自搬数据(D1);执行在 server/scheduler(P1)。
 
@@ -252,17 +259,277 @@ message MasterDirective {
 > 状态:**探索中**,未锁进 §6。落地走 OpenSpec change(`master-node`)时逐条定案。
 
 **分期 TODO(每期可独立验收)**:
-- [ ] **M1 骨架**:openraft 起 3 节点 + 选主;节点自注册(心跳→raft 成员表);单调 partition_id;软状态(存活/容量)内存;gRPC `Heartbeat(stream)`/`RegisterNode`/`ListNodes`。**不做放置**。
-- [ ] **M2 放置**:`CreatePartitions`(分配 id + 故障域 rack-aware 选盘 + 写 raft placement)+ **容量感知选盘(余量 ≥ partition 上界且相近的 N 块盘;盘将满转 RO、不再放新,见 §7.3)** + `LookupPartition` + 路由索引心跳重建 + `AssignPartition`(取可写分区)。- [ ] **M3 调谐**:副本状态机(BOOTSTRAP→STANDBY/LEADER,§7.2)+ 心跳失联检测 → 产再复制任务。
-- [ ] **M4 再平衡/EC 钩子**:容量均衡、decommission、对接 D5 EC 转换决策。
+- [x] **M1 骨架**:openraft 起 3 节点 + 选主;节点自注册(心跳→raft 成员表);单调 partition_id;软状态(存活/容量)内存;gRPC `Heartbeat(stream)`/`RegisterNode`/`ListNodes`。**不做放置**。**(已实现:`crates/master`,redb 后端过 openraft `Suite::test_all` + 崩溃恢复属性测试 + 3 节点集成测试;配置/监控见 §7.7)**
+- [x] **M2 放置**:`CreatePartitions`(分配 id + 故障域 rack-aware 选盘 + 写 raft placement)+ **容量感知选盘(余量 ≥ partition 上界且相近的 N 块盘;盘将满转 RO、不再放新,见 §7.3)** + `LookupPartition` + 路由索引心跳重建 + `AssignPartition`(取可写分区)。**(已实现:`crates/master`——M2a 选盘纯函数 + `CreatePartition` 确定性 apply;M2b `CreatePartitions`/`LookupPartition`/`AssignPartition` gRPC(路由由 hard-state placement + 软状态 liveness 直接联表,未单设 RoutingIndex 缓存);M2c Q5 自动扩容 loop + 防抖/限速/上限护栏;过属性测试 + 3 节点集成测试。见 `openspec/changes/master-placement/`)**
+- [x] **M3 调谐**:副本状态机(BOOTSTRAP→STANDBY/LEADER,§7.2)+ 心跳失联检测 → 产再复制任务。**(已实现:`crates/master`——`reconcile.rs` 纯决策 `plan_transitions`/`plan_rereplication`;心跳反应式下发转移(current≠target)、leader-only 后台 loop 失联检测 → `AddReplica` 再复制补副本;过属性/单测 + 集成测试(转移下发 + 失联再复制)。见 `openspec/changes/master-reconcile/`。转移/拉复制的**执行**待 store server。)**
+- [ ] **M4 再平衡/EC 钩子**:容量均衡、decommission、对接 D5 EC 转换决策。**(decommission 已实现:`crates/master`——`decommissioning` hard state + `DecommissionNode`/`RemoveReplica` 命令 + `plan_evacuation` 先补后删 evacuation(守 §3.1),过单测 + 集成测试(103 下线→迁到 104→移除 103)。见 `openspec/changes/master-decommission/`。容量再平衡 / D5 EC 转换钩子**推迟**:EC 依赖 store server + 封存段语义(§5)。)**
 
 **待拍决策(实现前确认)**:
-- [ ] **Q1 节点注册 / 单机盘识别**:自注册 + 固化(SeaweedFS,倾向)vs 人工 HardwareLayout(Ambry)。
+- [x] **Q1 节点注册 / 单机盘识别**:**自注册**——节点启动后心跳自报(节点 + 盘 + `statfs` 探到的**真实容量**),master 固化(不采 Ambry 写死配置)。⚠ **准入**:自注册需节点身份校验(防乱入),这是安全点。
   - 证据(源码核实):Ambry `DiskId.getRawCapacityInBytes()` 来自 HardwareLayout 配置、从不探盘,可用空间靠进程内 `decrease/increaseAvailableSpaceInBytes` 记账;SeaweedFS `DiskLocation.CheckDiskSpace` 周期 `statfs` 上报真实 total/free 供均衡,`-max 0` = 空闲空间÷volume 大小自动定槽,`vol_dir.uuid`+`os.SameFile` 认盘去重,`loadExistingVolumes` 扫目录自恢复中断的 compaction 也一并回滚/前滚。
   - 倾向:取 SeaweedFS「配置给目录列表 → 节点 `statfs` 探真实容量 + 扫目录自恢复 + 健康探测上报 master」,不采 Ambry 把容量写死配置的做法(详见 §3「单机盘识别」行)。
-- [ ] **Q2 Raft 边界**:锁在 §7.1 hard-state(id/Nodes/Partitions/Policy),其余全软?(倾向 是)
-- [ ] **Q3 Raft 存储后端**:`redb`(倾向,纯 Rust 嵌入式、崩溃安全)vs 纯内存+快照;**不用 RocksDB**。
-- [ ] **Q4 LEADER/STANDBY**:MVP 单 DC 折叠成 `ACTIVE`(倾向),多 DC 再启用 LEADER 做跨 DC 拉复制。
-- [ ] **Q5 partition 分配触发**:手动 `CreatePartitions` + master 内置 rack-aware 自动放置(倾向,替代 Ambry 的静态 JSON+bootstrap);自动扩容(容量水位触发)留后。
-- [ ] **Q6 admin 入口**:MVP 只给 gRPC/CLI(不做开箱 web 控制台,保持轻)。
-- [ ] **Assign 交互对齐 SeaweedFS**:master 发 id + 位置,client 直连存储节点走 HTTP 写(D2/D4);master 不碰数据字节。
+- [x] **Q2 Raft 边界**:锁在 §7.1 hard-state(id/Nodes/Partitions/Policy),其余全软(心跳重建)。
+- [x] **Q3 Raft 存储后端**:**现阶段用 `redb`**(纯 Rust 嵌入式、崩溃安全);**不用 RocksDB**。
+- [x] **Q4 LEADER/STANDBY**:**副本之间不区分**(统一 `ACTIVE`,不选 leader);多 DC 若需跨 DC 省带宽再议。
+- [x] **Q5 partition 分配触发**:**自动扩容**——master 监测可写容量/分区水位,**自动建新分区**(rack-aware + 容量感知放置,§7.3);`CreatePartitions` 仍作机制供 admin 手动调。⚠ 需**防抖/限速 + 上限**(避免水位抖动导致过量建分区)。
+- [x] **Q6 admin 入口**:**做 admin web**(独立 `admin` 服务,对齐 CubeFS `console`/SeaweedFS `weed admin`)——(a) **运维操作**:经 master admin gRPC(§7.4)建分区/decommission/触发 compaction/开关复制/触发 EC/标 RO 等;(b) **控制面状态 dashboard**:拓扑 + 节点/盘/分区/副本 状态机态/容量/健康(admin web 自建);(c) **指标时序**复用 **Prometheus + Grafana**(metric crate 已导出 /metrics),内嵌/外链,**不自造时序图表**;(d) 需 **operator 鉴权**。gRPC/CLI 仍保留作底层入口。
+- [x] **Assign 交互对齐 SeaweedFS**:master 发 id + 位置,client 直连存储节点走 HTTP 写(D2/D4);master 不碰数据字节。
+- [x] **Q7 blobId 的对象标识**:blobId = 64bit = `partitionId`(高32) + `objectId`(低32);**objectId = master 按 partition 单调号段发号**(号段批处理不进 per-object 写路径,Raft 水位持久化容忍空洞永不复用)。见 §8 + `openspec/changes/blobid-master-assign`。
+
+### 7.7 M1 配置项清单 / 监控项清单(CLAUDE.md §7 必须项)
+
+> 与 `crates/master` 的 `impl Default`+`Validate`(配置)、指标注册处(监控)逐项对齐;改代码即改表。
+
+**配置项清单**(`MasterConfig`,TOML `[master]` 表下):
+
+| key | 类型 | 默认值 | 取值/校验 | 含义/影响 |
+|---|---|---|---|---|
+| `master.node_id` | u64 | 1 | ≥1 | 本节点在 raft 集群里的稳定 id(跨重启不变) |
+| `master.raft_addr` | String | `127.0.0.1:7100` | 非空 | `RaftInternal` gRPC 监听地址 |
+| `master.grpc_addr` | String | `127.0.0.1:7101` | 非空 | 控制面 `Master` gRPC 监听地址 |
+| `master.data_dir` | String | `master-data` | 非空 | redb 目录(Raft log + 状态机快照) |
+| `master.initial_members` | Vec\<u64\> | `[]` | — | 初始成员集(引导);空=由外部 `initialize` 引导 |
+| `master.cluster_secret` | String | `""` | — | 准入密钥(Q1);空=关校验(仅本地测试) |
+| `master.heartbeat_timeout_secs` | u64 | 15 | ≥1 | 超过则软状态标节点 down |
+| `master.partition_capacity_bytes` | u64 | 100 GiB | ≥1 | 分区容量上界;选盘时盘可用容量须 ≥ 它(M2,§7.3) |
+| `master.disk_near_full_ratio` | f64 | 0.95 | (0,1] | 盘用量超此比例不放新分区(M2,对齐 Ambry ≈95%) |
+| `master.auto_grow_enabled` | bool | false | — | Q5 自动扩容开关(默认关,安全) |
+| `master.auto_grow_min_writable` | u64 | 4 | — | 低水位:RW 分区数低于它就补建 |
+| `master.auto_grow_max_partitions` | u64 | 100000 | — | 分区总量上限(护栏) |
+| `master.auto_grow_interval_secs` | u64 | 30 | ≥1 | 扩容检查周期,兼作限速节拍 |
+| `master.auto_grow_batch` | u64 | 4 | ≥1 | 单周期建分区上限(限速护栏) |
+| `master.reconcile_interval_secs` | u64 | 5 | ≥1 | 调谐/失联检测周期(M3) |
+
+> openraft 内部的 `heartbeat_interval`/`election_timeout`(M1 内置 250ms / 500–1000ms 常量)尚未暴露为配置项,M2 再提升为 `[master.raft]` 子表。
+
+**监控项清单**(`MasterMetrics`,接入进程的 `Registry`):
+
+| 指标名 | 类型 | 标签 | 单位 | 含义 |
+|---|---|---|---|---|
+| `master_raft_term` | gauge | — | — | 当前 raft term |
+| `master_is_leader` | gauge | — | 0/1 | 本节点是否为 leader |
+| `master_applied_commands_total` | counter | — | 条 | 状态机 apply 的命令数 |
+| `master_registered_nodes` | gauge | — | 个 | 已注册节点数(hard state) |
+| `master_heartbeats_total` | counter | — | 次 | 收到的心跳数 |
+| `master_admission_rejected_total` | counter | — | 次 | 被准入校验拒绝的请求数 |
+| `master_partitions_created_total` | counter | — | 个 | 成功创建的分区数(M2) |
+| `master_partition_create_failed_total` | counter | — | 次 | 建分区失败数(M2) |
+| `master_transitions_issued_total` | counter | — | 次 | 下发的副本状态转移指令数(M3) |
+| `master_rereplications_total` | counter | — | 次 | 触发的再复制次数(M3) |
+| `master_replicas_removed_total` | counter | — | 次 | 下线迁移移除的副本数(M4) |
+
+## 8. blobId 结构(D3 的落地)
+
+blobId = store 的 `StoreKey`,**定长 64bit(8B)**:高 32bit `partitionId` + 低 32bit `objectId`。store 只当它是不透明 key,**解析字段是 client SDK / master 层的事**。
+
+```
+64bit blobId (8B):
+┌────────────────────────┬────────────────────────┐
+│ partitionId (高 32bit)  │ objectId (低 32bit)     │
+│ 自带定位(D3),永不复用 │ partition 内单调递增    │
+└────────────────────────┴────────────────────────┘
+```
+
+**已定**:
+- `partitionId`(高 32bit,自带定位 D3);一旦分配**永不复用**(对齐 Ambry:blob id 永久占用);上限 42.9 亿 partition。
+- `objectId`(低 32bit):**master 按 partition 单调号段发号**——号段两层批处理(master→client 号段 + master→Raft 水位块)+ Raft 水位持久化(多数派 fsync)+ 容忍空洞永不复用;见 `openspec/changes/blobid-master-assign`。上限 42.9 亿/partition,平均 16–64KB 文件配合定容远够(依据见该 change D8)。
+- **不含 version 字段**:64bit 全给 partition+object,blobId 布局**永久冻结**(显式偏离 §3.4,理由见 blobid-master-assign D7)。
+- **不编 account/container / dc**:64bit 无余量;多租户 / 多 DC 信息推到**网关层 / 独立元数据**(等接 S3/多 DC 时在 blobId 之外解决,不再靠 version 升级)。
+- store 侧:`StoreKey`(8B)= 整个 blobId,不解析内部字段;较原 32B 方案索引每条省 24B(10¹¹ 省 ~2.4TB)。
+
+**已知取舍**:
+- objectId 单调递增 → blobId 可枚举;MVP 无 ACL + 数据口直连靠**网络隔离 / 数据口鉴权 / 网关 ACL** 兜底,不靠 blobId 不可猜性(blobid-master-assign D6)。
+
+## 9. store server(数据节点)角色
+
+store 引擎(BlobStore)的**多副本编排 + 网络 + 复制外壳**。store 保持纯单副本引擎,store server 负责按 master 指令管一台机上所有副本的生死、发心跳、跑数据面。对齐 Ambry `StorageManager → DiskManager → BlobStore`。
+
+**层次**:
+```
+store server(一个进程 / 一台数据节点)
+  └─ 挂载 N 个 disk(每盘一个 DiskManager,持有该盘目录 + 容量)
+       └─ 每 disk 建一堆 BlobStore(每个 = 一个 partition-replica,store crate)
+```
+
+**组件**:
+| 组件 | 职责 |
+|---|---|
+| DiskManager ×每盘 | 持有盘目录、该盘上的 BlobStore 集、盘容量/健康 |
+| ReplicaLifecycle | master 指令(target_state)→ store 操作(见下表)|
+| HeartbeatClient | gRPC 流:报活 + 各盘 `available_capacity`(store 自省)+ 各副本 current_state/lag |
+| DataHttpServer | HTTP 数据面:put/get/replicate 路由到对应 BlobStore(D2) |
+| ReplicationPuller | STANDBY 副本从 peer 拉式 anti-entropy;BOOTSTRAP 拉全量(D4) |
+| LocalWorker | 本地常驻:周期 flush + 单店 compaction(死占比阈值) + hard_delete |
+
+**指令 → store 操作映射(胶水核心)**:
+| target / 分区态 | store server 动作 | 上报 current |
+|---|---|---|
+| OFFLINE→BOOTSTRAP | `BlobStore::create/open` + 拉全量(从 peer) | BOOTSTRAP |
+| BOOTSTRAP→STANDBY | 开放全部请求(收 PUT)+ 继续拉复制 | STANDBY |
+| STANDBY↔LEADER | MVP 折叠 ACTIVE,no-op(多 DC 才用) | ACTIVE |
+| STANDBY→INACTIVE | 停写、只 GET、等 peer 追平 | INACTIVE |
+| INACTIVE→OFFLINE | 停服务(仍持数据) | OFFLINE |
+| OFFLINE→DROPPED | `BlobStore::close` + 删目录回收 | DROPPED |
+| 分区 RW→RO/SEALED | 该 replica 只读,拒 PUT | — |
+| task 再复制 | = OFFLINE→BOOTSTRAP(选空盘建店 + 拉全量) | — |
+| task EC 转换(D5) | 交 P1 scheduler / 本地 worker 做段级 EC | — |
+
+**本地 worker vs P1 scheduler 分工(澄清)**:
+- **本地 worker(store server 常驻,永远要有)**:flush / 单店 compaction / hard_delete —— 都是"单 BlobStore 内、本地、轻"(对齐 Ambry CompactionManager 跑在 StorageManager 里)。
+- **P1 独立 scheduler(集群级、跨节点、重)**:再复制编排 / 跨节点再平衡 / EC 转换调度(master 决策 + 跨节点搬数据)。
+- → compaction/flush 是本地事,**不等 P1**。
+
+**store 连接点**:
+- 生命周期:`create/open/close`(已成)+ **需补 `drop`(删目录回收)**。
+- 容量:store 的 `available_capacity`/`is_full` → 心跳上报 master → 喂 §7.3 容量感知放置(闭环)。
+- 读写/后台:`put/get`/`flush`/`compact_if_needed`/`hard_delete`(已成)直接被编排,**store 基本不改**。
+
+**待拍/开放**:
+- [x] **N1 命名**:`store server`(数据节点)。
+- [x] **N2 拉复制归属**:**内嵌 store server**(对齐 Ambry ReplicationManager,同进程贴本地副本;用 N4 每盘池限流)。
+- [x] **N3 bootstrap 拉全量方式**:**混合,全部实现(不推后,MTTR 优先)**——封存段(不可变)走**物理流式拷贝**(快;对齐 Ambry `FileCopyBasedReplication` / SeaweedFS 卷拷;disk-aware 每盘限并发,呼应 N4);活跃段尾巴走**逻辑 catch-up**(token,复用拉复制)补拷贝期间的新写。协议需含 FileCopy 类消息(§7.4)。
+- [x] **N4 本地并发模型**:**每盘一个小线程池**(池大小按盘 IO 能力定;同盘上的 BlobStore 共享;贴合 §9 DiskManager + Ambry DiskIOScheduler)。异步网络层(axum/tonic)通过该池 offload 阻塞的 store 调用,不卡 tokio reactor;并发被限制在硬件可承受范围。衔接 store D4 P4。
+- [ ] **store 需补 `drop`**:关闭 + 删 partition-replica 目录、回收磁盘。
+
+### 9.1 实现状态 + 配置/监控清单(CLAUDE.md §7 必须项)
+
+**S1(数据节点骨架 + 数据面)已实现**(`crates/store`,见 `openspec/changes/store-server/`):`DiskManager`(`statfs` 探真实容量,Q1)、`ReplicaManager`(按 partition 管 `BlobStore`,幂等)、`DataHttpServer`(axum `PUT`/`GET`,同步引擎经 `spawn_blocking` offload)。过集成测试(put/get 往返 + 409/404/400)+ 单测(statfs、ensure_replica 幂等)。**不接 master / 不复制 / 不含 EC(暂不解锁)**。
+
+**S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报)。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
+
+- 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE` / `POST .../undelete` / `POST .../ttl`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)。
+
+**S3a(拉复制逻辑核心)已实现**(见 `openspec/changes/store-server-replication/`):store 引擎新增**忠实 apply 原语** `BlobStore::apply_replicated`(newest-wins + lifeVersion,**原样保留** peer 的 flags/lifeVersion/expiration/op_time,只增不删幂等,守 §3.1;防副本发散);store-server 新增 `replica-metadata` HTTP 端点(step-1,`find_entries_since`)+ blob 读 `?replication=1`(step-2,含已删除/过期数据体)+ `replication.rs`(`PeerSource` trait + `replicate_from_peer` 收敛循环 + `HttpPeer` 阻塞 adapter);后台复制器经 master `LookupPartition` 发现 peer(排除自身、按 `up` 过滤),对每个本地 replica 的每个 peer 周期拉一轮;BOOTSTRAP 从 `token=Uninitialized` 全量逻辑回放追平。过单测(apply 四态 + 收敛/幂等/bootstrap)+ 集成测试(两 store-server 真 HTTP 收敛 + delete 传播)。
+  - **N3 分期(文档化,非代码就地另选,见该 change design.md D-A)**:S3a 只落**逻辑拉复制**(正确收敛的完备核,含 bootstrap 全量逻辑回放);**S3b** 再叠加封存段**物理流式拷贝**(MTTR 优化)。N3 最终形态(混合)不变。
+  - **传输(细化 D2,见 design.md D-B)**:node↔node 复制元数据走 store-server 现有 **HTTP(axum)**(非新起 gRPC server);master↔node 控制面仍 gRPC。
+
+**S3b(封存段物理拷贝,N3 混合完成)已实现**(见 `openspec/changes/store-bootstrap-copy/`):`blob` 引擎加封存段只读拷贝原语(`sealed_segments`/`read_segment_prefix`/`LogSegment::raw_prefix`)+ `open_rebuild_index_with`;数据节点加发送端点(`GET .../segments`、`GET .../segments/{position}`)+ 接收装载 `ReplicaManager::install_bootstrap`(段文件 `tmp→fsync→rename` 崩溃安全 + 重建打开);复制器对**空**副本首次先物理拷贝封存段(不可变),续拉游标 = 最高封存段末尾,再逻辑补活跃尾;无 peer/无封存段回落纯逻辑。过单测(封存段枚举/拷贝重建)+ 集成测试(多封存段 + 活跃尾混合 bootstrap,真 HTTP 收敛)。
+ - 待续:disk-aware 每盘并发限流(N4);放置据 `DiskHealth` 避让;`DROPPED` 删目录回收;真流式 put;client SDK(暂不做)。**EC 仍锁定(暂不解锁)**。
+
+**S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分三条独立周期 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(`compact_if_needed(compaction_dead_ratio)`,按封存段死数据占比阈值增量压缩)、**hard_delete**(擦除已删对象数据体);各周期时长独立可配置;同步引擎调用经 `spawn_blocking` offload。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据 / hard_delete 擦除计数)。
+
+**配置项清单**(`StoreServerConfig`,TOML `[store_server]` 表下):
+
+| key | 类型 | 默认值 | 取值/校验 | 含义 |
+|---|---|---|---|---|
+| `store_server.node_id` | u64 | 1 | ≥1 | 数据节点 id(与 master 一致) |
+| `store_server.data_dirs` | Vec\<String\> | `[]` | 非空 | 挂载盘目录(每个当一块盘,`statfs` 探容量) |
+| `store_server.http_addr` | String | `127.0.0.1:7200` | 非空 | 数据面 HTTP 监听地址 |
+| `store_server.partition_capacity_bytes` | u64 | 100 GiB | ≥1 | 每个分区副本 `BlobStore` 容量上界(对齐 master) |
+| `store_server.master_addr` | String | `""` | — | master 控制面 gRPC 地址;空=不接 master(S1 独立)(S2) |
+| `store_server.cluster_secret` | String | `""` | — | 集群准入密钥(与 master 一致);空=关校验(S2) |
+| `store_server.heartbeat_interval_secs` | u64 | 3 | ≥1 | 心跳周期(S2) |
+| `store_server.disk_health_enabled` | bool | false | — | 主动磁盘探测开关(默认关,对齐 Ambry)(S2) |
+| `store_server.disk_health_interval_secs` | u64 | 60 | ≥1 | 主动探测周期(S2) |
+| `store_server.disk_health_timeout_secs` | u64 | 10 | ≥1 | 主动探测单次读写超时(抓盘 hang)(S2) |
+| `store_server.replication_enabled` | bool | false | — | 拉复制开关(默认关);需 `master_addr` 发现 peer(S3a) |
+| `store_server.replication_interval_secs` | u64 | 5 | ≥1 | 拉复制周期(S3a) |
+| `store_server.replication_max_batch_bytes` | u64 | 4 MiB | ≥1 | 单次向 peer 拉元数据的批字节上限(限流)(S3a) |
+| `store_server.bootstrap_copy_enabled` | bool | true | — | 封存段物理拷贝加速 bootstrap(S3b);随 `replication_enabled` 生效 |
+| `store_server.local_worker_enabled` | bool | true | — | 本地维护 worker 开关(S4:周期 flush/compaction/hard_delete) |
+| `store_server.flush_interval_secs` | u64 | 30 | ≥1 | 本地 worker flush 周期(推进持久化边界)(S4) |
+| `store_server.compaction_interval_secs` | u64 | 3600 | ≥1 | 本地 worker compaction 检查周期(S4) |
+| `store_server.compaction_dead_ratio` | f64 | 0.5 | (0,1] | 封存段死数据占比 ≥ 此值才压缩(S4) |
+| `store_server.hard_delete_interval_secs` | u64 | 300 | ≥1 | 本地 worker hard_delete 周期(擦除已删数据体)(S4) |
+
+> store 引擎自身配置(段大小等)复用 `[store]` 段(见 store.md §10);`start_with` 可注入(测试/小部署)。
+
+**监控项清单**(`StoreServerMetrics`):
+
+| 指标名 | 类型 | 单位 | 含义 |
+|---|---|---|---|
+| `store_server_put_total` | counter | 次 | blob PUT 请求数 |
+| `store_server_get_total` | counter | 次 | blob GET 请求数 |
+| `store_server_put_bytes_total` | counter | 字节 | 写入字节数 |
+| `store_server_get_bytes_total` | counter | 字节 | 读取字节数 |
+| `store_server_replicas` | gauge | 个 | 本地 partition-replica 数 |
+| `store_server_errors_total` | counter | 次 | 数据面错误数 |
+| `store_server_heartbeats_total` | counter | 次 | 收到的心跳指令数(S2) |
+| `store_server_replication_rounds_total` | counter | 次 | 拉复制轮次(S3a) |
+| `store_server_replication_applied_total` | counter | 条 | 从 peer apply 的记录数(S3a) |
+| `store_server_replication_bytes_total` | counter | 字节 | 从 peer apply 的字节数(S3a) |
+| `store_server_replication_errors_total` | counter | 次 | 拉复制错误数(S3a) |
+| `store_server_bootstrap_segments_total` | counter | 个 | bootstrap 物理拷贝的封存段数(S3b) |
+| `store_server_bootstrap_bytes_total` | counter | 字节 | bootstrap 物理拷贝字节数(S3b) |
+| `store_server_flushes_total` | counter | 次 | 本地 worker flush 次数(S4) |
+| `store_server_compactions_total` | counter | 次 | 本地 worker 发生压缩的 replica 次数(S4) |
+| `store_server_hard_deleted_total` | counter | 条 | 本地 worker 擦除数据体的记录数(S4) |
+
+## 10. 数据面读写 + quorum(D4 展开)
+
+**W=2 / R=1,靠"不可变 + 拉复制"收敛**(对齐 Ambry `routerPutSuccessTarget=2`/`routerGetSuccessTarget=1`)。Router 逻辑在 **client SDK**(无 frontend)。
+
+**PUT(异步 quorum)**:
+```
+client SDK: 从缓存的可写分区挑 P → 拼 blobId=partitionId(P)+objectId(master 号段发号,§8)
+  → 并行 HTTP PUT 到 P 的全部 N 副本(store server)
+  → 收 W=2 ack 即返回成功;第 3 副本靠拉复制补
+```
+**GET(R=1,不可变红利)**:
+```
+client SDK: 解析 partitionId → LookupPartition(master,可缓存)→ 副本位置
+  → HTTP GET 一个副本(§7.2 状态门控);not found/失败→换副本 → R=1 成功即返回
+```
+> 关键:blob 不可变 → **不需要 R+W>N**。W=2 保证 ≥2 份有,GET 试几个必命中,第 3 份复制补。省掉 quorum 读。
+
+**变更(DELETE/TTL/UNDELETE)—— 唯一最终一致窗口**:并行写墓碑/更新 → W=2 ack;`newest-wins`+`lifeVersion`(store 已实现)解冲突;拉复制传播。⚠ 未追上的副本短暂可能返回旧态(接受,最终一致)。
+
+**拉复制(anti-entropy)收敛**:
+```
+每 STANDBY 副本 对每 peer:周期发 ReplicaMetadataRequest(token=log offset 游标)
+  → peer 返 token 后的新记录元数据 → 算缺失 key → GetRequest 拉 → apply(newest-wins) → 推进 token
+```
+- 复用 store 已有 `FindToken`(每-peer log offset 游标)。**bootstrap 拉全量 = 混合(§9 N3,全部实现)**:封存段物理流式拷贝(快,MTTR 优先)+ 活跃段尾巴 token 逻辑补;非纯 token=0 逻辑回放。
+- **S3a 落地(见 §9.1 + `store-server-replication`)**:step-1 ReplicaMetadata 与 step-2 拉 blob **均走 store-server 现有 HTTP(axum)**(细化 D2:node↔node 复制走 HTTP,master↔node 仍 gRPC);写入用 store `apply_replicated` 忠实保留 peer lifeVersion。物理段拷贝(N3 的 MTTR 优化)分期到 S3b。
+
+**参数(默认,已定)**:
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| put 并行度 | = RF | 并行写全部副本 |
+| W(put/delete/ttl/undelete) | **2** | ≥2 算成功,存活 1 副本丢失 |
+| R(get) | **1** | 不可变,读任一有的副本 |
+| ack 时机 | page-cache(吞吐优先) | 高持久档可选 fsync-ack;W=2 跨故障域缓解 |
+| 读修复 | 不做 | 靠后台拉复制,保持异步 |
+
+**持久性窗口(§3 必须点)**:W=2 ack = 数据进 2 副本 page-cache(未必 fsync);若 flush 前这 2 份同时掉电可能丢 → 靠 W=2 跨故障域 + 周期 fsync 缩窗;高持久档再议 fsync-ack / W=3。与 store.md §3「flush 是持久化边界」一致。
+
+## 11. admin web(Q6 落地)
+
+**已实现**(`crates/admin`,见 `openspec/changes/admin-web/`):独立服务 = master 控制面 gRPC 客户端 + axum HTTP + 内嵌 SPA。对齐 CubeFS `console` / SeaweedFS `weed admin`。
+
+```
+浏览器 ──HTTP/JSON──▶ admin(axum) ──gRPC──▶ master
+   内嵌 React/Vite SPA(vite singlefile 单文件,`include_str!` 进二进制)
+   指标图表 ──外链──▶ Grafana(不自造图表,Q6)
+```
+
+- **master 侧新增** `ListPartitions` 只读 gRPC:联 hard-state placement(节点/盘/target_state)与 soft-state `current_state`/`lag`,供 dashboard 展示分区/副本拓扑(proto 带 version)。
+- **JSON API**:`GET /api/cluster`(term/leader/节点数/分区数 + grafana_url)、`GET /api/nodes`(节点 + 盘容量/余量/健康 + up)、`GET /api/partitions`(分区 + 副本 target/current)、`POST /api/partitions`(建分区)、`POST /api/nodes/{id}/decommission`(下线)。
+- **operator 鉴权**:`/api/*` 校验 `Authorization: Bearer <operator_token>`,缺/错 → 401;空 token = 关校验(仅本地)。写操作对 master 出示 `cluster_secret`。
+- **SPA**:概览卡片 + 节点/盘表 + 分区/副本拓扑(BOOTSTRAP/ERROR/发散高亮)+ 建分区/下线表单 + Grafana 外链;token 存 localStorage,401 弹登录。
+- **非 goals**:RBAC/多用户/审计持久化、分页(海量分区)、compaction/复制开关/EC 运维(EC 仍锁定)——后续按需。
+
+**增强(见 `openspec/changes/admin-enhancements/`)已实现**:
+- **分页**:`ListPartitions` 加 `offset`/`limit`/`total`;admin `GET /api/partitions?offset=&limit=` → `{items,total,offset,limit}`;SPA 翻页。
+- **RBAC 双角色**:`operator_token`(读+写)/ `viewer_token`(只读);写操作 viewer → **403**;`GET /api/me` 返回角色;SPA 按角色显隐写操作。
+- **SetPartitionState 运维**:master `SetPartitionState` gRPC(RW/RO/SEALED,raft 命令 `MasterCommand::SetPartitionState`)+ admin `POST /api/partitions/{id}/state`;SPA 每行 可写/只读/封存 按钮。
+- **中英双语**:SPA i18n(en/zh 字典 + 语言切换,localStorage 持久化)。
+
+### 11.1 配置项清单(`AdminConfig`,TOML `[admin]` 表下)
+
+| key | 类型 | 默认值 | 取值/校验 | 含义 |
+|---|---|---|---|---|
+| `admin.master_addr` | String | `127.0.0.1:7101` | 非空 | master 控制面 gRPC 地址 |
+| `admin.listen_addr` | String | `127.0.0.1:7300` | 非空 | admin HTTP 监听地址 |
+| `admin.operator_token` | String | `""` | — | operator 准入令牌(Bearer,读+写);空 = 关校验(仅本地) |
+| `admin.viewer_token` | String | `""` | — | viewer 准入令牌(Bearer,只读);写操作返回 403;空 = 不启用只读角色 |
+| `admin.cluster_secret` | String | `""` | — | 集群准入密钥(与 master 一致),用于对 master 发写操作 |
+| `admin.grafana_url` | String | `""` | — | Grafana 外链;空 = 不显示按钮 |
+
+### 11.2 监控项清单(`AdminMetrics`)
+
+| 指标名 | 类型 | 单位 | 含义 |
+|---|---|---|---|
+| `admin_api_requests_total` | counter | 次 | admin API 请求数 |
+| `admin_ops_total` | counter | 次 | 运维操作数(建分区/下线) |
+| `admin_master_rpc_errors_total` | counter | 次 | 调 master gRPC 失败数 |

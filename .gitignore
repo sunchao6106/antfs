@@ -12,3 +12,10 @@ target/
 # 本地 agent/会话工具产物,不入库
 .omo/
 .opencode/
+
+# devcluster 本地集群数据(可重生)
+/.localcluster/
+
+# admin SPA 依赖 / 构建中间产物(dist/index.html 需入库供 include_str! 内嵌)
+crates/admin/ui/node_modules/
+crates/admin/ui/*.tsbuildinfo

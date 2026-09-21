@@ -1,142 +1,49 @@
-//! `StoreMetrics`:store 模块的统计打点(对齐 Ambry `StoreMetrics` 的 BlobStore 层子集)。
-//!
-//! DI 与多实例区分策略见 [`docs/design/common.md` §2.2];完整清单见 [`docs/design/store.md` §11]。
-//!
-//! - [`StoreMetrics`] 持有注册在 `Registry` 上的 `*Vec`(每个 `Registry` 只建一次),对齐 Ambry
-//!   `StorageManager` 里 `new StoreMetrics(registry)`。
-//! - [`StoreMetrics::for_store`] 用 label `store="<id>"` 取某个 store 的子 handle 集
-//!   [`StoreMetricHandles`],存进该 `BlobStore`;多 store 共享同一 `Registry`、靠 label 区分。
-//!
-//! 本轮只接 BlobStore 层指标;Log/Index/过滤器/stats 内部打点待这些模块各自接入(见 store.md §11)。
+//! `StoreServerMetrics`:数据节点打点(接 common/metric 的 `Registry`)。
 
-use metric::{
-    counter_vec, gauge_vec, latency_seconds_vec, Histogram, HistogramTimer, HistogramVec,
-    IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry, Result,
-};
+use metric::{counter, gauge, IntCounter, IntGauge, Registry, Result};
 
-/// 注册在某个 `Registry` 上的 store 指标(带 `store` label 的 `*Vec`)。每 `Registry` 建一次,
-/// 各 store 用 [`for_store`](Self::for_store) 取自己的子 handle。
+/// 数据节点指标集,构造时注册进传入 `Registry`。
 #[derive(Clone)]
-pub struct StoreMetrics {
-    request_duration: HistogramVec,
-    already_exists: IntCounterVec,
-    compaction_reclaimed_bytes: IntCounterVec,
-    compaction_duration: HistogramVec,
-    hard_delete_total: IntCounterVec,
-    hard_delete_duration: HistogramVec,
-    used_capacity_bytes: IntGaugeVec,
-    invalid_data_bytes: IntGaugeVec,
-    segment_count: IntGaugeVec,
+pub struct StoreServerMetrics {
+    pub put_total: IntCounter,
+    pub get_total: IntCounter,
+    pub put_bytes: IntCounter,
+    pub get_bytes: IntCounter,
+    pub replicas: IntGauge,
+    pub errors: IntCounter,
+    pub heartbeats: IntCounter,
+    pub mutations: IntCounter,
+    pub replication_rounds: IntCounter,
+    pub replication_applied: IntCounter,
+    pub replication_bytes: IntCounter,
+    pub replication_errors: IntCounter,
+    pub bootstrap_segments: IntCounter,
+    pub bootstrap_bytes: IntCounter,
+    pub flushes: IntCounter,
+    pub compactions: IntCounter,
+    pub hard_deleted: IntCounter,
 }
 
-impl StoreMetrics {
+impl StoreServerMetrics {
     pub fn new(registry: &Registry) -> Result<Self> {
-        Ok(StoreMetrics {
-            request_duration: latency_seconds_vec(
-                registry,
-                "store_request_duration_seconds",
-                "per-operation request latency",
-                &["store", "op"],
-            )?,
-            already_exists: counter_vec(
-                registry,
-                "store_already_exists_total",
-                "put hit an existing key (put/delete tombstone)",
-                &["store"],
-            )?,
-            compaction_reclaimed_bytes: counter_vec(
-                registry,
-                "store_compaction_reclaimed_bytes_total",
-                "bytes reclaimed by compaction",
-                &["store"],
-            )?,
-            compaction_duration: latency_seconds_vec(
-                registry,
-                "store_compaction_duration_seconds",
-                "single compaction run duration",
-                &["store"],
-            )?,
-            hard_delete_total: counter_vec(
-                registry,
-                "store_hard_delete_total",
-                "objects scrubbed by hard delete",
-                &["store"],
-            )?,
-            hard_delete_duration: latency_seconds_vec(
-                registry,
-                "store_hard_delete_duration_seconds",
-                "hard delete run duration",
-                &["store"],
-            )?,
-            used_capacity_bytes: gauge_vec(
-                registry,
-                "store_log_used_capacity_bytes",
-                "log bytes used (live + dead)",
-                &["store"],
-            )?,
-            invalid_data_bytes: gauge_vec(
-                registry,
-                "store_log_invalid_data_bytes",
-                "dead (reclaimable) log bytes",
-                &["store"],
-            )?,
-            segment_count: gauge_vec(
-                registry,
-                "store_log_segment_count",
-                "number of log segments",
-                &["store"],
-            )?,
+        Ok(StoreServerMetrics {
+            put_total: counter(registry, "store_server_put_total", "blob put requests")?,
+            get_total: counter(registry, "store_server_get_total", "blob get requests")?,
+            put_bytes: counter(registry, "store_server_put_bytes_total", "bytes written")?,
+            get_bytes: counter(registry, "store_server_get_bytes_total", "bytes read")?,
+            replicas: gauge(registry, "store_server_replicas", "local partition replicas")?,
+            errors: counter(registry, "store_server_errors_total", "data-plane errors")?,
+            heartbeats: counter(registry, "store_server_heartbeats_total", "heartbeat directives received")?,
+            mutations: counter(registry, "store_server_mutations_total", "delete/undelete/ttl mutations")?,
+            replication_rounds: counter(registry, "store_server_replication_rounds_total", "pull-replication rounds run")?,
+            replication_applied: counter(registry, "store_server_replication_applied_total", "records applied from peers")?,
+            replication_bytes: counter(registry, "store_server_replication_bytes_total", "bytes applied from peers")?,
+            replication_errors: counter(registry, "store_server_replication_errors_total", "pull-replication errors")?,
+            bootstrap_segments: counter(registry, "store_server_bootstrap_segments_total", "sealed segments physically copied on bootstrap")?,
+            bootstrap_bytes: counter(registry, "store_server_bootstrap_bytes_total", "bytes physically copied on bootstrap")?,
+            flushes: counter(registry, "store_server_flushes_total", "local-worker flushes run")?,
+            compactions: counter(registry, "store_server_compactions_total", "local-worker segment compactions run")?,
+            hard_deleted: counter(registry, "store_server_hard_deleted_total", "records hard-deleted (data body erased) by local worker")?,
         })
-    }
-
-    /// 取某个 store 的子 handle 集(按 `store="<id>"` label 绑定)。廉价:`with_label_values` 返回克隆的子 handle。
-    pub fn for_store(&self, store_id: &str) -> StoreMetricHandles {
-        StoreMetricHandles {
-            store_id: store_id.to_string(),
-            request_duration: self.request_duration.clone(),
-            already_exists: self.already_exists.with_label_values(&[store_id]),
-            compaction_reclaimed_bytes: self
-                .compaction_reclaimed_bytes
-                .with_label_values(&[store_id]),
-            compaction_duration: self.compaction_duration.with_label_values(&[store_id]),
-            hard_delete_total: self.hard_delete_total.with_label_values(&[store_id]),
-            hard_delete_duration: self.hard_delete_duration.with_label_values(&[store_id]),
-            used_capacity_bytes: self.used_capacity_bytes.with_label_values(&[store_id]),
-            invalid_data_bytes: self.invalid_data_bytes.with_label_values(&[store_id]),
-            segment_count: self.segment_count.with_label_values(&[store_id]),
-        }
-    }
-}
-
-/// 某个 `BlobStore` 实例持有的、已绑定 `store` label 的子 handle 集。
-#[derive(Clone)]
-pub struct StoreMetricHandles {
-    store_id: String,
-    request_duration: HistogramVec,
-    pub(crate) already_exists: IntCounter,
-    pub(crate) compaction_reclaimed_bytes: IntCounter,
-    pub(crate) compaction_duration: Histogram,
-    pub(crate) hard_delete_total: IntCounter,
-    pub(crate) hard_delete_duration: Histogram,
-    pub(crate) used_capacity_bytes: IntGauge,
-    pub(crate) invalid_data_bytes: IntGauge,
-    pub(crate) segment_count: IntGauge,
-}
-
-impl StoreMetricHandles {
-    /// 起一个操作计时器(drop 时记录耗时到 `store_request_duration_seconds{op=...}`)。
-    pub(crate) fn op_timer(&self, op: &str) -> HistogramTimer {
-        self.request_duration
-            .with_label_values(&[&self.store_id, op])
-            .start_timer()
-    }
-
-    /// 未接入外部 `Registry` 时的兜底(裸构造器/测试用):挂在一个丢弃的私有 `Registry` 上,
-    /// 打点仍可自增,只是不被导出。
-    pub(crate) fn disabled() -> Self {
-        let registry = Registry::new();
-        StoreMetrics::new(&registry)
-            .expect("fresh registry never has duplicate registrations")
-            .for_store("default")
     }
 }

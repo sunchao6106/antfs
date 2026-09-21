@@ -4,18 +4,31 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "store"
+path = "src/main.rs"
+
 [dependencies]
-thiserror = "1"
-crc32fast = "1"
-libc = "0.2"
-xorf = "0.13.0"
-memmap2 = "0.9"
-crossbeam-skiplist = "0.1"
+blob = { path = "../blob" }
+master = { path = "../master" }
 config = { path = "../common/config" }
 metric = { path = "../common/metric" }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+axum = "0.8"
+bytes = "1"
+hex = "0.4"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+serde_json = "1"
 
 [dev-dependencies]
-proptest = "1"
-config = { path = "../common/config" }
-metric = { path = "../common/metric" }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }

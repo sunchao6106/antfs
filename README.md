@@ -10,10 +10,14 @@
 | 模块 | 说明 | 状态 |
 |---|---|---|
 | common | 公共库:`config`(`serde`+`config` 分层配置)、`metric`(`prometheus` 统计打点);对标 Ambry `config` 包 + Dropwizard `MetricRegistry` | 进行中 |
-| store | 单机存储引擎:`Log` / `LogSegment` / `PersistentIndex` / `BlobStore`(put/get/delete/undelete/updateTtl/compaction/hard_delete/恢复);对标 Ambry `ambry-store` | 进行中 |
-| frontend / S3 网关、复制、集群等 | 其余 Ambry 模块 | 规划中 |
+| blob | 单机存储引擎:`Log` / `LogSegment` / `PersistentIndex` / `BlobStore`(put/get/delete/undelete/updateTtl/compaction/hard_delete/恢复 + 复制 apply);对标 Ambry `ambry-store` | 进行中 |
+| master | 集群大脑:内建 Raft(`openraft`)管放置/节点状态机/调谐/下线;对标 Helix+ZK 的替代 | 进行中 |
+| store | 数据节点(store server):多副本编排 + HTTP 数据面 + 心跳/磁盘监控 + 拉复制;承载 `blob` 引擎 | 进行中 |
+| frontend / S3 网关 / admin web 等 | 其余 Ambry 模块 | 规划中 |
 
-store 当前要点:
+> 命名:`blob` = 单机 blob 存储引擎(旧 `store`);`store` = 数据节点(旧 `store-server`)。
+
+blob 引擎当前要点:
 - IO:**同步阻塞 `std::fs` + buffered(OS page cache)**,对齐 Ambry 原版
 - 索引:并发活跃段 + **mmap 封存段 + 持久化 Binary Fuse 过滤器**
 

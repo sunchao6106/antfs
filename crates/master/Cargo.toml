@@ -1,0 +1,33 @@
+[package]
+name = "master"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "master"
+path = "src/main.rs"
+
+[dependencies]
+config = { path = "../common/config" }
+metric = { path = "../common/metric" }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+redb = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+futures = "0.3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
