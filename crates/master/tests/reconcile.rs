@@ -255,6 +255,7 @@ async fn decommission_evacuates_replicas_add_before_remove() {
             version: 1,
             cluster_secret: SECRET.into(),
             node_id: 103,
+            force: true, // 本测试聚焦 evacuation 行为,跳过可行性前置校验
         })
         .await
         .expect("decommission")

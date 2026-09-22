@@ -46,6 +46,19 @@ const en: Dict = {
   role: "Role",
   confirmDecom: "Decommission node {id}? Replicas will be evacuated (add-before-remove).",
   createdPartitions: "Created partitions: {ids}",
+  capacity: "Capacity (used / total)",
+  freeCapacity: "Free capacity",
+  underReplicated: "Under-replicated",
+  health: "Health",
+  healthy: "healthy",
+  recovering: "recovering",
+  stuck: "stuck (no spare)",
+  reason_node_down: "node down",
+  reason_replica_error: "replica error",
+  reason_decommissioning: "decommissioning",
+  reason_bootstrapping: "syncing",
+  lag: "lag",
+  decomForce: "Rejected: {err}\n\nForce decommission anyway? (will leave affected partitions under-replicated)",
 };
 
 const zh: Dict = {
@@ -90,6 +103,19 @@ const zh: Dict = {
   role: "角色",
   confirmDecom: "下线节点 {id}?其副本将被迁移(先补后删)。",
   createdPartitions: "已创建分区:{ids}",
+  capacity: "容量(已用 / 总)",
+  freeCapacity: "可用容量",
+  underReplicated: "欠副本分区",
+  health: "健康",
+  healthy: "健康",
+  recovering: "恢复中",
+  stuck: "卡住(无落点)",
+  reason_node_down: "节点失联",
+  reason_replica_error: "副本错误",
+  reason_decommissioning: "下线迁移中",
+  reason_bootstrapping: "同步中",
+  lag: "落后",
+  decomForce: "被拒绝:{err}\n\n仍要强制下线吗?(会使受影响分区欠副本)",
 };
 
 const dicts: Record<Lang, Dict> = { en, zh };

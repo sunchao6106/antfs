@@ -31,6 +31,8 @@ pub struct MasterMetrics {
     pub rereplications: IntCounter,
     /// 移除的副本数(counter,M4 decommission evacuation)。
     pub replicas_removed: IntCounter,
+    /// 当前欠副本(健康副本数 < RF)的分区数(gauge,反映集群健康)。
+    pub under_replicated_partitions: IntGauge,
 }
 
 impl MasterMetrics {
@@ -78,6 +80,11 @@ impl MasterMetrics {
                 registry,
                 "master_replicas_removed_total",
                 "replicas removed during decommission evacuation",
+            )?,
+            under_replicated_partitions: gauge(
+                registry,
+                "master_under_replicated_partitions",
+                "partitions whose healthy replica count is below RF",
             )?,
         })
     }

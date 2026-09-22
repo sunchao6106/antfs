@@ -23,6 +23,12 @@ export interface Cluster {
   term: number;
   registered_nodes: number;
   next_partition_id: number;
+  total_capacity_bytes: number;
+  free_bytes: number;
+  used_bytes: number;
+  nodes_up: number;
+  nodes_total: number;
+  under_replicated_partitions: number;
   grafana_url: string;
 }
 export interface Disk {
@@ -53,6 +59,9 @@ export interface Partition {
   state: string;
   replication_factor: number;
   replicas: Replica[];
+  healthy_replicas: number;
+  healable: boolean;
+  under_replicated_reason: string;
 }
 
 export interface PartitionPage {
@@ -94,8 +103,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ state }),
     }),
-  decommission: (nodeId: number) =>
-    req<string>(`/api/nodes/${nodeId}/decommission`, { method: "POST" }),
+  decommission: (nodeId: number, force = false) =>
+    req<string>(`/api/nodes/${nodeId}/decommission?force=${force}`, { method: "POST" }),
 };
 
 export function fmtBytes(n: number): string {

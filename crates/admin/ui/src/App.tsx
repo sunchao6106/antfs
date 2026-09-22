@@ -89,7 +89,7 @@ export function App() {
 
       {error && <div className="banner err">{error}</div>}
 
-      <Overview t={t} cluster={cluster} nodes={nodes} total={total} />
+      <Overview t={t} cluster={cluster} total={total} />
       {isOperator && <Ops t={t} nodes={nodes} onDone={refresh} setError={setError} />}
       <Nodes t={t} nodes={nodes} />
       <Partitions
@@ -121,21 +121,27 @@ function LangToggle({ lang, switchLang }: { lang: Lang; switchLang: (l: Lang) =>
   );
 }
 
-function Overview({ t, cluster, nodes, total }: { t: T; cluster: Cluster | null; nodes: Node[]; total: number }) {
-  const up = nodes.filter((n) => n.up).length;
+function Overview({ t, cluster, total }: { t: T; cluster: Cluster | null; total: number }) {
+  const under = cluster?.under_replicated_partitions ?? 0;
   return (
     <section className="cards">
       <Card label={t("leader")} value={cluster ? `${t("node")} ${cluster.leader ?? "—"}` : "—"} />
       <Card label={t("raftTerm")} value={cluster ? String(cluster.term) : "—"} />
-      <Card label={t("nodesUpTotal")} value={`${up} / ${nodes.length}`} />
+      <Card label={t("nodesUpTotal")} value={cluster ? `${cluster.nodes_up} / ${cluster.nodes_total}` : "—"} />
       <Card label={t("partitions")} value={String(total)} />
+      <Card
+        label={t("capacity")}
+        value={cluster ? `${fmtBytes(cluster.used_bytes)} / ${fmtBytes(cluster.total_capacity_bytes)}` : "—"}
+      />
+      <Card label={t("freeCapacity")} value={cluster ? fmtBytes(cluster.free_bytes) : "—"} />
+      <Card label={t("underReplicated")} value={String(under)} danger={under > 0} />
     </section>
   );
 }
 
-function Card({ label, value }: { label: string; value: string }) {
+function Card({ label, value, danger }: { label: string; value: string; danger?: boolean }) {
   return (
-    <div className="card">
+    <div className={`card ${danger ? "danger" : ""}`}>
       <div className="card-label">{label}</div>
       <div className="card-value">{value}</div>
     </div>
@@ -165,7 +171,19 @@ function Ops({ t, nodes, onDone, setError }: { t: T; nodes: Node[]; onDone: () =
       setError("");
       onDone();
     } catch (e) {
-      setError(String(e));
+      // 被前置校验拒绝(含受影响分区)→ 询问是否强制下线。
+      const msg = String(e);
+      if (confirm(t("decomForce", { err: msg }))) {
+        try {
+          await api.decommission(Number(decomId), true);
+          setError("");
+          onDone();
+        } catch (e2) {
+          setError(String(e2));
+        }
+      } else {
+        setError(msg);
+      }
     }
   };
 
@@ -282,6 +300,14 @@ function Partitions({
   const pageNo = Math.floor(offset / PAGE_SIZE) + 1;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
+  const health = (p: Partition): { cls: string; text: string } => {
+    const frac = `${p.healthy_replicas}/${p.replication_factor}`;
+    if (!p.under_replicated_reason) return { cls: "ok", text: `${frac} ${t("healthy")}` };
+    const reason = t(`reason_${p.under_replicated_reason}`);
+    if (!p.healable) return { cls: "down", text: `${frac} · ${t("stuck")} · ${reason}` };
+    return { cls: "warn", text: `${frac} · ${t("recovering")} · ${reason}` };
+  };
+
   return (
     <section>
       <h2>{t("partitions")}</h2>
@@ -290,42 +316,54 @@ function Partitions({
           <tr>
             <th>{t("partitions")}</th>
             <th>{t("state")}</th>
+            <th>{t("health")}</th>
             <th>{t("rf")}</th>
             <th>{t("replicas")}</th>
             {isOperator && <th>{t("actions")}</th>}
           </tr>
         </thead>
         <tbody>
-          {partitions.map((p) => (
-            <tr key={p.partition_id}>
-              <td>{p.partition_id}</td>
-              <td><span className="pill small">{p.state}</span></td>
-              <td>{p.replication_factor}</td>
-              <td>
-                {p.replicas.map((r) => {
-                  const diverged = r.current_state != null && r.current_state !== r.target_state;
-                  const err = r.current_state === "ERROR";
-                  return (
-                    <span key={r.node_id} className={`repl ${err ? "err" : diverged ? "warn" : ""}`} title={r.addr}>
-                      n{r.node_id}: {r.target_state}
-                      {r.current_state != null && ` / ${r.current_state}`}
-                      {!r.up && " ⚠"}
-                    </span>
-                  );
-                })}
-              </td>
-              {isOperator && (
-                <td className="row-actions">
-                  <button className="btn tiny" onClick={() => setState(p.partition_id, "RW")}>{t("markRW")}</button>
-                  <button className="btn tiny" onClick={() => setState(p.partition_id, "RO")}>{t("markRO")}</button>
-                  <button className="btn tiny" onClick={() => setState(p.partition_id, "SEALED")}>{t("markSealed")}</button>
+          {partitions.map((p) => {
+            const h = health(p);
+            return (
+              <tr key={p.partition_id}>
+                <td>{p.partition_id}</td>
+                <td><span className="pill small">{p.state}</span></td>
+                <td><span className={`pill ${h.cls}`}>{h.text}</span></td>
+                <td>{p.replication_factor}</td>
+                <td>
+                  {p.replicas.map((r) => {
+                    const diverged = r.current_state != null && r.current_state !== r.target_state;
+                    const err = r.current_state === "ERROR";
+                    const title = `${r.addr} · ${r.disk_id} · ${r.up ? t("up") : t("down")}` +
+                      (r.lag_bytes != null && r.lag_bytes > 0 ? ` · ${t("lag")} ${fmtBytes(r.lag_bytes)}` : "");
+                    return (
+                      <span
+                        key={r.node_id}
+                        className={`repl ${err ? "err" : !r.up ? "err" : diverged ? "warn" : ""}`}
+                        title={title}
+                      >
+                        n{r.node_id}: {r.target_state}
+                        {r.current_state != null && ` / ${r.current_state}`}
+                        {!r.up && " ⚠"}
+                        {r.lag_bytes != null && r.lag_bytes > 0 && ` (${t("lag")} ${fmtBytes(r.lag_bytes)})`}
+                      </span>
+                    );
+                  })}
                 </td>
-              )}
-            </tr>
-          ))}
+                {isOperator && (
+                  <td className="row-actions">
+                    <button className="btn tiny" onClick={() => setState(p.partition_id, "RW")}>{t("markRW")}</button>
+                    <button className="btn tiny" onClick={() => setState(p.partition_id, "RO")}>{t("markRO")}</button>
+                    <button className="btn tiny" onClick={() => setState(p.partition_id, "SEALED")}>{t("markSealed")}</button>
+                  </td>
+                )}
+              </tr>
+            );
+          })}
           {partitions.length === 0 && (
             <tr>
-              <td colSpan={isOperator ? 5 : 4} className="empty">{t("noPartitions")}</td>
+              <td colSpan={isOperator ? 6 : 5} className="empty">{t("noPartitions")}</td>
             </tr>
           )}
         </tbody>

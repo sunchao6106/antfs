@@ -23,6 +23,17 @@ pub struct ClusterDto {
     pub term: u64,
     pub registered_nodes: u64,
     pub next_partition_id: u32,
+    /// 全集群各盘容量之和(字节)。
+    pub total_capacity_bytes: u64,
+    /// 全集群各盘可用之和(字节)。
+    pub free_bytes: u64,
+    /// 已用 = 总 - 可用(字节)。
+    pub used_bytes: u64,
+    /// 存活节点数 / 已注册节点数(存活由心跳超时判定)。
+    pub nodes_up: u64,
+    pub nodes_total: u64,
+    /// 欠副本(健康副本 < RF)分区数。
+    pub under_replicated_partitions: u64,
 }
 
 /// 一块盘(节点视图内)。
@@ -64,6 +75,12 @@ pub struct PartitionDto {
     pub state: String,
     pub replication_factor: u32,
     pub replicas: Vec<ReplicaDto>,
+    /// 存活且 ACTIVE 的副本数(< RF 即欠副本)。
+    pub healthy_replicas: u32,
+    /// 欠副本时是否有空闲健康节点可补(false = 卡住,需加容量)。
+    pub healable: bool,
+    /// 欠副本原因码(healthy 时空):node_down/replica_error/decommissioning/bootstrapping。
+    pub under_replicated_reason: String,
 }
 
 /// admin 对 master 的只读 + 运维能力(handler 依赖此 trait,便于测试注入)。
@@ -74,7 +91,7 @@ pub trait MasterApi: Send + Sync {
     /// 分页列分区,返回 `(本页, 总数)`;`limit=0` 表示不限。
     async fn partitions(&self, offset: u64, limit: u32) -> Result<(Vec<PartitionDto>, u64)>;
     async fn create_partitions(&self, count: u32, replication_factor: u32) -> Result<Vec<u32>>;
-    async fn decommission(&self, node_id: u64) -> Result<()>;
+    async fn decommission(&self, node_id: u64, force: bool) -> Result<()>;
     async fn set_partition_state(&self, partition_id: u32, state: &str) -> Result<()>;
 }
 
@@ -103,12 +120,28 @@ impl MasterApi for GrpcMasterApi {
             .await
             .map_err(|e| Error::MasterRpc(e.to_string()))?
             .into_inner();
+        // 容量/健康汇总:master 无现成聚合,由 admin 汇总节点盘容量 + 分区健康。
+        let nodes = self.nodes().await?;
+        let (partitions, _) = self.partitions(0, 0).await?;
+        let total_capacity_bytes: u64 =
+            nodes.iter().flat_map(|n| n.disks.iter()).map(|d| d.capacity_bytes).sum();
+        let free_bytes: u64 =
+            nodes.iter().flat_map(|n| n.disks.iter()).map(|d| d.free_bytes).sum();
+        let nodes_up = nodes.iter().filter(|n| n.up).count() as u64;
+        let under_replicated_partitions =
+            partitions.iter().filter(|p| !p.under_replicated_reason.is_empty()).count() as u64;
         Ok(ClusterDto {
             this_node: s.this_node,
             leader: s.leader,
             term: s.term,
             registered_nodes: s.registered_nodes,
             next_partition_id: s.next_partition_id,
+            total_capacity_bytes,
+            free_bytes,
+            used_bytes: total_capacity_bytes.saturating_sub(free_bytes),
+            nodes_up,
+            nodes_total: nodes.len() as u64,
+            under_replicated_partitions,
         })
     }
 
@@ -175,6 +208,9 @@ impl MasterApi for GrpcMasterApi {
                     state: p.state,
                     replication_factor: p.replication_factor,
                     replicas,
+                    healthy_replicas: p.healthy_replicas,
+                    healable: p.healable,
+                    under_replicated_reason: p.under_replicated_reason,
                 }
             })
             .collect();
@@ -203,23 +239,27 @@ impl MasterApi for GrpcMasterApi {
         Ok(resp.partition_ids)
     }
 
-    async fn decommission(&self, node_id: u64) -> Result<()> {
+    async fn decommission(&self, node_id: u64, force: bool) -> Result<()> {
         let mut c = self.client.clone();
         let resp = c
             .decommission_node(DecommissionRequest {
                 version: 1,
                 cluster_secret: self.cluster_secret.clone(),
                 node_id,
+                force,
             })
             .await
             .map_err(|e| Error::MasterRpc(e.to_string()))?
             .into_inner();
         if !resp.ok {
-            return Err(Error::MasterRejected(if resp.error.is_empty() {
+            let msg = if resp.error.is_empty() {
                 format!("not leader (leader={})", resp.leader_addr)
-            } else {
+            } else if resp.affected_partitions.is_empty() {
                 resp.error
-            }));
+            } else {
+                format!("{} (受影响分区: {:?})", resp.error, resp.affected_partitions)
+            };
+            return Err(Error::MasterRejected(msg));
         }
         Ok(())
     }

@@ -137,6 +137,12 @@ async fn get_cluster(State(st): State<AppState>) -> Response {
             "term": c.term,
             "registered_nodes": c.registered_nodes,
             "next_partition_id": c.next_partition_id,
+            "total_capacity_bytes": c.total_capacity_bytes,
+            "free_bytes": c.free_bytes,
+            "used_bytes": c.used_bytes,
+            "nodes_up": c.nodes_up,
+            "nodes_total": c.nodes_total,
+            "under_replicated_partitions": c.under_replicated_partitions,
             "grafana_url": st.grafana_url,
         }))
         .into_response(),
@@ -214,10 +220,20 @@ async fn post_partitions(
     }
 }
 
-async fn post_decommission(State(st): State<AppState>, Path(id): Path<u64>) -> Response {
+#[derive(Deserialize)]
+struct DecommissionParams {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn post_decommission(
+    State(st): State<AppState>,
+    Path(id): Path<u64>,
+    axum::extract::Query(p): axum::extract::Query<DecommissionParams>,
+) -> Response {
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
-    match st.master.decommission(id).await {
+    match st.master.decommission(id, p.force).await {
         Ok(()) => (StatusCode::OK, "decommission scheduled").into_response(),
         Err(e) => map_err(&st, e).into_response(),
     }
@@ -236,7 +252,19 @@ mod tests {
     #[async_trait]
     impl MasterApi for FakeMaster {
         async fn cluster(&self) -> crate::error::Result<ClusterDto> {
-            Ok(ClusterDto { this_node: 1, leader: Some(1), term: 3, registered_nodes: 2, next_partition_id: 5 })
+            Ok(ClusterDto {
+                this_node: 1,
+                leader: Some(1),
+                term: 3,
+                registered_nodes: 2,
+                next_partition_id: 5,
+                total_capacity_bytes: 2000,
+                free_bytes: 1500,
+                used_bytes: 500,
+                nodes_up: 2,
+                nodes_total: 2,
+                under_replicated_partitions: 0,
+            })
         }
         async fn nodes(&self) -> crate::error::Result<Vec<NodeDto>> {
             Ok(vec![])
@@ -248,6 +276,9 @@ mod tests {
                     state: "RW".into(),
                     replication_factor: 3,
                     replicas: vec![],
+                    healthy_replicas: 3,
+                    healable: true,
+                    under_replicated_reason: String::new(),
                 })
                 .collect();
             let take = if limit == 0 { all.len() } else { limit as usize };
@@ -257,7 +288,7 @@ mod tests {
         async fn create_partitions(&self, count: u32, _rf: u32) -> crate::error::Result<Vec<u32>> {
             Ok((0..count).collect())
         }
-        async fn decommission(&self, _node_id: u64) -> crate::error::Result<()> {
+        async fn decommission(&self, _node_id: u64, _force: bool) -> crate::error::Result<()> {
             Ok(())
         }
         async fn set_partition_state(&self, _id: u32, _state: &str) -> crate::error::Result<()> {

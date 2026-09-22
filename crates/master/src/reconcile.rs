@@ -15,6 +15,45 @@ pub fn reconcile_ready(leader_elapsed: Duration, grace: Duration) -> bool {
     leader_elapsed >= grace
 }
 
+/// 欠副本原因码(前端映射为中英文案)。
+pub const REASON_NODE_DOWN: &str = "node_down";
+pub const REASON_REPLICA_ERROR: &str = "replica_error";
+pub const REASON_DECOMMISSIONING: &str = "decommissioning";
+pub const REASON_BOOTSTRAPPING: &str = "bootstrapping";
+
+/// 一个副本的健康输入(硬放置 + 软状态合成)。
+pub struct ReplicaHealth {
+    pub up: bool,
+    /// 心跳上报的实然态:ACTIVE/BOOTSTRAP/ERROR/OFFLINE/""(未上报)。
+    pub current_state: String,
+    pub decommissioning: bool,
+}
+
+/// 分区健康分类:返回(健康副本数, 欠副本主因)。
+///
+/// 健康 = 节点存活 且 `current_state==ACTIVE` 且 非下线迁移中。`healthy >= rf` 时原因为 `None`。
+/// 欠副本主因优先级:节点失联 > 副本错误 > 下线迁移中 > 同步中。
+pub fn classify_partition(replicas: &[ReplicaHealth], rf: u8) -> (u32, Option<&'static str>) {
+    let healthy = replicas
+        .iter()
+        .filter(|r| r.up && r.current_state == "ACTIVE" && !r.decommissioning)
+        .count() as u32;
+    if healthy >= rf as u32 {
+        return (healthy, None);
+    }
+    let reason = if replicas.iter().any(|r| !r.up) {
+        REASON_NODE_DOWN
+    } else if replicas.iter().any(|r| r.current_state == "ERROR") {
+        REASON_REPLICA_ERROR
+    } else if replicas.iter().any(|r| r.decommissioning) {
+        REASON_DECOMMISSIONING
+    } else {
+        REASON_BOOTSTRAPPING
+    };
+    (healthy, Some(reason))
+}
+
+
 /// 一条状态转移指令:把某分区在某盘上的副本推向 `target_state`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transition {
@@ -234,5 +273,27 @@ mod tests {
         assert!(!reconcile_ready(Duration::from_secs(14), grace), "still within grace");
         assert!(reconcile_ready(Duration::from_secs(15), grace), "grace elapsed: reconcile");
         assert!(reconcile_ready(Duration::from_secs(60), grace));
+    }
+
+    fn rh(up: bool, state: &str, decom: bool) -> ReplicaHealth {
+        ReplicaHealth { up, current_state: state.to_string(), decommissioning: decom }
+    }
+
+    #[test]
+    fn classify_partition_reasons() {
+        let all_active = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "ACTIVE", false)];
+        assert_eq!(classify_partition(&all_active, 3), (3, None), "fully healthy");
+
+        let one_down = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(false, "ACTIVE", false)];
+        assert_eq!(classify_partition(&one_down, 3), (2, Some(REASON_NODE_DOWN)));
+
+        let one_err = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "ERROR", false)];
+        assert_eq!(classify_partition(&one_err, 3), (2, Some(REASON_REPLICA_ERROR)));
+
+        let one_decom = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "ACTIVE", true)];
+        assert_eq!(classify_partition(&one_decom, 3), (2, Some(REASON_DECOMMISSIONING)));
+
+        let one_boot = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "BOOTSTRAP", false)];
+        assert_eq!(classify_partition(&one_boot, 3), (2, Some(REASON_BOOTSTRAPPING)));
     }
 }

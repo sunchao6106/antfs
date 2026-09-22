@@ -198,10 +198,13 @@ impl MasterNode {
             let timeout = Duration::from_secs(config.heartbeat_timeout_secs);
             let grace = Duration::from_secs(config.reconcile_startup_grace_secs);
             let mut leader_since: Option<Instant> = None;
+            let mut last_unsatisfiable: std::collections::BTreeSet<PartitionId> =
+                std::collections::BTreeSet::new();
             loop {
                 tick.tick().await;
                 if raft.metrics().borrow().current_leader != Some(config.node_id) {
                     leader_since = None; // 卸任 leader:下次重新计稳定期
+                    last_unsatisfiable.clear();
                     continue;
                 }
                 // 启动/切主稳定期:软状态靠心跳从零重建,期内不据"暂无心跳"误判失联(防再复制风暴)。
@@ -228,13 +231,33 @@ impl MasterNode {
                         add_targets.insert(*pid);
                     }
                 }
+                metrics.under_replicated_partitions.set(add_targets.len() as i64);
+                let mut unsatisfiable: std::collections::BTreeSet<PartitionId> =
+                    std::collections::BTreeSet::new();
                 for pid in add_targets {
                     // 排除该分区已有节点 + 所有下线节点(故障域打散,只落存活健康盘)。
                     let mut exclude: std::collections::HashSet<NodeId> =
                         partitions[&pid].replicas.iter().map(|r| r.node_id).collect();
                     exclude.extend(decom.iter().copied());
-                    try_add_replica(&raft, &soft, &all_nodes, &config, &metrics, pid, &exclude, &up)
-                        .await;
+                    if try_add_replica(&raft, &soft, &all_nodes, &config, &metrics, pid, &exclude, &up)
+                        .await
+                    {
+                        unsatisfiable.insert(pid);
+                    }
+                }
+                // 不可满足的补副本(如 RF>健康节点数)只在集合变化时记一次,避免每周期刷屏;
+                // 后台照常每周期重算,有新节点/盘加入即自动补齐。
+                if unsatisfiable != last_unsatisfiable {
+                    if unsatisfiable.is_empty() {
+                        tracing::info!("reconcile: 之前无法补的欠副本已全部满足");
+                    } else {
+                        tracing::warn!(
+                            count = unsatisfiable.len(),
+                            partitions = ?unsatisfiable,
+                            "reconcile: 欠副本且无空闲盘可补(需加节点/盘),将持续重试"
+                        );
+                    }
+                    last_unsatisfiable = unsatisfiable;
                 }
 
                 // 下线 evacuation 的"后删":健康副本已达 RF 才移除下线节点旧副本(守 §3.1)。
@@ -265,7 +288,7 @@ async fn try_add_replica(
     pid: crate::types::PartitionId,
     exclude: &std::collections::HashSet<NodeId>,
     up: &std::collections::HashSet<NodeId>,
-) {
+) -> bool {
     let candidates: BTreeMap<NodeId, NodeInfo> = all_nodes
         .iter()
         .filter(|(id, _)| !exclude.contains(id) && up.contains(id))
@@ -292,11 +315,35 @@ async fn try_add_replica(
             {
                 metrics.rereplications.inc();
             }
+            false
         }
         Err(e) => {
-            tracing::warn!(partition = pid, error = %e, "reconcile: no spare disk to add replica");
+            tracing::debug!(partition = pid, error = %e, "reconcile: no eligible disk to add replica");
+            true
         }
     }
+}
+
+/// 是否存在可放新副本的空闲健康节点(re-replication / healable / 下线可行性共用)。
+fn has_spare_disk(
+    all_nodes: &BTreeMap<NodeId, NodeInfo>,
+    soft: &SoftState,
+    config: &MasterConfig,
+    exclude: &std::collections::HashSet<NodeId>,
+    up: &std::collections::HashSet<NodeId>,
+) -> bool {
+    let candidates: BTreeMap<NodeId, NodeInfo> = all_nodes
+        .iter()
+        .filter(|(id, _)| !exclude.contains(id) && up.contains(id))
+        .map(|(id, info)| (*id, info.clone()))
+        .collect();
+    let usage = soft
+        .free_snapshot()
+        .into_iter()
+        .map(|(k, free_bytes)| (k, DiskFree { free_bytes }))
+        .collect();
+    select_disks(&candidates, &usage, 1, config.partition_capacity_bytes, config.disk_near_full_ratio)
+        .is_ok()
 }
 
 fn enc<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, Status> {
@@ -635,6 +682,7 @@ impl Master for MasterService {
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
         let total = g.state.partitions.len() as u64;
+        let up_set = self.soft.up_nodes(timeout);
         // BTreeMap 按 partition_id 升序,offset/limit 稳定切片(limit=0 表示不限)。
         let take = if req.limit == 0 { usize::MAX } else { req.limit as usize };
         let partitions = g
@@ -666,12 +714,41 @@ impl Master for MasterService {
                         })
                     })
                     .collect();
+                // 健康分类(承 reconcile::classify_partition):健康副本数 + 欠副本主因。
+                let health_inputs: Vec<crate::reconcile::ReplicaHealth> = part
+                    .replicas
+                    .iter()
+                    .map(|r| crate::reconcile::ReplicaHealth {
+                        up: self.soft.is_up(r.node_id, timeout),
+                        current_state: self
+                            .soft
+                            .replica_state(*pid, r.node_id)
+                            .map(|st| st.current_state)
+                            .unwrap_or_default(),
+                        decommissioning: g.state.decommissioning.contains(&r.node_id),
+                    })
+                    .collect();
+                let (healthy_replicas, reason) =
+                    crate::reconcile::classify_partition(&health_inputs, part.replication_factor);
+                // 欠副本时:是否有空闲健康节点可补(排除已持有 + 下线节点)。
+                let healable = match reason {
+                    None => true,
+                    Some(_) => {
+                        let mut exclude: std::collections::HashSet<NodeId> =
+                            part.replicas.iter().map(|r| r.node_id).collect();
+                        exclude.extend(g.state.decommissioning.iter().copied());
+                        has_spare_disk(&g.state.nodes, &self.soft, &self.config, &exclude, &up_set)
+                    }
+                };
                 PartitionEntry {
                     partition_id: *pid,
                     state: pstate(part.state).to_string(),
                     replication_factor: part.replication_factor as u32,
                     replicas,
                     currents,
+                    healthy_replicas,
+                    healable,
+                    under_replicated_reason: reason.unwrap_or("").to_string(),
                 }
             })
             .collect();
@@ -786,7 +863,41 @@ impl Master for MasterService {
                 ok: false,
                 leader_addr: self.leader_addr().unwrap_or_default(),
                 error: "not leader".to_string(),
+                affected_partitions: vec![],
             }));
+        }
+        // 前置可行性校验:下线后该节点承载的分区,若无空闲健康节点可补回 RF → 拒绝(除非 force)。
+        if !req.force {
+            let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+            let affected: Vec<u32> = {
+                let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+                let up_set = self.soft.up_nodes(timeout);
+                g.state
+                    .partitions
+                    .iter()
+                    .filter(|(_, part)| part.replicas.iter().any(|r| r.node_id == req.node_id))
+                    .filter(|(_, part)| {
+                        let mut exclude: std::collections::HashSet<NodeId> =
+                            part.replicas.iter().map(|r| r.node_id).collect();
+                        exclude.insert(req.node_id);
+                        exclude.extend(g.state.decommissioning.iter().copied());
+                        !has_spare_disk(&g.state.nodes, &self.soft, &self.config, &exclude, &up_set)
+                    })
+                    .map(|(pid, _)| *pid)
+                    .collect()
+            };
+            if !affected.is_empty() {
+                return Ok(Response::new(DecommissionResponse {
+                    version: PROTO_VERSION,
+                    ok: false,
+                    leader_addr: String::new(),
+                    error: format!(
+                        "下线将使 {} 个分区欠副本且无空闲盘可补齐;确认后可用 force 强制下线",
+                        affected.len()
+                    ),
+                    affected_partitions: affected,
+                }));
+            }
         }
         match self.raft.client_write(MasterCommand::DecommissionNode { node_id: req.node_id }).await {
             Ok(_) => Ok(Response::new(DecommissionResponse {
@@ -794,12 +905,14 @@ impl Master for MasterService {
                 ok: true,
                 leader_addr: String::new(),
                 error: String::new(),
+                affected_partitions: vec![],
             })),
             Err(e) => Ok(Response::new(DecommissionResponse {
                 version: PROTO_VERSION,
                 ok: false,
                 leader_addr: self.leader_addr().unwrap_or_default(),
                 error: format!("{e}"),
+                affected_partitions: vec![],
             })),
         }
     }
