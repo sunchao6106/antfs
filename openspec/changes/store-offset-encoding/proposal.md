@@ -1,13 +1,13 @@
 ## Why
 
-LogSegment 数据区如何编排记录、`IndexValue` 如何存 offset,直接决定三件事的取舍:**单段寻址范围 ↔ 数据文件空间浪费 ↔ 索引条目大小**。SeaweedFS 等在这里做了 "记录强制 N 字节对齐 + 索引存 `offset/N`" 的压缩(以 32GiB 卷上限换 4 字节 offset + 每对象 padding 浪费),是一个**被生产系统采用但前提特定**的方案。本 change 固化 ambry-rs 在此点的选型与被否决方案,避免后续实现时凭直觉误抄 ÷N 压缩。
+LogSegment 数据区如何编排记录、`IndexValue` 如何存 offset,直接决定三件事的取舍:**单段寻址范围 ↔ 数据文件空间浪费 ↔ 索引条目大小**。SeaweedFS 等在这里做了 "记录强制 N 字节对齐 + 索引存 `offset/N`" 的压缩(以 32GiB 卷上限换 4 字节 offset + 每对象 padding 浪费),是一个**被生产系统采用但前提特定**的方案。本 change 固化 antfs 在此点的选型与被否决方案,避免后续实现时凭直觉误抄 ÷N 压缩。
 
 本 change 只**固化设计决策**,不改实现代码(现状 `LogSegment` 顺序打包、`IndexValue` 全宽 `LogOffset` 已符合本决策)。
 
 ## What Changes
 
 - **固化**:数据区变长记录**紧密顺序打包,不做 N 字节对齐 padding**;`IndexValue` 的 offset 用**全宽字节偏移**(`LogOffset { segment, offset }`,段内 offset 存真实字节号),**不做 ÷N 压缩**。
-- **明确分水岭**:offset 是否压缩的决定因素是**「索引是否全量常驻 RAM」,不是 key 长度**。ambry-rs 索引为磁盘 mmap 封存段(见 io-index-design),offset 位宽是磁盘账,故选全宽。
+- **明确分水岭**:offset 是否压缩的决定因素是**「索引是否全量常驻 RAM」,不是 key 长度**。antfs 索引为磁盘 mmap 封存段(见 io-index-design),offset 位宽是磁盘账,故选全宽。
 - **否决**:÷N 对齐压缩方案(SeaweedFS 式)。**保留**:余数位塞索引的混合方案,仅作未来"热索引子集缓进 RAM"时的二段优化。
 
 ## Capabilities

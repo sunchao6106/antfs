@@ -9,7 +9,7 @@
 //!
 //! 本轮只接 BlobStore 层指标;Log/Index/过滤器/stats 内部打点待这些模块各自接入(见 store.md §11)。
 
-use metric::{
+use antfs_metric::{
     counter_vec, gauge_vec, latency_seconds_vec, Histogram, HistogramTimer, HistogramVec,
     IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry, Result,
 };

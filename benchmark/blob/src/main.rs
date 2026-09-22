@@ -1,9 +1,9 @@
-//! `bench-blob`:BlobStore 层面的吞吐/延迟压测二进制。
+//! `antfs-bench-blob`:BlobStore 层面的吞吐/延迟压测二进制。
 //!
-//! 直接压 `blob::BlobStore`(单机引擎),多线程共享 `Arc<BlobStore>`(D4:写方法 `&self`),
+//! 直接压 `antfs_blob::BlobStore`(单机引擎),多线程共享 `Arc<BlobStore>`(D4:写方法 `&self`),
 //! 分 PUT / GET 两阶段测吞吐(ops/s、MB/s)与延迟分位(p50/p99/max)。
 //!
-//! 用法:`bench-blob [--ops N] [--value-size B] [--threads T] [--read-ops N]
+//! 用法:`antfs-bench-blob [--ops N] [--value-size B] [--threads T] [--read-ops N]
 //!        [--read-threads T] [--index-max N] [--segment-mib M] [--dir PATH]`
 //!
 //! 后续 `benchmark/` 下会新增数据节点(HTTP 数据面)与 S3 frontend 的压测二进制;本程序只覆盖 blob 引擎层。
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use blob::{BlobStore, StoreKey};
+use antfs_blob::{BlobStore, StoreKey};
 
 struct Args {
     ops: u64,
@@ -76,7 +76,7 @@ fn parse_args() -> Args {
 
 fn print_help() {
     eprintln!(
-        "bench-blob — BlobStore 层压测\n\
+        "antfs-bench-blob — BlobStore 层压测\n\
          \n\
          --ops N           PUT 次数 (default 100000)\n\
          --value-size B    每个 blob 字节数 (default 4096)\n\
@@ -268,14 +268,14 @@ fn main() {
                 .unwrap_or(0);
             let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/var/tmp".into());
             (
-                PathBuf::from(format!("{base}/ambry_bench_blob_{ns}")),
+                PathBuf::from(format!("{base}/antfs_bench_blob_{ns}")),
                 true,
             )
         }
     };
 
     println!(
-        "bench-blob: ops={} value={}B put-threads={} read-ops={} read-threads={} index-max={} segment={}MiB total-capacity={}MiB dir={}",
+        "antfs-bench-blob: ops={} value={}B put-threads={} read-ops={} read-threads={} index-max={} segment={}MiB total-capacity={}MiB dir={}",
         args.ops,
         args.value_size,
         args.threads,

@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use blob::StoreKey;
+use antfs_blob::StoreKey;
 
 use crate::config::StoreServerConfig;
 use crate::disk::DiskManager;
@@ -36,20 +36,20 @@ pub struct StoreServer {
 }
 
 impl StoreServer {
-    /// 挂盘、建 store 引擎依赖、装配 replica 管理器(用默认 [`blob::StoreConfig`])。
-    pub fn start(config: StoreServerConfig, registry: &metric::Registry) -> Result<Self> {
-        Self::start_with(config, blob::StoreConfig::default(), registry)
+    /// 挂盘、建 store 引擎依赖、装配 replica 管理器(用默认 [`antfs_blob::StoreConfig`])。
+    pub fn start(config: StoreServerConfig, registry: &antfs_metric::Registry) -> Result<Self> {
+        Self::start_with(config, antfs_blob::StoreConfig::default(), registry)
     }
 
     /// 同 [`start`](Self::start),但显式传入 store 引擎配置(测试/小部署可用小段大小)。
     pub fn start_with(
         config: StoreServerConfig,
-        store_config: blob::StoreConfig,
-        registry: &metric::Registry,
+        store_config: antfs_blob::StoreConfig,
+        registry: &antfs_metric::Registry,
     ) -> Result<Self> {
-        config::Validate::validate(&config)?;
+        antfs_config::Validate::validate(&config)?;
         let disks = DiskManager::mount(&config.data_dirs)?;
-        let store_metrics = blob::StoreMetrics::new(registry)?;
+        let store_metrics = antfs_blob::StoreMetrics::new(registry)?;
         let metrics = Arc::new(StoreServerMetrics::new(registry)?);
         let replicas = Arc::new(ReplicaManager::new(
             disks.clone(),
@@ -131,14 +131,14 @@ fn parse_key(key_hex: &str) -> Option<StoreKey> {
 }
 
 /// store 引擎错误 → 变更端点 HTTP 状态码。
-fn map_mut_err(e: &blob::Error) -> StatusCode {
+fn map_mut_err(e: &antfs_blob::Error) -> StatusCode {
     match e {
-        blob::Error::NotFound => StatusCode::NOT_FOUND,
-        blob::Error::Deleted
-        | blob::Error::NotDeleted
-        | blob::Error::AlreadyExists
-        | blob::Error::AlreadyUpdated => StatusCode::CONFLICT,
-        blob::Error::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        antfs_blob::Error::NotFound => StatusCode::NOT_FOUND,
+        antfs_blob::Error::Deleted
+        | antfs_blob::Error::NotDeleted
+        | antfs_blob::Error::AlreadyExists
+        | antfs_blob::Error::AlreadyUpdated => StatusCode::CONFLICT,
+        antfs_blob::Error::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -206,7 +206,7 @@ async fn put_blob(
             st.metrics.put_bytes.inc_by(len);
             StatusCode::CREATED.into_response()
         }
-        Ok(Err(blob::Error::AlreadyExists)) => StatusCode::CONFLICT.into_response(),
+        Ok(Err(antfs_blob::Error::AlreadyExists)) => StatusCode::CONFLICT.into_response(),
         Ok(Err(e)) => {
             st.metrics.errors.inc();
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
@@ -236,7 +236,7 @@ async fn get_blob(
             st.metrics.get_bytes.inc_by(data.len() as u64);
             (StatusCode::OK, data).into_response()
         }
-        Ok(Err(blob::Error::NotFound | blob::Error::Deleted | blob::Error::Expired)) => {
+        Ok(Err(antfs_blob::Error::NotFound | antfs_blob::Error::Deleted | antfs_blob::Error::Expired)) => {
             StatusCode::NOT_FOUND.into_response()
         }
         Ok(Err(e)) => {

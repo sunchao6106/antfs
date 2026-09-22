@@ -1,6 +1,15 @@
-# ambry-rs
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/ant-white.svg">
+    <img alt="antfs logo" src="docs/assets/ant.svg" width="128">
+  </picture>
+</p>
 
-用 Rust 重写 **整个 Ambry**(不止存储引擎)。分阶段推进:
+# 蚂蚁文件系统 (antfs)
+
+**antfs 取意「蚂蚁」:像蚂蚁一样,个体微小、数量惊人、协作可靠 —— 为海量小文件存储而生。**
+
+用 Rust 实现的分布式 blob 存储系统,设计参考了 [LinkedIn Ambry](https://github.com/linkedin/ambry) 与 [SeaweedFS](https://github.com/seaweedfs/seaweedfs):小文件追加进 log、索引定位,O(1) 次磁盘寻道完成读写;集群元数据由内建 Raft 的 master 管理,不依赖外部协调组件。分阶段推进:
 
 - **现阶段:忠实的 Rust 翻译** —— 对齐 Ambry 的架构与语义,先把功能 1:1 搬到 Rust(仅在等价前提下用现代实现,如 Binary Fuse 过滤器替 Bloom)。
 - **后续:在 Rust 版本之上做优化** —— 待翻译完成、正确性锁定后,再针对性能 / 并发 / 存储密度做改进。
@@ -30,7 +39,7 @@ blob 引擎当前要点:
 ```bash
 cargo build
 cargo test
-cargo run -p smoke
+cargo run -p antfs-smoke
 ```
 > 需 rustup 工具链;新开的 shell 先 `. "$HOME/.cargo/env"`。
 
@@ -41,9 +50,10 @@ cargo run -p smoke
 ```bash
 ./vm-cargo.sh build   # 自动转进 VM 跑 cargo(源码 virtiofs 挂载,target/数据落 VM 原生 ext4)
 ./vm-cargo.sh test
-./vm-cargo.sh run -p smoke
+./vm-cargo.sh run -p antfs-smoke
 ```
 
-### RustRover
+## 致谢
 
-IDE 配置(本机工具链 / 可选远程 VM 工具链)见 `docs/RUSTROVER.md`。
+- 架构设计参考 [LinkedIn Ambry](https://github.com/linkedin/ambry) 与 [SeaweedFS](https://github.com/seaweedfs/seaweedfs)。
+- Logo:蚂蚁图标来自 [Delapouite](https://delapouite.com/) / [game-icons.net](https://game-icons.net),[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)。

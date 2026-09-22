@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use master::pb::master_client::MasterClient;
-use master::pb::LookupRequest;
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::pb::LookupRequest;
 use serde::{Deserialize, Serialize};
-use blob::{
+use antfs_blob::{
     ApplyOutcome, BlobStore, FindInfo, FindToken, LogOffset, MessageInfo, ReplicatedRecord, StoreKey,
 };
 
@@ -86,7 +86,7 @@ fn entry_from(m: &MessageInfo) -> MetadataEntry {
     }
 }
 
-/// store 记录三态标志位(与 `blob::index::value` 的 FLAG_* 对齐)。
+/// store 记录三态标志位(与 `antfs_blob::index::value` 的 FLAG_* 对齐)。
 const FLAG_DELETED: u8 = 1 << 0;
 const FLAG_TTL_UPDATED: u8 = 1 << 1;
 const FLAG_UNDELETED: u8 = 1 << 2;
@@ -381,7 +381,7 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blob::StoreConfig;
+    use antfs_blob::StoreConfig;
 
     fn store(dir: &std::path::Path) -> BlobStore {
         BlobStore::create(dir, 64 << 20, 1 << 20, 1000).unwrap()
@@ -404,7 +404,7 @@ mod tests {
         fn fetch_data(&self, key: &StoreKey) -> Result<Option<Vec<u8>>> {
             match self.store.get_with_options(key, true, true) {
                 Ok(d) => Ok(Some(d)),
-                Err(blob::Error::NotFound) => Ok(None),
+                Err(antfs_blob::Error::NotFound) => Ok(None),
                 Err(e) => Err(Error::Store(e)),
             }
         }
@@ -437,7 +437,7 @@ mod tests {
         // delete 传播。
         peer.delete(key(1)).unwrap();
         let (_, _) = replicate_from_peer(&local, &src, FindToken::Uninitialized, u64::MAX).unwrap();
-        assert!(matches!(local.get(&key(1)), Err(blob::Error::Deleted)));
+        assert!(matches!(local.get(&key(1)), Err(antfs_blob::Error::Deleted)));
     }
 
     #[test]

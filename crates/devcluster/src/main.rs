@@ -10,11 +10,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use master::pb::master_client::MasterClient;
-use master::pb::CreatePartitionsRequest;
-use master::{MasterConfig, MasterNode};
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::pb::CreatePartitionsRequest;
+use antfs_master::{MasterConfig, MasterNode};
 use openraft::BasicNode;
-use store::{StoreServer, StoreServerConfig};
+use antfs_store::{StoreServer, StoreServerConfig};
 
 const SECRET: &str = "local-dev-secret";
 const OPERATOR_TOKEN: &str = "operator";
@@ -87,8 +87,8 @@ fn print_help() {
 }
 
 /// 小段大小引擎配置:本地演示用小 segment,快速滚段、看得到 compaction。
-fn dev_store_engine() -> blob::StoreConfig {
-    blob::StoreConfig {
+fn dev_store_engine() -> antfs_blob::StoreConfig {
+    antfs_blob::StoreConfig {
         segment_size_bytes: 8 << 20,
         index_max_inmem_elements: 100_000,
         io_error_count_to_trigger_shutdown: 0,
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         reconcile_interval_secs: 5,
         ..Default::default()
     };
-    let mreg = metric::Registry::new();
+    let mreg = antfs_metric::Registry::new();
     let master = MasterNode::start(mcfg.clone(), &mreg).await?;
     master.serve()?;
     // 仅首次(未初始化)才 bootstrap;重启时集群已在 redb 里初始化,再调 initialize 会被 openraft
@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             flush_interval_secs: 5,
             ..Default::default()
         };
-        let sreg = metric::Registry::new();
+        let sreg = antfs_metric::Registry::new();
         let server = StoreServer::start_with(scfg, dev_store_engine(), &sreg)?;
         server.serve().await?;
         // 泄漏 server 句柄使其在进程存活期间常驻(单命令 dev 工具,退出即回收)。
@@ -196,21 +196,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(count = created.len(), "partitions created: {created:?}");
 
     // ---- admin web ----
-    let areg = metric::Registry::new();
-    let ametrics = Arc::new(admin::AdminMetrics::new(&areg)?);
+    let areg = antfs_metric::Registry::new();
+    let ametrics = Arc::new(antfs_admin::AdminMetrics::new(&areg)?);
     let amaster = Arc::new(
-        admin::master_api::GrpcMasterApi::connect(&grpc_addr, SECRET.to_string()).await?,
+        antfs_admin::master_api::GrpcMasterApi::connect(&grpc_addr, SECRET.to_string()).await?,
     );
-    let astate = admin::server::AppState {
+    let astate = antfs_admin::server::AppState {
         master: amaster,
         metrics: ametrics,
         grafana_url: String::new(),
     };
-    let aauth = admin::server::AuthConfig {
+    let aauth = antfs_admin::server::AuthConfig {
         operator_token: OPERATOR_TOKEN.to_string(),
         viewer_token: VIEWER_TOKEN.to_string(),
     };
-    let arouter = admin::server::build_router(astate, aauth);
+    let arouter = antfs_admin::server::build_router(astate, aauth);
     let admin_addr = format!("127.0.0.1:{}", args.admin_port);
     let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
     tokio::spawn(async move {
@@ -242,7 +242,7 @@ fn print_summary(
     partitions: &[u32],
 ) {
     println!("\n========================================================");
-    println!("  ambry-rs 本地集群已就绪 (数据目录 {})", args.dir.display());
+    println!("  antfs 本地集群已就绪 (数据目录 {})", args.dir.display());
     println!("--------------------------------------------------------");
     println!("  admin web     : http://{admin_addr}");
     println!("                  operator token = {OPERATOR_TOKEN} (读写)");
@@ -260,7 +260,7 @@ fn print_summary(
         println!("      http://{}/partitions/{pid}/blobs/{key}", store_addrs[0]);
         println!("    curl http://{}/partitions/{pid}/blobs/{key}", store_addrs[0]);
         println!("  引擎层压测(独立跑,不压本集群):");
-        println!("    cargo run -p bench-blob --release -- --ops 100000 --value-size 4096");
+        println!("    cargo run -p antfs-bench-blob --release -- --ops 100000 --value-size 4096");
     }
     println!("========================================================");
     println!("  Ctrl-C 停止。\n");

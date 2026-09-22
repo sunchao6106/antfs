@@ -2,24 +2,24 @@
 
 use std::sync::Arc;
 
-use admin::config::AdminConfig;
-use admin::master_api::GrpcMasterApi;
-use admin::metrics::AdminMetrics;
-use admin::server::{build_router, AppState, AuthConfig};
-use config::Validate;
+use antfs_admin::config::AdminConfig;
+use antfs_admin::master_api::GrpcMasterApi;
+use antfs_admin::metrics::AdminMetrics;
+use antfs_admin::server::{build_router, AppState, AuthConfig};
+use antfs_config::Validate;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
-    let cfg: AdminConfig = config::Loader::new()
+    let cfg: AdminConfig = antfs_config::Loader::new()
         .with_file("admin.toml", false)
         .with_env_prefix("AMBRY")
         .load()
         .unwrap_or_default();
     cfg.validate()?;
 
-    let registry = metric::Registry::new();
+    let registry = antfs_metric::Registry::new();
     let metrics = Arc::new(AdminMetrics::new(&registry)?);
     let master = Arc::new(GrpcMasterApi::connect(&cfg.master_addr, cfg.cluster_secret.clone()).await?);
 

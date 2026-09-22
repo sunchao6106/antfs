@@ -45,7 +45,7 @@
 | 阶段 1 换元数据(ReplicaMetadata) | 控制面 | **gRPC**(`tonic`+`prost`,proto 带版本) |
 | 阶段 2 拉 blob 字节 | 数据面 | **裸 HTTP 流式**(`Bytes`,不整缓进内存) |
 
-## 6. 对 ambry-rs 的映射与缺口
+## 6. 对 antfs 的映射与缺口
 
 - **已就位(store 侧地基)**:`find_entries_since` / `FindToken` / `journal` / `find_missing_keys` / `is_key_deleted` / `update_ttl` —— 即未来复制线程要调的 store 原语。
 - **待实现(复制角色)**:`ReplicaThread` 等价物、`RemoteReplicaInfo`、token 持久化器、两阶段 RPC 端点、leader-based admin。归 server 内复制角色(cluster.md §1)。

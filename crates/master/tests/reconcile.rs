@@ -5,10 +5,10 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use master::config::MasterConfig;
-use master::pb::master_client::MasterClient;
-use master::types::{MasterCommand, NodeInfo, ReplicaPlacement};
-use master::MasterNode;
+use antfs_master::config::MasterConfig;
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::types::{MasterCommand, NodeInfo, ReplicaPlacement};
+use antfs_master::MasterNode;
 use openraft::BasicNode;
 
 const SECRET: &str = "test-secret";
@@ -46,18 +46,18 @@ fn data_node(rack: &str) -> NodeInfo {
         addr: format!("127.0.0.1:{}", free_port()),
         disks: BTreeMap::from([(
             "d0".to_string(),
-            master::types::DiskSpec { capacity_bytes: 1_000_000_000_000 },
+            antfs_master::types::DiskSpec { capacity_bytes: 1_000_000_000_000 },
         )]),
         registered_at_ms: 1,
     }
 }
 
-fn beat(node_id: u64, replicas: Vec<master::pb::ReplicaBeat>) -> master::pb::NodeBeat {
-    master::pb::NodeBeat {
+fn beat(node_id: u64, replicas: Vec<antfs_master::pb::ReplicaBeat>) -> antfs_master::pb::NodeBeat {
+    antfs_master::pb::NodeBeat {
         version: 1,
         cluster_secret: SECRET.into(),
         node_id,
-        disks: vec![master::pb::DiskBeat {
+        disks: vec![antfs_master::pb::DiskBeat {
             disk_id: "d0".into(),
             capacity_bytes: 1_000_000_000_000,
             free_bytes: 900_000_000_000,
@@ -89,7 +89,7 @@ async fn reconcile_transitions_and_rereplication() {
         std::fs::create_dir_all(&dir).unwrap();
         let c = cfg(id, &dir, free_port(), free_port());
         members.insert(id, BasicNode::new(c.raft_addr.clone()));
-        let registry = metric::Registry::new();
+        let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
         nodes.push(node);
@@ -129,7 +129,7 @@ async fn reconcile_transitions_and_rereplication() {
         .await
         .expect("create partition");
     let pid = match resp.data {
-        master::MasterResponse::PartitionId(id) => id,
+        antfs_master::MasterResponse::PartitionId(id) => id,
         other => panic!("unexpected: {other:?}"),
     };
 
@@ -141,7 +141,7 @@ async fn reconcile_transitions_and_rereplication() {
     let mut hb101 = client
         .heartbeat(tokio_stream::iter(vec![beat(
             101,
-            vec![master::pb::ReplicaBeat {
+            vec![antfs_master::pb::ReplicaBeat {
                 partition_id: pid,
                 disk_id: "d0".into(),
                 current_state: "BOOTSTRAP".into(),
@@ -195,7 +195,7 @@ async fn decommission_evacuates_replicas_add_before_remove() {
         std::fs::create_dir_all(&dir).unwrap();
         let c = cfg(id, &dir, free_port(), free_port());
         members.insert(id, BasicNode::new(c.raft_addr.clone()));
-        let registry = metric::Registry::new();
+        let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
         nodes.push(node);
@@ -231,7 +231,7 @@ async fn decommission_evacuates_replicas_add_before_remove() {
         .await
         .expect("create partition");
     let pid = match resp.data {
-        master::MasterResponse::PartitionId(id) => id,
+        antfs_master::MasterResponse::PartitionId(id) => id,
         other => panic!("unexpected: {other:?}"),
     };
 
@@ -251,7 +251,7 @@ async fn decommission_evacuates_replicas_add_before_remove() {
 
     // 下线 103:evacuation 应先在 104 补副本,再移除 103。
     let d = client
-        .decommission_node(master::pb::DecommissionRequest {
+        .decommission_node(antfs_master::pb::DecommissionRequest {
             version: 1,
             cluster_secret: SECRET.into(),
             node_id: 103,

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tonic::transport::Channel;
 
-use master::pb::master_client::MasterClient;
-use master::pb::{
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::pb::{
     ClusterStateRequest, CreatePartitionsRequest, DecommissionRequest, ListNodesRequest,
     ListPartitionsRequest, SetPartitionStateRequest,
 };

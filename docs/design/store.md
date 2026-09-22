@@ -44,12 +44,12 @@ Header(小端 + crc32 覆盖其前):`magic("AMBS") | version | capacity | data_e
 | 方案 | 数据浪费 | 索引 offset 占用 | 寻址范围 | 复杂度 | 代表 |
 |---|---|---|---|---|---|
 | ① ÷N 对齐(存 `offset/N`,强制记录起点 N 对齐) | 平均 ~N/2 B/对象 padding | 最小(如 4B) | `2^(8·宽) · N` | 中(维护"必须对齐"不变量) | SeaweedFS(N=8→32GiB) |
-| **② 全宽 offset(直接存字节号,不对齐)** | **0** | 大(8/16B) | 近乎无限(u64=16EiB) | **最简单** | **Ambry / ambry-rs 本方案** |
+| **② 全宽 offset(直接存字节号,不对齐)** | **0** | 大(8/16B) | 近乎无限(u64=16EiB) | **最简单** | **Ambry / antfs 本方案** |
 | ③ 余数塞索引(存 `offset/N` + 低位余数进空闲 bit) | **0** | 小(4B + ~3bit) | `2^(8·宽) · N` | 高(需腾空闲位 + 破坏扫描步进) | — |
 
 **分水岭是「索引驻留在 RAM 还是磁盘」,不是 key 长度**:
 - 方案①(÷N 压缩)只在**索引全量常驻 RAM**时才划算——每字节 ×十亿条都要命,故牺牲磁盘 padding 换 RAM。这是 SeaweedFS 的约束(needle map 全内存)。
-- ambry-rs 的索引是**磁盘上的 mmap 封存段 + 过滤器,并非全内存**(见 §5、§1),offset 多占几字节是**磁盘账(便宜)**,不吃 RAM。故选方案②:**换来 log 零 padding + 无"必须对齐"不变量(少一类崩溃一致性 footgun,对齐持久性红线)+ 单段寻址上限由容量策略而非位宽决定**。
+- antfs 的索引是**磁盘上的 mmap 封存段 + 过滤器,并非全内存**(见 §5、§1),offset 多占几字节是**磁盘账(便宜)**,不吃 RAM。故选方案②:**换来 log 零 padding + 无"必须对齐"不变量(少一类崩溃一致性 footgun,对齐持久性红线)+ 单段寻址上限由容量策略而非位宽决定**。
 
 **被否决:方案①(÷N 对齐)**——理由:我们索引不常驻 RAM,①省的 RAM 收益不存在,却白背 padding 浪费 + 对齐不变量的维护/崩溃风险。**保留:方案③** 仅作未来"把热索引子集缓进 RAM 做小对象吞吐"时的二段优化,base 设计不用。
 
@@ -206,7 +206,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [x] 每 Log 定容上界(store 层):`total_capacity`(per-replica 构造参数,对齐 Ambry `capacityInBytes`)+ 写满归一为 `Error::StoreFull` + 容量自省(`total_capacity`/`available_capacity`/`is_full`)。**「写满自动滚动新 partition」是集群/路由层职责,不在 store**
-- [x] 压测:`benchmark/blob`(`bench-blob` 二进制)—— 多线程共享 `Arc<BlobStore>` 压 PUT/GET,报吞吐(ops/s、MB/s)+ 延迟分位(p50/p99/max);`benchmark/` 下后续加 blob-server / S3 frontend 压测
+- [x] 压测:`benchmark/blob`(`antfs-bench-blob` 二进制)—— 多线程共享 `Arc<BlobStore>` 压 PUT/GET,报吞吐(ops/s、MB/s)+ 延迟分位(p50/p99/max);`benchmark/` 下后续加 blob-server / S3 frontend 压测
 - [ ] **封存段 EC 冷层**(热副本→冷 EC,封存段级;转换/读/修复在服务层)——见 [`cluster.md` §5 (D5)](./cluster.md);store 侧需支持封存段的 EC 读路径(有整副本直读,否则读 k 分片重构)
 - [ ] (已废弃)monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销
 
@@ -228,7 +228,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.io_error_count_to_trigger_shutdown` | u32 | 0(=禁用) | 任意(0 禁用,≥1 阈值) | **已接入**:连续 IO 错误达此值则 store 自关(被动磁盘检测)+ 触发回调;0=禁用,对齐 Ambry 默认 `MAX_VALUE` | `store.io.error.count.to.trigger.shutdown` |
 | `store.max_journal_entries_to_return` | u32 | 5000 | 1–10000 | journal 单次返回上限 | `store.max.number.of.entries.to.return.from.journal` |
 | `store.index_persisted_entry_min_bytes` | u32 | 115 | ≥1 | 索引条目持久化最小字节(注:Rust `IndexValue` 定长 59B,值需按实际布局重定) | `store.index.persisted.entry.min.bytes` |
-| `store.segment_size_bytes` | u64 | **待定** | ≥1 | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;ambry-rs 需按"每 Log 定容上界"设计锚点定具体值) | `store.segment.size.in.bytes` |
+| `store.segment_size_bytes` | u64 | **待定** | ≥1 | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;antfs 需按"每 Log 定容上界"设计锚点定具体值) | `store.segment.size.in.bytes` |
 | `store.index_mem_state` | enum | `mmap_without_force_load` | 枚举 | 索引内存策略 | `store.index.mem.state` |
 
 ### 10.2 `[store.compaction]`
@@ -270,7 +270,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.hard_delete.deleted_message_retention_minutes` | u64 | 10080 | ≥1 | 软删后多久可硬删(Ambry 默认 168h) | `store.deleted.message.retention.hours/minutes` |
 | `store.hard_delete.ttl_update_buffer_seconds` | u32 | 86400 | ≥0 | TTL 更新须早于过期的缓冲 | `store.ttl.update.buffer.time.seconds` |
 
-### 10.5 `[store.filter]`(存在性过滤器;ambry-rs 用 Binary Fuse 替 Bloom)
+### 10.5 `[store.filter]`(存在性过滤器;antfs 用 Binary Fuse 替 Bloom)
 | key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
 |---|---|---|---|---|---|
 | `store.filter.rebuild_on_startup` | bool | false | — | 启动时重建 `.fuse`(损坏兜底) | `store.index.rebuild.bloom.filter.enabled` |

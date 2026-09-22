@@ -1,5 +1,5 @@
 [package]
-name = "smoke"
+name = "antfs-smoke"
 version = "0.0.0"
 edition.workspace = true
 

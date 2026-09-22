@@ -1,4 +1,4 @@
-use metric::{counter, gather, gauge, histogram, latency_seconds, Histogram, IntCounter, Registry};
+use antfs_metric::{counter, gather, gauge, histogram, latency_seconds, Histogram, IntCounter, Registry};
 
 struct StoreMetrics {
     get_response: Histogram,
@@ -7,7 +7,7 @@ struct StoreMetrics {
 }
 
 impl StoreMetrics {
-    fn new(registry: &Registry) -> metric::Result<Self> {
+    fn new(registry: &Registry) -> antfs_metric::Result<Self> {
         Ok(StoreMetrics {
             get_response: latency_seconds(registry, "store_get_response_seconds", "get latency")?,
             put_response: latency_seconds(registry, "store_put_response_seconds", "put latency")?,
@@ -87,7 +87,7 @@ fn duplicate_registration_is_error() {
 #[test]
 fn labeled_vec_distinguishes_instances_on_shared_registry() {
     let registry = Registry::new();
-    let ops = metric::counter_vec(&registry, "store_ops_total", "ops", &["store", "op"]).unwrap();
+    let ops = antfs_metric::counter_vec(&registry, "store_ops_total", "ops", &["store", "op"]).unwrap();
     // 两个 store 共享同一 Vec,用 label 区分(common.md §2.2)。
     ops.with_label_values(&["p1", "put"]).inc();
     ops.with_label_values(&["p1", "put"]).inc();
@@ -104,12 +104,12 @@ fn labeled_vec_distinguishes_instances_on_shared_registry() {
 #[test]
 fn labeled_gauge_and_histogram_vec() {
     let registry = Registry::new();
-    let cap = metric::gauge_vec(&registry, "store_capacity_bytes", "cap", &["store"]).unwrap();
+    let cap = antfs_metric::gauge_vec(&registry, "store_capacity_bytes", "cap", &["store"]).unwrap();
     cap.with_label_values(&["p1"]).set(4096);
     assert_eq!(cap.with_label_values(&["p1"]).get(), 4096);
 
     let lat =
-        metric::latency_seconds_vec(&registry, "store_req_seconds", "latency", &["store", "op"])
+        antfs_metric::latency_seconds_vec(&registry, "store_req_seconds", "latency", &["store", "op"])
             .unwrap();
     lat.with_label_values(&["p1", "get"]).observe(0.01);
     assert_eq!(lat.with_label_values(&["p1", "get"]).get_sample_count(), 1);

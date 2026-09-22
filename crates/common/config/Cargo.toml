@@ -1,11 +1,11 @@
 [package]
-name = "config"
+name = "antfs-config"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-# package 重命名:crates.io 的 `config` 与本 crate 同名,别名为 `config_rs` 消除冲突。
+# 历史上本 crate 叫 `config`,与 crates.io 的 `config` 同名而加了别名;crate 改名 antfs-config 后保留该别名以减少改动。
 config-rs = { package = "config", version = "0.14", default-features = false, features = ["toml"] }
 thiserror = "1"

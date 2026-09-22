@@ -12,7 +12,7 @@
 //!
 //! ```
 //! use serde::Deserialize;
-//! use config::{Loader, Validate, Result, in_range};
+//! use antfs_config::{Loader, Validate, Result, in_range};
 //!
 //! #[derive(Debug, Deserialize)]
 //! #[serde(default)]

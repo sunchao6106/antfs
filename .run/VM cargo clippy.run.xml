@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="VM: cargo clippy (-D warnings)" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="./vm-cargo.sh clippy -p store --all-targets -- -D warnings" />
+    <option name="SCRIPT_TEXT" value="./vm-cargo.sh clippy -p antfs-store --all-targets -- -D warnings" />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="SCRIPT_PATH" value="" />
     <option name="SCRIPT_OPTIONS" value="" />

@@ -6,7 +6,7 @@ use std::os::unix::fs::FileExt;
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/var/tmp/ambry_smoke.bin".to_string());
+        .unwrap_or_else(|| "/var/tmp/antfs_smoke.bin".to_string());
 
     // 写
     let file = std::fs::OpenOptions::new()
@@ -16,7 +16,7 @@ fn main() {
         .truncate(true)
         .open(&path)
         .expect("create");
-    let payload = b"sync buffered hello from ambry-rs\n";
+    let payload = b"sync buffered hello from antfs\n";
     file.write_all_at(payload, 0).expect("write_at");
     file.sync_all().expect("sync_all");
     drop(file);

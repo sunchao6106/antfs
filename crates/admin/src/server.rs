@@ -297,7 +297,7 @@ mod tests {
     }
 
     fn app_auth(auth: AuthConfig) -> Router {
-        let registry = metric::Registry::new();
+        let registry = antfs_metric::Registry::new();
         let state = AppState {
             master: Arc::new(FakeMaster),
             metrics: Arc::new(AdminMetrics::new(&registry).unwrap()),

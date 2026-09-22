@@ -1,18 +1,18 @@
 [package]
-name = "store"
+name = "antfs-store"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "store"
+name = "antfs-store"
 path = "src/main.rs"
 
 [dependencies]
-blob = { path = "../blob" }
-master = { path = "../master" }
-config = { path = "../common/config" }
-metric = { path = "../common/metric" }
+antfs-blob = { path = "../blob" }
+antfs-master = { path = "../master" }
+antfs-config = { path = "../common/config" }
+antfs-metric = { path = "../common/metric" }
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"

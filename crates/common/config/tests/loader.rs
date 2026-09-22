@@ -1,4 +1,4 @@
-use config::{at_least, in_range, one_of, ConfigError, Loader, Result, Validate};
+use antfs_config::{at_least, in_range, one_of, ConfigError, Loader, Result, Validate};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq)]

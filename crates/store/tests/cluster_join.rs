@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use master::config::MasterConfig;
-use master::pb::master_client::MasterClient;
-use master::pb::{CreatePartitionsRequest, ListPartitionsRequest};
-use master::MasterNode;
+use antfs_master::config::MasterConfig;
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::pb::{CreatePartitionsRequest, ListPartitionsRequest};
+use antfs_master::MasterNode;
 use openraft::BasicNode;
-use store::{StoreServer, StoreServerConfig};
+use antfs_store::{StoreServer, StoreServerConfig};
 use tower::ServiceExt;
 
 const SECRET: &str = "s2-secret";
@@ -23,8 +23,8 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-fn small_store_config() -> blob::StoreConfig {
-    blob::StoreConfig {
+fn small_store_config() -> antfs_blob::StoreConfig {
+    antfs_blob::StoreConfig {
         segment_size_bytes: 1 << 20,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
@@ -67,7 +67,7 @@ async fn store_server_joins_master_and_serves_directed_replica() {
         reconcile_interval_secs: 60, // 慢,避免干扰
         reconcile_startup_grace_secs: 0,
     };
-    let mreg = metric::Registry::new();
+    let mreg = antfs_metric::Registry::new();
     let master = MasterNode::start(mcfg.clone(), &mreg).await.expect("master start");
     master.serve().expect("master serve");
     master
@@ -97,7 +97,7 @@ async fn store_server_joins_master_and_serves_directed_replica() {
         disk_health_timeout_secs: 10,
         ..Default::default()
     };
-    let ssreg = metric::Registry::new();
+    let ssreg = antfs_metric::Registry::new();
     let ss = StoreServer::start_with(sscfg, small_store_config(), &ssreg).expect("ss start");
     ss.serve().await.expect("ss serve"); // 注册 + 心跳后台任务
 

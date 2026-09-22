@@ -10,14 +10,14 @@
 //!   Prometheus 改为**服务端**从计数/桶用 `rate()` / `histogram_quantile()` 算,客户端只累加,更省更准。
 //!
 //! ```
-//! use metric::{counter, latency_seconds, gather, Registry, IntCounter, Histogram};
+//! use antfs_metric::{counter, latency_seconds, gather, Registry, IntCounter, Histogram};
 //!
 //! struct StoreMetrics {
 //!     get_response: Histogram,
 //!     store_start_failure: IntCounter,
 //! }
 //! impl StoreMetrics {
-//!     fn new(registry: &Registry) -> metric::Result<Self> {
+//!     fn new(registry: &Registry) -> antfs_metric::Result<Self> {
 //!         Ok(Self {
 //!             get_response: latency_seconds(registry, "store_get_response_seconds", "get latency")?,
 //!             store_start_failure: counter(registry, "store_start_failure_total", "start failures")?,

@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use proptest::prelude::*;
-use blob::LogSegment;
+use antfs_blob::LogSegment;
 
 #[derive(Debug, Clone)]
 enum Op {

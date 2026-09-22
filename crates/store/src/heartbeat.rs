@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use master::pb::master_client::MasterClient;
-use master::pb::{DiskBeat, NodeBeat, RegisterRequest, ReplicaBeat};
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::pb::{DiskBeat, NodeBeat, RegisterRequest, ReplicaBeat};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 

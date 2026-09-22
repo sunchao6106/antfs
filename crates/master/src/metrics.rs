@@ -4,7 +4,7 @@
 //! master 是单例进程(非多 store 那种多实例),故用**无 label** 的裸 handle。指标断言必须打在
 //! 实际接入的这个 `Registry` 上(CLAUDE.md §6)。
 
-use metric::{counter, gauge, IntCounter, IntGauge, Registry, Result};
+use antfs_metric::{counter, gauge, IntCounter, IntGauge, Registry, Result};
 
 /// master 指标集,构造时注册进传入的 `Registry`。
 #[derive(Clone)]

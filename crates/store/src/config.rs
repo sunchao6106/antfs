@@ -3,7 +3,7 @@
 //! 字段名即 TOML key(在 `[store_server]` 表下)。默认值/范围须与本文件 `impl Default` + `Validate`
 //! 对齐(CLAUDE.md §7)。
 
-use config::{at_least, Result, Validate};
+use antfs_config::{at_least, Result, Validate};
 use serde::Deserialize;
 
 /// 数据节点配置。
@@ -81,13 +81,13 @@ impl Validate for StoreServerConfig {
         at_least("store_server.node_id", self.node_id, 1)?;
         at_least("store_server.partition_capacity_bytes", self.partition_capacity_bytes, 1)?;
         if self.data_dirs.is_empty() {
-            return Err(config::ConfigError::invalid(
+            return Err(antfs_config::ConfigError::invalid(
                 "store_server.data_dirs",
                 "must declare at least one disk directory",
             ));
         }
         if self.http_addr.is_empty() {
-            return Err(config::ConfigError::invalid("store_server.http_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid("store_server.http_addr", "must not be empty"));
         }
         at_least("store_server.heartbeat_interval_secs", self.heartbeat_interval_secs, 1)?;
         at_least("store_server.disk_health_interval_secs", self.disk_health_interval_secs, 1)?;
@@ -98,7 +98,7 @@ impl Validate for StoreServerConfig {
         at_least("store_server.compaction_interval_secs", self.compaction_interval_secs, 1)?;
         at_least("store_server.hard_delete_interval_secs", self.hard_delete_interval_secs, 1)?;
         if !(self.compaction_dead_ratio > 0.0 && self.compaction_dead_ratio <= 1.0) {
-            return Err(config::ConfigError::invalid(
+            return Err(antfs_config::ConfigError::invalid(
                 "store_server.compaction_dead_ratio",
                 "must be in (0, 1]",
             ));

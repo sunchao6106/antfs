@@ -1,4 +1,4 @@
-# CLAUDE.md — ambry-rs 工程约定
+# CLAUDE.md — 蚂蚁文件系统 (antfs) 工程约定
 
 用 Rust 重写整个 Ambry。**现阶段:忠实的 Rust 翻译**(对齐 Ambry 架构与语义,仅在等价前提下用现代实现);
 后续再在 Rust 版本之上做优化。总原则:**整体照搬 Ambry 架构,局部替换为业界最新最佳实现**。

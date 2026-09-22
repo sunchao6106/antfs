@@ -1,6 +1,6 @@
 //! `AdminMetrics`:admin 服务打点(接 common/metric 的 `Registry`)。
 
-use metric::{counter, IntCounter, Registry, Result};
+use antfs_metric::{counter, IntCounter, Registry, Result};
 
 /// admin 服务指标集,构造时注册进传入 `Registry`。
 #[derive(Clone)]

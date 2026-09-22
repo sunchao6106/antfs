@@ -106,7 +106,7 @@ fn spawn_loop<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blob::{StoreConfig, StoreKey, StoreMetrics};
+    use antfs_blob::{StoreConfig, StoreKey, StoreMetrics};
 
     use crate::disk::DiskManager;
 
@@ -116,7 +116,7 @@ mod tests {
 
     fn manager(dir: &std::path::Path) -> ReplicaManager {
         let dm = DiskManager::mount(&[dir.to_string_lossy().into_owned()]).unwrap();
-        let registry = metric::Registry::new();
+        let registry = antfs_metric::Registry::new();
         let sc = StoreConfig {
             segment_size_bytes: 1 << 20,
             index_max_inmem_elements: 1000,

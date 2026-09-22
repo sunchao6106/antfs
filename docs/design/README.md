@@ -1,4 +1,4 @@
-# ambry-rs 设计总览
+# 蚂蚁文件系统 (antfs) 设计总览
 
 用 Rust 重写**整个 Ambry**(不止存储引擎)。分阶段:**现阶段是忠实的 Rust 翻译**(对齐 Ambry 架构与语义,仅在等价前提下用现代实现),**后续在 Rust 版本之上做优化**。大原则:**整体照搬 Ambry 架构,局部替换为业界最新最佳实现**。
 
@@ -38,4 +38,4 @@ Partition(逻辑分区,句柄里编码,永不变)
 
 工程**跨平台**(Linux / macOS,均 Unix;非 Unix 不支持)。本机 macOS 装 rustup 后可直接 `cargo build/test`——已无任何"非 Linux 不可"的硬依赖(段预分配按平台分派:Linux `posix_fallocate` / macOS `F_PREALLOCATE` / 回退 `set_len`)。
 
-生产目标是 Linux ext4,故保留 **colima Linux VM** 作为**可选**的目标 OS 保真 / 大数据量 / 性能测试路径:`./vm-cargo.sh <cmd>` 转进 VM 跑 cargo(源码 virtiofs 挂载,target/数据落 VM 原生 ext4)。RustRover 配置见 `docs/RUSTROVER.md`。
+生产目标是 Linux ext4,故保留 **colima Linux VM** 作为**可选**的目标 OS 保真 / 大数据量 / 性能测试路径:`./vm-cargo.sh <cmd>` 转进 VM 跑 cargo(源码 virtiofs 挂载,target/数据落 VM 原生 ext4)。

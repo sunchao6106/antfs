@@ -1,6 +1,6 @@
 //! `StoreServerMetrics`:数据节点打点(接 common/metric 的 `Registry`)。
 
-use metric::{counter, gauge, IntCounter, IntGauge, Registry, Result};
+use antfs_metric::{counter, gauge, IntCounter, IntGauge, Registry, Result};
 
 /// 数据节点指标集,构造时注册进传入 `Registry`。
 #[derive(Clone)]

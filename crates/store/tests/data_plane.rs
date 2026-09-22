@@ -3,12 +3,12 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use store::{StoreServer, StoreServerConfig};
+use antfs_store::{StoreServer, StoreServerConfig};
 use tower::ServiceExt;
 
-fn small_store_config() -> blob::StoreConfig {
+fn small_store_config() -> antfs_blob::StoreConfig {
     // 小段:避免测试预分配 8GiB 默认段。
-    blob::StoreConfig { segment_size_bytes: 1 << 20, index_max_inmem_elements: 1000, io_error_count_to_trigger_shutdown: 0 }
+    antfs_blob::StoreConfig { segment_size_bytes: 1 << 20, index_max_inmem_elements: 1000, io_error_count_to_trigger_shutdown: 0 }
 }
 
 fn server(dir: &std::path::Path) -> StoreServer {
@@ -19,7 +19,7 @@ fn server(dir: &std::path::Path) -> StoreServer {
         partition_capacity_bytes: 4 << 20,
         ..Default::default()
     };
-    let registry = metric::Registry::new();
+    let registry = antfs_metric::Registry::new();
     StoreServer::start_with(cfg, small_store_config(), &registry).expect("start")
 }
 

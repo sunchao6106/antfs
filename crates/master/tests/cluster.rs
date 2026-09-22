@@ -5,11 +5,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use master::config::MasterConfig;
-use master::pb::master_client::MasterClient;
-use master::pb::{ClusterStateRequest, ListNodesRequest, RegisterRequest};
-use master::types::{MasterCommand, NodeInfo};
-use master::MasterNode;
+use antfs_master::config::MasterConfig;
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::pb::{ClusterStateRequest, ListNodesRequest, RegisterRequest};
+use antfs_master::types::{MasterCommand, NodeInfo};
+use antfs_master::MasterNode;
 use openraft::BasicNode;
 
 const SECRET: &str = "test-secret";
@@ -53,7 +53,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = node_config(id, &dir, free_port(), free_port());
         raft_addrs.insert(id, BasicNode::new(cfg.raft_addr.clone()));
-        let registry = metric::Registry::new();
+        let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(cfg, &registry).await.expect("start node");
         node.serve().expect("serve");
         registries.insert(id, registry);
@@ -82,7 +82,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
         addr: "127.0.0.1:9000".into(),
         disks: BTreeMap::from([(
             "d0".to_string(),
-            master::types::DiskSpec { capacity_bytes: 16_000_000_000_000 },
+            antfs_master::types::DiskSpec { capacity_bytes: 16_000_000_000_000 },
         )]),
         registered_at_ms: 1,
     };
@@ -128,7 +128,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     assert!(state.registered_nodes >= 1);
 
     // 指标断言:打在 leader 实际接入的那个 Registry 上(CLAUDE.md §6),不新建实例。
-    let dump = metric::gather(&registries[&leader_id]).expect("gather metrics");
+    let dump = antfs_metric::gather(&registries[&leader_id]).expect("gather metrics");
     assert!(
         dump.contains("master_registered_nodes 1"),
         "leader registry must report 1 registered node, got:\n{dump}"
@@ -164,7 +164,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
             addr: format!("127.0.0.1:90{id}"),
             disks: BTreeMap::from([(
                 "d0".to_string(),
-                master::types::DiskSpec { capacity_bytes: 1_000_000_000_000 },
+                antfs_master::types::DiskSpec { capacity_bytes: 1_000_000_000_000 },
             )]),
             registered_at_ms: 1,
         };
@@ -176,13 +176,13 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     }
 
     // 心跳上报各盘实时余量(软状态,供选盘);发给 leader 的 gRPC。
-    let beats: Vec<master::pb::NodeBeat> = [101u64, 102, 103]
+    let beats: Vec<antfs_master::pb::NodeBeat> = [101u64, 102, 103]
         .into_iter()
-        .map(|id| master::pb::NodeBeat {
+        .map(|id| antfs_master::pb::NodeBeat {
             version: 1,
             cluster_secret: SECRET.into(),
             node_id: id,
-            disks: vec![master::pb::DiskBeat {
+            disks: vec![antfs_master::pb::DiskBeat {
                 disk_id: "d0".into(),
                 capacity_bytes: 1_000_000_000_000,
                 free_bytes: 900_000_000_000,
@@ -203,7 +203,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
 
     // 建 1 个 RF=3 分区,断言副本跨 3 个不同节点。
     let created = client
-        .create_partitions(master::pb::CreatePartitionsRequest {
+        .create_partitions(antfs_master::pb::CreatePartitionsRequest {
             version: 1,
             cluster_secret: SECRET.into(),
             count: 1,
@@ -217,7 +217,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     let pid = created.partition_ids[0];
 
     let locs = client
-        .lookup_partition(master::pb::LookupRequest { version: 1, partition_id: pid })
+        .lookup_partition(antfs_master::pb::LookupRequest { version: 1, partition_id: pid })
         .await
         .expect("lookup_partition")
         .into_inner();
@@ -228,7 +228,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     assert_eq!(nodes_used, vec![101, 102, 103], "replicas must span the 3 data nodes");
 
     let assigned = client
-        .assign_partition(master::pb::AssignRequest { version: 1 })
+        .assign_partition(antfs_master::pb::AssignRequest { version: 1 })
         .await
         .expect("assign_partition")
         .into_inner();

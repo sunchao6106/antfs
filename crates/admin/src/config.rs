@@ -2,7 +2,7 @@
 //!
 //! 字段名即 TOML key;默认值/范围须与 `impl Default` + `Validate` 对齐(CLAUDE.md §7)。
 
-use config::{Result, Validate};
+use antfs_config::{Result, Validate};
 use serde::Deserialize;
 
 /// admin web 服务配置。
@@ -39,10 +39,10 @@ impl Default for AdminConfig {
 impl Validate for AdminConfig {
     fn validate(&self) -> Result<()> {
         if self.master_addr.is_empty() {
-            return Err(config::ConfigError::invalid("admin.master_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid("admin.master_addr", "must not be empty"));
         }
         if self.listen_addr.is_empty() {
-            return Err(config::ConfigError::invalid("admin.listen_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid("admin.listen_addr", "must not be empty"));
         }
         Ok(())
     }

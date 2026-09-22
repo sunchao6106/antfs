@@ -3,26 +3,6 @@
 version = 4
 
 [[package]]
-name = "admin"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "axum",
- "config 0.0.0",
- "http-body-util",
- "master",
- "metric",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -88,6 +68,137 @@ dependencies = [
  "anstyle",
  "once_cell_polyfill",
  "windows-sys",
+]
+
+[[package]]
+name = "antfs-admin"
+version = "0.0.0"
+dependencies = [
+ "antfs-config",
+ "antfs-master",
+ "antfs-metric",
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "antfs-bench-blob"
+version = "0.0.0"
+dependencies = [
+ "antfs-blob",
+]
+
+[[package]]
+name = "antfs-blob"
+version = "0.0.0"
+dependencies = [
+ "antfs-config",
+ "antfs-metric",
+ "crc32fast",
+ "crossbeam-skiplist",
+ "libc",
+ "memmap2",
+ "proptest",
+ "serde",
+ "thiserror",
+ "xorf",
+]
+
+[[package]]
+name = "antfs-config"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "antfs-devcluster"
+version = "0.0.0"
+dependencies = [
+ "antfs-admin",
+ "antfs-blob",
+ "antfs-config",
+ "antfs-master",
+ "antfs-metric",
+ "antfs-store",
+ "axum",
+ "openraft",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "antfs-master"
+version = "0.0.0"
+dependencies = [
+ "antfs-config",
+ "antfs-metric",
+ "futures",
+ "openraft",
+ "proptest",
+ "prost",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "antfs-metric"
+version = "0.0.0"
+dependencies = [
+ "prometheus",
+]
+
+[[package]]
+name = "antfs-smoke"
+version = "0.0.0"
+
+[[package]]
+name = "antfs-store"
+version = "0.0.0"
+dependencies = [
+ "antfs-blob",
+ "antfs-config",
+ "antfs-master",
+ "antfs-metric",
+ "axum",
+ "bytes",
+ "hex",
+ "http-body-util",
+ "libc",
+ "openraft",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -193,13 +304,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bench-blob"
-version = "0.0.0"
-dependencies = [
- "blob",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -219,22 +323,6 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
-
-[[package]]
-name = "blob"
-version = "0.0.0"
-dependencies = [
- "config 0.0.0",
- "crc32fast",
- "crossbeam-skiplist",
- "libc",
- "memmap2",
- "metric",
- "proptest",
- "serde",
- "thiserror",
- "xorf",
-]
 
 [[package]]
 name = "borsh"
@@ -367,15 +455,6 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "config"
-version = "0.0.0"
-dependencies = [
- "config 0.14.1",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "config"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68578f196d2a33ff61b27fae256c3164f65e36382648e30666dde05b8cc9dfdf"
@@ -445,23 +524,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "unicode-xid",
-]
-
-[[package]]
-name = "devcluster"
-version = "0.0.0"
-dependencies = [
- "admin",
- "axum",
- "blob",
- "config 0.0.0",
- "master",
- "metric",
- "openraft",
- "store",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1041,30 +1103,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
-name = "master"
-version = "0.0.0"
-dependencies = [
- "config 0.0.0",
- "futures",
- "metric",
- "openraft",
- "proptest",
- "prost",
- "redb",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1083,13 +1121,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "metric"
-version = "0.0.0"
-dependencies = [
- "prometheus",
 ]
 
 [[package]]
@@ -1808,10 +1839,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
-name = "smoke"
-version = "0.0.0"
-
-[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1826,33 +1853,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "store"
-version = "0.0.0"
-dependencies = [
- "axum",
- "blob",
- "bytes",
- "config 0.0.0",
- "hex",
- "http-body-util",
- "libc",
- "master",
- "metric",
- "openraft",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "strsim"

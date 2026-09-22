@@ -4,8 +4,8 @@
 # - cargo target 放 VM 原生 ext4(避免 virtiofs 慢/O_DIRECT 问题)
 set -euo pipefail
 
-PROJECT_DIR="/Users/admin/code/opensource/ambry-rs"
-VM_TARGET_DIR="/var/tmp/ambry-rs-target"
+PROJECT_DIR="/Users/sunchao/source_code/antfs"
+VM_TARGET_DIR="/var/tmp/antfs-target"
 
 colima ssh -- sh -c "
   . \$HOME/.cargo/env

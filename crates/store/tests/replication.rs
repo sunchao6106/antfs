@@ -3,13 +3,13 @@
 
 use std::time::Duration;
 
-use blob::{FindToken, StoreKey};
-use store::replication::{replicate_from_peer, sync_from_peer, HttpPeer};
-use store::{StoreServer, StoreServerConfig};
+use antfs_blob::{FindToken, StoreKey};
+use antfs_store::replication::{replicate_from_peer, sync_from_peer, HttpPeer};
+use antfs_store::{StoreServer, StoreServerConfig};
 use tokio::net::TcpListener;
 
-fn small_store_config() -> blob::StoreConfig {
-    blob::StoreConfig {
+fn small_store_config() -> antfs_blob::StoreConfig {
+    antfs_blob::StoreConfig {
         segment_size_bytes: 1 << 20,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
@@ -29,7 +29,7 @@ async fn spawn(dir: &std::path::Path) -> (String, StoreServer) {
 
 async fn spawn_with(
     dir: &std::path::Path,
-    scfg: blob::StoreConfig,
+    scfg: antfs_blob::StoreConfig,
     partition_capacity_bytes: u64,
 ) -> (String, StoreServer) {
     let cfg = StoreServerConfig {
@@ -39,7 +39,7 @@ async fn spawn_with(
         partition_capacity_bytes,
         ..Default::default()
     };
-    let registry = metric::Registry::new();
+    let registry = antfs_metric::Registry::new();
     let srv = StoreServer::start_with(cfg, scfg, &registry).expect("start");
     srv.replicas().ensure_replica(0).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -89,7 +89,7 @@ async fn pull_replication_converges_over_http() {
     .await
     .unwrap()
     .unwrap();
-    assert!(matches!(store_b.get(&key(1)), Err(blob::Error::Deleted)), "delete 传播");
+    assert!(matches!(store_b.get(&key(1)), Err(antfs_blob::Error::Deleted)), "delete 传播");
     assert_eq!(store_b.get(&key(2)).unwrap(), b"beta", "未删的仍在");
 }
 
@@ -98,7 +98,7 @@ async fn pull_replication_converges_over_http() {
 async fn hybrid_bootstrap_physical_then_logical() {
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     // 小段容量,写大记录以滚动出封存段。
-    let scfg = blob::StoreConfig {
+    let scfg = antfs_blob::StoreConfig {
         segment_size_bytes: 1 << 20,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,

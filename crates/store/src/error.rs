@@ -6,16 +6,16 @@ use thiserror::Error;
 pub enum Error {
     /// 底层 store 引擎错误。
     #[error("store engine: {0}")]
-    Store(#[from] blob::Error),
+    Store(#[from] antfs_blob::Error),
     /// IO 错误(建目录 / statfs 等)。
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     /// 配置错误。
     #[error("config: {0}")]
-    Config(#[from] config::ConfigError),
+    Config(#[from] antfs_config::ConfigError),
     /// metric 注册错误。
     #[error("metric: {0}")]
-    Metric(#[from] metric::Error),
+    Metric(#[from] antfs_metric::Error),
     /// 无满足容量上界的可用盘。
     #[error("no disk with enough free space")]
     NoDiskSpace,

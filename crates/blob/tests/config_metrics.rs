@@ -6,9 +6,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use config::{Loader, Validate};
-use metric::{gather, Registry};
-use blob::{BlobStore, StoreConfig, StoreKey, StoreMetrics};
+use antfs_config::{Loader, Validate};
+use antfs_metric::{gather, Registry};
+use antfs_blob::{BlobStore, StoreConfig, StoreKey, StoreMetrics};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 

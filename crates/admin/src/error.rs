@@ -6,10 +6,10 @@ use thiserror::Error;
 pub enum Error {
     /// 配置错误。
     #[error("config: {0}")]
-    Config(#[from] config::ConfigError),
+    Config(#[from] antfs_config::ConfigError),
     /// metric 注册错误。
     #[error("metric: {0}")]
-    Metric(#[from] metric::Error),
+    Metric(#[from] antfs_metric::Error),
     /// 连接/调用 master 失败。
     #[error("master rpc: {0}")]
     MasterRpc(String),

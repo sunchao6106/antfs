@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use blob::{BlobStore, StoreConfig, StoreMetrics};
+use antfs_blob::{BlobStore, StoreConfig, StoreMetrics};
 
 use crate::disk::DiskManager;
 use crate::error::{Error, Result};
@@ -113,7 +113,7 @@ impl ReplicaManager {
         let log_dir = dir.join("log");
         std::fs::create_dir_all(&log_dir)?;
         for (pos, bytes) in segments {
-            let final_path = log_dir.join(blob::LogSegmentName(*pos).filename());
+            let final_path = log_dir.join(antfs_blob::LogSegmentName(*pos).filename());
             let tmp_path = log_dir.join(format!("{pos}_log.seg.tmp"));
             let mut f = std::fs::File::create(&tmp_path)?;
             f.write_all(bytes)?;
@@ -122,7 +122,7 @@ impl ReplicaManager {
             std::fs::rename(&tmp_path, &final_path)?;
         }
         let store_id = format!("p{pid}");
-        let store = blob::BlobStore::open_rebuild_index_with(
+        let store = antfs_blob::BlobStore::open_rebuild_index_with(
             &dir,
             self.partition_capacity,
             &self.store_config,
@@ -176,7 +176,7 @@ mod tests {
     fn ensure_replica_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned()]).unwrap();
-        let registry = metric::Registry::new();
+        let registry = antfs_metric::Registry::new();
         let sc = StoreConfig { segment_size_bytes: 1 << 20, index_max_inmem_elements: 1000, io_error_count_to_trigger_shutdown: 0 };
         let sm = StoreMetrics::new(&registry).unwrap();
         let rm = ReplicaManager::new(dm, sc, sm, 4 << 20);

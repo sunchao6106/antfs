@@ -104,7 +104,7 @@ impl StoreMetrics {
 
 **所有权链(依赖注入,对齐 Ambry `AmbryServer`→`StorageManager`→`BlobStore`→`Log`/`PersistentIndex`)**:
 一个进程 **一个 `Registry`** + 各模块 **一份 config**,由**顶层创建一次**,构造参数逐层**透传**,下层组件**只读不建**(不建自己的 registry、不读全局单例)。
-当前 ambry-rs 无 server 层 → `Registry`/`StoreConfig` 由 **`BlobStore` 的调用方**持有并注入;将来抽象出 `StorageManager` 角色后,所有权上移到它,`BlobStore` 仍只接收。
+当前 antfs 无 server 层 → `Registry`/`StoreConfig` 由 **`BlobStore` 的调用方**持有并注入;将来抽象出 `StorageManager` 角色后,所有权上移到它,`BlobStore` 仍只接收。
 
 **多实例(多 store / replica / partition)共享同一 `Registry` 的区分:用 label,不用 name 前缀。**
 

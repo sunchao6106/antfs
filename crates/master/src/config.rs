@@ -4,7 +4,7 @@
 //! 字段名即 TOML key(在 `[master]` 表下)。默认值 / 范围必须与本文件 `impl Default` + `Validate` 对齐
 //! (CLAUDE.md §7)。
 
-use config::{at_least, Result, Validate};
+use antfs_config::{at_least, Result, Validate};
 use serde::Deserialize;
 
 /// master 节点配置。
@@ -75,7 +75,7 @@ impl Validate for MasterConfig {
         at_least("master.heartbeat_timeout_secs", self.heartbeat_timeout_secs, 1)?;
         at_least("master.partition_capacity_bytes", self.partition_capacity_bytes, 1)?;
         if !(self.disk_near_full_ratio > 0.0 && self.disk_near_full_ratio <= 1.0) {
-            return Err(config::ConfigError::invalid(
+            return Err(antfs_config::ConfigError::invalid(
                 "master.disk_near_full_ratio",
                 "must be in (0, 1]",
             ));
@@ -84,13 +84,13 @@ impl Validate for MasterConfig {
         at_least("master.auto_grow_batch", self.auto_grow_batch, 1)?;
         at_least("master.reconcile_interval_secs", self.reconcile_interval_secs, 1)?;
         if self.raft_addr.is_empty() {
-            return Err(config::ConfigError::invalid("master.raft_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid("master.raft_addr", "must not be empty"));
         }
         if self.grpc_addr.is_empty() {
-            return Err(config::ConfigError::invalid("master.grpc_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid("master.grpc_addr", "must not be empty"));
         }
         if self.data_dir.is_empty() {
-            return Err(config::ConfigError::invalid("master.data_dir", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid("master.data_dir", "must not be empty"));
         }
         Ok(())
     }

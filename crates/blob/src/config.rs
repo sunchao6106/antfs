@@ -4,7 +4,7 @@
 //! 只收录**当前引擎真实消费**的项:段大小、活跃索引内存条目上限。总容量是 per-replica 属性
 //! (对齐 Ambry:`capacityInBytes` 由 replica 传入、不在 `StoreConfig`),故不在此,由构造参数传入。
 
-use config::{at_least, Result, Validate};
+use antfs_config::{at_least, Result, Validate};
 use serde::Deserialize;
 
 /// store 引擎配置。字段名即 TOML key(在 `[store]` 表下)。

@@ -5,7 +5,7 @@ import type { Lang } from "./api";
 type Dict = Record<string, string>;
 
 const en: Dict = {
-  title: "ambry-rs · admin",
+  title: "antfs · admin",
   grafana: "Grafana",
   signIn: "Sign in",
   signOut: "Sign out",
@@ -62,7 +62,7 @@ const en: Dict = {
 };
 
 const zh: Dict = {
-  title: "ambry-rs · 管理台",
+  title: "antfs · 管理台",
   grafana: "Grafana",
   signIn: "登录",
   signOut: "登出",

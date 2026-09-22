@@ -1,27 +1,27 @@
 //! master 节点二进制入口:加载配置 → 起 Raft + gRPC → 单节点自举(如需)→ 常驻。
 //!
-//! 配置来源:`master.toml` + 环境变量前缀 `AMBRY`(见 admin/store 同款 `config::Loader`)。
+//! 配置来源:`master.toml` + 环境变量前缀 `AMBRY`(见 admin/store 同款 `antfs_config::Loader`)。
 //! 单节点自举:`initial_members == [node_id]` 时,若存储为空则 `initialize` 引导一个单成员集群;
 //! 已初始化(重启)则跳过。多节点集群由运维显式在某节点调 `initialize`(此处仅覆盖本地/单节点)。
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use master::{MasterConfig, MasterNode};
+use antfs_master::{MasterConfig, MasterNode};
 use openraft::BasicNode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
-    let cfg: MasterConfig = config::Loader::new()
+    let cfg: MasterConfig = antfs_config::Loader::new()
         .with_file("master.toml", false)
         .with_env_prefix("AMBRY")
         .load()
         .unwrap_or_default();
-    config::Validate::validate(&cfg)?;
+    antfs_config::Validate::validate(&cfg)?;
 
-    let registry = metric::Registry::new();
+    let registry = antfs_metric::Registry::new();
     let master = MasterNode::start(cfg.clone(), &registry).await?;
     master.serve()?;
 

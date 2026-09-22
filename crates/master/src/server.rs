@@ -54,7 +54,7 @@ impl MasterNode {
     /// 打开存储、构建 Raft、装配节点(不建 gRPC 监听;监听见 [`serve`](Self::serve))。
     pub async fn start(
         config: MasterConfig,
-        registry: &metric::Registry,
+        registry: &antfs_metric::Registry,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let metrics = MasterMetrics::new(registry)?;
         std::fs::create_dir_all(&config.data_dir)?;

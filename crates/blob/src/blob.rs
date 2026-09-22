@@ -3365,7 +3365,7 @@ mod tests {
             std::fs::write(log_dir.join(LogSegmentName(*pos).filename()), &bytes).unwrap();
         }
         let cfg = StoreConfig { segment_size_bytes: seg, index_max_inmem_elements: 1000, io_error_count_to_trigger_shutdown: 0 };
-        let reg = crate::StoreMetrics::new(&metric::Registry::new()).unwrap();
+        let reg = crate::StoreMetrics::new(&antfs_metric::Registry::new()).unwrap();
         let copied = BlobStore::open_rebuild_index_with(&dst, seg * 8, &cfg, &reg, "s3b").unwrap();
         // 封存段覆盖的 key(排除落在活跃段的)应可读。
         let mut readable = 0;

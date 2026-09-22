@@ -5,9 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use master::store::open;
-use master::types::{MasterCommand, NodeInfo, TypeConfig};
-use master::MasterMetrics;
+use antfs_master::store::open;
+use antfs_master::types::{MasterCommand, NodeInfo, TypeConfig};
+use antfs_master::MasterMetrics;
 use openraft::storage::RaftStateMachine;
 use openraft::testing::log_id;
 use openraft::{Entry, EntryPayload};
@@ -30,7 +30,7 @@ fn arb_cmd() -> impl Strategy<Value = MasterCommand> {
                 addr: format!("127.0.0.1:{}", 7000 + node_id),
                 disks: BTreeMap::from([(
                     "d0".to_string(),
-                    master::types::DiskSpec { capacity_bytes: cap },
+                    antfs_master::types::DiskSpec { capacity_bytes: cap },
                 )]),
                 registered_at_ms: 42,
             },
