@@ -10,7 +10,8 @@ use tonic::transport::Channel;
 use antfs_master::pb::master_client::MasterClient;
 use antfs_master::pb::{
     ClusterStateRequest, CreatePartitionsRequest, DecommissionRequest, ListNodesRequest,
-    ListPartitionsRequest, SetPartitionStateRequest,
+    ListPartitionsRequest, MetricsRequest, MoveReplicaRequest, RepairPartitionRequest,
+    SetPartitionStateRequest,
 };
 
 use crate::error::{Error, Result};
@@ -81,6 +82,27 @@ pub struct PartitionDto {
     pub healable: bool,
     /// 欠副本原因码(healthy 时空):node_down/replica_error/decommissioning/bootstrapping。
     pub under_replicated_reason: String,
+    /// 迁移中的"待迁出"源节点(add-before-remove,新副本健康后由 reconciler 移除)。
+    #[serde(default)]
+    pub moving_out_nodes: Vec<u64>,
+}
+
+/// `POST /api/partitions/{id}/repair` 的结果(master 侧 ok=false 也走 200 + ok:false,错误交前端展示)。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RepairOutcome {
+    pub ok: bool,
+    pub error: String,
+    pub added_node_id: u64,
+    pub added_disk_id: String,
+}
+
+/// `POST /api/partitions/{id}/move` 的结果(语义同 [`RepairOutcome`];to_node_id=0 入参 = 自动选目标)。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MoveOutcome {
+    pub ok: bool,
+    pub error: String,
+    pub to_node_id: u64,
+    pub to_disk_id: String,
 }
 
 /// admin 对 master 的只读 + 运维能力(handler 依赖此 trait,便于测试注入)。
@@ -93,6 +115,14 @@ pub trait MasterApi: Send + Sync {
     async fn create_partitions(&self, count: u32, replication_factor: u32) -> Result<Vec<u32>>;
     async fn decommission(&self, node_id: u64, force: bool) -> Result<()>;
     async fn set_partition_state(&self, partition_id: u32, state: &str) -> Result<()>;
+    /// master 节点的 Prometheus 文本(`GetMetrics`,任何节点可答)。
+    async fn master_metrics_text(&self) -> Result<String>;
+    /// 单个分区详情;不存在返回 [`Error::PartitionNotFound`](crate::error::Error::PartitionNotFound)。
+    async fn partition_detail(&self, partition_id: u32) -> Result<PartitionDto>;
+    /// 手动立即补一个副本(`RepairPartition`);gRPC ok=false 不算传输错,回 Ok(outcome{ok:false})。
+    async fn repair_partition(&self, partition_id: u32) -> Result<RepairOutcome>;
+    /// 副本迁移(`MoveReplica`,add-before-remove);to_node_id=0 = 自动选目标。
+    async fn move_replica(&self, partition_id: u32, from_node_id: u64, to_node_id: u64) -> Result<MoveOutcome>;
 }
 
 /// 基于 tonic 的 `MasterApi` 实现。持有一个 `Channel`,每次调用克隆客户端(共享连接池)。
@@ -211,6 +241,7 @@ impl MasterApi for GrpcMasterApi {
                     healthy_replicas: p.healthy_replicas,
                     healable: p.healable,
                     under_replicated_reason: p.under_replicated_reason,
+                    moving_out_nodes: p.moving_out_nodes,
                 }
             })
             .collect();
@@ -284,5 +315,78 @@ impl MasterApi for GrpcMasterApi {
             }));
         }
         Ok(())
+    }
+
+    async fn master_metrics_text(&self) -> Result<String> {
+        let mut c = self.client.clone();
+        let resp = c
+            .get_metrics(MetricsRequest { version: 1 })
+            .await
+            .map_err(|e| Error::MasterRpc(e.to_string()))?
+            .into_inner();
+        Ok(resp.text)
+    }
+
+    async fn partition_detail(&self, partition_id: u32) -> Result<PartitionDto> {
+        // 用 ListPartitions 联表视图而非 LookupPartition:后者只有路由用 ReplicaLoc,
+        // 缺 replication_factor/healthy/moving_out_nodes 等 dashboard 字段。
+        let (items, _) = self.partitions(0, 0).await?;
+        items
+            .into_iter()
+            .find(|p| p.partition_id == partition_id)
+            .ok_or(Error::PartitionNotFound(partition_id))
+    }
+
+    async fn repair_partition(&self, partition_id: u32) -> Result<RepairOutcome> {
+        let mut c = self.client.clone();
+        let resp = c
+            .repair_partition(RepairPartitionRequest {
+                version: 1,
+                cluster_secret: self.cluster_secret.clone(),
+                partition_id,
+            })
+            .await
+            .map_err(|e| Error::MasterRpc(e.to_string()))?
+            .into_inner();
+        let error = op_error(resp.ok, &resp.error, &resp.leader_addr);
+        Ok(RepairOutcome {
+            ok: resp.ok,
+            error,
+            added_node_id: resp.added_node_id,
+            added_disk_id: resp.added_disk_id,
+        })
+    }
+
+    async fn move_replica(
+        &self,
+        partition_id: u32,
+        from_node_id: u64,
+        to_node_id: u64,
+    ) -> Result<MoveOutcome> {
+        let mut c = self.client.clone();
+        let resp = c
+            .move_replica(MoveReplicaRequest {
+                version: 1,
+                cluster_secret: self.cluster_secret.clone(),
+                partition_id,
+                from_node_id,
+                to_node_id,
+            })
+            .await
+            .map_err(|e| Error::MasterRpc(e.to_string()))?
+            .into_inner();
+        let error = op_error(resp.ok, &resp.error, &resp.leader_addr);
+        Ok(MoveOutcome { ok: resp.ok, error, to_node_id: resp.to_node_id, to_disk_id: resp.to_disk_id })
+    }
+}
+
+/// 运维类响应的错误文本:ok 时为空;error 空但 !ok 通常是打到了 follower,回填 leader 地址。
+fn op_error(ok: bool, error: &str, leader_addr: &str) -> String {
+    if ok {
+        String::new()
+    } else if error.is_empty() {
+        format!("not leader (leader={leader_addr})")
+    } else {
+        error.to_string()
     }
 }

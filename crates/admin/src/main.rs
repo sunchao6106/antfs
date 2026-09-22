@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metrics = Arc::new(AdminMetrics::new(&registry)?);
     let master = Arc::new(GrpcMasterApi::connect(&cfg.master_addr, cfg.cluster_secret.clone()).await?);
 
-    let state = AppState { master, metrics, grafana_url: cfg.grafana_url.clone() };
+    let state = AppState { master, metrics, registry, grafana_url: cfg.grafana_url.clone() };
     let auth = AuthConfig {
         operator_token: cfg.operator_token.clone(),
         viewer_token: cfg.viewer_token.clone(),

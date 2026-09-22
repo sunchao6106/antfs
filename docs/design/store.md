@@ -298,6 +298,8 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 > **仍规划**:Log 的 overflow、PersistentIndex 的 recovery/find/flush 计时与 token 计数、封存段/Fuse 过滤器命中、
 > BlobStoreStats 扫描等——这些打点在 `Log`/`PersistentIndex`/`IndexSegment` 内部,需把 handle 透传进这些模块后接入。
 > 命名规范见 [`common.md` §2](./common.md)。裸构造器(`create`/`open`)用一个丢弃的私有 Registry(打点不导出),仅测试/无监控场景。
+>
+> **导出**:store-server(`crates/store`)把注入的 `Registry` 经 **`GET /metrics`**(Prometheus 文本格式,无鉴权)直出,上表引擎指标与 `StoreServerMetrics`(见 [`cluster.md` §9.1](./cluster.md))同口暴露。
 
 ### 11.1 BlobStore(顶层操作)
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |

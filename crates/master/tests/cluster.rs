@@ -236,3 +236,48 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     assert_eq!(assigned.partition_id, pid);
     assert_eq!(assigned.replicas.len(), 3);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_metrics_exports_prometheus_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("n1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = node_config(1, &dir, free_port(), free_port());
+    let raft_addr = cfg.raft_addr.clone();
+    let grpc_addr = cfg.grpc_addr.clone();
+    let registry = antfs_metric::Registry::new();
+    let node = MasterNode::start(cfg, &registry).await.expect("start");
+    node.serve().expect("serve");
+    // 单成员集群自举。
+    node.initialize(BTreeMap::from([(1u64, BasicNode::new(raft_addr))]))
+        .await
+        .expect("initialize");
+    node.raft
+        .wait(Some(Duration::from_secs(15)))
+        .metrics(|m| m.current_leader == Some(1), "leader elected")
+        .await
+        .expect("leader elected within timeout");
+
+    let mut client = MasterClient::connect(format!("http://{grpc_addr}")).await.expect("connect");
+    let resp = client
+        .get_metrics(antfs_master::pb::MetricsRequest { version: 1 })
+        .await
+        .expect("get_metrics")
+        .into_inner();
+    assert!(
+        resp.text.contains("master_heartbeats_total"),
+        "metrics text must export heartbeats counter, got:\n{}",
+        resp.text
+    );
+    assert!(
+        resp.text.contains("master_is_leader"),
+        "metrics text must export is_leader gauge, got:\n{}",
+        resp.text
+    );
+    // 文本必须能被 Prometheus 文本解析器解析(common/metric parse)。
+    let samples = antfs_metric::parse(&resp.text);
+    assert!(
+        samples.iter().any(|s| s.name == "master_is_leader" && s.value == 1.0),
+        "leader must export master_is_leader 1"
+    );
+}

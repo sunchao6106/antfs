@@ -16,6 +16,9 @@ pub enum Error {
     /// master 拒绝操作(回传其错误文本)。
     #[error("master rejected: {0}")]
     MasterRejected(String),
+    /// 分区不存在(master 无此分区;上层映射 404)。
+    #[error("partition {0} not found")]
+    PartitionNotFound(u32),
     /// IO / 监听错误。
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

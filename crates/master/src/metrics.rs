@@ -31,6 +31,10 @@ pub struct MasterMetrics {
     pub rereplications: IntCounter,
     /// 移除的副本数(counter,M4 decommission evacuation)。
     pub replicas_removed: IntCounter,
+    /// 手动 RepairPartition 触发数(counter)。
+    pub repairs_triggered: IntCounter,
+    /// 迁移完成后移除的迁出源副本数(counter,MoveReplica 的"后删")。
+    pub replicas_moved: IntCounter,
     /// 当前欠副本(健康副本数 < RF)的分区数(gauge,反映集群健康)。
     pub under_replicated_partitions: IntGauge,
 }
@@ -80,6 +84,16 @@ impl MasterMetrics {
                 registry,
                 "master_replicas_removed_total",
                 "replicas removed during decommission evacuation",
+            )?,
+            repairs_triggered: counter(
+                registry,
+                "master_repairs_triggered_total",
+                "manual repair-partition requests triggered",
+            )?,
+            replicas_moved: counter(
+                registry,
+                "master_replicas_moved_total",
+                "replicas removed after move completed",
             )?,
             under_replicated_partitions: gauge(
                 registry,

@@ -8,6 +8,7 @@ pub struct AdminMetrics {
     pub api_requests: IntCounter,
     pub ops: IntCounter,
     pub master_rpc_errors: IntCounter,
+    pub store_scrape_errors: IntCounter,
 }
 
 impl AdminMetrics {
@@ -16,6 +17,7 @@ impl AdminMetrics {
             api_requests: counter(registry, "admin_api_requests_total", "admin API requests served")?,
             ops: counter(registry, "admin_ops_total", "admin ops (create-partitions/decommission)")?,
             master_rpc_errors: counter(registry, "admin_master_rpc_errors_total", "failed master gRPC calls")?,
+            store_scrape_errors: counter(registry, "admin_store_scrape_errors_total", "failed scrapes of store /metrics endpoints")?,
         })
     }
 }

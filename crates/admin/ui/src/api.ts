@@ -62,6 +62,61 @@ export interface Partition {
   healthy_replicas: number;
   healable: boolean;
   under_replicated_reason: string;
+  moving_out_nodes: number[];
+}
+
+export interface RepairResult {
+  ok: boolean;
+  error: string;
+  added_node_id: number;
+  added_disk_id: string;
+}
+
+export interface MoveResult {
+  ok: boolean;
+  error: string;
+  to_node_id: number;
+  to_disk_id: string;
+}
+
+export interface MasterMetrics {
+  is_leader: number;
+  raft_term: number;
+  heartbeats_total: number;
+  applied_commands_total: number;
+  transitions_issued_total: number;
+  rereplications_total: number;
+  replicas_removed_total: number;
+  under_replicated_partitions: number;
+  registered_nodes: number;
+}
+
+export interface AdminMetrics {
+  api_requests_total: number;
+  ops_total: number;
+  master_rpc_errors_total: number;
+}
+
+export interface StoreMetrics {
+  node_id: number;
+  addr: string;
+  up: boolean;
+  scrape_ok: boolean;
+  put_total: number;
+  get_total: number;
+  put_bytes: number;
+  get_bytes: number;
+  errors_total: number;
+  replicas: number;
+  replication_bytes_total: number;
+  compactions_total: number;
+}
+
+export interface Metrics {
+  ts_ms: number;
+  master: MasterMetrics;
+  admin: AdminMetrics;
+  stores: StoreMetrics[];
 }
 
 export interface PartitionPage {
@@ -93,6 +148,15 @@ export const api = {
   nodes: () => req<Node[]>("/api/nodes"),
   partitions: (offset: number, limit: number) =>
     req<PartitionPage>(`/api/partitions?offset=${offset}&limit=${limit}`),
+  partition: (id: number) => req<Partition>(`/api/partitions/${id}`),
+  repairPartition: (id: number) =>
+    req<RepairResult>(`/api/partitions/${id}/repair`, { method: "POST" }),
+  movePartition: (id: number, from_node_id: number, to_node_id: number) =>
+    req<MoveResult>(`/api/partitions/${id}/move`, {
+      method: "POST",
+      body: JSON.stringify({ from_node_id, to_node_id }),
+    }),
+  metrics: () => req<Metrics>("/api/metrics"),
   createPartitions: (count: number, replication_factor: number) =>
     req<{ partition_ids: number[] }>("/api/partitions", {
       method: "POST",

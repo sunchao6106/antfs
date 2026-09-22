@@ -109,6 +109,11 @@ pub struct MasterState {
     pub policy: Policy,
     /// 下线中的节点(M4):不再作为放置/补副本候选,其副本被逐步迁走。
     pub decommissioning: BTreeSet<NodeId>,
+    /// 迁移中的"待迁出"源(MoveReplica,add-before-remove):(pid, node) 表示该节点上该分区的
+    /// 副本是迁出源,等新副本补上且健康副本(不含迁出源)≥ RF 后由 reconciler 移除(守 §3.1)。
+    /// 新增字段:`serde(default)` 使旧快照/旧持久态(无此字段)可读为空集(§3.4)。
+    #[serde(default)]
+    pub moving: BTreeSet<(PartitionId, NodeId)>,
 }
 
 impl MasterState {
@@ -166,6 +171,21 @@ impl MasterState {
                 }
                 MasterResponse::Registered
             }
+            MasterCommand::MoveReplica { partition_id, from_node_id, replica } => {
+                // add-before-remove:先补新副本(同 AddReplica 幂等),from 源记入 moving,
+                // 由 reconciler 在新副本健康后 RemoveReplica(守 §3.1)。
+                if let Some(p) = self.partitions.get_mut(partition_id) {
+                    let exists = p
+                        .replicas
+                        .iter()
+                        .any(|r| r.node_id == replica.node_id && r.disk_id == replica.disk_id);
+                    if !exists {
+                        p.replicas.push(replica.clone());
+                        self.moving.insert((*partition_id, *from_node_id));
+                    }
+                }
+                MasterResponse::Registered
+            }
             MasterCommand::DecommissionNode { node_id } => {
                 self.decommissioning.insert(*node_id);
                 MasterResponse::Registered
@@ -174,6 +194,8 @@ impl MasterState {
                 if let Some(p) = self.partitions.get_mut(partition_id) {
                     p.replicas.retain(|r| r.node_id != *node_id);
                 }
+                // 顺带清迁移标记:迁出源被移除(或本就不在 moving)都幂等。
+                self.moving.remove(&(*partition_id, *node_id));
                 MasterResponse::Registered
             }
             MasterCommand::SetPartitionState { partition_id, state } => {
@@ -204,6 +226,9 @@ pub enum MasterCommand {
     DecommissionNode { node_id: NodeId },
     /// 移除分区的一个副本(M4 evacuation 的"删",幂等)。
     RemoveReplica { partition_id: PartitionId, node_id: NodeId },
+    /// 副本迁移(MoveReplica):追加新副本(replica)+ 把 from 源记入 `moving`(add-before-remove;
+    /// 选盘在 leader 侧先算)。
+    MoveReplica { partition_id: PartitionId, from_node_id: NodeId, replica: ReplicaPlacement },
     /// 设置分区级写闸门状态(RW/RO/SEALED;admin 运维,对齐 §7.3 盘满转 RO)。
     SetPartitionState { partition_id: PartitionId, state: PartitionState },
 }
@@ -376,6 +401,50 @@ mod tests {
             state: PartitionState::ReadOnly,
         });
         assert_eq!(s.partitions[&0].state, PartitionState::ReadOnly, "gate updated to RO");
+    }
+
+    #[test]
+    fn move_replica_adds_new_and_marks_source_moving() {
+        let mut s = MasterState::default();
+        s.apply_command(&MasterCommand::CreatePartition {
+            replication_factor: 2,
+            replicas: vec![
+                ReplicaPlacement { node_id: 1, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement { node_id: 2, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+            ],
+        });
+        let mv = MasterCommand::MoveReplica {
+            partition_id: 0,
+            from_node_id: 2,
+            replica: ReplicaPlacement { node_id: 3, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+        };
+        s.apply_command(&mv);
+        assert_eq!(s.partitions[&0].replicas.len(), 3, "new replica added before remove");
+        assert!(s.moving.contains(&(0, 2)), "source must be marked moving-out");
+        // 幂等:重放同命令不重复追加、不重复标记。
+        s.apply_command(&mv);
+        assert_eq!(s.partitions[&0].replicas.len(), 3);
+        assert_eq!(s.moving.len(), 1);
+        // RemoveReplica 顺带清 moving。
+        s.apply_command(&MasterCommand::RemoveReplica { partition_id: 0, node_id: 2 });
+        assert_eq!(s.partitions[&0].replicas.len(), 2);
+        assert!(s.moving.is_empty(), "removing the source must clear its moving mark");
+    }
+
+    #[test]
+    fn stored_state_without_moving_field_deserializes() {
+        // §3.4 后向兼容:旧格式 JSON(无 `moving` 字段)必须能读,默认空集。
+        let old_json = serde_json::json!({
+            "next_partition_id": 1,
+            "object_next": {},
+            "nodes": {},
+            "partitions": {},
+            "policy": { "default_replication_factor": 3 },
+            "decommissioning": []
+        });
+        let s: MasterState = serde_json::from_value(old_json).expect("old format must deserialize");
+        assert!(s.moving.is_empty());
+        assert_eq!(s.next_partition_id, 1);
     }
 
     #[test]

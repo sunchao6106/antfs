@@ -25,6 +25,7 @@ use crate::PartitionId;
 struct AppState {
     replicas: Arc<ReplicaManager>,
     metrics: Arc<StoreServerMetrics>,
+    registry: antfs_metric::Registry,
 }
 
 /// 装配好的数据节点。
@@ -58,12 +59,18 @@ impl StoreServer {
             config.partition_capacity_bytes,
         ));
         let health = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        Ok(StoreServer { config, state: AppState { replicas, metrics }, disks, health })
+        Ok(StoreServer {
+            config,
+            state: AppState { replicas, metrics, registry: registry.clone() },
+            disks,
+            health,
+        })
     }
 
     /// axum 路由(测试可直接拿去 `oneshot`;生产用 [`serve`](Self::serve))。
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/metrics", get(metrics_handler))
             .route("/admin/partitions/{pid}", post(create_replica))
             .route(
                 "/partitions/{pid}/blobs/{key}",
@@ -122,6 +129,14 @@ impl StoreServer {
     /// 本地 replica 管理器(测试/S2 心跳用)。
     pub fn replicas(&self) -> Arc<ReplicaManager> {
         self.state.replicas.clone()
+    }
+}
+
+/// Prometheus 文本导出(无鉴权,供抓取)。
+async fn metrics_handler(State(st): State<AppState>) -> Response {
+    match antfs_metric::gather(&st.registry) {
+        Ok(t) => (StatusCode::OK, t).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

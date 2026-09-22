@@ -28,6 +28,23 @@ async fn status_of(router: &axum::Router, req: Request<Body>) -> StatusCode {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_exports_prometheus_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = server(tmp.path());
+    let router = srv.router();
+
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains("store_server_put_total"),
+        "/metrics must export registered store metrics, got:\n{text}"
+    );
+}
+
+#[tokio::test]
 async fn put_get_roundtrip_and_error_codes() {
     let tmp = tempfile::tempdir().unwrap();
     let srv = server(tmp.path());

@@ -126,3 +126,6 @@ pub fn gather(registry: &Registry) -> Result<String> {
 pub fn metric_name(subsystem: &str, name: &str) -> String {
     format!("{subsystem}_{name}")
 }
+
+mod parse;
+pub use parse::{parse, Sample};

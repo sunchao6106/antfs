@@ -152,6 +152,30 @@ pub fn plan_evacuation(
     out
 }
 
+/// 对迁移中的副本(MoveReplica)算"后删":新副本已补上、存活且非迁出源的副本数 ≥ RF 时,
+/// 可移除迁出源 (pid, node)(add-before-remove,守 §3.1)。
+///
+/// `moving`:`(pid, node)` = 该节点上该分区副本是待迁出源。迁出源自身即使存活也不计入健康数。
+pub fn plan_move(
+    partitions: &BTreeMap<PartitionId, PartitionInfo>,
+    moving: &BTreeSet<(PartitionId, NodeId)>,
+    up_nodes: &HashSet<NodeId>,
+) -> Vec<(PartitionId, NodeId)> {
+    let mut out = Vec::new();
+    for (pid, node) in moving {
+        let Some(info) = partitions.get(pid) else { continue };
+        let healthy = info
+            .replicas
+            .iter()
+            .filter(|r| up_nodes.contains(&r.node_id) && !moving.contains(&(*pid, r.node_id)))
+            .count();
+        if healthy >= info.replication_factor as usize {
+            out.push((*pid, *node));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +288,36 @@ mod tests {
         let parts = BTreeMap::from([(0, part(2, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE")]))]);
         let up = HashSet::from([1, 2]);
         assert!(plan_evacuation(&parts, &BTreeSet::new(), &up).is_empty());
+    }
+
+    #[test]
+    fn move_removes_source_after_replacement_healthy() {
+        // RF=3,副本在 1/2/3 + 新补 4;moving={(0,3)}:非迁出源存活 = {1,2,4} = 3 ≥ RF → 移除 3。
+        let parts = BTreeMap::from([(
+            0,
+            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]),
+        )]);
+        let moving = BTreeSet::from([(0u32, 3u64)]);
+        let up = HashSet::from([1, 2, 3, 4]); // 迁出源 3 自己也 up,也要被移除
+        assert_eq!(plan_move(&parts, &moving, &up), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn move_holds_source_until_replacement_up() {
+        // 新副本节点 4 尚未 up:非迁出源存活 = {1,2} = 2 < RF=3 → 不移除。
+        let parts = BTreeMap::from([(
+            0,
+            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]),
+        )]);
+        let moving = BTreeSet::from([(0u32, 3u64)]);
+        let up = HashSet::from([1, 2, 3]);
+        assert!(plan_move(&parts, &moving, &up).is_empty(), "replacement not up: must hold the source");
+    }
+
+    #[test]
+    fn move_ignores_unknown_partition() {
+        let moving = BTreeSet::from([(9u32, 1u64)]);
+        assert!(plan_move(&BTreeMap::new(), &moving, &HashSet::from([1])).is_empty());
     }
 
     #[test]

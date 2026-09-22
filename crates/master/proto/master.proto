@@ -16,6 +16,9 @@ service Master {
   rpc DecommissionNode(DecommissionRequest) returns (DecommissionResponse);
   rpc ListPartitions(ListPartitionsRequest) returns (ListPartitionsResponse);
   rpc SetPartitionState(SetPartitionStateRequest) returns (SetPartitionStateResponse);
+  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
+  rpc RepairPartition(RepairPartitionRequest) returns (RepairPartitionResponse);
+  rpc MoveReplica(MoveReplicaRequest) returns (MoveReplicaResponse);
 }
 
 // Raft 内部 RPC:master ↔ master(openraft 消息以序列化字节承载,避免逐字段镜像 openraft 内部类型)。
@@ -205,6 +208,7 @@ message PartitionEntry {
   uint32 healthy_replicas = 6;           // 存活且 ACTIVE 的副本数
   bool healable = 7;                     // 欠副本时:是否有空闲健康节点可补(false=卡住,需加容量)
   string under_replicated_reason = 8;    // 欠副本原因码(healthy 时为空):node_down/replica_error/decommissioning/bootstrapping/no_spare
+  repeated uint64 moving_out_nodes = 9;  // 迁移中的"待迁出"源节点(add-before-remove,新副本健康后移除)
 }
 
 message ListPartitionsResponse {
@@ -225,5 +229,48 @@ message SetPartitionStateResponse {
   bool ok = 2;
   string leader_addr = 3;
   string error = 4;
+}
+
+// 指标导出:任何节点(含 follower)都可答,返回本节点 Registry 的 Prometheus 文本。
+message MetricsRequest { uint32 version = 1; }
+
+message MetricsResponse {
+  uint32 version = 1;
+  string text = 2; // Prometheus 文本导出格式
+}
+
+// 手动立即补一个副本(不等 reconciler 周期)。
+message RepairPartitionRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint32 partition_id = 3;
+}
+
+message RepairPartitionResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;        // 非 leader 时回填
+  string error = 4;
+  uint64 added_node_id = 5;      // 成功时:新副本落点
+  string added_disk_id = 6;
+}
+
+// 副本迁移:add-before-remove(守 §3.1)——先在目标补新副本并记入 moving,新副本健康后由
+// reconciler 移除 from 节点旧副本。to_node_id=0 = 自动选择目标节点。
+message MoveReplicaRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint32 partition_id = 3;
+  uint64 from_node_id = 4;
+  uint64 to_node_id = 5; // 0 = 自动选择
+}
+
+message MoveReplicaResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;        // 非 leader 时回填
+  string error = 4;
+  uint64 to_node_id = 5;         // 成功时:实际落点(自动选择时回填)
+  string to_disk_id = 6;
 }
 

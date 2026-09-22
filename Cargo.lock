@@ -80,6 +80,7 @@ dependencies = [
  "async-trait",
  "axum",
  "http-body-util",
+ "hyper-util",
  "serde",
  "serde_json",
  "thiserror",

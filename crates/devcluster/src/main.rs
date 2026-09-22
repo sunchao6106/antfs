@@ -204,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let astate = antfs_admin::server::AppState {
         master: amaster,
         metrics: ametrics,
+        registry: areg,
         grafana_url: String::new(),
     };
     let aauth = antfs_admin::server::AuthConfig {

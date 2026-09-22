@@ -23,16 +23,20 @@ use crate::pb::raft_internal_server::{RaftInternal, RaftInternalServer};
 use crate::pb::{
     AssignRequest, AssignResponse, ClusterState, ClusterStateRequest, CreatePartitionsRequest,
     CreatePartitionsResponse, DecommissionRequest, DecommissionResponse, ListNodesRequest,
-    ListPartitionsRequest, ListPartitionsResponse, LookupRequest, MasterDirective, NodeBeat,
-    NodeEntry, NodeList, PartitionEntry, PartitionLocations, RaftMessage, RegisterRequest,
-    RegisterResponse, ReplicaCurrent, ReplicaLoc, SetPartitionStateRequest,
-    SetPartitionStateResponse,
+    ListPartitionsRequest, ListPartitionsResponse, LookupRequest, MasterDirective, MetricsRequest,
+    MetricsResponse, MoveReplicaRequest, MoveReplicaResponse, NodeBeat, NodeEntry, NodeList,
+    PartitionEntry, PartitionLocations, RaftMessage, RegisterRequest, RegisterResponse,
+    RepairPartitionRequest, RepairPartitionResponse, ReplicaCurrent, ReplicaLoc,
+    SetPartitionStateRequest, SetPartitionStateResponse,
 };
-use crate::placement::{select_disks, DiskFree};
-use crate::reconcile::{plan_evacuation, plan_rereplication, plan_transitions, EvacAction};
+use crate::placement::{select_disks, DiskFree, PlacementError};
+use crate::reconcile::{plan_evacuation, plan_move, plan_rereplication, plan_transitions, EvacAction};
 use crate::soft::{DiskUsage, SoftState};
 use crate::store::{open, StateMachineData};
-use crate::types::{DiskSpec, MasterCommand, NodeId, NodeInfo, PartitionId, PartitionState, TypeConfig};
+use crate::types::{
+    DiskId, DiskSpec, MasterCommand, NodeId, NodeInfo, PartitionId, PartitionState,
+    ReplicaPlacement, TypeConfig,
+};
 
 const PROTO_VERSION: u32 = 1;
 
@@ -48,6 +52,8 @@ pub struct MasterNode {
     pub soft: SoftState,
     pub metrics: MasterMetrics,
     pub config: MasterConfig,
+    /// 指标注册表(GetMetrics 导出用;与 `metrics` 接入的同一 `Registry`)。
+    pub registry: antfs_metric::Registry,
 }
 
 impl MasterNode {
@@ -81,7 +87,14 @@ impl MasterNode {
         )
         .await?;
 
-        Ok(MasterNode { raft, sm_data, soft: SoftState::default(), metrics, config })
+        Ok(MasterNode {
+            raft,
+            sm_data,
+            soft: SoftState::default(),
+            metrics,
+            config,
+            registry: registry.clone(),
+        })
     }
 
     /// 用给定成员集初始化一个全新集群(在其中一个节点上调一次即可)。
@@ -105,6 +118,7 @@ impl MasterNode {
             soft: self.soft.clone(),
             metrics: self.metrics.clone(),
             config: self.config.clone(),
+            registry: self.registry.clone(),
         });
 
         tokio::spawn(async move {
@@ -213,12 +227,17 @@ impl MasterNode {
                     continue;
                 }
                 let up = soft.up_nodes(timeout);
-                let (partitions, all_nodes, decom) = {
+                let (partitions, all_nodes, decom, moving) = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => continue,
                     };
-                    (g.state.partitions.clone(), g.state.nodes.clone(), g.state.decommissioning.clone())
+                    (
+                        g.state.partitions.clone(),
+                        g.state.nodes.clone(),
+                        g.state.decommissioning.clone(),
+                        g.state.moving.clone(),
+                    )
                 };
 
                 // 补副本目标:失联再复制(M3)∪ 下线 evacuation 的"先补"(M4)。动作相同,合并去重。
@@ -241,6 +260,7 @@ impl MasterNode {
                     exclude.extend(decom.iter().copied());
                     if try_add_replica(&raft, &soft, &all_nodes, &config, &metrics, pid, &exclude, &up)
                         .await
+                        .is_err()
                     {
                         unsatisfiable.insert(pid);
                     }
@@ -272,23 +292,30 @@ impl MasterNode {
                         }
                     }
                 }
+
+                // 副本迁移(MoveReplica)的"后删":新副本补上且健康副本(不含迁出源)≥ RF 才移除迁出源。
+                for (pid, node) in plan_move(&partitions, &moving, &up) {
+                    if raft
+                        .client_write(MasterCommand::RemoveReplica { partition_id: pid, node_id: node })
+                        .await
+                        .is_ok()
+                    {
+                        metrics.replicas_moved.inc();
+                    }
+                }
             }
         });
     }
 }
 
-/// 在一个健康、非排除的节点上给分区补一个副本(re-replication / evacuation 共用)。
-#[allow(clippy::too_many_arguments)]
-async fn try_add_replica(
-    raft: &Raft<TypeConfig>,
+/// 在健康、非排除的节点里为一个新副本选盘(re-replication / repair / move 共用)。
+fn pick_replica_disk(
     soft: &SoftState,
     all_nodes: &BTreeMap<NodeId, NodeInfo>,
     config: &MasterConfig,
-    metrics: &MasterMetrics,
-    pid: crate::types::PartitionId,
     exclude: &std::collections::HashSet<NodeId>,
     up: &std::collections::HashSet<NodeId>,
-) -> bool {
+) -> Result<ReplicaPlacement, PlacementError> {
     let candidates: BTreeMap<NodeId, NodeInfo> = all_nodes
         .iter()
         .filter(|(id, _)| !exclude.contains(id) && up.contains(id))
@@ -299,29 +326,48 @@ async fn try_add_replica(
         .into_iter()
         .map(|(k, free_bytes)| (k, DiskFree { free_bytes }))
         .collect();
-    match select_disks(
+    let mut reps = select_disks(
         &candidates,
         &usage,
         1,
         config.partition_capacity_bytes,
         config.disk_near_full_ratio,
-    ) {
-        Ok(mut reps) => {
-            let replica = reps.remove(0);
-            if raft
-                .client_write(MasterCommand::AddReplica { partition_id: pid, replica })
-                .await
-                .is_ok()
-            {
-                metrics.rereplications.inc();
-            }
-            false
-        }
+    )?;
+    Ok(reps.remove(0))
+}
+
+/// 在一个健康、非排除的节点上给分区补一个副本(re-replication / evacuation / repair 共用)。
+///
+/// 返回:`Ok(Some((node, disk)))` = 提案成功及落点;`Ok(None)` = 提案失败(可重试);
+/// `Err(PlacementError)` = 无可放的盘(unsatisfiable)。
+#[allow(clippy::too_many_arguments)]
+async fn try_add_replica(
+    raft: &Raft<TypeConfig>,
+    soft: &SoftState,
+    all_nodes: &BTreeMap<NodeId, NodeInfo>,
+    config: &MasterConfig,
+    metrics: &MasterMetrics,
+    pid: crate::types::PartitionId,
+    exclude: &std::collections::HashSet<NodeId>,
+    up: &std::collections::HashSet<NodeId>,
+) -> Result<Option<(NodeId, DiskId)>, PlacementError> {
+    let replica = match pick_replica_disk(soft, all_nodes, config, exclude, up) {
+        Ok(r) => r,
         Err(e) => {
-            tracing::debug!(partition = pid, error = %e, "reconcile: no eligible disk to add replica");
-            true
+            tracing::debug!(partition = pid, error = %e, "no eligible disk to add replica");
+            return Err(e);
         }
+    };
+    let at = (replica.node_id, replica.disk_id.clone());
+    if raft
+        .client_write(MasterCommand::AddReplica { partition_id: pid, replica })
+        .await
+        .is_ok()
+    {
+        metrics.rereplications.inc();
+        return Ok(Some(at));
     }
+    Ok(None)
 }
 
 /// 是否存在可放新副本的空闲健康节点(re-replication / healable / 下线可行性共用)。
@@ -395,6 +441,7 @@ struct MasterService {
     soft: SoftState,
     metrics: MasterMetrics,
     config: MasterConfig,
+    registry: antfs_metric::Registry,
 }
 
 impl MasterService {
@@ -749,6 +796,13 @@ impl Master for MasterService {
                     healthy_replicas,
                     healable,
                     under_replicated_reason: reason.unwrap_or("").to_string(),
+                    moving_out_nodes: g
+                        .state
+                        .moving
+                        .iter()
+                        .filter(|(p, _)| p == pid)
+                        .map(|&(_, n)| n)
+                        .collect(),
                 }
             })
             .collect();
@@ -914,6 +968,201 @@ impl Master for MasterService {
                 error: format!("{e}"),
                 affected_partitions: vec![],
             })),
+        }
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<MetricsRequest>,
+    ) -> Result<Response<MetricsResponse>, Status> {
+        // 任何节点(含 follower)都可答:导出本节点 Registry 的 Prometheus 文本。
+        let text =
+            antfs_metric::gather(&self.registry).map_err(|e| Status::internal(format!("{e}")))?;
+        Ok(Response::new(MetricsResponse { version: PROTO_VERSION, text }))
+    }
+
+    async fn repair_partition(
+        &self,
+        request: Request<RepairPartitionRequest>,
+    ) -> Result<Response<RepairPartitionResponse>, Status> {
+        let req = request.into_inner();
+        self.check_secret(&req.cluster_secret)?;
+        self.metrics.repairs_triggered.inc();
+        let fail = |error: String| {
+            Ok(Response::new(RepairPartitionResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                leader_addr: String::new(),
+                error,
+                added_node_id: 0,
+                added_disk_id: String::new(),
+            }))
+        };
+
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return Ok(Response::new(RepairPartitionResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                leader_addr: self.leader_addr().unwrap_or_default(),
+                error: "not leader".to_string(),
+                added_node_id: 0,
+                added_disk_id: String::new(),
+            }));
+        }
+
+        // 排除该分区已有副本节点 + 所有下线节点(同 reconciler 的补副本约束)。
+        let (all_nodes, exclude) = {
+            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let Some(part) = g.state.partitions.get(&req.partition_id) else {
+                return fail("partition not found".to_string());
+            };
+            let mut exclude: std::collections::HashSet<NodeId> =
+                part.replicas.iter().map(|r| r.node_id).collect();
+            exclude.extend(g.state.decommissioning.iter().copied());
+            (g.state.nodes.clone(), exclude)
+        };
+        let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+        let up = self.soft.up_nodes(timeout);
+        match try_add_replica(
+            &self.raft,
+            &self.soft,
+            &all_nodes,
+            &self.config,
+            &self.metrics,
+            req.partition_id,
+            &exclude,
+            &up,
+        )
+        .await
+        {
+            Ok(Some((node, disk))) => Ok(Response::new(RepairPartitionResponse {
+                version: PROTO_VERSION,
+                ok: true,
+                leader_addr: String::new(),
+                error: String::new(),
+                added_node_id: node,
+                added_disk_id: disk,
+            })),
+            Ok(None) => fail("raft write failed".to_string()),
+            Err(_) => fail("no eligible disk".to_string()),
+        }
+    }
+
+    async fn move_replica(
+        &self,
+        request: Request<MoveReplicaRequest>,
+    ) -> Result<Response<MoveReplicaResponse>, Status> {
+        let req = request.into_inner();
+        self.check_secret(&req.cluster_secret)?;
+        let fail = |error: String| {
+            Ok(Response::new(MoveReplicaResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                leader_addr: String::new(),
+                error,
+                to_node_id: 0,
+                to_disk_id: String::new(),
+            }))
+        };
+
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return Ok(Response::new(MoveReplicaResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                leader_addr: self.leader_addr().unwrap_or_default(),
+                error: "not leader".to_string(),
+                to_node_id: 0,
+                to_disk_id: String::new(),
+            }));
+        }
+
+        let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+        let up = self.soft.up_nodes(timeout);
+        let (all_nodes, decom, part_replicas, already_moving) = {
+            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let Some(part) = g.state.partitions.get(&req.partition_id) else {
+                return fail("partition not found".to_string());
+            };
+            (
+                g.state.nodes.clone(),
+                g.state.decommissioning.clone(),
+                part.replicas.clone(),
+                g.state.moving.contains(&(req.partition_id, req.from_node_id)),
+            )
+        };
+        if !part_replicas.iter().any(|r| r.node_id == req.from_node_id) {
+            return fail(format!(
+                "node {} does not hold a replica of partition {}",
+                req.from_node_id, req.partition_id
+            ));
+        }
+        if already_moving {
+            return fail("move already in progress".to_string());
+        }
+
+        // 候选排除:现有副本节点 ∪ 下线节点(自动选择时;指定目标时另作校验)。
+        let mut exclude: std::collections::HashSet<NodeId> =
+            part_replicas.iter().map(|r| r.node_id).collect();
+        exclude.extend(decom.iter().copied());
+        let replica = if req.to_node_id != 0 {
+            if !up.contains(&req.to_node_id) {
+                return fail(format!("target node {} is not up", req.to_node_id));
+            }
+            if exclude.contains(&req.to_node_id) {
+                return fail(format!(
+                    "target node {} already holds a replica or is decommissioning",
+                    req.to_node_id
+                ));
+            }
+            let Some(info) = all_nodes.get(&req.to_node_id) else {
+                return fail(format!("target node {} not registered", req.to_node_id));
+            };
+            // 选盘限定在该节点。
+            let candidates = BTreeMap::from([(req.to_node_id, info.clone())]);
+            let usage = self
+                .soft
+                .free_snapshot()
+                .into_iter()
+                .map(|(k, free_bytes)| (k, DiskFree { free_bytes }))
+                .collect();
+            match select_disks(
+                &candidates,
+                &usage,
+                1,
+                self.config.partition_capacity_bytes,
+                self.config.disk_near_full_ratio,
+            ) {
+                Ok(mut reps) => reps.remove(0),
+                Err(_) => return fail("no eligible disk".to_string()),
+            }
+        } else {
+            match pick_replica_disk(&self.soft, &all_nodes, &self.config, &exclude, &up) {
+                Ok(r) => r,
+                Err(_) => return fail("no eligible disk".to_string()),
+            }
+        };
+        let to_node_id = replica.node_id;
+        let to_disk_id = replica.disk_id.clone();
+        match self
+            .raft
+            .client_write(MasterCommand::MoveReplica {
+                partition_id: req.partition_id,
+                from_node_id: req.from_node_id,
+                replica,
+            })
+            .await
+        {
+            Ok(_) => Ok(Response::new(MoveReplicaResponse {
+                version: PROTO_VERSION,
+                ok: true,
+                leader_addr: String::new(),
+                error: String::new(),
+                to_node_id,
+                to_disk_id,
+            })),
+            Err(e) => fail(format!("{e}")),
         }
     }
 }

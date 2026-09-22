@@ -229,6 +229,15 @@ service Master {
   rpc ListNodes(Empty) returns (NodeList);
   rpc DecommissionNode(NodeRef) returns (Ack);
   rpc GetClusterState(Empty) returns (ClusterState);
+
+  // 指标导出:任何节点(含 follower)可答,返回本节点 Registry 的 Prometheus 文本。
+  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
+  // 手动立即补一个副本(不等 reconciler 周期);返回新副本落点。
+  rpc RepairPartition(RepairPartitionRequest) returns (RepairPartitionResponse);
+  // 副本迁移:add-before-remove(守 §3.1)——先在目标补新副本并把源记入 `moving` 集合
+  // (hard state,`PartitionEntry.moving_out_nodes` 可见),新副本补上且健康副本(不含迁出源)
+  // ≥ RF 后由 reconciler 移除迁出源;to_node_id=0 = 自动选目标。
+  rpc MoveReplica(MoveReplicaRequest) returns (MoveReplicaResponse);
 }
 
 message NodeBeat {
@@ -320,6 +329,8 @@ message MasterDirective {
 | `master_transitions_issued_total` | counter | — | 次 | 下发的副本状态转移指令数(M3) |
 | `master_rereplications_total` | counter | — | 次 | 触发的再复制次数(M3) |
 | `master_replicas_removed_total` | counter | — | 次 | 下线迁移移除的副本数(M4) |
+| `master_repairs_triggered_total` | counter | — | 次 | 手动 RepairPartition 补副本请求数(进入 RPC 即计,含失败) |
+| `master_replicas_moved_total` | counter | — | 次 | 副本迁移(MoveReplica)完成后移除的迁出源副本数 |
 
 ## 8. blobId 结构(D3 的落地)
 
@@ -400,7 +411,7 @@ store server(一个进程 / 一台数据节点)
 
 **S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报)。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
 
-- 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE` / `POST .../undelete` / `POST .../ttl`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)。
+- 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE` / `POST .../undelete` / `POST .../ttl`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)+ `GET /metrics`(Prometheus 文本导出,无鉴权)。
 
 **S3a(拉复制逻辑核心)已实现**(见 `openspec/changes/store-server-replication/`):store 引擎新增**忠实 apply 原语** `BlobStore::apply_replicated`(newest-wins + lifeVersion,**原样保留** peer 的 flags/lifeVersion/expiration/op_time,只增不删幂等,守 §3.1;防副本发散);store-server 新增 `replica-metadata` HTTP 端点(step-1,`find_entries_since`)+ blob 读 `?replication=1`(step-2,含已删除/过期数据体)+ `replication.rs`(`PeerSource` trait + `replicate_from_peer` 收敛循环 + `HttpPeer` 阻塞 adapter);后台复制器经 master `LookupPartition` 发现 peer(排除自身、按 `up` 过滤),对每个本地 replica 的每个 peer 周期拉一轮;BOOTSTRAP 从 `token=Uninitialized` 全量逻辑回放追平。过单测(apply 四态 + 收敛/幂等/bootstrap)+ 集成测试(两 store-server 真 HTTP 收敛 + delete 传播)。
   - **N3 分期(文档化,非代码就地另选,见该 change design.md D-A)**:S3a 只落**逻辑拉复制**(正确收敛的完备核,含 bootstrap 全量逻辑回放);**S3b** 再叠加封存段**物理流式拷贝**(MTTR 优化)。N3 最终形态(混合)不变。
@@ -518,6 +529,12 @@ client SDK: 解析 partitionId → LookupPartition(master,可缓存)→ 副本�
 - **SetPartitionState 运维**:master `SetPartitionState` gRPC(RW/RO/SEALED,raft 命令 `MasterCommand::SetPartitionState`)+ admin `POST /api/partitions/{id}/state`;SPA 每行 可写/只读/封存 按钮。
 - **中英双语**:SPA i18n(en/zh 字典 + 语言切换,localStorage 持久化)。
 
+**指标聚合与副本修复/迁移运维(已实现)**:
+- **`GET /metrics`**(RBAC 之外,Prometheus 抓取惯例):admin 自身 Registry 文本 + master `GetMetrics` 文本拼接;master 不可达时仍 200,只留 `# master metrics unavailable: ...` 注释行(并计 `admin_master_rpc_errors_total`)。
+- **`GET /api/metrics`**(viewer 可读):聚合 JSON `{ts_ms, master, admin, stores}`——master 段经 `GetMetrics` 文本 parse 取 `master_*` 无 label 指标(不可达 → 全 0,仍 200);admin 段取自身 Registry;stores 段对每个已注册节点**并发**抓 `http://{addr}/metrics`(2s 超时,hyper-util client),按名求和 `store_server_*` 指标,失败 → `scrape_ok:false` + 其余 0 + 计 `admin_store_scrape_errors_total`。
+- **`GET /api/partitions/{id}`**:单分区详情(复用列表项结构,含 `moving_out_nodes`;用 `ListPartitions` 联表视图按 id 过滤——`LookupPartition` 只有路由用 ReplicaLoc,缺 RF/healthy/moving 字段);不存在 → 404。
+- **`POST /api/partitions/{id}/repair`** / **`POST /api/partitions/{id}/move`**(operator):转发 master `RepairPartition`/`MoveReplica`(带 `cluster_secret`;move body `{from_node_id, to_node_id}`,`to_node_id` 缺省/0 = 自动选目标);master 侧 `ok=false` 也回 200 + `{"ok":false,"error":...}` 供前端展示,仅传输层错误走 502。
+
 ### 11.1 配置项清单(`AdminConfig`,TOML `[admin]` 表下)
 
 | key | 类型 | 默认值 | 取值/校验 | 含义 |
@@ -534,5 +551,6 @@ client SDK: 解析 partitionId → LookupPartition(master,可缓存)→ 副本�
 | 指标名 | 类型 | 单位 | 含义 |
 |---|---|---|---|
 | `admin_api_requests_total` | counter | 次 | admin API 请求数 |
-| `admin_ops_total` | counter | 次 | 运维操作数(建分区/下线) |
+| `admin_ops_total` | counter | 次 | 运维操作数(建分区/下线/置态/修复/迁移) |
 | `admin_master_rpc_errors_total` | counter | 次 | 调 master gRPC 失败数 |
+| `admin_store_scrape_errors_total` | counter | 次 | 抓取 store `/metrics` 端点失败数(连接/超时/非 200/非法文本) |
