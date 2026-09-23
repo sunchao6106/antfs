@@ -3,6 +3,7 @@
 //! 进程内嵌 [`antfs_router::Router`]:自己向 master 取 blobId 号段、直连 store 写读。
 //! 被测项 =「Router + master 发号 + 数据面」这条链。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -121,6 +122,9 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
     put_phase.report();
 
     let written = Arc::new(written.lock().expect("written poisoned").clone());
+    if !written.is_empty() {
+        report_partition_spread(&written);
+    }
     if !written.is_empty() && cfg.read_ratio > 0 {
         let reads = (written.len() as u64 * cfg.read_ratio / 100).max(1);
         let next = AtomicU64::new(0);
@@ -177,4 +181,23 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
         println!("verify: {checked} blobs byte-identical");
     }
     Ok(())
+}
+
+/// 打印写成功的 blobId 在**各分区**上的分布 —— 轮转发号是否真的把写摊到多个分区上的直接证据。
+///
+/// 注意:分区摊开 ≠ 盘摊开。盘级是否摊开还要看这些分区的副本落在哪些盘上(master 的放置决定;
+/// 用 `store-*/partition_*` 目录或 admin `ListPartitions` 对照)。
+fn report_partition_spread(keys: &[StoreKey]) {
+    let mut by_pid: BTreeMap<u32, u64> = BTreeMap::new();
+    for k in keys {
+        *by_pid.entry(k.partition_id()).or_default() += 1;
+    }
+    let total = keys.len() as u64;
+    println!("分配分布: {total} 个号落在 {} 个分区", by_pid.len());
+    for (pid, n) in &by_pid {
+        println!(
+            "  partition {pid:<6} {n:>8} 个 ({:.1}%)",
+            *n as f64 * 100.0 / total as f64
+        );
+    }
 }
