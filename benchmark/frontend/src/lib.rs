@@ -47,7 +47,8 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
         .map_err(|e| format!("build http client: {e}"))?;
 
     let payload = Bytes::from(pattern_bytes(cfg.size));
-    let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::with_capacity(cfg.ops as usize)));
+    let written: Arc<Mutex<Vec<String>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(cfg.ops as usize)));
     let next = AtomicU64::new(0);
     let started = Instant::now();
     let mut tasks = Vec::new();
@@ -139,7 +140,11 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
 }
 
 /// `POST /blobs` → 201 时返回 blobId(优先 `x-ambry-blob-id`,退回 `Location` 尾段)。
-async fn post_blob(http: &reqwest::Client, base: &str, data: Bytes) -> Result<String, &'static str> {
+async fn post_blob(
+    http: &reqwest::Client,
+    base: &str,
+    data: Bytes,
+) -> Result<String, &'static str> {
     let resp = http
         .post(format!("{base}/blobs"))
         .body(data)
@@ -156,7 +161,11 @@ async fn post_blob(http: &reqwest::Client, base: &str, data: Bytes) -> Result<St
             _ => "status",
         });
     }
-    if let Some(v) = resp.headers().get("x-ambry-blob-id").and_then(|v| v.to_str().ok()) {
+    if let Some(v) = resp
+        .headers()
+        .get("x-ambry-blob-id")
+        .and_then(|v| v.to_str().ok())
+    {
         return Ok(v.to_string());
     }
     let loc = resp
@@ -164,7 +173,11 @@ async fn post_blob(http: &reqwest::Client, base: &str, data: Bytes) -> Result<St
         .get(reqwest::header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    loc.rsplit('/').next().filter(|s| !s.is_empty()).map(|s| s.to_string()).ok_or("no_blob_id")
+    loc.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or("no_blob_id")
 }
 
 /// `GET /blobs/{id}` → 200 时返回字节数。

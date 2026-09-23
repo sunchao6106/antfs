@@ -51,7 +51,7 @@ StoreServer(一个进程 / 一台数据节点)
 
 - **S2**:HeartbeatClient(报 node+disk statfs+replica current_state)+ RegisterNode + ReplicaLifecycle(消费 master transitions:target→BlobStore create/open/close)。
 - **S3**:ReplicationPuller(拉式 anti-entropy,`find_entries_since` + HTTP 拉 blob)+ bootstrap(混合,N3)。
-- **S4**:LocalWorker(周期 flush / 单店 compaction / hard_delete 编排)。
-- **变更类端点**:delete/undelete/update_ttl HTTP。
+- **S4**:LocalWorker(周期 flush / 单店 compaction 编排)。原「隐私擦除」loop 已于 2026-09-23 随"对象不可变 + 删除不可逆"移除(见 `openspec/changes/simplify-delete-model/`)。
+- **变更类端点**:delete HTTP。原「复活」「改 TTL」两条已于 2026-09-23 移除;TTL 改为写入时经 `PUT ?expiration_ms=` 给定。
 - 真流式 put(边收边写,消除内存聚合)。
 - **EC 仍锁定**(用户指示暂不解锁)。

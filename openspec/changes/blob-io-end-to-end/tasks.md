@@ -1,5 +1,9 @@
 # Tasks
 
+> **后续变更(2026-09-23,`simplify-delete-model`)**:本清单里「复活」/「改 TTL」(REST 端点、router 方法、HEAD 响应头、
+> 真集群手测里的"复活/TTL"步骤)已随"对象不可变 + 删除不可逆"删除;`x-ambry-ttl-ms` 改为**写入时一次带 TTL**
+> (`Router::put_with_ttl`)。清单保留为实现当时的记录。
+
 ## master:发号(写路径入口)
 - [x] `proto`:新增 `rpc GetBlobIds` + `GetBlobIdsRequest/Response`(version 字段守 §3.4)
 - [x] `idalloc.rs`:leader 内存号段池(`Pool`)+ 抬水位(`AllocateObjectId`)+ 饱和批次 + 耗尽回退 + 空洞计数;单测(池算术/批次饱和/错误文案)
@@ -26,18 +30,18 @@
       被 `crates/frontend` 与 `benchmark/router` 依赖;由原 `crates/client` 重构而来
 - [x] `RouterConfig`(`[router]` 表:master_addr/cluster_secret/request_timeout_secs/id_segment_size;**无 W/R 配置**)
 - [x] `Router`:号段缓存(单飞取段)、`replicas_for`(拓扑缓存 + `up` 优先排序)、`put`(W=副本数/2+1,收满即返回)、
-      `get`(R=1 首个成功)、`delete/undelete/update_ttl`(多数派)、`stat`、`put_file/get_file`(流式)
+      `get`(R=1 首个成功)、`delete`(多数派)、`stat`、`put_file/get_file`(流式)
 - [x] 错误分类(`Error::kind()` 稳定契约)+ `RouterMetrics`(9 项)
 - [x] 集成测试 `tests/e2e.rs`(5 个,真 master + 真 store):往返(W 实算)、**一个副本挂掉仍能写(acks=2)且读换副本**、
       RF=1 只需 1 ack、号段唯一且都落在可写分区、缺失对象 NotFound / 未知分区不静默
 
 ## frontend:HTTP REST 入口
 - [x] `FrontendConfig`(`[frontend]` + `[frontend.router]` 子表复用 `RouterConfig`)+ CORS 白名单(空 = 不挂;拒 `*`)
-- [x] REST 端点:`POST/GET/HEAD/DELETE /blobs[/{blobId}]`、`POST .../undelete`、`POST .../ttl`、`POST /stitch`、`GET /metrics`
+- [x] REST 端点:`POST/GET/HEAD/DELETE /blobs[/{blobId}]`、`POST /stitch`、`GET /metrics`
 - [x] 流式上传(落暂存文件再 `put_file`,内存不随文件大小涨)+ `max_body_bytes` 校验(413)
 - [x] 分片拼装(无状态描述符当 blob 存 + 读时流式拼接 + 502 语义)
 - [x] `FrontendMetrics` 9 项
-- [x] 集成测试 `tests/rest.rs`(9 个):3 MiB 往返、HEAD、删/复活、TTL、**stitch 三片拼装一致**、400、413、副本挂一个仍 201/200、`/metrics`
+- [x] 集成测试 `tests/rest.rs`(9 个):3 MiB 往返、HEAD、删除、TTL(写入时)、**stitch 三片拼装一致**、400、413、副本挂一个仍 201/200、`/metrics`
 
 ## benchmark:压测二进制(独立目录,不在库里)
 - [x] `benchmark/common`(`antfs-bench-common`):负载生成、逐操作延迟收集、报表、极简 flag 解析
@@ -71,8 +75,7 @@
 - [x] `cargo test --workspace` 全绿;`cargo clippy --workspace --all-targets` 无本 change 引入的告警(仅剩 `crates/blob` 3 条既有告警)
 - [x] 真集群手测(devcluster,release,`/tmp/antfs-e2e`,6 分区 RF=3):
       REST 全流程 — 3 MiB 上传(201 + `Location`/`x-ambry-blob-id`/`x-ambry-blob-size`)→ 下载 `cmp` **逐字节一致** →
-      HEAD 元数据 → DELETE 204 → GET 404 → HEAD `deleted:true` → undelete 200(`life-version:1`)→ GET 200 →
-      TTL 204 → GET 404(`expired:true`)→ 缺参/非法 id 400 → `/metrics` 有 `frontend_*{outcome}`;
+      HEAD 元数据 → DELETE 204 → GET 404 → HEAD `deleted:true` → 缺参/非法 id 400 → `/metrics` 有 `frontend_*{outcome}`;
       **stitch**:3 MiB 切 32 片逐片上传 → `POST /stitch` → 取回**逐字节一致**,缺 session / 空片列表均 400
 - [x] `devcluster --run-bench router|frontend`:一条命令起全栈 → 等就绪 → 压一轮(带 `--verify`)→ 打印 → 退出
 - [x] 压测数字(4 KiB 对象,并发 8,release,单机 5 进程共抢一张盘 ⇒ **只作冒烟**,正式压测须压测端与服务端分机):
@@ -104,14 +107,18 @@
 | 10 | **每次成功上传打一条 INFO 日志**(2 万次上传 = 2 万行,日志成热点) | `--run-bench` 输出里逐条 `blob stored` | 改 `debug!` | — |
 | 11 | **整块写路径缺 4 GiB(u32)上限校验**:`encode_record` 里 `data.len() as u32` **静默截断**,而流式路径有检查 → 段配 >4 GiB 时写一条 4 GiB+ 记录会落盘 `data_len` 回绕的记录,之后读取一律 `Corrupt`(持久性红线) | 代码审查(`blob.rs` 两侧不对称) | 记录长度策略抽成 `record_data_len(len) -> Result<u32>`,`encode_record` 改返回 `Result<Vec<u8>>`(**6 个调用点**都要处理,单一咽喉点不可绕过),流式路径共用同一策略;删掉两处 `as u32` 截断 | `record_len_tests::{record_data_len_accepts_up_to_u32_max_and_rejects_more, bulk_put_path_rejects_oversized_slice_via_policy}`(只测长度策略,无需真分配 4 GiB) |
 
-> **配套的默认值改动(用户指示)**:`StoreConfig::segment_size_bytes` 默认 **8 GiB → 4 GiB**。两条理由(前者是硬伤):
-> ① **旧默认组合根本用不了**:`blob::log::validate_capacities` 硬校验 `total % segment == 0`,而默认分区容量 100 GiB
-> 与 8 GiB **不整除**(`100/8=12.5`)→ 纯默认配置的 store 建 replica 时报
-> `total capacity 107374182400 must be a multiple of segment capacity 8589934592`;改 4 GiB 后 `100/4=25` 整。
-> ② 段 ≤ 4 GiB 时单条记录必然 ≤ `段 − 102 < u32::MAX`,"长度回绕写坏记录"在**结构上**不可能(上面的显式校验退化为第二道保险);
-> 4 GiB 也是满足该不变量的**最大值**(2/1 GiB 虽也满足,但滚动更频繁、索引文件对数翻倍)。
-> 文档同步:`docs/design/store.md` §10.1 配置表(原先还写着"待定");不变量由
-> `crates/store/tests/config_defaults.rs` 三条测试钉住(段/分区容量整除、u32 上限、`max_body_bytes` 放得进一段)。
+> **配套的默认值改动(用户指示)**:`StoreConfig::segment_size_bytes` 默认 **8 GiB → 4 GiB**。理由:
+> 段 ≤ 4 GiB 时单条记录必然 ≤ `段 − 102 < u32::MAX`,"长度回绕写坏记录"在**结构上**不可能(上面的显式校验退化为第二道保险);
+> 4 GiB 也是满足该不变量的**最大值**(2/1 GiB 虽也满足,但滚动更频繁、索引文件对数翻倍),且容量粒度比 8 GiB 更细。
+> 文档同步:`docs/design/store.md` §10.1 配置表(原先还写着"待定")。
+>
+> **另一处容量规则放宽(用户指示)**:`Log` 不再要求"总容量是段容量的整数倍" —— 末段为**残段**,
+> 装不下记录时按写满处理(`SegmentFull` → `StoreFull`);`total < segment` 退化为单段(对齐 Ambry
+> `segmentCapacity = min(capacity, segment)`)。这样段大小与分区容量两个配置项**解耦**
+> (100 GiB + 8 GiB = 12 整段 + 1 个 4 GiB 残段,过去是直接 `BadArgument`)。
+> 实现:`crates/blob/src/log.rs`(`validate_capacities` 放宽 + `div_ceil` 段数 + `roll_over` 算残段容量 +
+> `max_segment_capacity` 区分"参数错"与"写满");测试 `crates/blob/tests/segment_tail.rs`(5 条:残段几何、
+> 残段过小→写满且不建空段、`total < segment` 单段、重开几何不变、引擎层报 `StoreFull` 而非 `BadArgument`)。
 
 **审查后确认"不是 bug"的两处**(避免误修):
 - store 不校验 `blobId 的高 32 位 == URL 里的 partition`:按 `cluster.md §8`,**store 只把 8B key 当不透明值**,
@@ -149,5 +156,5 @@
 - [ ] 号段后台预取(D2 双 buffer)、读路由缓存 TTL / 失败后强制刷新
 - [ ] in-log 预留槽零拷贝写(见 design.md D5 被否决方案)
 - [ ] 真流式 GET(store 的 `GET` 仍把数据体整个读进内存)
-- [ ] `Router::put*` 增加 `expiration_ms`(让 frontend 的 `x-ambry-ttl-ms` 变成原子写)
+- [x] ~~`Router::put*` 增加 `expiration_ms`~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,`x-ambry-ttl-ms` 已是单次原子写;见 `simplify-delete-model`)
 - [ ] 分片:签名片 id、服务端会话、递归删片;S3 兼容层;多租户 ACL/配额

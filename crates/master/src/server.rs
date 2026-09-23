@@ -17,6 +17,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::config::MasterConfig;
+use crate::idalloc::IdAllocator;
 use crate::metrics::MasterMetrics;
 use crate::network::GrpcNetworkFactory;
 use crate::pb::master_server::{Master, MasterServer};
@@ -33,7 +34,6 @@ use crate::pb::{
     SetMaintenanceRequest, SetMaintenanceResponse, SetPartitionStateRequest,
     SetPartitionStateResponse, StartBalanceRequest, StartBalanceResponse,
 };
-use crate::idalloc::IdAllocator;
 use crate::placement::{select_disks, DiskFree, PlacementError};
 use crate::reconcile::{
     drop_confirmed, plan_evacuation, plan_move, plan_rereplication, plan_transitions, EvacAction,
@@ -60,7 +60,15 @@ const DROPPED: &str = "DROPPED";
 fn placement_usage(soft: &SoftState) -> BTreeMap<(NodeId, DiskId), DiskFree> {
     soft.usage_snapshot()
         .into_iter()
-        .map(|(k, u)| (k, DiskFree { free_bytes: u.free_bytes, health: u.health }))
+        .map(|(k, u)| {
+            (
+                k,
+                DiskFree {
+                    free_bytes: u.free_bytes,
+                    health: u.health,
+                },
+            )
+        })
         .collect()
 }
 
@@ -70,7 +78,10 @@ fn used_ratio(u: &DiskUsage) -> Option<f64> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 轻量伪随机(u64,仅用于"按权重挑分区"这类散列用途,**非安全用途**)。
@@ -154,7 +165,9 @@ impl MasterNode {
         let raft_addr = self.config.raft_addr.parse()?;
         let grpc_addr = self.config.grpc_addr.parse()?;
 
-        let raft_svc = RaftInternalServer::new(RaftInternalService { raft: self.raft.clone() });
+        let raft_svc = RaftInternalServer::new(RaftInternalService {
+            raft: self.raft.clone(),
+        });
         let master_svc = MasterServer::new(MasterService {
             raft: self.raft.clone(),
             sm_data: self.sm_data.clone(),
@@ -166,10 +179,16 @@ impl MasterNode {
         });
 
         tokio::spawn(async move {
-            let _ = Server::builder().add_service(raft_svc).serve(raft_addr).await;
+            let _ = Server::builder()
+                .add_service(raft_svc)
+                .serve(raft_addr)
+                .await;
         });
         tokio::spawn(async move {
-            let _ = Server::builder().add_service(master_svc).serve(grpc_addr).await;
+            let _ = Server::builder()
+                .add_service(master_svc)
+                .serve(grpc_addr)
+                .await;
         });
 
         // 后台把 raft 的 term/leader 同步到 gauge(观测软状态,不进 Raft)。
@@ -181,7 +200,9 @@ impl MasterNode {
                 {
                     let m = rx.borrow_and_update();
                     metrics.raft_term.set(m.current_term as i64);
-                    metrics.is_leader.set(i64::from(m.current_leader == Some(this_node)));
+                    metrics
+                        .is_leader
+                        .set(i64::from(m.current_leader == Some(this_node)));
                 }
                 if rx.changed().await.is_err() {
                     break;
@@ -288,7 +309,16 @@ impl MasterNode {
                     continue;
                 }
                 let up = soft.up_nodes(timeout);
-                let (partitions, all_nodes, decom, moving, move_targets, pending_drop, maintenance, balance) = {
+                let (
+                    partitions,
+                    all_nodes,
+                    decom,
+                    moving,
+                    move_targets,
+                    pending_drop,
+                    maintenance,
+                    balance,
+                ) = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => continue,
@@ -312,7 +342,8 @@ impl MasterNode {
 
                 // 集群级观测 gauge(周期刷新,仅 leader;对齐 under_replicated_partitions 的更新时机)。
                 {
-                    let (mut n_rw, mut n_ro, mut n_sealed, mut n_majority_down) = (0i64, 0i64, 0i64, 0i64);
+                    let (mut n_rw, mut n_ro, mut n_sealed, mut n_majority_down) =
+                        (0i64, 0i64, 0i64, 0i64);
                     for (pid, info) in &partitions {
                         match info.state {
                             PartitionState::ReadWrite => n_rw += 1,
@@ -323,7 +354,9 @@ impl MasterNode {
                         let healthy = info
                             .replicas
                             .iter()
-                            .filter(|r| up.contains(&r.node_id) && !errored.contains(&(*pid, r.node_id)))
+                            .filter(|r| {
+                                up.contains(&r.node_id) && !errored.contains(&(*pid, r.node_id))
+                            })
                             .count();
                         if healthy * 2 <= info.replication_factor as usize {
                             n_majority_down += 1;
@@ -332,24 +365,32 @@ impl MasterNode {
                     metrics.partitions_rw.set(n_rw);
                     metrics.partitions_ro.set(n_ro);
                     metrics.partitions_sealed.set(n_sealed);
-                    let writable_capacity = n_rw.saturating_mul(config.partition_capacity_bytes as i64);
+                    let writable_capacity =
+                        n_rw.saturating_mul(config.partition_capacity_bytes as i64);
                     metrics.writable_capacity_bytes.set(writable_capacity);
                     // 可写已用:每分区取各副本 used 最大值后求和(RF 副本不重复计,口径见 soft)。
-                    let used = soft
-                        .sum_used_bytes(
-                            partitions
-                                .iter()
-                                .filter(|(_, p)| p.state == PartitionState::ReadWrite)
-                                .map(|(pid, _)| *pid),
-                        ) as i64;
+                    let used = soft.sum_used_bytes(
+                        partitions
+                            .iter()
+                            .filter(|(_, p)| p.state == PartitionState::ReadWrite)
+                            .map(|(pid, _)| *pid),
+                    ) as i64;
                     metrics.writable_used_bytes.set(used);
-                    metrics.writable_free_bytes.set(writable_capacity.saturating_sub(used));
+                    metrics
+                        .writable_free_bytes
+                        .set(writable_capacity.saturating_sub(used));
                     metrics.nodes_up.set(up.len() as i64);
                     let (capacity, free) = soft.capacity_totals();
                     metrics.cluster_free_bytes.set(free as i64);
-                    metrics.cluster_used_bytes.set(capacity.saturating_sub(free) as i64);
-                    metrics.max_replica_lag_bytes.set(soft.max_replica_lag_bytes() as i64);
-                    metrics.majority_replicas_down_partitions.set(n_majority_down);
+                    metrics
+                        .cluster_used_bytes
+                        .set(capacity.saturating_sub(free) as i64);
+                    metrics
+                        .max_replica_lag_bytes
+                        .set(soft.max_replica_lag_bytes() as i64);
+                    metrics
+                        .majority_replicas_down_partitions
+                        .set(n_majority_down);
                     metrics.maintenance.set(i64::from(maintenance));
                     // A5:主动探测报出不健康的盘数(空串 = 未启用探测,不计)。
                     let unhealthy = usage
@@ -385,13 +426,17 @@ impl MasterNode {
                 }
 
                 let mut add_targets: std::collections::BTreeSet<PartitionId> =
-                    plan_rereplication(&partitions, &up, &errored).into_iter().collect();
+                    plan_rereplication(&partitions, &up, &errored)
+                        .into_iter()
+                        .collect();
                 for a in &evac {
                     if let EvacAction::Add(pid) = a {
                         add_targets.insert(*pid);
                     }
                 }
-                metrics.under_replicated_partitions.set(add_targets.len() as i64);
+                metrics
+                    .under_replicated_partitions
+                    .set(add_targets.len() as i64);
 
                 // A4 盘将满 → 自动转 RO(**只置不回**,止损)。位置:gauge 刷新**之后**(让本周期观测先
                 // 反映上一轮状态)、维护模式 skip **之前** —— 盘满会立刻挡住写入,这是止损而非"恢复动作",
@@ -441,12 +486,17 @@ impl MasterNode {
                     std::collections::BTreeSet::new();
                 for pid in add_targets {
                     // 排除该分区已有节点 + 所有下线节点(故障域打散,只落存活健康盘)。
-                    let mut exclude: std::collections::HashSet<NodeId> =
-                        partitions[&pid].replicas.iter().map(|r| r.node_id).collect();
+                    let mut exclude: std::collections::HashSet<NodeId> = partitions[&pid]
+                        .replicas
+                        .iter()
+                        .map(|r| r.node_id)
+                        .collect();
                     exclude.extend(decom.iter().copied());
-                    if try_add_replica(&raft, &soft, &all_nodes, &config, &metrics, pid, &exclude, &up)
-                        .await
-                        .is_err()
+                    if try_add_replica(
+                        &raft, &soft, &all_nodes, &config, &metrics, pid, &exclude, &up,
+                    )
+                    .await
+                    .is_err()
                     {
                         unsatisfiable.insert(pid);
                     }
@@ -470,7 +520,10 @@ impl MasterNode {
                 for a in evac {
                     if let EvacAction::Remove(pid, node) = a {
                         if raft
-                            .client_write(MasterCommand::RemoveReplica { partition_id: pid, node_id: node })
+                            .client_write(MasterCommand::RemoveReplica {
+                                partition_id: pid,
+                                node_id: node,
+                            })
                             .await
                             .is_ok()
                         {
@@ -494,7 +547,10 @@ impl MasterNode {
                     .collect();
                 for (pid, node) in plan_move(&partitions, &moving, &up, &successor_active) {
                     if raft
-                        .client_write(MasterCommand::RemoveReplica { partition_id: pid, node_id: node })
+                        .client_write(MasterCommand::RemoveReplica {
+                            partition_id: pid,
+                            node_id: node,
+                        })
                         .await
                         .is_ok()
                     {
@@ -510,7 +566,10 @@ impl MasterNode {
                         continue;
                     }
                     if raft
-                        .client_write(MasterCommand::ConfirmDrop { partition_id: pid, node_id: node })
+                        .client_write(MasterCommand::ConfirmDrop {
+                            partition_id: pid,
+                            node_id: node,
+                        })
                         .await
                         .is_err()
                     {
@@ -534,8 +593,16 @@ impl MasterNode {
                             for m in &p.moves {
                                 let (phase, _) =
                                     crate::balance::move_phase(p, m, &partitions, &moving);
-                                if matches!(phase, crate::balance::MovePhase::Done | crate::balance::MovePhase::Failed) {
-                                    balance_counted.insert((p.plan_id, m.partition_id, m.from_node_id));
+                                if matches!(
+                                    phase,
+                                    crate::balance::MovePhase::Done
+                                        | crate::balance::MovePhase::Failed
+                                ) {
+                                    balance_counted.insert((
+                                        p.plan_id,
+                                        m.partition_id,
+                                        m.from_node_id,
+                                    ));
                                 }
                             }
                         }
@@ -546,13 +613,17 @@ impl MasterNode {
                             let phases: Vec<crate::balance::MovePhase> = plan
                                 .moves
                                 .iter()
-                                .map(|m| crate::balance::move_phase(plan, m, &partitions, &moving).0)
+                                .map(|m| {
+                                    crate::balance::move_phase(plan, m, &partitions, &moving).0
+                                })
                                 .collect();
                             let count = |want: crate::balance::MovePhase| {
                                 phases.iter().filter(|p| **p == want).count()
                             };
-                            let (n_pending, n_in_flight) =
-                                (count(crate::balance::MovePhase::Pending), count(crate::balance::MovePhase::InFlight));
+                            let (n_pending, n_in_flight) = (
+                                count(crate::balance::MovePhase::Pending),
+                                count(crate::balance::MovePhase::InFlight),
+                            );
                             metrics.balance_pending.set(n_pending as i64);
                             metrics.balance_in_flight.set(n_in_flight as i64);
                             // 终态计数(每条只计一次;counter 口径见 metrics.rs)。
@@ -578,7 +649,11 @@ impl MasterNode {
                             }
                             // 全部 move 进入终态 → 收官 DONE(apply 幂等;下周期 status!=RUNNING 不再写)。
                             if phases.iter().all(|p| {
-                                matches!(p, crate::balance::MovePhase::Done | crate::balance::MovePhase::Failed)
+                                matches!(
+                                    p,
+                                    crate::balance::MovePhase::Done
+                                        | crate::balance::MovePhase::Failed
+                                )
                             }) {
                                 let _ = raft
                                     .client_write(MasterCommand::SetBalanceStatus {
@@ -593,8 +668,11 @@ impl MasterNode {
                             for (m, phase) in plan.moves.iter().zip(&phases) {
                                 let key = (plan.plan_id, m.partition_id, m.from_node_id);
                                 if *phase == crate::balance::MovePhase::InFlight {
-                                    let since = balance_dispatched_at.entry(key).or_insert_with(Instant::now);
-                                    if since.elapsed() >= Duration::from_secs(config.balance_move_timeout_secs)
+                                    let since = balance_dispatched_at
+                                        .entry(key)
+                                        .or_insert_with(Instant::now);
+                                    if since.elapsed()
+                                        >= Duration::from_secs(config.balance_move_timeout_secs)
                                         && raft
                                             .client_write(MasterCommand::FailBalanceMove {
                                                 plan_id: plan.plan_id,
@@ -627,20 +705,31 @@ impl MasterNode {
                                 if *phase != crate::balance::MovePhase::Pending {
                                     continue;
                                 }
-                                let Some(part) = partitions.get(&m.partition_id) else { continue };
-                                // 执行前再校验(计划是评估时快照,执行期集群可能已变):
-                                let fail_reason = if !part.replicas.iter().any(|r| r.node_id == m.from_node_id) {
-                                    Some("source no longer holds the replica".to_string())
-                                } else if !up.contains(&m.to_node_id) || decom.contains(&m.to_node_id) {
-                                    Some(format!("target node {} not up/decommissioning", m.to_node_id))
-                                } else {
-                                    None
+                                let Some(part) = partitions.get(&m.partition_id) else {
+                                    continue;
                                 };
+                                // 执行前再校验(计划是评估时快照,执行期集群可能已变):
+                                let fail_reason =
+                                    if !part.replicas.iter().any(|r| r.node_id == m.from_node_id) {
+                                        Some("source no longer holds the replica".to_string())
+                                    } else if !up.contains(&m.to_node_id)
+                                        || decom.contains(&m.to_node_id)
+                                    {
+                                        Some(format!(
+                                            "target node {} not up/decommissioning",
+                                            m.to_node_id
+                                        ))
+                                    } else {
+                                        None
+                                    };
                                 // 幂等陷阱:目标已持有该副本 = 上次已投递受理(apply 只在目标不存在时
                                 // 才追加+记 moving)→ **不当失败重投**,等 plan_move 摘源即可。
                                 let target_holds =
                                     part.replicas.iter().any(|r| r.node_id == m.to_node_id);
-                                if fail_reason.is_none() && !target_holds && !moving.contains(&(m.partition_id, m.from_node_id)) {
+                                if fail_reason.is_none()
+                                    && !target_holds
+                                    && !moving.contains(&(m.partition_id, m.from_node_id))
+                                {
                                     // 目标盘再校验/重选:评估时选的盘此刻可能已不可用(将满/坏盘)。
                                     let picked = match all_nodes.get(&m.to_node_id) {
                                         Some(info) => {
@@ -767,7 +856,9 @@ fn plan_drops(
     let errored = soft.errored_replicas();
     let mut out = Vec::new();
     for (pid, node) in mine {
-        let Some(info) = state.partitions.get(&pid) else { continue };
+        let Some(info) = state.partitions.get(&pid) else {
+            continue;
+        };
         let successor = match state.move_target_of(pid, node) {
             Some(target) if active.contains(&(pid, target)) => SuccessorConfirm::Active,
             Some(_) => SuccessorConfirm::NotYetActive,
@@ -777,7 +868,9 @@ fn plan_drops(
             continue;
         }
         // disk_id 从软状态取该副本所在盘;拿不到落点就不发(宁可留一份数据,不猜是哪块盘)。
-        let Some(st) = soft.replica_state(pid, node) else { continue };
+        let Some(st) = soft.replica_state(pid, node) else {
+            continue;
+        };
         out.push(crate::pb::Transition {
             partition_id: pid,
             disk_id: st.disk_id,
@@ -811,7 +904,10 @@ async fn try_add_replica(
     };
     let at = (replica.node_id, replica.disk_id.clone());
     if raft
-        .client_write(MasterCommand::AddReplica { partition_id: pid, replica })
+        .client_write(MasterCommand::AddReplica {
+            partition_id: pid,
+            replica,
+        })
         .await
         .is_ok()
     {
@@ -851,7 +947,10 @@ fn dec<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, Status> {
     serde_json::from_slice(b).map_err(|e| Status::internal(format!("decode: {e}")))
 }
 fn reply(payload: Vec<u8>) -> Response<RaftMessage> {
-    Response::new(RaftMessage { version: PROTO_VERSION, payload })
+    Response::new(RaftMessage {
+        version: PROTO_VERSION,
+        payload,
+    })
 }
 
 /// Raft 内部 RPC 服务端:反序列化 → 本地 Raft → 序列化 `Result<Resp, RaftError>`。
@@ -913,8 +1012,11 @@ impl MasterService {
     fn leader_addr(&self) -> Option<String> {
         let m = self.raft.metrics().borrow().clone();
         let leader = m.current_leader?;
-        let addrs: BTreeMap<u64, String> =
-            m.membership_config.nodes().map(|(id, n)| (*id, n.addr.clone())).collect();
+        let addrs: BTreeMap<u64, String> = m
+            .membership_config
+            .nodes()
+            .map(|(id, n)| (*id, n.addr.clone()))
+            .collect();
         addrs.get(&leader).cloned()
     }
 
@@ -948,8 +1050,10 @@ impl MasterService {
         timeout: Duration,
     ) -> Option<PartitionId> {
         let cap = self.config.partition_capacity_bytes;
-        let weight =
-            |pid: PartitionId| cap.saturating_sub(used.get(&pid).copied().unwrap_or(0)).max(1);
+        let weight = |pid: PartitionId| {
+            cap.saturating_sub(used.get(&pid).copied().unwrap_or(0))
+                .max(1)
+        };
 
         let mut cands: Vec<PartitionId> = g
             .state
@@ -1015,7 +1119,14 @@ impl Master for MasterService {
         let disks = req
             .disks
             .into_iter()
-            .map(|d| (d.disk_id, DiskSpec { capacity_bytes: d.capacity_bytes }))
+            .map(|d| {
+                (
+                    d.disk_id,
+                    DiskSpec {
+                        capacity_bytes: d.capacity_bytes,
+                    },
+                )
+            })
             .collect();
         let info = NodeInfo {
             dc: req.dc,
@@ -1026,7 +1137,10 @@ impl Master for MasterService {
         };
         match self
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: req.node_id, info })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: req.node_id,
+                info,
+            })
             .await
         {
             Ok(_) => Ok(Response::new(RegisterResponse {
@@ -1044,7 +1158,8 @@ impl Master for MasterService {
         }
     }
 
-    type HeartbeatStream = Pin<Box<dyn futures::Stream<Item = Result<MasterDirective, Status>> + Send>>;
+    type HeartbeatStream =
+        Pin<Box<dyn futures::Stream<Item = Result<MasterDirective, Status>> + Send>>;
 
     async fn heartbeat(
         &self,
@@ -1060,33 +1175,46 @@ impl Master for MasterService {
         tokio::spawn(async move {
             while let Ok(Some(beat)) = in_stream.message().await {
                 if !secret.is_empty() && beat.cluster_secret != secret {
-                    let _ = tx.send(Err(Status::unauthenticated("invalid cluster secret"))).await;
+                    let _ = tx
+                        .send(Err(Status::unauthenticated("invalid cluster secret")))
+                        .await;
                     break;
                 }
                 metrics.heartbeats.inc();
                 let disks: HashMap<String, DiskUsage> = beat
                     .disks
                     .into_iter()
-                    .map(|d| (d.disk_id, DiskUsage {
-                        capacity_bytes: d.capacity_bytes,
-                        free_bytes: d.free_bytes,
-                        health: d.health,
-                    }))
+                    .map(|d| {
+                        (
+                            d.disk_id,
+                            DiskUsage {
+                                capacity_bytes: d.capacity_bytes,
+                                free_bytes: d.free_bytes,
+                                health: d.health,
+                            },
+                        )
+                    })
                     .collect();
                 soft.record_beat(beat.node_id, disks);
 
                 // M3:记录副本实然态,算出该节点待下发的转移(current != target)。
-                let reported: BTreeMap<PartitionId, String> =
-                    beat.replicas.iter().map(|r| (r.partition_id, r.current_state.clone())).collect();
+                let reported: BTreeMap<PartitionId, String> = beat
+                    .replicas
+                    .iter()
+                    .map(|r| (r.partition_id, r.current_state.clone()))
+                    .collect();
                 soft.record_replicas(
                     beat.node_id,
                     beat.replicas.into_iter().map(|r| {
-                        (r.partition_id, crate::soft::ReplicaState {
-                            disk_id: r.disk_id,
-                            current_state: r.current_state,
-                            lag_bytes: r.lag_bytes,
-                            used_bytes: r.used_bytes,
-                        })
+                        (
+                            r.partition_id,
+                            crate::soft::ReplicaState {
+                                disk_id: r.disk_id,
+                                current_state: r.current_state,
+                                lag_bytes: r.lag_bytes,
+                                used_bytes: r.used_bytes,
+                            },
+                        )
                     }),
                     beat.full_report,
                 );
@@ -1110,12 +1238,19 @@ impl Master for MasterService {
                 if !transitions.is_empty() {
                     metrics.transitions_issued.inc_by(transitions.len() as u64);
                 }
-                let dropped = transitions.iter().filter(|t| t.target_state == DROPPED).count();
+                let dropped = transitions
+                    .iter()
+                    .filter(|t| t.target_state == DROPPED)
+                    .count();
                 if dropped > 0 {
                     metrics.dropped_directives.inc_by(dropped as u64);
                 }
                 if tx
-                    .send(Ok(MasterDirective { version: PROTO_VERSION, transitions, tasks: vec![] }))
+                    .send(Ok(MasterDirective {
+                        version: PROTO_VERSION,
+                        transitions,
+                        tasks: vec![],
+                    }))
                     .await
                     .is_err()
                 {
@@ -1132,7 +1267,10 @@ impl Master for MasterService {
         _request: Request<ListNodesRequest>,
     ) -> Result<Response<NodeList>, Status> {
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
-        let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+        let g = self
+            .sm_data
+            .read()
+            .map_err(|_| Status::internal("sm lock poisoned"))?;
         let nodes = g
             .state
             .nodes
@@ -1147,7 +1285,10 @@ impl Master for MasterService {
                         capacity_bytes: spec.capacity_bytes,
                         free_bytes: usage.get(disk_id).map(|u| u.free_bytes).unwrap_or(0),
                         // 主动探测结果回填(空 = 尚未探测/未启用):admin 节点页据此显示健康徽标。
-                        health: usage.get(disk_id).map(|u| u.health.clone()).unwrap_or_default(),
+                        health: usage
+                            .get(disk_id)
+                            .map(|u| u.health.clone())
+                            .unwrap_or_default(),
                     })
                     .collect();
                 NodeEntry {
@@ -1160,7 +1301,10 @@ impl Master for MasterService {
                 }
             })
             .collect();
-        Ok(Response::new(NodeList { version: PROTO_VERSION, nodes }))
+        Ok(Response::new(NodeList {
+            version: PROTO_VERSION,
+            nodes,
+        }))
     }
 
     async fn get_cluster_state(
@@ -1168,7 +1312,10 @@ impl Master for MasterService {
         _request: Request<ClusterStateRequest>,
     ) -> Result<Response<ClusterState>, Status> {
         let m = self.raft.metrics().borrow().clone();
-        let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+        let g = self
+            .sm_data
+            .read()
+            .map_err(|_| Status::internal("sm lock poisoned"))?;
         Ok(Response::new(ClusterState {
             version: PROTO_VERSION,
             this_node: self.config.node_id,
@@ -1200,10 +1347,17 @@ impl Master for MasterService {
         }
 
         let rf_default = {
-            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let g = self
+                .sm_data
+                .read()
+                .map_err(|_| Status::internal("sm lock poisoned"))?;
             g.state.policy.default_replication_factor
         };
-        let rf = if req.replication_factor == 0 { rf_default } else { req.replication_factor as u8 };
+        let rf = if req.replication_factor == 0 {
+            rf_default
+        } else {
+            req.replication_factor as u8
+        };
 
         let mut ids = Vec::new();
         for _ in 0..req.count {
@@ -1245,7 +1399,10 @@ impl Master for MasterService {
         self.metrics.lookup_requests.inc();
         let pid = request.into_inner().partition_id;
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
-        let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+        let g = self
+            .sm_data
+            .read()
+            .map_err(|_| Status::internal("sm lock poisoned"))?;
         let part = g
             .state
             .partitions
@@ -1256,7 +1413,12 @@ impl Master for MasterService {
             .iter()
             .map(|r| ReplicaLoc {
                 node_id: r.node_id,
-                addr: g.state.nodes.get(&r.node_id).map(|n| n.addr.clone()).unwrap_or_default(),
+                addr: g
+                    .state
+                    .nodes
+                    .get(&r.node_id)
+                    .map(|n| n.addr.clone())
+                    .unwrap_or_default(),
                 disk_id: r.disk_id.clone(),
                 target_state: r.target_state.clone(),
                 up: self.soft.is_up(r.node_id, timeout),
@@ -1288,13 +1450,20 @@ impl Master for MasterService {
             }
         };
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
-        let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+        let g = self
+            .sm_data
+            .read()
+            .map_err(|_| Status::internal("sm lock poisoned"))?;
         let keep = |p: &crate::types::PartitionInfo| want.is_none_or(|s| p.state == s);
         // 过滤先于分页:`total` 是过滤后的总数,offset/limit 作用在过滤后的集合上。
         let total = g.state.partitions.values().filter(|p| keep(p)).count() as u64;
         let up_set = self.soft.up_nodes(timeout);
         // BTreeMap 按 partition_id 升序,offset/limit 稳定切片(limit=0 表示不限)。
-        let take = if req.limit == 0 { usize::MAX } else { req.limit as usize };
+        let take = if req.limit == 0 {
+            usize::MAX
+        } else {
+            req.limit as usize
+        };
         let partitions = g
             .state
             .partitions
@@ -1308,7 +1477,12 @@ impl Master for MasterService {
                     .iter()
                     .map(|r| ReplicaLoc {
                         node_id: r.node_id,
-                        addr: g.state.nodes.get(&r.node_id).map(|n| n.addr.clone()).unwrap_or_default(),
+                        addr: g
+                            .state
+                            .nodes
+                            .get(&r.node_id)
+                            .map(|n| n.addr.clone())
+                            .unwrap_or_default(),
                         disk_id: r.disk_id.clone(),
                         target_state: r.target_state.clone(),
                         up: self.soft.is_up(r.node_id, timeout),
@@ -1318,12 +1492,14 @@ impl Master for MasterService {
                     .replicas
                     .iter()
                     .filter_map(|r| {
-                        self.soft.replica_state(*pid, r.node_id).map(|st| ReplicaCurrent {
-                            node_id: r.node_id,
-                            current_state: st.current_state,
-                            lag_bytes: st.lag_bytes,
-                            used_bytes: st.used_bytes,
-                        })
+                        self.soft
+                            .replica_state(*pid, r.node_id)
+                            .map(|st| ReplicaCurrent {
+                                node_id: r.node_id,
+                                current_state: st.current_state,
+                                lag_bytes: st.lag_bytes,
+                                used_bytes: st.used_bytes,
+                            })
                     })
                     .collect();
                 // 健康分类(承 reconcile::classify_partition):健康副本数 + 欠副本主因。
@@ -1371,7 +1547,11 @@ impl Master for MasterService {
                 }
             })
             .collect();
-        Ok(Response::new(ListPartitionsResponse { version: PROTO_VERSION, partitions, total }))
+        Ok(Response::new(ListPartitionsResponse {
+            version: PROTO_VERSION,
+            partitions,
+            total,
+        }))
     }
 
     async fn set_partition_state(
@@ -1404,7 +1584,10 @@ impl Master for MasterService {
         }
         match self
             .raft
-            .client_write(MasterCommand::SetPartitionState { partition_id: req.partition_id, state })
+            .client_write(MasterCommand::SetPartitionState {
+                partition_id: req.partition_id,
+                state,
+            })
             .await
         {
             Ok(_) => Ok(Response::new(SetPartitionStateResponse {
@@ -1542,9 +1725,15 @@ impl Master for MasterService {
         self.check_secret(&req.cluster_secret)?;
 
         // count = 0 → 用 master 默认号段大小(薄 client:默认值由服务端定)。
-        let count = if req.count == 0 { self.config.id_alloc_segment_size } else { req.count };
+        let count = if req.count == 0 {
+            self.config.id_alloc_segment_size
+        } else {
+            req.count
+        };
         if count == 0 {
-            return Ok(Response::new(self.blob_ids_fail("id_alloc_segment_size must be > 0")));
+            return Ok(Response::new(
+                self.blob_ids_fail("id_alloc_segment_size must be > 0"),
+            ));
         }
 
         let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
@@ -1564,9 +1753,9 @@ impl Master for MasterService {
                 Some(p) => match g.state.partitions.get(&p) {
                     Some(part) if part.state != PartitionState::ReadWrite => {
                         let state = pstate(part.state).to_string();
-                        return Ok(Response::new(
-                            self.blob_ids_fail(format!("partition {p} is not writable (state {state})")),
-                        ));
+                        return Ok(Response::new(self.blob_ids_fail(format!(
+                            "partition {p} is not writable (state {state})"
+                        ))));
                     }
                     // 显式点名一个没有副本的分区:号段发得出来也写不进去,直接拒(与自动挑选同一判据)。
                     Some(part) if part.replicas.is_empty() => {
@@ -1581,7 +1770,11 @@ impl Master for MasterService {
                         ))
                     }
                 },
-                None => match self.pick_writable_partition(&g, &self.soft.used_bytes_by_partition(), timeout) {
+                None => match self.pick_writable_partition(
+                    &g,
+                    &self.soft.used_bytes_by_partition(),
+                    timeout,
+                ) {
                     Some(p) => p,
                     None => return Ok(Response::new(self.blob_ids_fail("no writable partition"))),
                 },
@@ -1612,7 +1805,11 @@ impl Master for MasterService {
         };
 
         // 发号:池内直接取;不够则先经 Raft 抬水位(失败 → ok=false,err 说明原因)。
-        match self.id_alloc.allocate(&self.raft, pid, count, &self.config, &self.metrics).await {
+        match self
+            .id_alloc
+            .allocate(&self.raft, pid, count, &self.config, &self.metrics)
+            .await
+        {
             Ok((start, n)) => {
                 self.metrics.blob_ids_allocated.inc_by(n as u64);
                 Ok(Response::new(GetBlobIdsResponse {
@@ -1650,7 +1847,10 @@ impl Master for MasterService {
         if !req.force {
             let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
             let affected: Vec<u32> = {
-                let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+                let g = self
+                    .sm_data
+                    .read()
+                    .map_err(|_| Status::internal("sm lock poisoned"))?;
                 let up_set = self.soft.up_nodes(timeout);
                 g.state
                     .partitions
@@ -1679,7 +1879,13 @@ impl Master for MasterService {
                 }));
             }
         }
-        match self.raft.client_write(MasterCommand::DecommissionNode { node_id: req.node_id }).await {
+        match self
+            .raft
+            .client_write(MasterCommand::DecommissionNode {
+                node_id: req.node_id,
+            })
+            .await
+        {
             Ok(_) => Ok(Response::new(DecommissionResponse {
                 version: PROTO_VERSION,
                 ok: true,
@@ -1704,7 +1910,10 @@ impl Master for MasterService {
         // 任何节点(含 follower)都可答:导出本节点 Registry 的 Prometheus 文本。
         let text =
             antfs_metric::gather(&self.registry).map_err(|e| Status::internal(format!("{e}")))?;
-        Ok(Response::new(MetricsResponse { version: PROTO_VERSION, text }))
+        Ok(Response::new(MetricsResponse {
+            version: PROTO_VERSION,
+            text,
+        }))
     }
 
     async fn repair_partition(
@@ -1739,7 +1948,10 @@ impl Master for MasterService {
 
         // 排除该分区已有副本节点 + 所有下线节点(同 reconciler 的补副本约束)。
         let (all_nodes, exclude) = {
-            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let g = self
+                .sm_data
+                .read()
+                .map_err(|_| Status::internal("sm lock poisoned"))?;
             let Some(part) = g.state.partitions.get(&req.partition_id) else {
                 return fail("partition not found".to_string());
             };
@@ -1807,7 +2019,10 @@ impl Master for MasterService {
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let up = self.soft.up_nodes(timeout);
         let (all_nodes, decom, part_replicas, already_moving) = {
-            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let g = self
+                .sm_data
+                .read()
+                .map_err(|_| Status::internal("sm lock poisoned"))?;
             let Some(part) = g.state.partitions.get(&req.partition_id) else {
                 return fail("partition not found".to_string());
             };
@@ -1815,7 +2030,9 @@ impl Master for MasterService {
                 g.state.nodes.clone(),
                 g.state.decommissioning.clone(),
                 part.replicas.clone(),
-                g.state.moving.contains(&(req.partition_id, req.from_node_id)),
+                g.state
+                    .moving
+                    .contains(&(req.partition_id, req.from_node_id)),
             )
         };
         if !part_replicas.iter().any(|r| r.node_id == req.from_node_id) {
@@ -1913,7 +2130,10 @@ impl Master for MasterService {
         let usage = self.soft.usage_snapshot();
         let used = self.soft.used_bytes_by_partition();
         let (nodes, partitions, moving, decom, prev_plan_id) = {
-            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let g = self
+                .sm_data
+                .read()
+                .map_err(|_| Status::internal("sm lock poisoned"))?;
             (
                 g.state.nodes.clone(),
                 g.state.partitions.clone(),
@@ -1922,7 +2142,11 @@ impl Master for MasterService {
                 g.state.balance.as_ref().map(|p| p.plan_id).unwrap_or(0),
             )
         };
-        let max_moves = if req.max_moves == 0 { self.config.balance_max_moves } else { req.max_moves };
+        let max_moves = if req.max_moves == 0 {
+            self.config.balance_max_moves
+        } else {
+            req.max_moves
+        };
         let moves = crate::balance::plan_balance(&crate::balance::BalanceInputs {
             partitions: &partitions,
             nodes: &nodes,
@@ -1947,7 +2171,9 @@ impl Master for MasterService {
         };
         match self
             .raft
-            .client_write(MasterCommand::SetBalancePlan { plan: Some(record.clone()) })
+            .client_write(MasterCommand::SetBalancePlan {
+                plan: Some(record.clone()),
+            })
             .await
         {
             Ok(_) => {
@@ -1978,14 +2204,26 @@ impl Master for MasterService {
         let req = request.into_inner();
         self.check_secret(&req.cluster_secret)?;
         let resp = |ok: bool, leader_addr: String, error: String| {
-            Ok(Response::new(StartBalanceResponse { version: PROTO_VERSION, ok, leader_addr, error }))
+            Ok(Response::new(StartBalanceResponse {
+                version: PROTO_VERSION,
+                ok,
+                leader_addr,
+                error,
+            }))
         };
         let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
         if !is_leader {
-            return resp(false, self.leader_addr().unwrap_or_default(), "not leader".to_string());
+            return resp(
+                false,
+                self.leader_addr().unwrap_or_default(),
+                "not leader".to_string(),
+            );
         }
         {
-            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let g = self
+                .sm_data
+                .read()
+                .map_err(|_| Status::internal("sm lock poisoned"))?;
             let cur = g.state.balance.as_ref();
             // 必须是当前计划且处于 PREVIEW:plan_id 不匹配 = 陈旧确认(计划已被替换/取消)。
             match cur {
@@ -1994,10 +2232,19 @@ impl Master for MasterService {
                     return resp(
                         false,
                         String::new(),
-                        format!("plan {} is not preview (status {:?})", req.plan_id, p.status),
+                        format!(
+                            "plan {} is not preview (status {:?})",
+                            req.plan_id, p.status
+                        ),
                     );
                 }
-                _ => return resp(false, String::new(), format!("plan {} not found", req.plan_id)),
+                _ => {
+                    return resp(
+                        false,
+                        String::new(),
+                        format!("plan {} not found", req.plan_id),
+                    )
+                }
             }
         }
         match self
@@ -2009,7 +2256,11 @@ impl Master for MasterService {
             .await
         {
             Ok(_) => resp(true, String::new(), String::new()),
-            Err(e) => resp(false, self.leader_addr().unwrap_or_default(), format!("{e}")),
+            Err(e) => resp(
+                false,
+                self.leader_addr().unwrap_or_default(),
+                format!("{e}"),
+            ),
         }
     }
 
@@ -2023,25 +2274,54 @@ impl Master for MasterService {
         let req = request.into_inner();
         self.check_secret(&req.cluster_secret)?;
         let resp = |ok: bool, leader_addr: String, error: String| {
-            Ok(Response::new(CancelBalanceResponse { version: PROTO_VERSION, ok, leader_addr, error }))
+            Ok(Response::new(CancelBalanceResponse {
+                version: PROTO_VERSION,
+                ok,
+                leader_addr,
+                error,
+            }))
         };
         let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
         if !is_leader {
-            return resp(false, self.leader_addr().unwrap_or_default(), "not leader".to_string());
+            return resp(
+                false,
+                self.leader_addr().unwrap_or_default(),
+                "not leader".to_string(),
+            );
         }
         {
-            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let g = self
+                .sm_data
+                .read()
+                .map_err(|_| Status::internal("sm lock poisoned"))?;
             match g.state.balance.as_ref() {
                 Some(p) if p.plan_id == req.plan_id => {}
-                _ => return resp(false, String::new(), format!("plan {} not found", req.plan_id)),
+                _ => {
+                    return resp(
+                        false,
+                        String::new(),
+                        format!("plan {} not found", req.plan_id),
+                    )
+                }
             }
         }
-        match self.raft.client_write(MasterCommand::SetBalancePlan { plan: None }).await {
+        match self
+            .raft
+            .client_write(MasterCommand::SetBalancePlan { plan: None })
+            .await
+        {
             Ok(_) => {
-                tracing::info!(plan_id = req.plan_id, "balance plan cancelled (in-flight moves converge naturally)");
+                tracing::info!(
+                    plan_id = req.plan_id,
+                    "balance plan cancelled (in-flight moves converge naturally)"
+                );
                 resp(true, String::new(), String::new())
             }
-            Err(e) => resp(false, self.leader_addr().unwrap_or_default(), format!("{e}")),
+            Err(e) => resp(
+                false,
+                self.leader_addr().unwrap_or_default(),
+                format!("{e}"),
+            ),
         }
     }
 
@@ -2050,11 +2330,18 @@ impl Master for MasterService {
         &self,
         _request: Request<BalanceStateRequest>,
     ) -> Result<Response<BalanceStateResponse>, Status> {
-        let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+        let g = self
+            .sm_data
+            .read()
+            .map_err(|_| Status::internal("sm lock poisoned"))?;
         match g.state.balance.as_ref() {
             Some(plan) => {
                 let view = crate::balance::plan_view(plan, &g.state.partitions, &g.state.moving);
-                Ok(Response::new(BalanceStateResponse { version: PROTO_VERSION, present: true, plan: Some(view) }))
+                Ok(Response::new(BalanceStateResponse {
+                    version: PROTO_VERSION,
+                    present: true,
+                    plan: Some(view),
+                }))
             }
             None => Ok(Response::new(BalanceStateResponse {
                 version: PROTO_VERSION,
@@ -2099,7 +2386,10 @@ async fn place_one_partition(
         format!("placement: {e}")
     })?;
     match raft
-        .client_write(MasterCommand::CreatePartition { replication_factor: rf, replicas })
+        .client_write(MasterCommand::CreatePartition {
+            replication_factor: rf,
+            replicas,
+        })
         .await
     {
         Ok(resp) => match resp.data {

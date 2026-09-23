@@ -14,7 +14,11 @@ use openraft::BasicNode;
 const SECRET: &str = "test-secret";
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
@@ -34,7 +38,7 @@ fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
         auto_grow_max_partitions: 100_000,
         auto_grow_interval_secs: 30,
         auto_grow_batch: 4,
-        reconcile_interval_secs: 1, // 快速调谐,便于测试
+        reconcile_interval_secs: 1,      // 快速调谐,便于测试
         reconcile_startup_grace_secs: 0, // 测试免宽限,立即调谐
         id_alloc_segment_size: 1024,
         id_alloc_raft_batch_multiple: 2,
@@ -52,7 +56,9 @@ fn data_node(rack: &str) -> NodeInfo {
         addr: format!("127.0.0.1:{}", free_port()),
         disks: BTreeMap::from([(
             "d0".to_string(),
-            antfs_master::types::DiskSpec { capacity_bytes: 1_000_000_000_000 },
+            antfs_master::types::DiskSpec {
+                capacity_bytes: 1_000_000_000_000,
+            },
         )]),
         registered_at_ms: 1,
     }
@@ -123,14 +129,20 @@ async fn reconcile_transitions_and_rereplication() {
             .expect("leader elected");
     }
     let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
-    let leader = nodes.iter().find(|n| n.config.node_id == leader_id).unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
 
     // 注册 4 个数据节点(101..104),各不同机架。
     let racks = [(101u64, "rA"), (102, "rB"), (103, "rC"), (104, "rD")];
     for (id, rack) in racks {
         leader
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: id, info: data_node(rack) })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: data_node(rack),
+            })
             .await
             .expect("register data node");
     }
@@ -141,9 +153,21 @@ async fn reconcile_transitions_and_rereplication() {
         .client_write(MasterCommand::CreatePartition {
             replication_factor: 3,
             replicas: vec![
-                ReplicaPlacement { node_id: 101, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 102, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 103, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 101,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 102,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 103,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         })
         .await
@@ -174,7 +198,10 @@ async fn reconcile_transitions_and_rereplication() {
         .into_inner();
     let directive = hb101.message().await.expect("recv").expect("directive");
     assert!(
-        directive.transitions.iter().any(|t| t.partition_id == pid && t.target_state == "ACTIVE"),
+        directive
+            .transitions
+            .iter()
+            .any(|t| t.partition_id == pid && t.target_state == "ACTIVE"),
         "heartbeat with current!=target must return a transition to ACTIVE"
     );
 
@@ -201,9 +228,15 @@ async fn reconcile_transitions_and_rereplication() {
     .await;
     let g = sm.read().unwrap();
     let part = &g.state.partitions[&pid];
-    assert!(grew, "reconciler must add a replacement replica on live node 104; replicas={:?}",
-        part.replicas.iter().map(|r| r.node_id).collect::<Vec<_>>());
-    assert!(part.replicas.len() >= 4, "placement must grow with the replacement replica");
+    assert!(
+        grew,
+        "reconciler must add a replacement replica on live node 104; replicas={:?}",
+        part.replicas.iter().map(|r| r.node_id).collect::<Vec<_>>()
+    );
+    assert!(
+        part.replicas.len() >= 4,
+        "placement must grow with the replacement replica"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -230,12 +263,18 @@ async fn decommission_evacuates_replicas_add_before_remove() {
             .expect("leader");
     }
     let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
-    let leader = nodes.iter().find(|n| n.config.node_id == leader_id).unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
 
     for (id, rack) in [(101u64, "rA"), (102, "rB"), (103, "rC"), (104, "rD")] {
         leader
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: id, info: data_node(rack) })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: data_node(rack),
+            })
             .await
             .expect("register");
     }
@@ -244,9 +283,21 @@ async fn decommission_evacuates_replicas_add_before_remove() {
         .client_write(MasterCommand::CreatePartition {
             replication_factor: 3,
             replicas: vec![
-                ReplicaPlacement { node_id: 101, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 102, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 103, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 101,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 102,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 103,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         })
         .await
@@ -297,10 +348,21 @@ async fn decommission_evacuates_replicas_add_before_remove() {
     })
     .await;
     let g = sm.read().unwrap();
-    let mut ids: Vec<u64> = g.state.partitions[&pid].replicas.iter().map(|r| r.node_id).collect();
+    let mut ids: Vec<u64> = g.state.partitions[&pid]
+        .replicas
+        .iter()
+        .map(|r| r.node_id)
+        .collect();
     ids.sort();
-    assert!(done, "evacuation must move replica off 103 onto a healthy node; got {ids:?}");
-    assert_eq!(ids, vec![101, 102, 104], "final placement excludes decommissioned 103, includes 104");
+    assert!(
+        done,
+        "evacuation must move replica off 103 onto a healthy node; got {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        vec![101, 102, 104],
+        "final placement excludes decommissioned 103, includes 104"
+    );
 }
 
 /// 宽限期内 reconciler 不动作(用于确定性地观察 move 的中间态,不被"后删"竞态干扰)。
@@ -334,12 +396,18 @@ async fn repair_and_move_replica_validation() {
             .expect("leader");
     }
     let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
-    let leader = nodes.iter().find(|n| n.config.node_id == leader_id).unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
 
     for (id, rack) in [(101u64, "rA"), (102, "rB"), (103, "rC"), (104, "rD")] {
         leader
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: id, info: data_node(rack) })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: data_node(rack),
+            })
             .await
             .expect("register");
     }
@@ -348,9 +416,21 @@ async fn repair_and_move_replica_validation() {
         .client_write(MasterCommand::CreatePartition {
             replication_factor: 3,
             replicas: vec![
-                ReplicaPlacement { node_id: 101, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 102, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 103, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 101,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 102,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 103,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         })
         .await
@@ -397,7 +477,11 @@ async fn repair_and_move_replica_validation() {
         .await
         .expect("repair")
         .into_inner();
-    assert!(!r.ok && r.error == "partition not found", "got: {}", r.error);
+    assert!(
+        !r.ok && r.error == "partition not found",
+        "got: {}",
+        r.error
+    );
 
     // 全部 4 节点都已持有副本 → 无可放盘。
     let r = client
@@ -423,8 +507,16 @@ async fn repair_and_move_replica_validation() {
         .client_write(MasterCommand::CreatePartition {
             replication_factor: 2,
             replicas: vec![
-                ReplicaPlacement { node_id: 101, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 102, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 101,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 102,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         })
         .await
@@ -454,8 +546,15 @@ async fn repair_and_move_replica_validation() {
     {
         let g = leader.sm_data.read().unwrap();
         let p = &g.state.partitions[&pid2];
-        assert_eq!(p.replicas.len(), 3, "add-before-remove: new replica added first");
-        assert!(g.state.moving.contains(&(pid2, 102)), "source must be marked moving-out");
+        assert_eq!(
+            p.replicas.len(),
+            3,
+            "add-before-remove: new replica added first"
+        );
+        assert!(
+            g.state.moving.contains(&(pid2, 102)),
+            "source must be marked moving-out"
+        );
     }
 
     // 幂等防护:重复 move 同一 (pid, from) → 报错。
@@ -470,7 +569,11 @@ async fn repair_and_move_replica_validation() {
         .await
         .expect("move")
         .into_inner();
-    assert!(!dup.ok && dup.error == "move already in progress", "got: {}", dup.error);
+    assert!(
+        !dup.ok && dup.error == "move already in progress",
+        "got: {}",
+        dup.error
+    );
 
     // from 不持有副本 → 报错。
     let bad = client
@@ -484,7 +587,11 @@ async fn repair_and_move_replica_validation() {
         .await
         .expect("move")
         .into_inner();
-    assert!(!bad.ok && bad.error.contains("does not hold a replica"), "got: {}", bad.error);
+    assert!(
+        !bad.ok && bad.error.contains("does not hold a replica"),
+        "got: {}",
+        bad.error
+    );
 
     // 指定目标已持有该分区副本 → 报错。
     let conflict = client
@@ -498,7 +605,11 @@ async fn repair_and_move_replica_validation() {
         .await
         .expect("move")
         .into_inner();
-    assert!(!conflict.ok && conflict.error.contains("already holds a replica"), "got: {}", conflict.error);
+    assert!(
+        !conflict.ok && conflict.error.contains("already holds a replica"),
+        "got: {}",
+        conflict.error
+    );
 
     // list_partitions 回填 moving_out_nodes。
     let list = client
@@ -511,8 +622,16 @@ async fn repair_and_move_replica_validation() {
         .await
         .expect("list_partitions")
         .into_inner();
-    let entry = list.partitions.iter().find(|p| p.partition_id == pid2).expect("pid2 entry");
-    assert_eq!(entry.moving_out_nodes, vec![102], "moving-out source must be listed");
+    let entry = list
+        .partitions
+        .iter()
+        .find(|p| p.partition_id == pid2)
+        .expect("pid2 entry");
+    assert_eq!(
+        entry.moving_out_nodes,
+        vec![102],
+        "moving-out source must be listed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -539,12 +658,18 @@ async fn move_replica_completes_add_before_remove() {
             .expect("leader");
     }
     let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
-    let leader = nodes.iter().find(|n| n.config.node_id == leader_id).unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
 
     for (id, rack) in [(101u64, "rA"), (102, "rB"), (103, "rC"), (104, "rD")] {
         leader
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: id, info: data_node(rack) })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: data_node(rack),
+            })
             .await
             .expect("register");
     }
@@ -553,9 +678,21 @@ async fn move_replica_completes_add_before_remove() {
         .client_write(MasterCommand::CreatePartition {
             replication_factor: 3,
             replicas: vec![
-                ReplicaPlacement { node_id: 101, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 102, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 103, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 101,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 102,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 103,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         })
         .await
@@ -588,7 +725,11 @@ async fn move_replica_completes_add_before_remove() {
         .await
         .expect("move")
         .into_inner();
-    assert!(!m.ok && m.error == "no eligible disk", "no up target: {}", m.error);
+    assert!(
+        !m.ok && m.error == "no eligible disk",
+        "no up target: {}",
+        m.error
+    );
 
     // 104 上线 → move 成功落到 104。
     let mut hb = client
@@ -633,7 +774,9 @@ async fn move_replica_completes_add_before_remove() {
     let sm = leader.sm_data.clone();
     let done = wait_until(Duration::from_secs(20), || {
         let g = sm.read().unwrap();
-        let Some(p) = g.state.partitions.get(&pid) else { return false };
+        let Some(p) = g.state.partitions.get(&pid) else {
+            return false;
+        };
         let mut ids: Vec<u64> = p.replicas.iter().map(|r| r.node_id).collect();
         ids.sort();
         ids == vec![101, 102, 104] && g.state.moving.is_empty()
@@ -641,9 +784,16 @@ async fn move_replica_completes_add_before_remove() {
     .await;
     let ids: Vec<u64> = {
         let g = leader.sm_data.read().unwrap();
-        g.state.partitions[&pid].replicas.iter().map(|r| r.node_id).collect()
+        g.state.partitions[&pid]
+            .replicas
+            .iter()
+            .map(|r| r.node_id)
+            .collect()
     };
-    assert!(done, "move must complete: source removed after replacement healthy; got {ids:?}");
+    assert!(
+        done,
+        "move must complete: source removed after replacement healthy; got {ids:?}"
+    );
 
     // 指标断言:apply 可见先于 client_write 返回后的 inc(跨任务调度),故同样用带超时轮询;
     // 且并行测试下 leader 可能改选,"后删"由时任 leader 执行并计数,故跨全部节点 Registry 断言。
@@ -655,7 +805,10 @@ async fn move_replica_completes_add_before_remove() {
         })
     })
     .await;
-    assert!(counted, "one moved replica must be counted on the acting leader");
+    assert!(
+        counted,
+        "one moved replica must be counted on the acting leader"
+    );
 }
 
 /// 观测指标:assign/lookup 打点 + reconciler 集群 gauges(断言打在 leader 实际接入的 Registry,CLAUDE.md §6)。
@@ -683,7 +836,10 @@ async fn assign_lookup_counters_and_cluster_gauges() {
             .expect("leader");
     }
     let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
-    let leader = nodes.iter().find(|n| n.config.node_id == leader_id).unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
     let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
         .await
         .expect("connect");
@@ -696,14 +852,23 @@ async fn assign_lookup_counters_and_cluster_gauges() {
         .into_inner();
     assert!(!a.ok, "no writable partition yet");
     let miss = client
-        .lookup_partition(antfs_master::pb::LookupRequest { version: 1, partition_id: 999 })
+        .lookup_partition(antfs_master::pb::LookupRequest {
+            version: 1,
+            partition_id: 999,
+        })
         .await;
-    assert_eq!(miss.expect_err("unknown partition").code(), tonic::Code::NotFound);
+    assert_eq!(
+        miss.expect_err("unknown partition").code(),
+        tonic::Code::NotFound
+    );
 
     for (id, rack) in [(101u64, "rA"), (102, "rB"), (103, "rC")] {
         leader
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: id, info: data_node(rack) })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: data_node(rack),
+            })
             .await
             .expect("register");
     }
@@ -715,9 +880,21 @@ async fn assign_lookup_counters_and_cluster_gauges() {
             .client_write(MasterCommand::CreatePartition {
                 replication_factor: 3,
                 replicas: vec![
-                    ReplicaPlacement { node_id: 101, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                    ReplicaPlacement { node_id: 102, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                    ReplicaPlacement { node_id: 103, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                    ReplicaPlacement {
+                        node_id: 101,
+                        disk_id: "d0".into(),
+                        target_state: "ACTIVE".into(),
+                    },
+                    ReplicaPlacement {
+                        node_id: 102,
+                        disk_id: "d0".into(),
+                        target_state: "ACTIVE".into(),
+                    },
+                    ReplicaPlacement {
+                        node_id: 103,
+                        disk_id: "d0".into(),
+                        target_state: "ACTIVE".into(),
+                    },
                 ],
             })
             .await
@@ -750,7 +927,11 @@ async fn assign_lookup_counters_and_cluster_gauges() {
         lag_bytes: lag,
         used_bytes: 0,
     };
-    for (id, st) in [(101u64, replica_beat("ACTIVE", 12345)), (102, replica_beat("ERROR", 0)), (103, replica_beat("ERROR", 0))] {
+    for (id, st) in [
+        (101u64, replica_beat("ACTIVE", 12345)),
+        (102, replica_beat("ERROR", 0)),
+        (103, replica_beat("ERROR", 0)),
+    ] {
         let mut hb = client
             .heartbeat(tokio_stream::iter(vec![beat(id, vec![st])]))
             .await
@@ -771,16 +952,28 @@ async fn assign_lookup_counters_and_cluster_gauges() {
     }
     for pid in [pids[0], pids[1]] {
         client
-            .lookup_partition(antfs_master::pb::LookupRequest { version: 1, partition_id: pid })
+            .lookup_partition(antfs_master::pb::LookupRequest {
+                version: 1,
+                partition_id: pid,
+            })
             .await
             .expect("lookup");
     }
 
     // counter 在 handler 返回前已 inc,直接断言。
     let dump = antfs_metric::gather(&leader.registry).expect("gather");
-    assert!(dump.contains("master_assign_requests_total 3"), "got:\n{dump}");
-    assert!(dump.contains("master_assign_failures_total 1"), "got:\n{dump}");
-    assert!(dump.contains("master_lookup_requests_total 3"), "got:\n{dump}");
+    assert!(
+        dump.contains("master_assign_requests_total 3"),
+        "got:\n{dump}"
+    );
+    assert!(
+        dump.contains("master_assign_failures_total 1"),
+        "got:\n{dump}"
+    );
+    assert!(
+        dump.contains("master_lookup_requests_total 3"),
+        "got:\n{dump}"
+    );
 
     // reconciler gauges:wait_until 轮询(禁 sleep);grace=0、周期 1s。
     let cap = 100u64 * 1024 * 1024 * 1024; // = cfg.partition_capacity_bytes
@@ -828,8 +1021,16 @@ async fn start_masters(tmp: &std::path::Path, grace: u64) -> Vec<MasterNode> {
 }
 
 fn leader_of(nodes: &[MasterNode]) -> &MasterNode {
-    let leader_id = nodes[0].raft.metrics().borrow().current_leader.expect("leader elected");
-    nodes.iter().find(|n| n.config.node_id == leader_id).expect("leader in set")
+    let leader_id = nodes[0]
+        .raft
+        .metrics()
+        .borrow()
+        .current_leader
+        .expect("leader elected");
+    nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .expect("leader in set")
 }
 
 async fn connect(node: &MasterNode) -> MasterClient<tonic::transport::Channel> {
@@ -842,7 +1043,10 @@ async fn register_data_nodes(leader: &MasterNode, ids: &[(u64, &str)]) {
     for (id, rack) in ids {
         leader
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: *id, info: data_node(rack) })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: *id,
+                info: data_node(rack),
+            })
             .await
             .expect("register data node");
     }
@@ -885,7 +1089,11 @@ async fn send_beat(
     hb.message().await.expect("recv").expect("directive")
 }
 
-fn replica(partition_id: u32, current_state: &str, used_bytes: u64) -> antfs_master::pb::ReplicaBeat {
+fn replica(
+    partition_id: u32,
+    current_state: &str,
+    used_bytes: u64,
+) -> antfs_master::pb::ReplicaBeat {
     antfs_master::pb::ReplicaBeat {
         partition_id,
         disk_id: "d0".into(),
@@ -972,7 +1180,11 @@ fn replicas_on(node: &MasterNode, node_id: u64, disk_id: &str) -> Option<i64> {
 
 fn placement(leader: &MasterNode, pid: u32) -> Vec<u64> {
     let g = leader.sm_data.read().expect("sm lock");
-    let mut ids: Vec<u64> = g.state.partitions[&pid].replicas.iter().map(|r| r.node_id).collect();
+    let mut ids: Vec<u64> = g.state.partitions[&pid]
+        .replicas
+        .iter()
+        .map(|r| r.node_id)
+        .collect();
     ids.sort();
     ids
 }
@@ -988,7 +1200,10 @@ async fn maintenance_pauses_reconcile_until_disabled() {
     // 先在"还没有分区"时开维护:此后 reconciler 不得执行任何自动动作(无先行动作的竞态)。
     let m = set_maintenance(&mut client, true, false).await;
     assert!(m.ok, "leader must accept set_maintenance: {}", m.error);
-    assert!(m.leader_addr.is_empty(), "success response carries no redirect addr");
+    assert!(
+        m.leader_addr.is_empty(),
+        "success response carries no redirect addr"
+    );
 
     // 非 leader:follower 不落写,严格回 leader_addr 供 admin 重定向。
     let follower_id = nodes
@@ -996,14 +1211,29 @@ async fn maintenance_pauses_reconcile_until_disabled() {
         .map(|n| n.config.node_id)
         .find(|id| *id != leader.config.node_id)
         .expect("follower exists");
-    let follower = nodes.iter().find(|n| n.config.node_id == follower_id).unwrap();
+    let follower = nodes
+        .iter()
+        .find(|n| n.config.node_id == follower_id)
+        .unwrap();
     let mut fclient = connect(follower).await;
     let f = set_maintenance(&mut fclient, false, false).await;
-    assert!(!f.ok && f.error == "not leader", "got ok={} err={}", f.ok, f.error);
-    assert_eq!(f.leader_addr, leader.config.raft_addr, "follower must redirect to the leader");
+    assert!(
+        !f.ok && f.error == "not leader",
+        "got ok={} err={}",
+        f.ok,
+        f.error
+    );
+    assert_eq!(
+        f.leader_addr, leader.config.raft_addr,
+        "follower must redirect to the leader"
+    );
 
     // 数据节点:101/102/104 心跳存活;103 从不心跳 → 失联(该分区欠副本)。
-    register_data_nodes(leader, &[(101, "rA"), (102, "rB"), (103, "rC"), (104, "rD")]).await;
+    register_data_nodes(
+        leader,
+        &[(101, "rA"), (102, "rB"), (103, "rC"), (104, "rD")],
+    )
+    .await;
     let pid = create_partition(leader, &[101, 102, 103]).await;
     for id in [101u64, 102] {
         send_beat(&mut client, id, vec![replica(pid, "ACTIVE", 1_000)]).await;
@@ -1025,13 +1255,32 @@ async fn maintenance_pauses_reconcile_until_disabled() {
     // 跨 ≥3 个 reconciler 周期(interval=1s)轮询"是否新增副本" → 始终不得新增。
     let added = wait_until(Duration::from_secs(3), || {
         let g = leader.sm_data.read().unwrap();
-        g.state.partitions.get(&pid).map(|p| p.replicas.iter().any(|r| r.node_id == 104)).unwrap_or(false)
+        g.state
+            .partitions
+            .get(&pid)
+            .map(|p| p.replicas.iter().any(|r| r.node_id == 104))
+            .unwrap_or(false)
     })
     .await;
-    assert!(!added, "maintenance must pause re-replication (no replacement replica)");
-    assert_eq!(placement(leader, pid), vec![101, 102, 103], "placement untouched during maintenance");
-    assert_eq!(gauge(leader, "master_maintenance"), Some(1), "still in maintenance");
-    assert_eq!(gauge(leader, "master_under_replicated_partitions"), Some(1), "still under-replicated");
+    assert!(
+        !added,
+        "maintenance must pause re-replication (no replacement replica)"
+    );
+    assert_eq!(
+        placement(leader, pid),
+        vec![101, 102, 103],
+        "placement untouched during maintenance"
+    );
+    assert_eq!(
+        gauge(leader, "master_maintenance"),
+        Some(1),
+        "still in maintenance"
+    );
+    assert_eq!(
+        gauge(leader, "master_under_replicated_partitions"),
+        Some(1),
+        "still under-replicated"
+    );
 
     // 关闭维护 → 自动补副本收敛(104 是唯一存活候选),欠副本数回落 0。
     let m = set_maintenance(&mut client, false, false).await;
@@ -1059,7 +1308,17 @@ async fn used_bytes_gauges_and_list_partitions_state_filter() {
     let mut client = connect(leader).await;
 
     // 105 注册但从不在任何分区上 → 其盘副本数 0(disk_skew 的 min 端)。
-    register_data_nodes(leader, &[(101, "rA"), (102, "rB"), (103, "rC"), (104, "rD"), (105, "rE")]).await;
+    register_data_nodes(
+        leader,
+        &[
+            (101, "rA"),
+            (102, "rB"),
+            (103, "rC"),
+            (104, "rD"),
+            (105, "rE"),
+        ],
+    )
+    .await;
     let pid_rw = create_partition(leader, &[101, 102, 103]).await;
     let pid_ro = create_partition(leader, &[101, 102, 103]).await;
     let pid_sealed = create_partition(leader, &[101, 102, 104]).await;
@@ -1067,22 +1326,30 @@ async fn used_bytes_gauges_and_list_partitions_state_filter() {
     set_partition_state(&mut client, pid_sealed, "SEALED").await;
 
     // 各副本上报实际占用:pid_rw 三副本 1000/3000/2000,pid_ro 500,pid_sealed 9999。
-    send_beat(&mut client, 101, vec![
-        replica(pid_rw, "ACTIVE", 1_000),
-        replica(pid_ro, "ACTIVE", 500),
-    ])
+    send_beat(
+        &mut client,
+        101,
+        vec![
+            replica(pid_rw, "ACTIVE", 1_000),
+            replica(pid_ro, "ACTIVE", 500),
+        ],
+    )
     .await;
-    send_beat(&mut client, 102, vec![
-        replica(pid_rw, "ACTIVE", 3_000),
-        replica(pid_ro, "ACTIVE", 500),
-    ])
+    send_beat(
+        &mut client,
+        102,
+        vec![
+            replica(pid_rw, "ACTIVE", 3_000),
+            replica(pid_ro, "ACTIVE", 500),
+        ],
+    )
     .await;
     send_beat(&mut client, 103, vec![replica(pid_rw, "ACTIVE", 2_000)]).await;
     send_beat(&mut client, 104, vec![replica(pid_sealed, "ACTIVE", 9_999)]).await;
 
     let cap = 100i64 * 1024 * 1024 * 1024; // = cfg.partition_capacity_bytes
-    // 口径:可写已用 = 仅 RW 分区,每分区取各副本 used 最大值(3000,不是三副本之和 6000)再求和。
-    // 放置:101×3、102×3、103×2、104×1、105×0 → skew = 3 − 0 = 3。
+                                           // 口径:可写已用 = 仅 RW 分区,每分区取各副本 used 最大值(3000,不是三副本之和 6000)再求和。
+                                           // 放置:101×3、102×3、103×2、104×1、105×0 → skew = 3 − 0 = 3。
     let ok = wait_until(Duration::from_secs(20), || {
         gauge(leader, "master_partitions_rw") == Some(1)
             && gauge(leader, "master_writable_capacity_bytes") == Some(cap)
@@ -1103,30 +1370,66 @@ async fn used_bytes_gauges_and_list_partitions_state_filter() {
     );
 
     // ListPartitions:state 过滤 + 副本 used_bytes 回填。
-    let rw = list_partitions(&mut client, "RW", 0).await.expect("list RW");
+    let rw = list_partitions(&mut client, "RW", 0)
+        .await
+        .expect("list RW");
     assert_eq!(rw.total, 1, "total counts only RW partitions");
     assert_eq!(rw.partitions.len(), 1);
     let entry = &rw.partitions[0];
     assert_eq!(entry.partition_id, pid_rw);
     let used = |node_id: u64| {
-        entry.currents.iter().find(|c| c.node_id == node_id).expect("current").used_bytes
+        entry
+            .currents
+            .iter()
+            .find(|c| c.node_id == node_id)
+            .expect("current")
+            .used_bytes
     };
-    assert_eq!(used(101), 1_000, "current[101].used_bytes comes from the heartbeat");
+    assert_eq!(
+        used(101),
+        1_000,
+        "current[101].used_bytes comes from the heartbeat"
+    );
     assert_eq!(used(102), 3_000);
     assert_eq!(used(103), 2_000);
 
     // 过滤先于分页:total 是过滤后总数,offset 作用在过滤后的集合上(越界即空页)。
-    let rw_page2 = list_partitions(&mut client, "RW", 1).await.expect("list RW page2");
-    assert_eq!(rw_page2.total, 1, "total is the filtered count, offset applies after filtering");
-    assert!(rw_page2.partitions.is_empty(), "offset past the filtered set yields an empty page");
-
-    let ro = list_partitions(&mut client, "RO", 0).await.expect("list RO");
-    assert_eq!((ro.total, ro.partitions[0].partition_id), (1, pid_ro));
-    let sealed = list_partitions(&mut client, "SEALED", 0).await.expect("list SEALED");
-    assert_eq!((sealed.total, sealed.partitions[0].partition_id), (1, pid_sealed));
-    assert_eq!(list_partitions(&mut client, "", 0).await.expect("list all").total, 3, "empty state = no filter");
+    let rw_page2 = list_partitions(&mut client, "RW", 1)
+        .await
+        .expect("list RW page2");
     assert_eq!(
-        list_partitions(&mut client, "BOGUS", 0).await.expect_err("invalid state").code(),
+        rw_page2.total, 1,
+        "total is the filtered count, offset applies after filtering"
+    );
+    assert!(
+        rw_page2.partitions.is_empty(),
+        "offset past the filtered set yields an empty page"
+    );
+
+    let ro = list_partitions(&mut client, "RO", 0)
+        .await
+        .expect("list RO");
+    assert_eq!((ro.total, ro.partitions[0].partition_id), (1, pid_ro));
+    let sealed = list_partitions(&mut client, "SEALED", 0)
+        .await
+        .expect("list SEALED");
+    assert_eq!(
+        (sealed.total, sealed.partitions[0].partition_id),
+        (1, pid_sealed)
+    );
+    assert_eq!(
+        list_partitions(&mut client, "", 0)
+            .await
+            .expect("list all")
+            .total,
+        3,
+        "empty state = no filter"
+    );
+    assert_eq!(
+        list_partitions(&mut client, "BOGUS", 0)
+            .await
+            .expect_err("invalid state")
+            .code(),
         tonic::Code::InvalidArgument,
         "invalid state must be rejected, not treated as 'all'"
     );
@@ -1146,7 +1449,12 @@ async fn unhealthy_disk_is_reported_and_avoided_by_placement() {
     send_beat(&mut client, 101, vec![]).await; // 先活一次(下面的 beat_disk 覆盖盘健康)
     {
         let mut hb = client
-            .heartbeat(tokio_stream::iter(vec![beat_disk(101, vec![], DISK_FREE, "WRITE_TIMEOUT")]))
+            .heartbeat(tokio_stream::iter(vec![beat_disk(
+                101,
+                vec![],
+                DISK_FREE,
+                "WRITE_TIMEOUT",
+            )]))
             .await
             .expect("hb")
             .into_inner();
@@ -1171,8 +1479,16 @@ async fn unhealthy_disk_is_reported_and_avoided_by_placement() {
             .health
             .clone()
     };
-    assert_eq!(health_of(101), "WRITE_TIMEOUT", "probe result must be surfaced in ListNodes");
-    assert_eq!(health_of(102), "", "probe disabled must stay empty, not be invented");
+    assert_eq!(
+        health_of(101),
+        "WRITE_TIMEOUT",
+        "probe result must be surfaced in ListNodes"
+    );
+    assert_eq!(
+        health_of(102),
+        "",
+        "probe disabled must stay empty, not be invented"
+    );
 
     // 指标打在实际接入的 Registry 上(CLAUDE.md §6):恰有 1 块不健康盘(空串不计)。
     let counted = wait_until(Duration::from_secs(20), || {
@@ -1233,7 +1549,14 @@ async fn near_full_disk_forces_partition_read_only_without_auto_revert() {
     }
 
     let sm = leader.sm_data.clone();
-    let state_of = |pid: u32| sm.read().expect("sm").state.partitions.get(&pid).map(|p| p.state);
+    let state_of = |pid: u32| {
+        sm.read()
+            .expect("sm")
+            .state
+            .partitions
+            .get(&pid)
+            .map(|p| p.state)
+    };
     let forced = wait_until(Duration::from_secs(20), || {
         state_of(pid) == Some(antfs_master::types::PartitionState::ReadOnly)
     })
@@ -1257,7 +1580,12 @@ async fn near_full_disk_forces_partition_read_only_without_auto_revert() {
 
     // 空间释放(101 盘回到 90% 余量)+ 跨 ≥3 个调谐周期 → **不自动回 RW**(只置不回)。
     let mut hb = client
-        .heartbeat(tokio_stream::iter(vec![beat_disk(101, vec![replica(pid, "ACTIVE", 1_000)], DISK_FREE, "")]))
+        .heartbeat(tokio_stream::iter(vec![beat_disk(
+            101,
+            vec![replica(pid, "ACTIVE", 1_000)],
+            DISK_FREE,
+            "",
+        )]))
         .await
         .expect("hb")
         .into_inner();
@@ -1266,17 +1594,30 @@ async fn near_full_disk_forces_partition_read_only_without_auto_revert() {
         state_of(pid) == Some(antfs_master::types::PartitionState::ReadWrite)
     })
     .await;
-    assert!(!reverted, "space freed must NOT auto-revert RO → RW (运维手工恢复)");
-    assert_eq!(gauge(leader, "master_partitions_forced_ro_total"), Some(1), "still set only once");
+    assert!(
+        !reverted,
+        "space freed must NOT auto-revert RO → RW (运维手工恢复)"
+    );
+    assert_eq!(
+        gauge(leader, "master_partitions_forced_ro_total"),
+        Some(1),
+        "still set only once"
+    );
 
     // 恢复走运维路径(现有的 SetPartitionState),且用量已正常 → 不会被再次自动转 RO。
     set_partition_state(&mut client, pid, "RW").await;
-    assert_eq!(state_of(pid), Some(antfs_master::types::PartitionState::ReadWrite));
+    assert_eq!(
+        state_of(pid),
+        Some(antfs_master::types::PartitionState::ReadWrite)
+    );
     let re_forced = wait_until(Duration::from_secs(3), || {
         state_of(pid) == Some(antfs_master::types::PartitionState::ReadOnly)
     })
     .await;
-    assert!(!re_forced, "manual RW restore with a healthy disk must stick");
+    assert!(
+        !re_forced,
+        "manual RW restore with a healthy disk must stick"
+    );
 }
 
 /// A6:DROPPED 的确认闸门。宽限期关掉 reconciler(只验证心跳路径的判定)。
@@ -1287,7 +1628,11 @@ async fn dropped_requires_successor_active_and_keeps_retrying() {
     let leader = leader_of(&nodes);
     let mut client = connect(leader).await;
 
-    register_data_nodes(leader, &[(101, "rA"), (102, "rB"), (103, "rC"), (104, "rD")]).await;
+    register_data_nodes(
+        leader,
+        &[(101, "rA"), (102, "rB"), (103, "rC"), (104, "rD")],
+    )
+    .await;
     let pid = create_partition(leader, &[101, 102, 103]).await;
     // 101/103 存活并上报副本;102 **从不心跳**(= 失联);104 存活但不持有该分区。
     for id in [101u64, 103] {
@@ -1313,36 +1658,63 @@ async fn dropped_requires_successor_active_and_keeps_retrying() {
         let g = leader.sm_data.read().expect("sm");
         g.state.move_target_of(pid, 103)
     };
-    assert_eq!(targets, Some(104), "successor must be recorded in move_targets");
+    assert_eq!(
+        targets,
+        Some(104),
+        "successor must be recorded in move_targets"
+    );
 
     // 模拟 reconciler 的"后删"已提交(本测试只验证下发闸门)。
     leader
         .raft
-        .client_write(MasterCommand::RemoveReplica { partition_id: pid, node_id: 103 })
+        .client_write(MasterCommand::RemoveReplica {
+            partition_id: pid,
+            node_id: 103,
+        })
         .await
         .expect("remove source");
     let pending = |pid: u32| {
-        leader.sm_data.read().expect("sm").state.pending_drop.contains(&(pid, 103))
+        leader
+            .sm_data
+            .read()
+            .expect("sm")
+            .state
+            .pending_drop
+            .contains(&(pid, 103))
     };
     assert!(pending(pid), "RemoveReplica must record a pending drop");
 
     let dropped_of = |d: &antfs_master::pb::MasterDirective| {
-        d.transitions.iter().filter(|t| t.target_state == "DROPPED").cloned().collect::<Vec<_>>()
+        d.transitions
+            .iter()
+            .filter(|t| t.target_state == "DROPPED")
+            .cloned()
+            .collect::<Vec<_>>()
     };
 
     // ① 继任者尚未 ACTIVE(104 仍 BOOTSTRAP)→ 源仍上报 → **不下发** DROPPED。
     send_beat(&mut client, 104, vec![replica(pid, "BOOTSTRAP", 0)]).await;
     let d = send_beat(&mut client, 103, vec![replica(pid, "ACTIVE", 1_000)]).await;
-    assert!(dropped_of(&d).is_empty(), "successor not ACTIVE yet: must not drop the source");
+    assert!(
+        dropped_of(&d).is_empty(),
+        "successor not ACTIVE yet: must not drop the source"
+    );
     assert!(pending(pid), "pending drop must be kept for the next round");
 
     // ② 继任者 ACTIVE → 下发 DROPPED(带源节点盘号);此时副本 102 失联也**不拖延**删除。
     send_beat(&mut client, 104, vec![replica(pid, "ACTIVE", 0)]).await;
     let d = send_beat(&mut client, 103, vec![replica(pid, "ACTIVE", 1_000)]).await;
     let dropped = dropped_of(&d);
-    assert_eq!(dropped.len(), 1, "successor ACTIVE + source removed ⇒ exactly one DROPPED");
+    assert_eq!(
+        dropped.len(),
+        1,
+        "successor ACTIVE + source removed ⇒ exactly one DROPPED"
+    );
     assert_eq!(dropped[0].partition_id, pid);
-    assert_eq!(dropped[0].disk_id, "d0", "DROPPED must target the disk the source holds");
+    assert_eq!(
+        dropped[0].disk_id, "d0",
+        "DROPPED must target the disk the source holds"
+    );
     assert_eq!(
         dropped[0].target_state, "DROPPED",
         "transition target_state carries the new DROPPED value (proto unchanged)"
@@ -1356,11 +1728,18 @@ async fn dropped_requires_successor_active_and_keeps_retrying() {
 
     // 幂等重发:store 还没删完(仍上报该 pid)→ 每轮心跳继续下发。
     let d = send_beat(&mut client, 103, vec![replica(pid, "ACTIVE", 1_000)]).await;
-    assert_eq!(dropped_of(&d).len(), 1, "must keep re-sending until the source stops reporting");
+    assert_eq!(
+        dropped_of(&d).len(),
+        1,
+        "must keep re-sending until the source stops reporting"
+    );
 
     // ③ 源不再上报该 pid → 不再下发(记账清理由 reconciler 负责,见下一个测试)。
     let d = send_beat(&mut client, 103, vec![]).await;
-    assert!(dropped_of(&d).is_empty(), "source no longer reports the replica: nothing to drop");
+    assert!(
+        dropped_of(&d).is_empty(),
+        "source no longer reports the replica: nothing to drop"
+    );
 }
 
 /// A6 全链路:迁移完成 → reconciler 后删 + 心跳下发 DROPPED → 源不再上报后清 `pending_drop`。
@@ -1371,7 +1750,11 @@ async fn move_completion_drops_source_dir_and_clears_pending_drop() {
     let leader = leader_of(&nodes);
     let mut client = connect(leader).await;
 
-    register_data_nodes(leader, &[(101, "rA"), (102, "rB"), (103, "rC"), (104, "rD")]).await;
+    register_data_nodes(
+        leader,
+        &[(101, "rA"), (102, "rB"), (103, "rC"), (104, "rD")],
+    )
+    .await;
     let pid = create_partition(leader, &[101, 102, 103]).await;
     // 原 3 副本都上报 ACTIVE(避免被误判欠副本而触发再复制),104 存活但不持有该分区。
     for id in [101u64, 102, 103] {
@@ -1393,35 +1776,70 @@ async fn move_completion_drops_source_dir_and_clears_pending_drop() {
     assert!(m.ok, "move must succeed: {}", m.error);
 
     // 继任者 104 尚未上报该分区(未 ACTIVE)→ 后删闸门必须拦住源,跨 ≥3 个调谐周期不动(§3.1 真·先补后删)。
-    let removed_early = wait_until(Duration::from_secs(3), || !placement(leader, pid).contains(&103)).await;
-    assert!(!removed_early, "successor not ACTIVE yet: the source must survive");
-    assert!(placement(leader, pid).contains(&103), "source still in placement, data not dropped");
+    let removed_early = wait_until(Duration::from_secs(3), || {
+        !placement(leader, pid).contains(&103)
+    })
+    .await;
+    assert!(
+        !removed_early,
+        "successor not ACTIVE yet: the source must survive"
+    );
+    assert!(
+        placement(leader, pid).contains(&103),
+        "source still in placement, data not dropped"
+    );
 
     // 继任者 104 追平(上报 ACTIVE)→ reconciler 的后删闸门(目标 ACTIVE + 其余 up ≥ RF)才放行。
     send_beat(&mut client, 104, vec![replica(pid, "ACTIVE", 0)]).await;
 
-    let removed = wait_until(Duration::from_secs(20), || !placement(leader, pid).contains(&103)).await;
+    let removed = wait_until(Duration::from_secs(20), || {
+        !placement(leader, pid).contains(&103)
+    })
+    .await;
     assert!(
         removed,
         "reconciler must remove the source once the successor is ACTIVE; placement={:?}",
         placement(leader, pid)
     );
     let recorded = wait_until(Duration::from_secs(20), || {
-        leader.sm_data.read().expect("sm").state.pending_drop.contains(&(pid, 103))
+        leader
+            .sm_data
+            .read()
+            .expect("sm")
+            .state
+            .pending_drop
+            .contains(&(pid, 103))
     })
     .await;
-    assert!(recorded, "the removal must be recorded as a pending drop (source dir still there)");
+    assert!(
+        recorded,
+        "the removal must be recorded as a pending drop (source dir still there)"
+    );
     let pending_gauge = wait_until(Duration::from_secs(20), || {
         gauge(leader, "master_pending_drops") == Some(1)
     })
     .await;
-    assert!(pending_gauge, "master_pending_drops must reflect the待删 pair");
+    assert!(
+        pending_gauge,
+        "master_pending_drops must reflect the待删 pair"
+    );
 
     // 源 103 心跳仍上报该副本 → 下发 DROPPED(带盘号),store 据此删本地副本/目录。
     let d = send_beat(&mut client, 103, vec![replica(pid, "ACTIVE", 1_000)]).await;
-    let dropped: Vec<_> = d.transitions.iter().filter(|t| t.target_state == "DROPPED").collect();
-    assert_eq!(dropped.len(), 1, "source still holds it: DROPPED must be sent");
-    assert_eq!((dropped[0].partition_id, dropped[0].disk_id.as_str()), (pid, "d0"));
+    let dropped: Vec<_> = d
+        .transitions
+        .iter()
+        .filter(|t| t.target_state == "DROPPED")
+        .collect();
+    assert_eq!(
+        dropped.len(),
+        1,
+        "source still holds it: DROPPED must be sent"
+    );
+    assert_eq!(
+        (dropped[0].partition_id, dropped[0].disk_id.as_str()),
+        (pid, "d0")
+    );
 
     // store 删完 → 源心跳不再上报该 pid → reconciler 清记账(pending_drop 空、gauge 归零)。
     let d = send_beat(&mut client, 103, vec![]).await;
@@ -1430,7 +1848,13 @@ async fn move_completion_drops_source_dir_and_clears_pending_drop() {
         "source no longer reports the replica: no more DROPPED"
     );
     let cleared = wait_until(Duration::from_secs(20), || {
-        leader.sm_data.read().expect("sm").state.pending_drop.is_empty()
+        leader
+            .sm_data
+            .read()
+            .expect("sm")
+            .state
+            .pending_drop
+            .is_empty()
             && gauge(leader, "master_pending_drops") == Some(0)
     })
     .await;
@@ -1443,5 +1867,8 @@ async fn move_completion_drops_source_dir_and_clears_pending_drop() {
         let g = leader.sm_data.read().expect("sm");
         g.state.move_target_of(pid, 103)
     };
-    assert_eq!(targets_cleared, None, "confirmed drop must also clear the successor bookkeeping");
+    assert_eq!(
+        targets_cleared, None,
+        "confirmed drop must also clear the successor bookkeeping"
+    );
 }

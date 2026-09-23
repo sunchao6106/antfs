@@ -6,23 +6,28 @@
 use antfs_blob::StoreConfig;
 use antfs_store::StoreServerConfig;
 
-/// **默认段大小必须整除默认分区容量** —— `blob::log::validate_capacities` 是硬校验
-/// (`total % segment == 0`,否则 `BadArgument`),不整除的直接后果是:**纯默认配置的 store 一个 replica 都建不出来**。
+/// **非整数倍的总容量现在是合法的**:最后一段是"残段"(容量 = `total − k × segment`)。
+/// 这条盯的是"配置项之间已解耦" —— 例如 100 GiB 分区 + 8 GiB 段 = 12 个整段 + 1 个 4 GiB 残段。
 ///
-/// 历史:`StoreConfig::segment_size_bytes` 曾是 8 GiB,而分区容量默认 100 GiB —— `100 % 8 != 0`,
-/// 即旧默认组合会在 `ensure_replica` 建库时报
-/// `total capacity 107374182400 must be a multiple of segment capacity 8589934592`。
-/// 现默认 4 GiB:`100 / 4 = 25` 整,同时满足下面那条 u32 不变量。
+/// 历史:`blob::log::validate_capacities` 曾硬校验 `total % segment == 0`,导致默认组合
+/// (100 GiB + 8 GiB)直接 `BadArgument`、建不出 replica;现由 `crates/blob/tests/segment_tail.rs`
+/// 覆盖残段的几何与"写不下"语义。
 #[test]
-fn default_segment_size_divides_default_partition_capacity() {
+fn non_multiple_partition_and_segment_sizes_are_legal() {
     let part = StoreServerConfig::default().partition_capacity_bytes;
     let seg = StoreConfig::default().segment_size_bytes;
+    let segments = part.div_ceil(seg);
+    let tail = part - (segments - 1) * seg;
+    assert_eq!(segments, 25, "默认组合 100 GiB / 4 GiB = 25 段");
+    assert_eq!(tail, seg, "整倍时末段就是整段");
+    // 8 GiB 段:12 整段 + 4 GiB 残段 —— 过去这是"非法配置",现在完全可用。
+    let s8 = 8 * 1024 * 1024 * 1024u64;
+    assert_eq!(part.div_ceil(s8), 13);
     assert_eq!(
-        part % seg,
-        0,
-        "默认分区容量 {part} 不能被默认段大小 {seg} 整除(会 BadArgument,建不出 replica)"
+        part - 12 * s8,
+        4 * 1024 * 1024 * 1024,
+        "多出一个 4 GiB 残段,不再浪费/报错"
     );
-    assert_eq!(part / seg, 25, "默认组合应为 25 段/分区");
 }
 
 /// **默认段大小下单条记录的数据体必然 < `u32::MAX`** —— 记录内 `data_len` 是 u32,
@@ -32,9 +37,16 @@ fn default_segment_size_keeps_single_record_under_u32() {
     const SEG_HEADER: u64 = 64; // `log_segment.rs::HEADER_SIZE`
     const RECORD_OVERHEAD: u64 = 38; // `blob.rs::RECORD_OVERHEAD`(KEY_SIZE = 8)
     let seg = StoreConfig::default().segment_size_bytes;
-    assert_eq!(seg, 4 * 1024 * 1024 * 1024, "默认段大小变更须复核本条不变量");
+    assert_eq!(
+        seg,
+        4 * 1024 * 1024 * 1024,
+        "默认段大小变更须复核本条不变量"
+    );
     let max_data = seg - SEG_HEADER - RECORD_OVERHEAD;
-    assert!(max_data < u32::MAX as u64, "上限 {max_data} 必须 < u32::MAX");
+    assert!(
+        max_data < u32::MAX as u64,
+        "上限 {max_data} 必须 < u32::MAX"
+    );
 }
 
 /// **单请求上限必须放得进一个段** —— 否则出现"大小检查放行、引擎却存不下"的 400

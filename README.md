@@ -1,62 +1,137 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/ant-white.svg">
-    <img alt="antfs logo" src="docs/assets/ant.svg" width="128">
-  </picture>
+  <img alt="antfs logo" src="docs/assets/logo.svg" width="440">
 </p>
 
-# 蚂蚁文件系统 (antfs)
+<p align="center">
+  <strong>A distributed blob storage system in Rust, purpose-built for massive small files.</strong>
+</p>
 
-**antfs 取意「蚂蚁」:像蚂蚁一样,个体微小、数量惊人、协作可靠 —— 为海量小文件存储而生。**
+<p align="center">
+  <a href="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange?logo=rust">
+  <a href="docs/design/README.md"><img alt="Docs" src="https://img.shields.io/badge/docs-design%20docs-green"></a>
+  <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
+</p>
 
-用 Rust 实现的分布式 blob 存储系统,设计参考了 [LinkedIn Ambry](https://github.com/linkedin/ambry) 与 [SeaweedFS](https://github.com/seaweedfs/seaweedfs):小文件追加进 log、索引定位,O(1) 次磁盘寻道完成读写;集群元数据由内建 Raft 的 master 管理,不依赖外部协调组件。分阶段推进:
+<p align="center">
+  English | <a href="README_zh.md">简体中文</a>
+</p>
 
-- **现阶段:忠实的 Rust 翻译** —— 对齐 Ambry 的架构与语义,先把功能 1:1 搬到 Rust(仅在等价前提下用现代实现,如 Binary Fuse 过滤器替 Bloom)。
-- **后续:在 Rust 版本之上做优化** —— 待翻译完成、正确性锁定后,再针对性能 / 并发 / 存储密度做改进。
+---
 
-## 模块
+## What is antfs?
 
-| 模块 | 说明 | 状态 |
+**antfs** takes its name from the **ant**: tiny individuals, astonishing numbers, reliable collaboration — exactly what a store for massive small files should be.
+
+The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [SeaweedFS](https://github.com/seaweedfs/seaweedfs), and [CubeFS](https://github.com/cubefs/cubefs): small files are appended into a log and located by an index, so reads and writes each cost **O(1) disk seeks**. Cluster metadata is managed by a master with a **built-in Raft** group — no external coordination service (ZooKeeper / etcd) required. The project moves in two phases:
+
+- **Phase 1 (current): a faithful Rust port** — mirror Ambry's architecture and semantics 1:1 in Rust, substituting modern implementations only where strictly equivalent (e.g. Binary Fuse filters in place of Bloom filters).
+- **Phase 2: optimize on top of the Rust base** — once the port is complete and correctness is locked down, push on performance, concurrency, and storage density.
+
+## Features
+
+- **O(1) small-file I/O** — append-only log + index; no per-object filesystem metadata, no random seeks.
+- **Built-in Raft control plane** — placement, node state machine, reconciliation, decommission, and blobId range allocation, all inside the master; nothing external to operate.
+- **Self-contained storage engine** — `Log` / `LogSegment` / `PersistentIndex` / `BlobStore`: immutable objects, irreversible deletes (tombstones), compaction, crash recovery, and a monotonic tombstone-wins replication merge.
+- **Fast sealed-segment indexing** — mmap'd sealed segments with persistent **Binary Fuse filters** for negative lookups.
+- **Quorum router SDK** — blobId range leasing from the master, W-majority writes, R=1 reads, streaming for large blobs; shared by the frontend and the benchmarks.
+- **REST API** — an HTTP frontend exposing `/blobs` (read / write / delete / TTL / chunked assembly) plus `/metrics`.
+- **Observability first** — Prometheus metrics everywhere, plus an admin web dashboard for topology, nodes, disks, partitions, and metrics.
+- **One-command local cluster** — spin up a full dev cluster (Raft master + 3 stores + admin web) with a single `cargo run`.
+
+## Architecture
+
+```text
+                          ┌────────────┐
+                          │ Admin Web  │  topology · nodes · disks · partitions · metrics
+                          └─────┬──────┘
+                                │
+   clients ── REST /blobs ──▶ Frontend ── embeds ──▶ Router SDK ── lease blobId ranges ──▶ ┌────────────────┐
+                                  │                   (W-quorum writes, R=1 reads)          │ Master (Raft)  │
+                                  │                            │                            │ placement      │
+                                  │                            ▼                            │ reconcile      │
+                                  │                ┌───────────────────────┐   heartbeat    │ decommission   │
+                                  │                │ Store nodes (× N)     │ ◀───────────── │ blobId ranges  │
+                                  └── replicate ──▶│  └─ blob engine:      │               └────────────────┘
+                                                   │    Log / LogSegment / │
+                                                   │    PersistentIndex    │
+                                                   └───────────────────────┘
+```
+
+| Component | Description | Status |
 |---|---|---|
-| common | 公共库:`config`(`serde`+`config` 分层配置)、`metric`(`prometheus` 统计打点);对标 Ambry `config` 包 + Dropwizard `MetricRegistry` | 进行中 |
-| blob | 单机存储引擎:`Log` / `LogSegment` / `PersistentIndex` / `BlobStore`(put/get/delete/undelete/updateTtl/compaction/hard_delete/恢复 + 复制 apply);对标 Ambry `ambry-store` | 进行中 |
-| master | 集群大脑:内建 Raft(`openraft`)管放置/节点状态机/调谐/下线/**发号(blobId 号段)**;对标 Helix+ZK 的替代 | 进行中 |
-| store | 数据节点(store server):多副本编排 + HTTP 数据面 + 心跳/磁盘监控 + 拉复制;承载 `blob` 引擎 | 进行中 |
-| router | 客户端 SDK(通用组件,`crates/common/router`):向 master 取号段、W 多数派写、R=1 读、流式大文件;frontend 与压测共用;对标 Ambry `NonBlockingRouter` | 进行中 |
-| frontend | HTTP REST 对象接口层(`/blobs` 读写/删/TTL/分片拼装 + `/metrics`);内嵌同一个 router SDK;对标 Ambry `ambry-frontend` | 进行中 |
-| admin | admin web:运维操作 + 控制面 dashboard(拓扑/节点/盘/分区/指标) | 进行中 |
-| S3 网关 / 多租户 ACL、配额 | 网关层远景(与 frontend 同层) | 规划中 |
+| `common` | Shared libraries: layered `config` (serde + config), `metric` (Prometheus). Counterpart of Ambry's `config` package + Dropwizard `MetricRegistry` | 🚧 In progress |
+| `blob` | Single-node storage engine: `Log` / `LogSegment` / `PersistentIndex` / `BlobStore` (put / get / delete / compaction / recovery + replication apply). Counterpart of `ambry-store` | 🚧 In progress |
+| `master` | Cluster brain: built-in Raft (`openraft`) for placement, node state, reconciliation, decommission, and blobId range issuance. Replaces the Helix + ZooKeeper stack | 🚧 In progress |
+| `store` | Data node (store server): multi-replica orchestration + HTTP data plane + heartbeat/disk monitoring + pull replication; hosts the `blob` engine | 🚧 In progress |
+| `router` | Client SDK (`crates/common/router`): blobId range leasing, W-majority writes, R=1 reads, large-blob streaming; shared by frontend and benchmarks. Counterpart of Ambry's `NonBlockingRouter` | 🚧 In progress |
+| `frontend` | HTTP REST object layer (`/blobs` + `/metrics`). Counterpart of `ambry-frontend` | 🚧 In progress |
+| `admin` | Admin web: ops actions + control-plane dashboard (topology / nodes / disks / partitions / metrics) | 🚧 In progress |
+| S3 gateway / multi-tenant ACL, quota | Gateway layer (same tier as frontend) | 📋 Planned |
 
-> 命名:`blob` = 单机 blob 存储引擎(旧 `store`);`store` = 数据节点(旧 `store-server`)。
+> Naming: `blob` = the single-node blob storage engine; `store` = the data node server.
 
-blob 引擎当前要点:
-- IO:**同步阻塞 `std::fs` + buffered(OS page cache)**,对齐 Ambry 原版
-- 索引:并发活跃段 + **mmap 封存段 + 持久化 Binary Fuse 过滤器**
+Storage engine highlights:
 
-详细设计见 [`docs/design/`](docs/design/)(总览 + 各模块);决策档案见 `openspec/changes/`。
+- **I/O**: synchronous blocking `std::fs` + buffered (OS page cache), aligned with original Ambry.
+- **Index**: concurrent active segments + **mmap'd sealed segments + persistent Binary Fuse filters**.
 
-## 开发环境
+Design docs live in [`docs/design/`](docs/design/) (overview + per-module); decision archives live in [`openspec/changes/`](openspec/changes/).
 
-工程**跨平台**(Linux / macOS,均 Unix)。本机 macOS 可直接开发:
+## Quick Start
+
+Requires a [rustup](https://rustup.rs/) toolchain (stable). Cross-platform on Unix: Linux and macOS.
 
 ```bash
 cargo build
 cargo test
-cargo run -p antfs-smoke
+cargo run -p antfs-smoke        # storage-engine smoke test
 ```
-> 需 rustup 工具链;新开的 shell 先 `. "$HOME/.cargo/env"`。
 
-### 可选:Linux 目标保真(colima VM)
-
-生产目标是 Linux ext4。需在真实目标 OS 上做保真 / 大数据量 / 性能测试时,用 colima Linux VM:
+Run a full local cluster — 1 Raft master + 3 store nodes + admin web, all in-process, with addresses printed on startup:
 
 ```bash
-./vm-cargo.sh build   # 自动转进 VM 跑 cargo(源码 virtiofs 挂载,target/数据落 VM 原生 ext4)
+cargo run -p antfs-devcluster
+```
+
+### Optional: Linux-fidelity runs (colima VM)
+
+The production target is Linux ext4. For fidelity, large-data, or performance testing on the real target OS, use the bundled colima VM wrapper:
+
+```bash
+./vm-cargo.sh build   # forwards cargo into the VM (sources over virtiofs, target/ & data on native ext4)
 ./vm-cargo.sh test
 ./vm-cargo.sh run -p antfs-smoke
 ```
 
-## 致谢
+## Documentation
 
-- 架构设计参考 [LinkedIn Ambry](https://github.com/linkedin/ambry) 与 [SeaweedFS](https://github.com/seaweedfs/seaweedfs)。
-- Logo:蚂蚁图标来自 [Delapouite](https://delapouite.com/) / [game-icons.net](https://game-icons.net),[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)。
+- 📐 [Design docs](docs/design/) — architecture overview and per-module designs
+- 📓 [DEVLOG](docs/DEVLOG.md) — step-by-step implementation log: what was done, key decisions, verification evidence
+- 🗂 [OpenSpec changes](openspec/changes/) — design decision archive
+- 🤝 [Contributing](CONTRIBUTING.md) — how to build, test, and propose changes
+
+## Roadmap
+
+- [x] Single-node blob engine (log + index + compaction + recovery)
+- [x] Master with built-in Raft (placement / reconcile / decommission / blobId ranges)
+- [x] Store server (replication, heartbeat, disk monitoring)
+- [x] Router SDK + REST frontend
+- [x] Admin web dashboard
+- [ ] Finish the faithful Ambry port and lock correctness (Phase 1 exit)
+- [ ] Performance / concurrency / storage-density optimizations (Phase 2)
+- [ ] S3 gateway, multi-tenant ACL and quota
+
+## Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first, and feel free to open an [issue](https://github.com/sunchao6106/ambry-rs/issues) or a pull request.
+
+## License
+
+antfs is licensed under the [Apache License 2.0](LICENSE).
+
+## Acknowledgements
+
+- Architecture inspired by [LinkedIn Ambry](https://github.com/linkedin/ambry), [SeaweedFS](https://github.com/seaweedfs/seaweedfs), and [CubeFS](https://github.com/cubefs/cubefs).
+- The antfs logo was drawn in-house as SVG — tiny ant, big dreams.

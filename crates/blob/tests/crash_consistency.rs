@@ -12,8 +12,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use proptest::prelude::*;
 use antfs_blob::LogSegment;
+use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -45,7 +45,7 @@ fn run_case(ops: Vec<Op>) {
     let path = unique_path();
     let data_capacity = 512u64 * 1024;
     let capacity = 64 + data_capacity;
-    let seg = LogSegment::create(&path, capacity).unwrap();
+    let seg = LogSegment::create(&path, capacity, 0).unwrap();
 
     let mut records: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut durable_end: u64 = 0;

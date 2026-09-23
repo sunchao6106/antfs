@@ -5,7 +5,9 @@
 //! `replicas_by_disk`(需按 node_id × disk_id 分盘观测,用 label vec)。指标断言必须打在实际接入
 //! 的这个 `Registry` 上(CLAUDE.md §6)。
 
-use antfs_metric::{counter, gauge, gauge_vec, IntCounter, IntGauge, IntGaugeVec, Registry, Result};
+use antfs_metric::{
+    counter, gauge, gauge_vec, IntCounter, IntGauge, IntGaugeVec, Registry, Result,
+};
 
 /// master 指标集,构造时注册进传入的 `Registry`。
 #[derive(Clone)]

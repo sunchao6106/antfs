@@ -61,7 +61,7 @@
 
 ### 3.3 持久性/崩溃风险清单(命中任一项 → 需额外审查 + 显式测试)
 
-- [ ] **写路径** —— 是否触及 put / delete / undelete / updateTtl / compaction / hard_delete?
+- [ ] **写路径** —— 是否触及 put / delete / compaction?
 - [ ] **元数据/索引** —— 是否改变 `IndexValue`、header、`seg_bytes` 等的写入/读取/重建方式?
 - [ ] **持久化边界 / 原子性** —— fsync 边界、tmp→fsync→rename 是否保持?操作能否中途完成留下不一致态?
 - [ ] **成功回报时机** —— 是否可能在数据真正落盘(fsync)前就对上层报成功?

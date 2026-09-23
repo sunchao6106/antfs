@@ -126,11 +126,15 @@ impl IdAllocator {
         let batch = Self::batch_size(count, cfg);
         metrics.id_alloc_raft_commits.inc();
         match Self::commit(raft, partition_id, batch).await? {
-            MasterResponse::ObjectIdRange { start, count: n, .. } => Ok((start, n)),
+            MasterResponse::ObjectIdRange {
+                start, count: n, ..
+            } => Ok((start, n)),
             MasterResponse::ObjectIdExhausted { .. } if batch > count => {
                 metrics.id_alloc_raft_commits.inc();
                 match Self::commit(raft, partition_id, count).await? {
-                    MasterResponse::ObjectIdRange { start, count: n, .. } => Ok((start, n)),
+                    MasterResponse::ObjectIdRange {
+                        start, count: n, ..
+                    } => Ok((start, n)),
                     MasterResponse::ObjectIdExhausted { .. } => Err(IdAllocError::Exhausted),
                     other => Err(IdAllocError::Unexpected(format!("{other:?}"))),
                 }
@@ -145,10 +149,13 @@ impl IdAllocator {
         partition_id: PartitionId,
         count: u32,
     ) -> Result<MasterResponse, IdAllocError> {
-        raft.client_write(MasterCommand::AllocateObjectId { partition_id, count })
-            .await
-            .map(|r| r.data)
-            .map_err(|e| IdAllocError::Raft(format!("{e}")))
+        raft.client_write(MasterCommand::AllocateObjectId {
+            partition_id,
+            count,
+        })
+        .await
+        .map(|r| r.data)
+        .map_err(|e| IdAllocError::Raft(format!("{e}")))
     }
 }
 
@@ -182,7 +189,11 @@ mod tests {
     #[test]
     fn empty_pool_has_no_remaining() {
         let p = Pool::default();
-        assert_eq!(p.remaining(), 0, "fresh partition pool starts empty → forces a raft reservation");
+        assert_eq!(
+            p.remaining(),
+            0,
+            "fresh partition pool starts empty → forces a raft reservation"
+        );
     }
 
     #[test]
@@ -198,14 +209,22 @@ mod tests {
     #[test]
     fn batch_size_saturates_instead_of_wrapping() {
         // 饱和到 u32::MAX,不回绕(回绕会让水位倒退 → 复用号,踩持久性红线)。
-        assert_eq!(IdAllocator::batch_size(u32::MAX, &cfg(u32::MAX, 2)), u32::MAX);
-        assert_eq!(IdAllocator::batch_size(u32::MAX, &cfg(u32::MAX, u32::MAX)), u32::MAX);
+        assert_eq!(
+            IdAllocator::batch_size(u32::MAX, &cfg(u32::MAX, 2)),
+            u32::MAX
+        );
+        assert_eq!(
+            IdAllocator::batch_size(u32::MAX, &cfg(u32::MAX, u32::MAX)),
+            u32::MAX
+        );
     }
 
     #[test]
     fn alloc_error_messages_are_actionable() {
         assert!(IdAllocError::Exhausted.to_string().contains("seal"));
         assert!(IdAllocError::Raft("x".into()).to_string().contains('x'));
-        assert!(IdAllocError::Unexpected("y".into()).to_string().contains('y'));
+        assert!(IdAllocError::Unexpected("y".into())
+            .to_string()
+            .contains('y'));
     }
 }

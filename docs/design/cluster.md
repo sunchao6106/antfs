@@ -22,7 +22,7 @@
 | **store server**(数据节点) | 承载 [`store`](./store.md) 引擎(挂 N disk、每 disk 一堆 BlobStore),服务 put/get,跑副本复制 | 已实现(见 §9) |
 | **master** | partition→replica 放置、节点/副本状态机、故障处置、**发号(blobId 号段)**;**内建 Raft**(自包含,不依赖外部协调器) | 已实现(见 §7) |
 | **router**(客户端 SDK / 通用组件) | Router 逻辑做成**库**(`crates/common/router`):号段缓存、选分区、拼 blobId、直连 store server 做 W/R、切副本;**frontend 与压测二进制共用同一份实现** | 已实现(见 [`router.md`](./router.md)) |
-| **frontend**(HTTP REST 入口) | `POST/GET/HEAD/DELETE /blobs`、TTL/undelete、分片拼装、`/metrics`;**内嵌同一 router SDK**,不重复实现 W/R | 已实现(见 [`frontend.md`](./frontend.md)) |
+| **frontend**(HTTP REST 入口) | `POST/GET/HEAD/DELETE /blobs`、写入时定 TTL(`x-ambry-ttl-ms`)、分片拼装、`/metrics`;**内嵌同一 router SDK**,不重复实现 W/R | 已实现(见 [`frontend.md`](./frontend.md)) |
 | **S3 网关**(远景) | S3 协议翻译 + auth/quota;与 frontend 同层,复用同一 SDK | 规划 |
 | **scheduler**(待定 P1) | 集群级 compaction 编排 / 再复制 / 均衡 / EC 调度 | 待定(见 §4) |
 | **admin web**(独立服务) | 运维操作(经 master admin gRPC)+ 控制面状态 dashboard(拓扑/节点/盘/分区/副本);指标时序复用 Prometheus+Grafana;需 operator 鉴权 | 已实现(见 §11) |
@@ -191,7 +191,7 @@ RoutingIndex   map<PartitionId, [ 存活副本位置 ]>                         
 | 状态 | 含义 | 可路由请求 |
 |---|---|---|
 | OFFLINE | 初始/已停,不服务 | 无 |
-| BOOTSTRAP | OFFLINE→STANDBY 中间态,追平 peers | GET / DELETE / TTL_UPDATE / UNDELETE(**不含 PUT**) |
+| BOOTSTRAP | OFFLINE→STANDBY 中间态,追平 peers | GET / DELETE(**不含 PUT**) |
 | STANDBY | 完全可用 | 全部 |
 | LEADER | 完全可用;**当前与 STANDBY 无差别**,预留将来跨 DC 复制(≤1/分区/DC) | 全部 |
 | INACTIVE | STANDBY→OFFLINE 中间态(下线中,等 peers 追平自己) | **仅 GET** |
@@ -477,7 +477,7 @@ store server(一个进程 / 一台数据节点)
 | HeartbeatClient | gRPC 流:报活 + 各盘 `available_capacity`(store 自省)+ 各副本 current_state/lag |
 | DataHttpServer | HTTP 数据面:put/get/replicate 路由到对应 BlobStore(D2) |
 | ReplicationPuller | STANDBY 副本从 peer 拉式 anti-entropy;BOOTSTRAP 拉全量(D4) |
-| LocalWorker | 本地常驻:周期 flush + 单店 compaction(死占比阈值) + hard_delete |
+| LocalWorker | 本地常驻:周期 flush + 单店 compaction(死占比阈值) |
 
 **指令 → store 操作映射(胶水核心)**:
 | target / 分区态 | store server 动作 | 上报 current |
@@ -493,14 +493,14 @@ store server(一个进程 / 一台数据节点)
 | task EC 转换(D5) | 交 P1 scheduler / 本地 worker 做段级 EC | — |
 
 **本地 worker vs P1 scheduler 分工(澄清)**:
-- **本地 worker(store server 常驻,永远要有)**:flush / 单店 compaction / hard_delete —— 都是"单 BlobStore 内、本地、轻"(对齐 Ambry CompactionManager 跑在 StorageManager 里)。
+- **本地 worker(store server 常驻,永远要有)**:flush / 单店 compaction —— 都是"单 BlobStore 内、本地、轻"(对齐 Ambry CompactionManager 跑在 StorageManager 里)。
 - **P1 独立 scheduler(集群级、跨节点、重)**:再复制编排 / 跨节点再平衡 / EC 转换调度(master 决策 + 跨节点搬数据)。
 - → compaction/flush 是本地事,**不等 P1**。
 
 **store 连接点**:
 - 生命周期:`create/open/close`(已成)+ **需补 `drop`(删目录回收)**。
 - 容量:store 的 `available_capacity`/`is_full` → 心跳上报 master → 喂 §7.3 容量感知放置(闭环)。
-- 读写/后台:`put/get`/`flush`/`compact_if_needed`/`hard_delete`(已成)直接被编排,**store 基本不改**。
+- 读写/后台:`put/get`/`flush`/`compact_if_needed`(已成)直接被编排,**store 基本不改**。
 
 **待拍/开放**:
 - [x] **N1 命名**:`store server`(数据节点)。
@@ -515,8 +515,8 @@ store server(一个进程 / 一台数据节点)
 
 **S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报)。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
 
-- 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE` / `POST .../undelete` / `POST .../ttl`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)+ `GET /metrics`(Prometheus 文本导出,无鉴权)+ `POST /admin/partitions/{pid}/compact`(手动触发该分区本地副本全库 compact,对齐 Ambry `TriggerCompaction`;响应 JSON `{live_bytes, dead_bytes, segments_before, segments_after}`,无本地副本 → 404)。
-  - **`PUT ...?expiration_ms=<i64>`**(见 `blob-io-end-to-end`):建对象时**即带 TTL**(此前只能先 PUT 再调 `/ttl`;分片上传的孤儿回收需要"出生即带 TTL")。
+- 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射;**删除不可逆**,见 `openspec/changes/simplify-delete-model/`)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)+ `GET /metrics`(Prometheus 文本导出,无鉴权)+ `POST /admin/partitions/{pid}/compact`(手动触发该分区本地副本全库 compact,对齐 Ambry `TriggerCompaction`;响应 JSON `{live_bytes, dead_bytes, segments_before, segments_after}`,无本地副本 → 404)。
+  - **`PUT ...?expiration_ms=<i64>`**(见 `blob-io-end-to-end`):建对象时**即带 TTL**(分片上传的孤儿回收需要"出生即带 TTL")。
   - **`GET .../blobs/{key}/metadata`**(见 `blob-io-end-to-end`):只读元数据**不读数据体**的 JSON(`BlobStore::stat`),供 frontend 的 `HEAD` 用;已删/已过期也返回 200 + 标志(元数据可读 ≠ 数据体可读),从未写过 → 404。
   - **流式 PUT(见 `blob-io-end-to-end`)**:带 `Content-Length` 时:≤ 1 MiB(常量 `INLINE_BODY_MAX`)走**内存路径**
     (`Bytes` → 引擎整块写);> 1 MiB 才 body 边收边落**该副本所在盘的暂存目录**(`<disk>/tmp/`,内存 O(64KiB))
@@ -530,12 +530,12 @@ store server(一个进程 / 一台数据节点)
   - **暂存文件在请求被取消时也要清掉**:store 侧用 RAII 守卫(`StagedFile` 的 `Drop`)删除 —— 客户端断开/上游 abort 会
     直接 drop 掉 handler future,"`.await` 之后手写 `remove_file`"那条路径根本不执行(实测一次 2 MiB × 3000 次压测
     漏出 1600+ 个暂存文件);`DiskManager::mount` 仍会清理崩溃遗留。
-- **一致性巡检素材(Wave3,只读,豁免白名单内)**:`GET /partitions/{pid}/scrub-report`(副本摘要,只走索引/mmap 不读数据体:`live_records`/`tombstones`/`live_bytes`/`sealed_segments`/段清单/log 末端游标);`GET /partitions/{pid}/verify?max_bytes=`(本地完整性校验:逐记录验 CRC 但**坏记录记下继续**,回 `records`/`bad_records`/`first_bad_offset`/`index_mismatch`/`truncated`,缺省上限用配置 `scrub_max_batch_bytes`)。无本地副本 → 404。语义与"能发现什么/发现不了什么"见 [`store.md` §12.10](./store.md)。
+- **一致性巡检素材(Wave3,只读,豁免白名单内)**:`GET /partitions/{pid}/scrub-report`(副本摘要,只走索引/mmap 不读数据体:`live_records`/`tombstones`/`live_bytes`/`sealed_segments`/段清单/log 末端游标 + **带伤启动计数 `damaged_records`/`abandoned_segments`**);`GET /partitions/{pid}/verify?max_bytes=`(本地完整性校验:逐记录验 CRC 但**坏记录记下继续**,回 `records`/`bad_records`/`first_bad_offset`/`index_mismatch`/`truncated`,缺省上限用配置 `scrub_max_batch_bytes`)。无本地副本 → 404。**记录损坏不再让副本起不来**:`open` 容错跳过坏记录(不删不改盘上字节)、记 ERROR 日志 + `store_open_bad_records_total`/`store_open_abandoned_segments_total`,并把这笔账经 `scrub-report` 的 `damaged_records`/`abandoned_segments` 暴露给巡检(健康副本恒为 0,故带伤副本在一致性巡检里直接表现为差异)。语义与残留边界见 [`store.md` §12.10](./store.md)。
 - **运维端点 `POST|GET /admin/replication-control`(A7)**:运行期暂停/恢复**本节点主动拉复制**。`POST` body `{paused}` → 200 `{paused}`;`GET` 回当前状态。只影响本节点向 peer 拉取(别人来拉本节点完全不受影响),与请求静默正交;**不持久化**(重启即恢复拉取),也不动已积累的复制游标(恢复后从原游标续拉)。对应 gauge `store_server_replication_paused`。
 - **异步 compact 台账(A3)**:`POST /admin/partitions/{pid}/compact?async=1` 立即回 200 `{job_id}`,后台在阻塞池跑 `BlobStore::compact()`(不带 `async` 走原同步路径,响应体不变);`GET /admin/compactions` 回最近 32 条任务(最新在前,超出逐条淘汰最旧),`GET /admin/compactions/{job_id}` 回单条,未知/已淘汰 → 404。任务 JSON:`{job_id, partition_id, state: running|done|failed, started_at_ms, finished_at_ms?, result?{live_bytes,dead_bytes,segments_before,segments_after}, error?}`(未完成字段**不出现在 JSON 里**)。台账是**进程内内存态**(重启即丢),只服务"这次 compaction 跑完没";compaction 本身幂等,崩溃由引擎侧 `COMPACT_COMMIT` 收敛,与台账无关。
-- **运维端点 `POST|GET /admin/request-control`(批 1)**:节点级/分区级**请求静默**(对标 Ambry `RequestControl` / `DataNodeRequestControl`)。`POST` body `{op, partition_id?, enable, ttl_secs?}`(`op` = `DataOp::as_str` 真值:put/get/delete/undelete/ttl_update;未知 op → 400,本地无该副本 → 404;`ttl_secs` 缺省用 `store_server.request_control_default_ttl_secs`,`0` = 立即到期),`GET` 回当前禁用集(已过期条目按"视为启用"剔除);命中禁用的数据面请求 → **503**(+ 说明文本,有剩余时长时带 `Retry-After`)。**豁免清单**:`?replication=1` 的 blob 读、`GET .../replica-metadata`、`GET .../segments*`、`GET /metrics`、**任何 `/admin/**`(含本端点自身)** 永不被禁——禁掉前四类会让副本停更(踩持久性红线),禁掉最后一类会做出"无法远程恢复"的节点。状态只在内存、不持久化(重启即全开),过期靠惰性判定。语义与偏离详见 [`store.md` §12](./store.md)。
+- **运维端点 `POST|GET /admin/request-control`(批 1)**:节点级/分区级**请求静默**(对标 Ambry `RequestControl` / `DataNodeRequestControl`)。`POST` body `{op, partition_id?, enable, ttl_secs?}`(`op` = `DataOp::as_str` 真值:put/get/delete;未知 op → 400,本地无该副本 → 404;`ttl_secs` 缺省用 `store_server.request_control_default_ttl_secs`,`0` = 立即到期),`GET` 回当前禁用集(已过期条目按"视为启用"剔除);命中禁用的数据面请求 → **503**(+ 说明文本,有剩余时长时带 `Retry-After`)。**豁免清单**:`?replication=1` 的 blob 读、`GET .../replica-metadata`、`GET .../segments*`、`GET /metrics`、**任何 `/admin/**`(含本端点自身)** 永不被禁——禁掉前四类会让副本停更(踩持久性红线),禁掉最后一类会做出"无法远程恢复"的节点。状态只在内存、不持久化(重启即全开),过期靠惰性判定。语义与偏离详见 [`store.md` §12](./store.md)。
 
-**S3a(拉复制逻辑核心)已实现**(见 `openspec/changes/store-server-replication/`):store 引擎新增**忠实 apply 原语** `BlobStore::apply_replicated`(newest-wins + lifeVersion,**原样保留** peer 的 flags/lifeVersion/expiration/op_time,只增不删幂等,守 §3.1;防副本发散);store-server 新增 `replica-metadata` HTTP 端点(step-1,`find_entries_since`)+ blob 读 `?replication=1`(step-2,含已删除/过期数据体)+ `replication.rs`(`PeerSource` trait + `replicate_from_peer` 收敛循环 + `HttpPeer` 阻塞 adapter);后台复制器经 master `LookupPartition` 发现 peer(排除自身、按 `up` 过滤),对每个本地 replica 的每个 peer 周期拉一轮;BOOTSTRAP 从 `token=Uninitialized` 全量逻辑回放追平。过单测(apply 四态 + 收敛/幂等/bootstrap)+ 集成测试(两 store-server 真 HTTP 收敛 + delete 传播)。
+**S3a(拉复制逻辑核心)已实现**(见 `openspec/changes/store-server-replication/`):store 引擎新增**忠实 apply 原语** `BlobStore::apply_replicated`(**墓碑恒胜**:peer 墓碑覆盖本地 PUT,peer PUT 永不覆盖本地 PUT/墓碑;只增不删幂等,原样保留 peer 的 flags/expiration,守 §3.1;防副本发散);store-server 新增 `replica-metadata` HTTP 端点(step-1,`find_entries_since`)+ blob 读 `?replication=1`(step-2,含**已过期**活记录的数据体;墓碑只写状态、不再传数据体,见 `simplify-delete-model`)+ `replication.rs`(`PeerSource` trait + `replicate_from_peer` 收敛循环 + `HttpPeer` 阻塞 adapter);后台复制器经 master `LookupPartition` 发现 peer(排除自身、按 `up` 过滤),对每个本地 replica 的每个 peer 周期拉一轮;BOOTSTRAP 从 `token=Uninitialized` 全量逻辑回放追平。过单测(apply 四态 + 收敛/幂等/bootstrap)+ 集成测试(两 store-server 真 HTTP 收敛 + delete 传播)。
   - **N3 分期(文档化,非代码就地另选,见该 change design.md D-A)**:S3a 只落**逻辑拉复制**(正确收敛的完备核,含 bootstrap 全量逻辑回放);**S3b** 再叠加封存段**物理流式拷贝**(MTTR 优化)。N3 最终形态(混合)不变。
   - **传输(细化 D2,见 design.md D-B)**:node↔node 复制元数据走 store-server 现有 **HTTP(axum)**(非新起 gRPC server);master↔node 控制面仍 gRPC。
 
@@ -544,7 +544,7 @@ store server(一个进程 / 一台数据节点)
  - **已补齐(见 `blob-io-end-to-end`)**:router SDK(router 库 + CLI)、frontend(REST 网关)、master 发号 `GetBlobIds`、
    流式 put(网络流式 + 落盘暂存 + 引擎 `put_from_reader`)、`.../metadata` 端点、`StoreFull → 507`、`PUT ?expiration_ms=`。
 
-**S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分三条独立周期 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(`compact_if_needed(compaction_dead_ratio)`,按封存段死数据占比阈值增量压缩)、**hard_delete**(擦除已删对象数据体);各周期时长独立可配置;同步引擎调用经 `spawn_blocking` offload。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据 / hard_delete 擦除计数)。
+**S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分**两条**独立周期 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(`compact_if_needed(compaction_dead_ratio)`,按封存段死数据占比阈值增量压缩);各周期时长独立可配置;同步引擎调用经 `spawn_blocking` offload。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据)。
 
 **配置项清单**(`StoreServerConfig`,TOML `[store_server]` 表下;加载用 `Loader::load_table("store_server")`,**同时兼容顶层 flat key**):
 
@@ -564,11 +564,10 @@ store server(一个进程 / 一台数据节点)
 | `store_server.replication_interval_secs` | u64 | 5 | ≥1 | 拉复制周期(S3a) |
 | `store_server.replication_max_batch_bytes` | u64 | 4 MiB | ≥1 | 单次向 peer 拉元数据的批字节上限(限流)(S3a) |
 | `store_server.bootstrap_copy_enabled` | bool | true | — | 封存段物理拷贝加速 bootstrap(S3b);随 `replication_enabled` 生效 |
-| `store_server.local_worker_enabled` | bool | true | — | 本地维护 worker 开关(S4:周期 flush/compaction/hard_delete) |
+| `store_server.local_worker_enabled` | bool | true | — | 本地维护 worker 开关(S4:周期 flush/compaction) |
 | `store_server.flush_interval_secs` | u64 | 30 | ≥1 | 本地 worker flush 周期(推进持久化边界)(S4) |
 | `store_server.compaction_interval_secs` | u64 | 3600 | ≥1 | 本地 worker compaction 检查周期(S4) |
 | `store_server.compaction_dead_ratio` | f64 | 0.5 | (0,1] | 封存段死数据占比 ≥ 此值才压缩(S4) |
-| `store_server.hard_delete_interval_secs` | u64 | 300 | ≥1 | 本地 worker hard_delete 周期(擦除已删数据体)(S4) |
 | `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限(挂在数据面路由的 `DefaultBodyLimit`;**流式 PUT 另按 `Content-Length` 前置校验,超限 413 且不读 body**)。默认与 axum 的 `DefaultBodyLimit` 默认值一致(§5.1 不擅改默认),要收真正的大 blob 须显式调大 |
 | `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0 | `/admin/request-control` 请求未传 `ttl_secs` 时的默认静默时长(秒);**0 = 不设默认时长(即留空即永久禁用)**(批 1) |
 | `store_server.scrub_max_batch_bytes` | u64 | 67108864 | ≥1 | `GET /partitions/{pid}/verify` 缺省的单次扫描读取字节上限(深扫读全量数据体,限流防打爆盘;到点响应 `truncated=true`)(Wave3) |
@@ -585,7 +584,7 @@ store server(一个进程 / 一台数据节点)
 | `store_server_get_bytes_total` | counter | 字节 | 读取字节数 |
 | `store_server_replicas` | gauge | 个 | 本地 partition-replica 数 |
 | `store_server_errors_total` | counter | 次 | 数据面错误数,label `kind`(`io` / `unavailable` / `join_error`) |
-| `store_server_request_duration_seconds` | histogram | 秒 | 数据面请求延迟(handler 入口 → 引擎完成,含 spawn_blocking 排队),label `op`(`put`/`get`/`delete`/`undelete`/`ttl_update`/`replica_metadata`/`segments`) |
+| `store_server_request_duration_seconds` | histogram | 秒 | 数据面请求延迟(handler 入口 → 引擎完成,含 spawn_blocking 排队),label `op`(`put`/`get`/`delete`/`replica_metadata`/`segments`) |
 | `store_server_in_flight_requests` | gauge | 个 | 在途数据面请求数,label `op` |
 | `store_server_manual_compactions_total` | counter | 次 | 手动 compact 端点(`POST /admin/partitions/{pid}/compact`)实际触发次数 |
 | `store_server_heartbeats_total` | counter | 次 | 收到的心跳指令数(S2) |
@@ -597,7 +596,6 @@ store server(一个进程 / 一台数据节点)
 | `store_server_bootstrap_bytes_total` | counter | 字节 | bootstrap 物理拷贝字节数(S3b) |
 | `store_server_flushes_total` | counter | 次 | 本地 worker flush 次数(S4) |
 | `store_server_compactions_total` | counter | 次 | 本地 worker 发生压缩的 replica 次数(S4) |
-| `store_server_hard_deleted_total` | counter | 条 | 本地 worker 擦除数据体的记录数(S4) |
 | `store_server_blob_request_duration_seconds` | histogram | 秒 | **成功** blob 请求延迟,label `op`(put/get)× `size`(small/medium/large,分桶边界 50 KiB / 1 MiB);错误/早退路径不 observe(批 1) |
 | `store_server_rejected_requests_total` | counter | 次 | 被 RequestControl 静默拒掉的请求数(在进引擎之前),label `op` × `reason`(目前仅 `disabled`)(批 1) |
 | `store_server_replication_paused` | gauge | — | 拉复制是否被运维暂停(`/admin/replication-control`;1 = 暂停本节点主动拉,0 = 正常)(A7) |
@@ -630,21 +628,21 @@ client/frontend: 解析 partitionId → LookupPartition(master,可缓存;副本�
 ```
 > 关键:blob 不可变 → **不需要 R+W>N**。W=2 保证 ≥2 份有,GET 试几个必命中,第 3 份复制补。省掉 quorum 读。
 
-**变更(DELETE/TTL/UNDELETE)—— 唯一最终一致窗口**:并行写墓碑/更新 → **W 多数派** ack;`newest-wins`+`lifeVersion`(store 已实现)解冲突;拉复制传播。⚠ 未追上的副本短暂可能返回旧态(接受,最终一致)。
+**变更(仅 `DELETE`)—— 唯一最终一致窗口**:并行写墓碑 → **W 多数派** ack;冲突由**墓碑恒胜**收敛(store 已实现,无需定序字段);拉复制传播。⚠ 未追上的副本短暂可能返回旧态(接受,最终一致)。
 
 **拉复制(anti-entropy)收敛**:
 ```
 每 STANDBY 副本 对每 peer:周期发 ReplicaMetadataRequest(token=log offset 游标)
-  → peer 返 token 后的新记录元数据 → 算缺失 key → GetRequest 拉 → apply(newest-wins) → 推进 token
+  → peer 返 token 后的新记录元数据 → 算缺失 key → GetRequest 拉 → apply(墓碑恒胜) → 推进 token
 ```
 - 复用 store 已有 `FindToken`(每-peer log offset 游标)。**bootstrap 拉全量 = 混合(§9 N3,全部实现)**:封存段物理流式拷贝(快,MTTR 优先)+ 活跃段尾巴 token 逻辑补;非纯 token=0 逻辑回放。
-- **S3a 落地(见 §9.1 + `store-server-replication`)**:step-1 ReplicaMetadata 与 step-2 拉 blob **均走 store-server 现有 HTTP(axum)**(细化 D2:node↔node 复制走 HTTP,master↔node 仍 gRPC);写入用 store `apply_replicated` 忠实保留 peer lifeVersion。物理段拷贝(N3 的 MTTR 优化)分期到 S3b。
+- **S3a 落地(见 §9.1 + `store-server-replication`)**:step-1 ReplicaMetadata 与 step-2 拉 blob **均走 store-server 现有 HTTP(axum)**(细化 D2:node↔node 复制走 HTTP,master↔node 仍 gRPC);写入用 store `apply_replicated`(**墓碑恒胜**)。物理段拷贝(N3 的 MTTR 优化)分期到 S3b。
 
 **参数(默认,已定)**:
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | put 并行度 | = RF | 并行写全部副本 |
-| W(put/delete/ttl/undelete) | **副本数 / 2 + 1** | 多数派:RF=3 → 2(存活 1 副本丢失)、RF=1 → 1。**实算,不做配置项** |
+| W(put/delete) | **副本数 / 2 + 1** | 多数派:RF=3 → 2(存活 1 副本丢失)、RF=1 → 1。**实算,不做配置项** |
 | R(get) | **1** | 不可变,读任一有的副本(副本按 `up` 排序,首个成功即返回) |
 | ack 时机 | page-cache(吞吐优先) | 高持久档可选 fsync-ack;W 跨故障域缓解 |
 | 读修复 | 不做 | 靠后台拉复制,保持异步 |

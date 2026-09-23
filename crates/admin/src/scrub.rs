@@ -19,13 +19,16 @@ pub struct ReportSummary {
     pub segments: Vec<(u64, u64)>,
     pub token_seg: Option<u64>,
     pub token_off: Option<u64>,
+    /// 打开时跳过的坏记录数(>0 = 该副本带伤启动)。
+    pub damaged_records: u64,
+    /// 打开时放弃扫描剩余部分的段数。
+    pub abandoned_segments: u64,
 }
 
 /// 某 key 在窗口内的**最终态**(后写覆盖先写)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyState {
     pub deleted: bool,
-    pub life_version: u16,
     pub size: u64,
 }
 
@@ -64,7 +67,10 @@ pub enum Divergence {
     /// 本地校验发现坏记录/索引漂移。
     Verify { node_id: u64, detail: String },
     /// key 级差异:该 key 在各副本上的状态/存在性不同。
-    Key { key_hex: String, nodes: Vec<(u64, String)> },
+    Key {
+        key_hex: String,
+        nodes: Vec<(u64, String)>,
+    },
 }
 
 /// 比对结论。
@@ -89,7 +95,9 @@ type SummaryField = (&'static str, fn(&ReportSummary) -> String);
 pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
     let ok: Vec<&ReplicaFacts> = replicas.iter().filter(|r| r.ok).collect();
     // 元数据窗口缺失(replica-metadata 失败)时该副本无法参与 key 级比对 → 一律算部分比对。
-    let partial = replicas.iter().any(|r| r.ok && (r.partial || r.keys.is_none()));
+    let partial = replicas
+        .iter()
+        .any(|r| r.ok && (r.partial || r.keys.is_none()));
     let mut divergences = Vec::new();
 
     // 副本数不足(至少两个可取副本才谈得上"一致")。
@@ -105,7 +113,7 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
     let key_comparison_usable = ok.iter().filter(|r| r.keys.is_some()).count() >= 2;
 
     // ① 摘要级:逐字段比对(记录数/字节/墓碑/段数/段清单)。
-    let fields: [SummaryField; 5] = [
+    let fields: [SummaryField; 7] = [
         ("live_records", |s| s.live_records.to_string()),
         ("tombstones", |s| s.tombstones.to_string()),
         ("live_bytes", |s| s.live_bytes.to_string()),
@@ -117,6 +125,9 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
                 .collect::<Vec<_>>()
                 .join(",")
         }),
+        // 带伤启动(打开时跳过坏记录/放弃段)也算摘要级差异:健康副本不该有这些值。
+        ("damaged_records", |s| s.damaged_records.to_string()),
+        ("abandoned_segments", |s| s.abandoned_segments.to_string()),
     ];
     for (field, get) in fields {
         let mut per_node: Vec<(u64, String)> = Vec::new();
@@ -132,7 +143,10 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
                 .map(|(n, v)| format!("n{n}={v}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            divergences.push(Divergence::Summary { field: field.to_string(), detail });
+            divergences.push(Divergence::Summary {
+                field: field.to_string(),
+                detail,
+            });
         }
     }
 
@@ -153,7 +167,7 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
         let mut distinct: BTreeSet<String> = BTreeSet::new();
         for r in &comparable {
             let st = match r.keys.as_ref().and_then(|m| m.get(key)) {
-                Some(s) => format!("deleted={} lv={} size={}", s.deleted, s.life_version, s.size),
+                Some(s) => format!("deleted={} size={}", s.deleted, s.size),
                 None => "missing".to_string(),
             };
             distinct.insert(st.clone());
@@ -162,7 +176,10 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
         if distinct.len() > 1 {
             key_divergences += 1;
             if divergences.len() < MAX_KEY_DIVERGENCES {
-                divergences.push(Divergence::Key { key_hex: key.clone(), nodes: states });
+                divergences.push(Divergence::Key {
+                    key_hex: key.clone(),
+                    nodes: states,
+                });
             }
         }
     }
@@ -170,9 +187,7 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
     if key_comparison_usable && key_divergences > MAX_KEY_DIVERGENCES {
         divergences.push(Divergence::Summary {
             field: "key_divergences_truncated".to_string(),
-            detail: format!(
-                "key 级差异共 {key_divergences} 条,仅列出前 {MAX_KEY_DIVERGENCES} 条"
-            ),
+            detail: format!("key 级差异共 {key_divergences} 条,仅列出前 {MAX_KEY_DIVERGENCES} 条"),
         });
     }
 
@@ -192,7 +207,12 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
     }
 
     let consistent = divergences.is_empty() && !partial;
-    Verdict { consistent, inconclusive: false, partial, divergences }
+    Verdict {
+        consistent,
+        inconclusive: false,
+        partial,
+        divergences,
+    }
 }
 
 /// 一轮 scrub 的紧凑摘要(环形缓冲,供 `GET /api/scrub` 列表)。
@@ -223,7 +243,10 @@ impl Default for ScrubRuns {
 
 impl ScrubRuns {
     pub fn new(cap: usize) -> Self {
-        ScrubRuns { inner: Mutex::new(VecDeque::new()), cap: cap.max(1) }
+        ScrubRuns {
+            inner: Mutex::new(VecDeque::new()),
+            cap: cap.max(1),
+        }
     }
 
     pub fn push(&self, run: ScrubRun) {
@@ -245,10 +268,16 @@ impl ScrubRuns {
 mod tests {
     use super::*;
 
-    fn facts(node: u64, live: u64, keys: &[(&str, bool, u16, u64)]) -> ReplicaFacts {
+    fn facts(node: u64, live: u64, keys: &[(&str, bool, u64)]) -> ReplicaFacts {
         let mut map = BTreeMap::new();
-        for (k, deleted, lv, size) in keys {
-            map.insert(k.to_string(), KeyState { deleted: *deleted, life_version: *lv, size: *size });
+        for (k, deleted, size) in keys {
+            map.insert(
+                k.to_string(),
+                KeyState {
+                    deleted: *deleted,
+                    size: *size,
+                },
+            );
         }
         ReplicaFacts {
             node_id: node,
@@ -262,6 +291,8 @@ mod tests {
                 segments: vec![(0, 100)],
                 token_seg: Some(0),
                 token_off: Some(100),
+                damaged_records: 0,
+                abandoned_segments: 0,
             }),
             keys: Some(map),
             partial: false,
@@ -271,24 +302,36 @@ mod tests {
 
     #[test]
     fn identical_replicas_are_consistent() {
-        let v = compare(&[facts(101, 2, &[("aa", false, 0, 4)]), facts(102, 2, &[("aa", false, 0, 4)])]);
+        let v = compare(&[
+            facts(101, 2, &[("aa", false, 4)]),
+            facts(102, 2, &[("aa", false, 4)]),
+        ]);
         assert!(v.consistent && !v.inconclusive && !v.partial, "{v:?}");
         assert!(v.divergences.is_empty());
     }
 
     #[test]
     fn summary_mismatch_is_reported_per_field() {
-        let v = compare(&[facts(101, 2, &[("aa", false, 0, 4)]), facts(102, 3, &[("aa", false, 0, 4)])]);
+        let v = compare(&[
+            facts(101, 2, &[("aa", false, 4)]),
+            facts(102, 3, &[("aa", false, 4)]),
+        ]);
         assert!(!v.consistent && !v.inconclusive);
-        assert_eq!(v.divergences.len(), 2, "live_records 与 live_bytes 都应报差异: {v:?}");
-        assert!(matches!(&v.divergences[0], Divergence::Summary { field, .. } if field == "live_records"));
+        assert_eq!(
+            v.divergences.len(),
+            2,
+            "live_records 与 live_bytes 都应报差异: {v:?}"
+        );
+        assert!(
+            matches!(&v.divergences[0], Divergence::Summary { field, .. } if field == "live_records")
+        );
     }
 
     #[test]
     fn missing_key_on_one_replica_is_key_divergence() {
         let v = compare(&[
-            facts(101, 2, &[("aa", false, 0, 4), ("bb", false, 0, 4)]),
-            facts(102, 1, &[("aa", false, 0, 4)]),
+            facts(101, 2, &[("aa", false, 4), ("bb", false, 4)]),
+            facts(102, 1, &[("aa", false, 4)]),
         ]);
         assert!(!v.consistent);
         let key_div: Vec<_> = v
@@ -299,7 +342,7 @@ mod tests {
         assert_eq!(key_div.len(), 1, "{v:?}");
         if let Divergence::Key { key_hex, nodes } = key_div[0] {
             assert_eq!(key_hex, "bb");
-            assert_eq!(nodes[0], (101, "deleted=false lv=0 size=4".to_string()));
+            assert_eq!(nodes[0], (101, "deleted=false size=4".to_string()));
             assert_eq!(nodes[1], (102, "missing".to_string()));
         }
     }
@@ -307,40 +350,54 @@ mod tests {
     #[test]
     fn lifecycle_mismatch_is_key_divergence() {
         let v = compare(&[
-            facts(101, 1, &[("aa", false, 0, 4)]),
-            facts(102, 1, &[("aa", true, 1, 4)]),
+            facts(101, 1, &[("aa", false, 4)]),
+            facts(102, 1, &[("aa", true, 4)]),
         ]);
         assert!(!v.consistent);
-        assert!(v.divergences.iter().any(|d| matches!(d, Divergence::Key { key_hex, .. } if key_hex == "aa")));
+        assert!(v
+            .divergences
+            .iter()
+            .any(|d| matches!(d, Divergence::Key { key_hex, .. } if key_hex == "aa")));
     }
 
     #[test]
     fn failed_replica_makes_verdict_inconclusive() {
-        let mut broken = facts(102, 2, &[("aa", false, 0, 4)]);
+        let mut broken = facts(102, 2, &[("aa", false, 4)]);
         broken.ok = false;
         broken.error = "404: no replica for partition".into();
         broken.report = None;
         broken.keys = None;
-        let v = compare(&[facts(101, 2, &[("aa", false, 0, 4)]), broken]);
+        let v = compare(&[facts(101, 2, &[("aa", false, 4)]), broken]);
         assert!(v.inconclusive && !v.consistent, "{v:?}");
     }
 
     #[test]
     fn partial_window_is_not_consistent_but_not_divergent() {
-        let mut r2 = facts(102, 2, &[("aa", false, 0, 4)]);
+        let mut r2 = facts(102, 2, &[("aa", false, 4)]);
         r2.partial = true;
-        let v = compare(&[facts(101, 2, &[("aa", false, 0, 4)]), r2]);
+        let v = compare(&[facts(101, 2, &[("aa", false, 4)]), r2]);
         assert!(!v.consistent && v.partial && !v.inconclusive, "{v:?}");
-        assert!(v.divergences.is_empty(), "截断本身不算差异,但要阻止 consistent");
+        assert!(
+            v.divergences.is_empty(),
+            "截断本身不算差异,但要阻止 consistent"
+        );
     }
 
     #[test]
     fn verify_problems_are_divergences() {
-        let mut r2 = facts(102, 2, &[("aa", false, 0, 4)]);
-        r2.verify = Some(VerifySummary { records: 5, bad_records: 1, index_mismatch: 0, truncated: false });
-        let v = compare(&[facts(101, 2, &[("aa", false, 0, 4)]), r2]);
+        let mut r2 = facts(102, 2, &[("aa", false, 4)]);
+        r2.verify = Some(VerifySummary {
+            records: 5,
+            bad_records: 1,
+            index_mismatch: 0,
+            truncated: false,
+        });
+        let v = compare(&[facts(101, 2, &[("aa", false, 4)]), r2]);
         assert!(!v.consistent);
-        assert!(v.divergences.iter().any(|d| matches!(d, Divergence::Verify { node_id: 102, .. })));
+        assert!(v
+            .divergences
+            .iter()
+            .any(|d| matches!(d, Divergence::Verify { node_id: 102, .. })));
     }
 
     #[test]
@@ -367,17 +424,45 @@ mod tests {
     fn replica_without_window_is_excluded_from_key_comparison() {
         // n103 的元数据窗口取不到(keys=None,partial=true)→ 它**不参与 key 级比对**,
         // 否则会把"未知"报成"缺失"(3 条假差异);结论由 partial 表达"只能部分比对"。
-        let mut blind = facts(103, 2, &[("aa", false, 0, 4)]);
+        let mut blind = facts(103, 2, &[("aa", false, 4)]);
         blind.keys = None;
         blind.partial = true;
         blind.error = "replica-metadata unavailable: bad record".into();
-        let v = compare(&[facts(101, 2, &[("aa", false, 0, 4)]), facts(102, 2, &[("aa", false, 0, 4)]), blind]);
+        let v = compare(&[
+            facts(101, 2, &[("aa", false, 4)]),
+            facts(102, 2, &[("aa", false, 4)]),
+            blind,
+        ]);
         assert!(v.partial && !v.consistent, "{v:?}");
         assert_eq!(
-            v.divergences.iter().filter(|d| matches!(d, Divergence::Key { .. })).count(),
+            v.divergences
+                .iter()
+                .filter(|d| matches!(d, Divergence::Key { .. }))
+                .count(),
             0,
             "窗口不可用的副本不应刷出 key 级差异: {v:?}"
         );
     }
 
+    #[test]
+    fn damaged_replica_shows_as_summary_divergence() {
+        // 带伤启动(打开时跳过坏记录)必须在一致性巡检里表现为差异 —— 否则"副本少数据但报健康"会瞒过运维。
+        let mut damaged = facts(102, 2, &[("aa", false, 4)]);
+        damaged.report.as_mut().unwrap().damaged_records = 3;
+        damaged.report.as_mut().unwrap().abandoned_segments = 1;
+        let v = compare(&[facts(101, 2, &[("aa", false, 4)]), damaged]);
+        assert!(!v.consistent, "{v:?}");
+        assert!(
+            v.divergences.iter().any(
+                |d| matches!(d, Divergence::Summary { field, .. } if field == "damaged_records")
+            ),
+            "应报 damaged_records 差异: {v:?}"
+        );
+        assert!(
+            v.divergences.iter().any(
+                |d| matches!(d, Divergence::Summary { field, .. } if field == "abandoned_segments")
+            ),
+            "应报 abandoned_segments 差异: {v:?}"
+        );
+    }
 }

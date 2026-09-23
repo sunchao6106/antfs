@@ -54,10 +54,18 @@ impl AuditLog {
     pub fn open(path: impl Into<PathBuf>) -> AuditLog {
         let path = path.into();
         // 必须带 `read(true)`:尾部查询要对同一个句柄反向读(append 只管写位置)。
-        match OpenOptions::new().create(true).append(true).read(true).open(&path) {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+        {
             Ok(f) => {
                 tracing::info!(path = %path.display(), "admin audit log opened");
-                AuditLog { path, file: Some(Mutex::new(f)) }
+                AuditLog {
+                    path,
+                    file: Some(Mutex::new(f)),
+                }
             }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "admin audit log unavailable, auditing disabled");

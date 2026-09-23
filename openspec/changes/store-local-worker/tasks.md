@@ -1,19 +1,22 @@
 # tasks — store-local-worker (S4)
 
+> **后续变更(2026-09-23,`simplify-delete-model`)**:本清单里已移除维护动作的配置项、指标、纯函数与单测已随"对象不可变 + 删除不可逆"删掉;本地 worker 现只有 **flush + compaction 两条 loop**。
+> 保留为实现当时的记录。
+
 ## 1. 变更文档
 - [x] 1.1 proposal / spec delta,`openspec validate store-local-worker --strict` 通过。
 
 ## 2. 配置 / 监控
-- [x] 2.1 `config.rs`:`local_worker_enabled`(默认 true)/`flush_interval_secs`/`compaction_interval_secs`/`compaction_dead_ratio`/`hard_delete_interval_secs` + `Default` + `Validate`(周期 ≥1,ratio ∈ (0,1])。
-- [x] 2.2 `metrics.rs`:`store_server_flushes_total`/`store_server_compactions_total`/`store_server_hard_deleted_total`。
+- [x] 2.1 `config.rs`:`local_worker_enabled`(默认 true)/`flush_interval_secs`/`compaction_interval_secs`/`compaction_dead_ratio` + `Default` + `Validate`(周期 ≥1,ratio ∈ (0,1])。
+- [x] 2.2 `metrics.rs`:`store_server_flushes_total`/`store_server_compactions_total`。
 
 ## 3. worker 实现
 - [x] 3.1 `replica.rs`:`ReplicaManager::handles()`(快照全部 `(pid, ReplicaHandle)`)。
-- [x] 3.2 `worker.rs`:`flush_all`/`compact_all(threshold)`/`hard_delete_all` 纯函数(返回计数,可单测)+ `spawn_local_worker`(三个独立周期 loop,经 `spawn_blocking`)。
+- [x] 3.2 `worker.rs`:`flush_all`/`compact_all(threshold)` 纯函数(返回计数,可单测)+ `spawn_local_worker`(两个独立周期 loop,经 `spawn_blocking`)。
 - [x] 3.3 `server.rs`:`serve()` 里若 `local_worker_enabled` 起 worker。
 
 ## 4. 测试
-- [x] 4.1 单测:put→flush_all→重开可读;put+delete→compact_all 回收;delete→hard_delete_all 擦零。
+- [x] 4.1 单测:put→flush_all→重开可读;put+delete→compact_all 回收。
 - [x] 4.2 `cargo test` 绿 + `cargo clippy` 无告警 + workspace build。
 
 ## 5. 文档

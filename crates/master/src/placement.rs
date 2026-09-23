@@ -164,7 +164,12 @@ mod tests {
             disks: disks
                 .iter()
                 .map(|(id, cap)| {
-                    (id.to_string(), DiskSpec { capacity_bytes: *cap })
+                    (
+                        id.to_string(),
+                        DiskSpec {
+                            capacity_bytes: *cap,
+                        },
+                    )
                 })
                 .collect(),
             registered_at_ms: 0,
@@ -175,12 +180,18 @@ mod tests {
 
     /// 盘余量快照(health 空串 = 该盘未启用主动探测)。
     fn free(free_bytes: u64) -> DiskFree {
-        DiskFree { free_bytes, health: String::new() }
+        DiskFree {
+            free_bytes,
+            health: String::new(),
+        }
     }
 
     /// 带健康上报的盘余量快照。
     fn free_health(free_bytes: u64, health: &str) -> DiskFree {
-        DiskFree { free_bytes, health: health.to_string() }
+        DiskFree {
+            free_bytes,
+            health: health.to_string(),
+        }
     }
 
     #[test]
@@ -215,7 +226,13 @@ mod tests {
             ((2, "d0".to_string()), free(10)),
         ]);
         let err = select_disks(&nodes, &usage, 2, CAP, 0.95).unwrap_err();
-        assert!(matches!(err, PlacementError::InsufficientDisks { needed: 2, available: 1 }));
+        assert!(matches!(
+            err,
+            PlacementError::InsufficientDisks {
+                needed: 2,
+                available: 1
+            }
+        ));
     }
 
     #[test]
@@ -231,7 +248,13 @@ mod tests {
         let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
         let usage = BTreeMap::new(); // 无心跳余量
         let err = select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap_err();
-        assert!(matches!(err, PlacementError::InsufficientDisks { needed: 1, available: 0 }));
+        assert!(matches!(
+            err,
+            PlacementError::InsufficientDisks {
+                needed: 1,
+                available: 0
+            }
+        ));
     }
 
     #[test]
@@ -247,10 +270,19 @@ mod tests {
         ]);
         // RF=2 只剩 1 块可用盘 → 不足(绝不放到坏盘上);RF=1 则只选健康的 node1。
         let err = select_disks(&nodes, &usage, 2, CAP, 0.95).unwrap_err();
-        assert!(matches!(err, PlacementError::InsufficientDisks { needed: 2, available: 1 }));
+        assert!(matches!(
+            err,
+            PlacementError::InsufficientDisks {
+                needed: 2,
+                available: 1
+            }
+        ));
         let one = select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap();
         assert_eq!(one.len(), 1);
-        assert_eq!(one[0].node_id, 1, "unhealthy disk must not host a new replica");
+        assert_eq!(
+            one[0].node_id, 1,
+            "unhealthy disk must not host a new replica"
+        );
     }
 
     #[test]

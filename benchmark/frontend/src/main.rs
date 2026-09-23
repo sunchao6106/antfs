@@ -24,7 +24,10 @@ async fn main() {
     let args = Args::parse(&["verify", "help"]);
     args.help(USAGE);
     let cfg = Cfg {
-        base: args.flag("frontend").unwrap_or("http://127.0.0.1:7400").to_string(),
+        base: args
+            .flag("frontend")
+            .unwrap_or("http://127.0.0.1:7400")
+            .to_string(),
         timeout_secs: args.num("timeout-secs", 30),
         ops: args.num("ops", 10_000),
         concurrency: args.num::<u64>("concurrency", 32).max(1),

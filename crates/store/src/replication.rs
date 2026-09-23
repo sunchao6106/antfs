@@ -2,7 +2,7 @@
 //!
 //! 承 cluster.md D4/§10:step-1 元数据(`find_entries_since`)走 HTTP(见 design.md D-B),
 //! step-2 缺失数据体走 HTTP blob 读(`?replication=1`)。忠实写入由 store `apply_replicated` 完成
-//! (保留 peer 的 flags/lifeVersion,防副本发散)。收敛逻辑同步阻塞,由调用方经 `spawn_blocking` offload。
+//! (忠实保留 peer 的 flags,防副本发散)。收敛逻辑同步阻塞,由调用方经 `spawn_blocking` offload。
 //!
 //! # 追平判据(副本实然态 `BOOTSTRAP → ACTIVE` 的唯一入口)
 //!
@@ -47,12 +47,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use antfs_blob::{
+    ApplyOutcome, BlobStore, FindInfo, FindToken, LogOffset, MessageInfo, ReplicatedRecord,
+    StoreKey,
+};
 use antfs_master::pb::master_client::MasterClient;
 use antfs_master::pb::LookupRequest;
 use serde::{Deserialize, Serialize};
-use antfs_blob::{
-    ApplyOutcome, BlobStore, FindInfo, FindToken, LogOffset, MessageInfo, ReplicatedRecord, StoreKey,
-};
 
 use crate::config::StoreServerConfig;
 use crate::error::{Error, Result};
@@ -67,10 +68,6 @@ pub struct MetadataEntry {
     pub size: u64,
     pub expiration_ms: i64,
     pub deleted: bool,
-    pub ttl_updated: bool,
-    pub undeleted: bool,
-    pub life_version: u16,
-    pub operation_time_ms: u64,
 }
 
 /// `replica-metadata` 端点响应:一批条目 + 新游标(seg/off,均 None = Uninitialized)+ 已读字节。
@@ -118,22 +115,18 @@ fn entry_from(m: &MessageInfo) -> MetadataEntry {
         size: m.size,
         expiration_ms: m.expiration_ms,
         deleted: m.deleted,
-        ttl_updated: m.ttl_updated,
-        undeleted: m.undeleted,
-        life_version: m.life_version,
-        operation_time_ms: m.operation_time_ms,
     }
 }
 
-/// store 记录三态标志位(与 `antfs_blob::index::value` 的 FLAG_* 对齐)。
+/// store 记录标志位(与 `antfs_blob::index::value` 的 FLAG_* 对齐)。
 const FLAG_DELETED: u8 = 1 << 0;
-const FLAG_TTL_UPDATED: u8 = 1 << 1;
-const FLAG_UNDELETED: u8 = 1 << 2;
 
 fn flags_of(e: &MetadataEntry) -> u8 {
-    (if e.deleted { FLAG_DELETED } else { 0 })
-        | (if e.ttl_updated { FLAG_TTL_UPDATED } else { 0 })
-        | (if e.undeleted { FLAG_UNDELETED } else { 0 })
+    if e.deleted {
+        FLAG_DELETED
+    } else {
+        0
+    }
 }
 
 /// peer 对 `GET /partitions/{pid}/replica-metadata` 的应答。
@@ -209,7 +202,12 @@ pub fn replicate_from_peer(
         let resp = match peer.metadata(token, max_bytes)? {
             PeerMetadata::Entries(resp) => resp,
             PeerMetadata::NoReplica => {
-                return Ok(SyncOutcome { token, stats, bootstrap: BootstrapStats::default(), no_replica: true })
+                return Ok(SyncOutcome {
+                    token,
+                    stats,
+                    bootstrap: BootstrapStats::default(),
+                    no_replica: true,
+                })
             }
         };
         if resp.entries.is_empty() {
@@ -223,7 +221,8 @@ pub fn replicate_from_peer(
             let Some(key) = bytes else {
                 return Err(Error::Replication(format!("bad key hex: {}", e.key)));
             };
-            // 仅本地缺失且 peer 存活时才拉数据体;变更(delete/ttl/undelete on existing)数据在本地。
+            // 只有本地**根本没有**这个 key 时才要拉数据体。删除(墓碑)/写入都在 peer 的元数据里带全了:
+            // 本地已有该 key 时,写一条 local 的墓碑或覆盖就够,数据体不需要搬。
             let need_data = !e.deleted && local.stat(&key).is_err();
             let data = if need_data {
                 match peer.fetch_data(&key)? {
@@ -237,8 +236,6 @@ pub fn replicate_from_peer(
                 key,
                 flags: flags_of(e),
                 expiration_ms: e.expiration_ms,
-                operation_time_ms: e.operation_time_ms,
-                life_version: e.life_version,
                 data,
             })?;
             if outcome == ApplyOutcome::Applied {
@@ -248,7 +245,12 @@ pub fn replicate_from_peer(
         }
         token = resp.next_token();
     }
-    Ok(SyncOutcome { token, stats, bootstrap: BootstrapStats::default(), no_replica: false })
+    Ok(SyncOutcome {
+        token,
+        stats,
+        bootstrap: BootstrapStats::default(),
+        no_replica: false,
+    })
 }
 
 /// 用阻塞 HTTP 客户端实现 `PeerSource`(在 `spawn_blocking` 线程里用,不碰 tokio reactor)。
@@ -264,7 +266,11 @@ impl HttpPeer {
             .timeout(timeout)
             .build()
             .map_err(|e| Error::Replication(e.to_string()))?;
-        Ok(HttpPeer { base: base.into(), pid, client })
+        Ok(HttpPeer {
+            base: base.into(),
+            pid,
+            client,
+        })
     }
 }
 
@@ -277,16 +283,25 @@ impl PeerSource for HttpPeer {
         if let FindToken::Offset(o) = token {
             url.push_str(&format!("&seg={}&off={}", o.segment, o.offset));
         }
-        let resp = self.client.get(&url).send().map_err(|e| Error::Replication(e.to_string()))?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| Error::Replication(e.to_string()))?;
         // 404 = 该 peer 上没有这个分区的副本(不是故障):如实回 `NoReplica`,让判据把它当
         // "peer 没有该分区数据"(见模块头「追平判据」第 1 条),而不是当成一轮错误。
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(PeerMetadata::NoReplica);
         }
         if !resp.status().is_success() {
-            return Err(Error::Replication(format!("metadata status {}", resp.status())));
+            return Err(Error::Replication(format!(
+                "metadata status {}",
+                resp.status()
+            )));
         }
-        let resp = resp.json::<MetadataResponse>().map_err(|e| Error::Replication(e.to_string()))?;
+        let resp = resp
+            .json::<MetadataResponse>()
+            .map_err(|e| Error::Replication(e.to_string()))?;
         Ok(PeerMetadata::Entries(resp))
     }
 
@@ -297,33 +312,62 @@ impl PeerSource for HttpPeer {
             self.pid,
             hex::encode(key.as_bytes())
         );
-        let resp = self.client.get(&url).send().map_err(|e| Error::Replication(e.to_string()))?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| Error::Replication(e.to_string()))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(Error::Replication(format!("fetch status {}", resp.status())));
+            return Err(Error::Replication(format!(
+                "fetch status {}",
+                resp.status()
+            )));
         }
-        let bytes = resp.bytes().map_err(|e| Error::Replication(e.to_string()))?;
+        let bytes = resp
+            .bytes()
+            .map_err(|e| Error::Replication(e.to_string()))?;
         Ok(Some(bytes.to_vec()))
     }
 
     fn sealed_segments(&self) -> Result<Vec<SegmentInfo>> {
         let url = format!("{}/partitions/{}/segments", self.base, self.pid);
-        let resp = self.client.get(&url).send().map_err(|e| Error::Replication(e.to_string()))?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| Error::Replication(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(Error::Replication(format!("segments status {}", resp.status())));
+            return Err(Error::Replication(format!(
+                "segments status {}",
+                resp.status()
+            )));
         }
-        resp.json::<Vec<SegmentInfo>>().map_err(|e| Error::Replication(e.to_string()))
+        resp.json::<Vec<SegmentInfo>>()
+            .map_err(|e| Error::Replication(e.to_string()))
     }
 
     fn fetch_segment(&self, position: u64) -> Result<Vec<u8>> {
-        let url = format!("{}/partitions/{}/segments/{}", self.base, self.pid, position);
-        let resp = self.client.get(&url).send().map_err(|e| Error::Replication(e.to_string()))?;
+        let url = format!(
+            "{}/partitions/{}/segments/{}",
+            self.base, self.pid, position
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| Error::Replication(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(Error::Replication(format!("segment status {}", resp.status())));
+            return Err(Error::Replication(format!(
+                "segment status {}",
+                resp.status()
+            )));
         }
-        let bytes = resp.bytes().map_err(|e| Error::Replication(e.to_string()))?;
+        let bytes = resp
+            .bytes()
+            .map_err(|e| Error::Replication(e.to_string()))?;
         Ok(bytes.to_vec())
     }
 }
@@ -359,7 +403,13 @@ pub fn bootstrap_from_peer(
     replicas.install_bootstrap(pid, &segs)?;
     // 续拉游标 = 最高封存段末尾(其后即活跃段,逻辑补)。
     let last = sealed.iter().max_by_key(|s| s.position).expect("non-empty");
-    Ok((Some(FindToken::Offset(LogOffset::new(last.position, last.data_end))), stats))
+    Ok((
+        Some(FindToken::Offset(LogOffset::new(
+            last.position,
+            last.data_end,
+        ))),
+        stats,
+    ))
 }
 
 /// 一轮对某 peer 的完整同步:空副本首次先物理 bootstrap(若启用),再从续拉游标逻辑补。
@@ -378,7 +428,10 @@ pub fn sync_from_peer(
     let mut start = prior_token.unwrap_or_default();
     let mut boot = BootstrapStats::default();
     let is_first = prior_token.is_none();
-    let empty = replicas.get(pid).map(|h| h.store.is_empty()).unwrap_or(false);
+    let empty = replicas
+        .get(pid)
+        .map(|h| h.store.is_empty())
+        .unwrap_or(false);
     if is_first && bootstrap_enabled && empty {
         if let Ok((Some(tok), s)) = bootstrap_from_peer(replicas, pid, peer) {
             start = tok;
@@ -415,7 +468,9 @@ pub fn lag_bytes(peer: FindToken, applied: FindToken, segment_capacity: u64) -> 
     };
     let segs = i128::from(p.segment).saturating_sub(i128::from(l.segment));
     let offs = i128::from(p.offset).saturating_sub(i128::from(l.offset));
-    let bytes = segs.saturating_mul(i128::from(segment_capacity)).saturating_add(offs);
+    let bytes = segs
+        .saturating_mul(i128::from(segment_capacity))
+        .saturating_add(offs);
     // 负值 = 本地已 apply 越过 peer 游标(对端重建/清空等),按"未滞后"报 0。
     u64::try_from(bytes).unwrap_or(0)
 }
@@ -468,7 +523,11 @@ fn mark_caught_up(replicas: &ReplicaManager, pid: PartitionId, reason: &str) {
         return;
     };
     if handle.mark_active() {
-        tracing::info!(partition = pid, reason, "replica caught up; reporting ACTIVE");
+        tracing::info!(
+            partition = pid,
+            reason,
+            "replica caught up; reporting ACTIVE"
+        );
     }
 }
 
@@ -488,8 +547,19 @@ pub fn sync_round(
     max_bytes: u64,
     bootstrap_enabled: bool,
 ) -> Result<SyncOutcome> {
-    let out = sync_from_peer(replicas, pid, peer, prior_token, max_bytes, bootstrap_enabled)?;
-    let lag = lag_bytes(out.token, prior_token.unwrap_or_default(), replicas.segment_size_bytes());
+    let out = sync_from_peer(
+        replicas,
+        pid,
+        peer,
+        prior_token,
+        max_bytes,
+        bootstrap_enabled,
+    )?;
+    let lag = lag_bytes(
+        out.token,
+        prior_token.unwrap_or_default(),
+        replicas.segment_size_bytes(),
+    );
     let Some(handle) = replicas.get(pid) else {
         return Ok(out);
     };
@@ -536,10 +606,19 @@ async fn run(
         if paused.load(Ordering::Relaxed) {
             continue;
         }
-        let pids: Vec<PartitionId> =
-            replicas.replica_states().into_iter().map(|s| s.partition_id).collect();
+        let pids: Vec<PartitionId> = replicas
+            .replica_states()
+            .into_iter()
+            .map(|s| s.partition_id)
+            .collect();
         for pid in pids {
-            let locs = match client.lookup_partition(LookupRequest { version: 1, partition_id: pid }).await {
+            let locs = match client
+                .lookup_partition(LookupRequest {
+                    version: 1,
+                    partition_id: pid,
+                })
+                .await
+            {
                 Ok(r) => r.into_inner().replicas,
                 Err(_) => continue,
             };
@@ -594,12 +673,6 @@ mod tests {
         BlobStore::create(dir, 64 << 20, 1 << 20, 1000).unwrap()
     }
 
-    fn hex_key(n: u8) -> String {
-        let mut b = [0u8; 8];
-        b[0] = n;
-        hex::encode(b)
-    }
-
     /// 进程内 PeerSource:直接包裹一个 `BlobStore`,免 socket 的确定性收敛测试。
     struct LocalPeer<'a> {
         store: &'a BlobStore,
@@ -611,7 +684,7 @@ mod tests {
             )))
         }
         fn fetch_data(&self, key: &StoreKey) -> Result<Option<Vec<u8>>> {
-            match self.store.get_with_options(key, true, true) {
+            match self.store.get_with_options(key, true) {
                 Ok(d) => Ok(Some(d)),
                 Err(antfs_blob::Error::NotFound) => Ok(None),
                 Err(e) => Err(Error::Store(e)),
@@ -620,7 +693,7 @@ mod tests {
     }
 
     fn key(n: u8) -> StoreKey {
-        StoreKey::from_slice(&hex::decode(hex_key(n)).unwrap()).unwrap()
+        StoreKey::from_parts(0, n as u32)
     }
 
     #[test]
@@ -646,7 +719,10 @@ mod tests {
         // delete 传播。
         peer.delete(key(1)).unwrap();
         let _ = replicate_from_peer(&local, &src, FindToken::Uninitialized, u64::MAX).unwrap();
-        assert!(matches!(local.get(&key(1)), Err(antfs_blob::Error::Deleted)));
+        assert!(matches!(
+            local.get(&key(1)),
+            Err(antfs_blob::Error::Deleted)
+        ));
     }
 
     /// 滞后线性化:跨段按段容量折算;peer 不在前 / 游标未知 → 0。
@@ -658,8 +734,16 @@ mod tests {
         assert_eq!(lag_bytes(late, early, cap), 2 * cap - 500);
         assert_eq!(lag_bytes(early, late, cap), 0, "本地已在前 → 未滞后");
         assert_eq!(lag_bytes(early, early, cap), 0, "追平 → 0");
-        assert_eq!(lag_bytes(FindToken::Uninitialized, early, cap), 0, "无基线 → 0");
-        assert_eq!(lag_bytes(early, FindToken::Uninitialized, cap), 0, "无基线 → 0");
+        assert_eq!(
+            lag_bytes(FindToken::Uninitialized, early, cap),
+            0,
+            "无基线 → 0"
+        );
+        assert_eq!(
+            lag_bytes(early, FindToken::Uninitialized, cap),
+            0,
+            "无基线 → 0"
+        );
     }
 
     #[test]
@@ -689,19 +773,31 @@ mod tests {
     /// - 本地已收敛到 peer 游标 → 一致。
     #[test]
     fn local_has_nothing_past_handles_empty_partition_and_lagging_local() {
-        let (d_local, d_peer, d_empty) =
-            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (d_local, d_peer, d_empty) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
         let empty = store(d_empty.path());
         // 双方皆空(游标都是 Uninitialized)→ 一致。
-        assert!(local_has_nothing_past(&empty, FindToken::Uninitialized), "空分区(两侧都空)必须算追平");
+        assert!(
+            local_has_nothing_past(&empty, FindToken::Uninitialized),
+            "空分区(两侧都空)必须算追平"
+        );
 
         // 本地有数据 + peer 游标未知:本地还有内容 → 不一致。
         let local = store(d_local.path());
         local.put(key(1), b"a").unwrap();
-        assert!(!local_has_nothing_past(&local, FindToken::Uninitialized), "本地有数据 ≠ 追平");
+        assert!(
+            !local_has_nothing_past(&local, FindToken::Uninitialized),
+            "本地有数据 ≠ 追平"
+        );
 
         // 本地一条都没有 + peer 游标非空:本地落后 → 不一致。
-        assert!(!local_has_nothing_past(&empty, FindToken::Offset(LogOffset::new(0, 0))));
+        assert!(!local_has_nothing_past(
+            &empty,
+            FindToken::Offset(LogOffset::new(0, 0))
+        ));
 
         // 本地已从 peer 拉到末端:从 peer 游标再问本地库一无所获 → 一致。
         let peer = store(d_peer.path());
@@ -709,7 +805,10 @@ mod tests {
         let src = LocalPeer { store: &peer };
         let out = replicate_from_peer(&empty, &src, FindToken::Uninitialized, u64::MAX).unwrap();
         assert_eq!(out.stats.applied, 1, "peer 的 1 条记录必须拉过来");
-        assert!(local_has_nothing_past(&empty, out.token), "本地已 apply 到 peer 末端 → 一致");
+        assert!(
+            local_has_nothing_past(&empty, out.token),
+            "本地已 apply 到 peer 末端 → 一致"
+        );
     }
 
     /// `no_replica` 的判据半:peer 无该分区副本 → 满足(没有数据要同步);本轮从它身上拉到过东西则不算。
@@ -719,7 +818,13 @@ mod tests {
         let local = store(d.path());
         let empty = SyncOutcome::default();
         assert!(
-            caught_up_with_peer(&local, &SyncOutcome { no_replica: true, ..empty }),
+            caught_up_with_peer(
+                &local,
+                &SyncOutcome {
+                    no_replica: true,
+                    ..empty
+                }
+            ),
             "peer 无副本 = 无数据可同步 → 算追平"
         );
         assert!(
@@ -727,7 +832,10 @@ mod tests {
                 &local,
                 &SyncOutcome {
                     no_replica: true,
-                    stats: ReplicateStats { applied: 1, bytes: 8 },
+                    stats: ReplicateStats {
+                        applied: 1,
+                        bytes: 8
+                    },
                     ..empty
                 }
             ),

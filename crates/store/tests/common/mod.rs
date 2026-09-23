@@ -66,7 +66,10 @@ impl FakeMaster {
         };
         let svc = MasterServer::new(fake.clone());
         tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder().add_service(svc).serve(addr).await;
+            let _ = tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve(addr)
+                .await;
         });
         wait_until_connectable(addr).await;
         fake
@@ -79,7 +82,10 @@ impl FakeMaster {
 
     /// 排队一条指令:在**下一条**心跳流建立并收到首条 beat 后原样下发。
     pub fn push_directive(&self, directive: MasterDirective) {
-        self.directives.lock().expect("fake master directives lock").push(directive);
+        self.directives
+            .lock()
+            .expect("fake master directives lock")
+            .push(directive);
     }
 
     /// 排队一条「把某分区推到 `target_state`」的转移指令(单条 transition)。
@@ -279,7 +285,10 @@ async fn wait_until_connectable(addr: SocketAddr) {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return;
         }
-        assert!(Instant::now() < deadline, "fake master 未在超时内监听 {addr}");
+        assert!(
+            Instant::now() < deadline,
+            "fake master 未在超时内监听 {addr}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

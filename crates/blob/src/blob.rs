@@ -1,16 +1,19 @@
 //! `BlobStore`:把 [`Log`](crate::log::Log) 与 [`PersistentIndex`](crate::index::PersistentIndex)
 //! 串成一个对象存储:`put` / `get` / `delete`。
 //!
-//! 每次写入都在 Log 追加一条**自描述记录**(含 key/flags/crc),索引只保存
-//! `key → (LogOffset, 记录大小, flags)`。因此索引损坏时可由扫描 Log 重建(见路线图)。
+//! 对象**不可变**:写入后不再改数据,`delete` 只追加墓碑;key(blobId)永久占用,
+//! 删除不可逆,TTL 只在写入时定。
 //!
-//! 记录布局(小端,crc 覆盖其前所有字节):
+//! 每次写入都在 Log 追加一条**自描述记录**(含 key 后缀/flags/crc),索引只保存
+//! `key → (LogOffset, 记录大小, flags, TTL)`。因此索引损坏时可由扫描 Log 重建。
+//!
+//! 记录布局(小端,crc 覆盖其前所有字节;总开销 24B):
 //! ```text
-//! [ magic u16 | version u8 | flags u8 | key(32) | expiration i64 | op_time u64 | life_version u16 | data_len u32 | data | crc u32 ]
+//! [ magic u16 | version u8 | flags u8 | key_suffix u32 | expiration i64 | data_len u32 | data | crc u32 ]
 //! ```
-//! `put` 写 `flags=0`;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑;`undelete` 写
-//! `flags=FLAG_UNDELETED`、复制原数据的整记录并 `life_version+1`。expiration/op_time/life_version
-//! 落进记录,故从 log 重建索引时 TTL 与生命版本不丢失。
+//! key 的**高 32bit(partitionId)不落在记录里** —— 一个 log 段属于唯一一个副本,该前缀是整段
+//! 常量,写在段头(`LogSegment::key_prefix`),记录只存低 32bit 的 `objectId`;读时由
+//! [`Log::key_prefix`] 补全。`put` 写 `flags=0`;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑。
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -19,28 +22,24 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::StoreConfig;
 use crate::error::{Error, Result};
-use crate::index::value::{
-    FLAG_DELETED, FLAG_HARD_DELETED, FLAG_TTL_UPDATED, FLAG_UNDELETED, NO_EXPIRATION,
-};
+use crate::index::value::{FLAG_DELETED, NO_EXPIRATION};
 use crate::index::{IndexValue, PersistentIndex};
 use crate::log::Log;
 use crate::log_segment::LogSegment;
 use crate::metrics::{StoreMetricHandles, StoreMetrics};
-use crate::types::{LogOffset, LogSegmentName, StoreKey, KEY_SIZE};
+use crate::types::{LogOffset, LogSegmentName, StoreKey};
 
 const REC_MAGIC: u16 = 0x424D; // "MB"
-const REC_VERSION: u8 = 3;
+const REC_VERSION: u8 = 4;
 
 mod rec {
-    use super::KEY_SIZE;
     pub const MAGIC: usize = 0;
     pub const VERSION: usize = 2;
     pub const FLAGS: usize = 3;
-    pub const KEY: usize = 4;
-    pub const EXPIRATION: usize = KEY + KEY_SIZE; // i64
-    pub const OP_TIME: usize = EXPIRATION + 8; // u64
-    pub const LIFE_VERSION: usize = OP_TIME + 8; // u16
-    pub const DATA_LEN: usize = LIFE_VERSION + 2; // u32
+    /// key 的**低 32bit**(`objectId`);高 32bit 在段头(`LogSegment::key_prefix`)。
+    pub const KEY_SUFFIX: usize = 4; // u32
+    pub const EXPIRATION: usize = KEY_SUFFIX + 4; // i64
+    pub const DATA_LEN: usize = EXPIRATION + 8; // u32
     pub const DATA: usize = DATA_LEN + 4;
     pub const CRC_LEN: usize = 4;
 }
@@ -61,34 +60,31 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 只写记录头(magic/version/flags/key/expiration/op_time/life_version/data_len)。
+/// 只写记录头(magic/version/flags/key 后缀/expiration/data_len)。
 ///
 /// 流式写入需要**先落头再落数据体**(长度已知,先写在预留区首部),故与 [`encode_record`] 共用。
+/// `key_suffix` 按**大端**落盘,与 [`StoreKey`] 的字节序一致(便于十六进制对读)。
 fn encode_header_into(
     buf: &mut [u8],
-    key: &StoreKey,
+    key_suffix: u32,
     flags: u8,
     expiration_ms: i64,
-    operation_time_ms: u64,
-    life_version: u16,
     data_len: u32,
 ) {
     debug_assert!(buf.len() >= RECORD_HEADER);
     buf[rec::MAGIC..rec::MAGIC + 2].copy_from_slice(&REC_MAGIC.to_le_bytes());
     buf[rec::VERSION] = REC_VERSION;
     buf[rec::FLAGS] = flags;
-    buf[rec::KEY..rec::KEY + KEY_SIZE].copy_from_slice(key.as_bytes());
+    buf[rec::KEY_SUFFIX..rec::KEY_SUFFIX + 4].copy_from_slice(&key_suffix.to_be_bytes());
     buf[rec::EXPIRATION..rec::EXPIRATION + 8].copy_from_slice(&expiration_ms.to_le_bytes());
-    buf[rec::OP_TIME..rec::OP_TIME + 8].copy_from_slice(&operation_time_ms.to_le_bytes());
-    buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2].copy_from_slice(&life_version.to_le_bytes());
     buf[rec::DATA_LEN..rec::DATA_LEN + 4].copy_from_slice(&data_len.to_le_bytes());
 }
 
 /// 记录内 `data_len` 是 u32:数据体超过 `u32::MAX` 的记录**不可写** —— 否则长度字段回绕,落盘后任何读取
 /// 都会因 `decode_record` 的尺寸校验失败而报 `Corrupt`(持久性红线:宁拒绝,不写坏)。
 ///
-/// 段大小默认 4 GiB 时本检查**必然通过**(单条记录 ≤ 段 − 102 < `u32::MAX`),保留它是为"把段配大"
-/// (如 8 GiB)时兜底:`segment_size_bytes` 放大后仍能写进 log,但单条超过 4 GiB 的对象会被这里拒掉。
+/// 段大小上限 4 GiB(`StoreConfig::validate` 强制)时本检查**必然通过**(单条记录 ≤ 段 − 102
+/// < `u32::MAX`),保留它是第二道保险。
 fn record_data_len(len: u64) -> Result<u32> {
     u32::try_from(len).map_err(|_| {
         Error::BadArgument(format!(
@@ -98,24 +94,24 @@ fn record_data_len(len: u64) -> Result<u32> {
     })
 }
 
-fn encode_record(
-    key: &StoreKey,
-    flags: u8,
-    expiration_ms: i64,
-    operation_time_ms: u64,
-    life_version: u16,
-    data: &[u8],
-) -> Result<Vec<u8>> {
+/// 索引条目里的 `size` 是 u32(段 ≤ 4 GiB ⇒ 整条记录必然放得下):显式转换,不静默截断。
+fn record_size_u32(size: u64) -> Result<u32> {
+    u32::try_from(size).map_err(|_| {
+        Error::BadArgument(format!(
+            "record size {size} does not fit the index entry's u32 field"
+        ))
+    })
+}
+
+fn encode_record(key: &StoreKey, flags: u8, expiration_ms: i64, data: &[u8]) -> Result<Vec<u8>> {
     let data_len = record_data_len(data.len() as u64)?;
     let total = RECORD_OVERHEAD + data.len();
     let mut buf = vec![0u8; total];
     encode_header_into(
         &mut buf[..RECORD_HEADER],
-        key,
+        key.object_id(),
         flags,
         expiration_ms,
-        operation_time_ms,
-        life_version,
         data_len,
     );
     buf[rec::DATA..rec::DATA + data.len()].copy_from_slice(data);
@@ -129,12 +125,10 @@ struct DecodedRecord {
     flags: u8,
     key: StoreKey,
     expiration_ms: i64,
-    operation_time_ms: u64,
-    life_version: u16,
     data: Vec<u8>,
 }
 
-fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
+fn decode_record(buf: &[u8], key_prefix: u32) -> Result<DecodedRecord> {
     if buf.len() < RECORD_OVERHEAD {
         return Err(Error::Corrupt(format!("record too short: {}", buf.len())));
     }
@@ -149,16 +143,14 @@ fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
         )));
     }
     let flags = buf[rec::FLAGS];
-    let key = StoreKey::from_slice(&buf[rec::KEY..rec::KEY + KEY_SIZE]).expect("key size fixed");
-    let expiration_ms = i64::from_le_bytes(
-        buf[rec::EXPIRATION..rec::EXPIRATION + 8]
+    let key_suffix = u32::from_be_bytes(
+        buf[rec::KEY_SUFFIX..rec::KEY_SUFFIX + 4]
             .try_into()
             .unwrap(),
     );
-    let operation_time_ms =
-        u64::from_le_bytes(buf[rec::OP_TIME..rec::OP_TIME + 8].try_into().unwrap());
-    let life_version = u16::from_le_bytes(
-        buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2]
+    let key = StoreKey::from_parts(key_prefix, key_suffix);
+    let expiration_ms = i64::from_le_bytes(
+        buf[rec::EXPIRATION..rec::EXPIRATION + 8]
             .try_into()
             .unwrap(),
     );
@@ -183,8 +175,6 @@ fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
         flags,
         key,
         expiration_ms,
-        operation_time_ms,
-        life_version,
         data: buf[rec::DATA..crc_at].to_vec(),
     })
 }
@@ -202,6 +192,9 @@ pub struct BlobStore {
     total_capacity: u64,
     segment_capacity: u64,
     max_index_entries_per_segment: usize,
+    /// 本副本的 key 前缀 = blobId 高 32bit(partitionId)。写入 log 段头,记录体内只存低 32bit;
+    /// 写路径据此**拒绝不属于本分区的 key**(否则落盘后读不回来)。
+    key_prefix: u32,
     inner: RwLock<Arc<Inner>>,
     write_lock: Mutex<()>,
     seg_bytes: Mutex<BTreeMap<u64, SegBytes>>,
@@ -216,6 +209,8 @@ pub struct BlobStore {
     available: AtomicBool,
     /// 自关回调(store-server 设置:标 replica ERROR → 上报 master),仅触发一次。
     io_error_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 打开时的容错恢复报告(空 = 干净);见 [`OpenDamage`] 与 [`Self::open_damage`]。
+    open_damage: OpenDamage,
 }
 
 /// 一致的 `{log, index}` 快照;compaction 时整体替换,保证读者不见「新 log + 旧 index」撕裂态。
@@ -234,8 +229,7 @@ struct SegBytes {
 /// 有效数据字节的增量核算:当前索引赢家中**未删除**记录的 `size` 之和(墓碑不计)。
 ///
 /// 简化取舍:**不区分过期**——过期但尚未被 compaction 回收的对象仍占盘,故计入(避免按过期
-/// 时刻分桶的复杂度)。赢家变更(put/delete/undelete/update_ttl)时增量 add/remove,
-/// compaction/open 全量重算。
+/// 时刻分桶的复杂度)。赢家变更(put/delete)时增量 add/remove,compaction/open 全量重算。
 #[derive(Default)]
 struct ValidStats {
     bytes: u64,
@@ -244,13 +238,13 @@ struct ValidStats {
 impl ValidStats {
     fn add(&mut self, v: &IndexValue) {
         if !v.is_deleted() {
-            self.bytes += v.size;
+            self.bytes += v.size_bytes();
         }
     }
 
     fn remove(&mut self, v: &IndexValue) {
         if !v.is_deleted() {
-            self.bytes = self.bytes.saturating_sub(v.size);
+            self.bytes = self.bytes.saturating_sub(v.size_bytes());
         }
     }
 }
@@ -264,6 +258,33 @@ pub struct CompactionStats {
     pub segments_after: usize,
 }
 
+/// **打开副本时的容错恢复报告**:`open` 遇到坏记录不再整体失败,而是跳过坏记录、尽力恢复,
+/// 并把损伤如实记在这里(见 [`BlobStore::open_damage`]);同时 ERROR 日志 + 指标 + 经 `store` 的
+/// `scrub-report` 暴露给运维。
+///
+/// 设计取舍(CLAUDE.md §3.1 持久性偏执):
+/// - **不删、不改写、不截断**损坏字节 —— 保留证据,便于事后分析与人工处置;
+/// - 只把**无法解码**的记录从索引里跳过(它们本来就读不出来),其余记录照常可读可写;
+/// - 因此"带伤启动"的副本会**少数据但对外可服务**,损伤程度由本报告与 `verify` 如实呈现,
+///   绝不静默。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenDamage {
+    /// 打开时跳过(无法解码 / CRC 不符)的记录数。
+    pub bad_records: u64,
+    /// 第一条坏记录的 `(segment, offset)`。
+    pub first_bad_offset: Option<(u64, u64)>,
+    /// 因**无法重同步**而放弃扫描剩余部分的段数:该段自损坏点之后的内容没有进索引
+    /// (数据仍在盘上,未被删除或改写)。
+    pub abandoned_segments: u64,
+}
+
+impl OpenDamage {
+    /// 是否发生过损伤(日志/指标据此判断,避免干净副本也刷日志)。
+    pub fn is_clean(&self) -> bool {
+        self.bad_records == 0 && self.abandoned_segments == 0
+    }
+}
+
 /// 本地完整性校验结果(见 [`BlobStore::verify`])。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VerifyReport {
@@ -273,7 +294,7 @@ pub struct VerifyReport {
     pub bad_records: u64,
     /// 第一条坏记录的 `(segment, offset)`;全好则 `None`。
     pub first_bad_offset: Option<(u64, u64)>,
-    /// 活记录里"索引元数据与 log 记录不符"的条数(data_len/flags/life_version 任一不符)。
+    /// 活记录里"索引元数据与 log 记录不符"的条数(size/flags 任一不符)。
     pub index_mismatch: u64,
     /// 扫描未覆盖全部 log:`max_bytes` 到点,或遇到无法重同步的坏记录(段尾截断)时为 true。
     pub truncated: bool,
@@ -292,15 +313,12 @@ pub struct IndexStats {
     pub sealed_segments: usize,
 }
 
-/// blob 元数据(不读数据体):状态标志 + TTL + 生命版本 + 数据长度。
+/// blob 元数据(不读数据体):状态标志 + TTL + 数据长度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobMeta {
     pub deleted: bool,
-    pub undeleted: bool,
-    pub ttl_updated: bool,
     pub expired: bool,
     pub expiration_ms: i64,
-    pub life_version: u16,
     pub data_len: u64,
 }
 
@@ -312,10 +330,6 @@ pub struct MessageInfo {
     pub size: u64,
     pub expiration_ms: i64,
     pub deleted: bool,
-    pub ttl_updated: bool,
-    pub undeleted: bool,
-    pub life_version: u16,
-    pub operation_time_ms: u64,
 }
 
 /// 复制增量拉取游标(对齐 Ambry `StoreFindToken` 的核心:log offset 游标)。
@@ -351,35 +365,54 @@ pub enum ApplyOutcome {
 
 /// 从 peer 复制来的一条记录(拉复制 apply 的输入,承 Ambry replication `MessageInfo` + 数据体)。
 ///
-/// `data` 仅在"本地缺失且该记录为存活赢家(非墓碑)"时必需;其余情形(墓碑、或对已有 key 的
-/// TTL/UNDELETE 变更)数据体在本地或无需数据,置 `None` 即可。
+/// `data` 仅在"本地缺失且该记录为存活赢家(非墓碑)"时必需;墓碑无需数据,置 `None` 即可。
 #[derive(Debug, Clone)]
 pub struct ReplicatedRecord {
     pub key: StoreKey,
     pub flags: u8,
     pub expiration_ms: i64,
-    pub operation_time_ms: u64,
-    pub life_version: u16,
     pub data: Option<Vec<u8>>,
 }
 
 impl BlobStore {
-    /// 在 `dir` 下创建新库:数据在 `dir/log`,索引在 `dir/index`。
+    /// 在 `dir` 下创建新库(key 前缀 0,供无分区上下文的测试/工具用):数据在 `dir/log`,索引在 `dir/index`。
+    ///
+    /// 生产路径用 [`create_for_partition`](Self::create_for_partition)。用错前缀不会静默写坏数据:
+    /// 写路径按前缀校验 key,不属于本分区的 key 直接 [`BadArgument`](Error::BadArgument)。
     pub fn create(
         dir: impl AsRef<Path>,
         total_capacity: u64,
         segment_capacity: u64,
         max_index_entries_per_segment: usize,
     ) -> Result<Self> {
+        Self::create_for_partition(
+            dir,
+            total_capacity,
+            segment_capacity,
+            max_index_entries_per_segment,
+            0,
+        )
+    }
+
+    /// 在 `dir` 下创建新库,并声明本副本所属分区:`partition_id` 即 key 前缀(blobId 高 32bit),
+    /// 落进每个 log 段头,记录体内只存低 32bit 后缀。
+    pub fn create_for_partition(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        segment_capacity: u64,
+        max_index_entries_per_segment: usize,
+        partition_id: u32,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let (log_dir, index_dir) = sub_dirs(&dir);
-        let log = Log::create(&log_dir, total_capacity, segment_capacity)?;
+        let log = Log::create(&log_dir, total_capacity, segment_capacity, partition_id)?;
         let index = PersistentIndex::create(&index_dir, max_index_entries_per_segment)?;
         Ok(Self {
             dir,
             total_capacity,
             segment_capacity,
             max_index_entries_per_segment,
+            key_prefix: partition_id,
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(BTreeMap::new()),
@@ -389,6 +422,7 @@ impl BlobStore {
             io_error_threshold: AtomicU32::new(0),
             available: AtomicBool::new(true),
             io_error_hook: Mutex::new(None),
+            open_damage: OpenDamage::default(),
         })
     }
 
@@ -412,20 +446,33 @@ impl BlobStore {
         )?;
         let (log_dir, index_dir) = sub_dirs(&dir);
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
-        let index = match load_index_with_replay(&log, &index_dir, max_index_entries_per_segment) {
-            Ok(index) => index,
-            Err(Error::Corrupt(_)) => {
-                rebuild_index(&log, &index_dir, max_index_entries_per_segment)?
-            }
-            Err(e) => return Err(e),
+        let (index, open_damage) =
+            match load_index_with_replay(&log, &index_dir, max_index_entries_per_segment) {
+                Ok(index) => (index, OpenDamage::default()),
+                // 索引坏、或回放扫到损坏记录 → 全量**容错**重建(坏记录跳过,而不是让副本起不来)。
+                // 注意 `OutOfRange` 也要算损坏:记录头里的长度字段被写坏时,`read_full_record` 读越界
+                // 抛的就是它(见 `resync_skip` 的段尾校验),只认 `Corrupt` 会漏掉这类。
+                Err(Error::Corrupt(_) | Error::OutOfRange { .. }) => {
+                    rebuild_index_tolerant(&log, &index_dir, max_index_entries_per_segment)?
+                }
+                Err(e) => return Err(e),
+            };
+        // 段字节核算本身也是**容错扫描**(坏记录跳过而非报错),它同时是"索引完好但 log 已损坏"
+        // 这条路径上唯一的损伤发现者(索引可加载时不会走重建)。
+        let (seg_bytes, scan_damage) = scan_seg_bytes_tolerant(&log, &index)?;
+        let open_damage = if open_damage.is_clean() {
+            scan_damage
+        } else {
+            open_damage
         };
-        let seg_bytes = scan_seg_bytes(&log, &index)?;
+        log_open_damage(&dir, &open_damage);
         let valid_stats = compute_valid_stats(&log, &index)?;
         Ok(Self {
             dir,
             total_capacity,
             segment_capacity,
             max_index_entries_per_segment,
+            key_prefix: log.key_prefix(),
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(seg_bytes),
@@ -435,14 +482,14 @@ impl BlobStore {
             io_error_threshold: AtomicU32::new(0),
             available: AtomicBool::new(true),
             io_error_hook: Mutex::new(None),
+            open_damage,
         })
     }
 
     /// 索引损坏/丢失时的兜底:打开 Log,丢弃旧索引文件,顺序扫描全部记录重建索引。
     ///
-    /// 记录自描述(含 key/flags),按 Log 追加顺序(旧→新)插入即天然满足 newest-wins。
-    /// 只重建到最近一次 flush 的持久化边界(未落盘尾部本就不可见,无残记录)。
-    /// 注意:记录目前不落 expiration/op_time,重建后这两项归零(当前无 TTL 写入,不影响可见性)。
+    /// 记录自描述(含 key/flags/expiration),按 Log 追加顺序(旧→新)插入即天然满足 newest-wins,
+    /// 重建后 expiration 由记录读回(不丢 TTL)。只重建到最近一次 flush 的持久化边界(未落盘尾部本就不可见,无残记录)。
     pub fn open_rebuild_index(
         dir: impl AsRef<Path>,
         total_capacity: u64,
@@ -458,14 +505,23 @@ impl BlobStore {
         )?;
         let (log_dir, index_dir) = sub_dirs(&dir);
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
-        let index = rebuild_index(&log, &index_dir, max_index_entries_per_segment)?;
-        let seg_bytes = scan_seg_bytes(&log, &index)?;
+        let (index, open_damage) =
+            rebuild_index_tolerant(&log, &index_dir, max_index_entries_per_segment)?;
+        let (seg_bytes, scan_damage) = scan_seg_bytes_tolerant(&log, &index)?;
+        let open_damage = if open_damage.is_clean() {
+            scan_damage
+        } else {
+            open_damage
+        };
+        log_open_damage(&dir, &open_damage);
+
         let valid_stats = compute_valid_stats(&log, &index)?;
         Ok(Self {
             dir,
             total_capacity,
             segment_capacity,
             max_index_entries_per_segment,
+            key_prefix: log.key_prefix(),
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(seg_bytes),
@@ -475,12 +531,16 @@ impl BlobStore {
             io_error_threshold: AtomicU32::new(0),
             available: AtomicBool::new(true),
             io_error_hook: Mutex::new(None),
+            open_damage,
         })
     }
 
     /// 依赖注入版构造(对齐 Ambry `StorageManager`→`BlobStore` 的 DI 形状):由调用方注入共享的
     /// [`StoreConfig`] 与 [`StoreMetrics`],`store_id` 作为指标的 `store` label。`total_capacity`
     /// 是 per-replica 属性(对齐 Ambry `capacityInBytes`),仍显式传入。
+    ///
+    /// 本构造用 key 前缀 0(无分区上下文);生产副本走
+    /// [`create_with_partition`](Self::create_with_partition)。
     pub fn create_with(
         dir: impl AsRef<Path>,
         total_capacity: u64,
@@ -488,21 +548,30 @@ impl BlobStore {
         metrics: &StoreMetrics,
         store_id: &str,
     ) -> Result<Self> {
-        let mut store = Self::create(
+        Self::create_with_partition(dir, total_capacity, config, metrics, store_id, 0)
+    }
+
+    /// [`create_with`](Self::create_with) + 声明本副本分区(`partition_id` = key 前缀 = blobId 高 32bit)。
+    pub fn create_with_partition(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        config: &StoreConfig,
+        metrics: &StoreMetrics,
+        store_id: &str,
+        partition_id: u32,
+    ) -> Result<Self> {
+        let store = Self::create_for_partition(
             dir,
             total_capacity,
             config.segment_size_bytes,
             config.index_max_inmem_elements,
+            partition_id,
         )?;
-        store
-            .io_error_threshold
-            .store(config.io_error_count_to_trigger_shutdown, Ordering::Relaxed);
-        store.metrics = metrics.for_store(store_id);
-        store.refresh_gauges();
-        Ok(store)
+        Self::finish_di(store, config, metrics, store_id)
     }
 
     /// 打开已有库的依赖注入版,参数语义同 [`create_with`](Self::create_with)。
+    /// key 前缀取自盘上的段头(副本自描述其分区)。
     pub fn open_with(
         dir: impl AsRef<Path>,
         total_capacity: u64,
@@ -510,18 +579,46 @@ impl BlobStore {
         metrics: &StoreMetrics,
         store_id: &str,
     ) -> Result<Self> {
-        let mut store = Self::open(
+        Self::open_di(dir, total_capacity, config, metrics, store_id, None)
+    }
+
+    /// [`open_with`](Self::open_with) + **校验**盘上副本的分区正是 `partition_id`。
+    /// 不符即 [`Corrupt`](Error::Corrupt)(目录放错分区/被替换时大声失败,而不是按错前缀解释数据)。
+    pub fn open_with_partition(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        config: &StoreConfig,
+        metrics: &StoreMetrics,
+        store_id: &str,
+        partition_id: u32,
+    ) -> Result<Self> {
+        Self::open_di(
+            dir,
+            total_capacity,
+            config,
+            metrics,
+            store_id,
+            Some(partition_id),
+        )
+    }
+
+    /// `open_with*` 的实现:`expected_partition` 非空时校验段头前缀。
+    fn open_di(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        config: &StoreConfig,
+        metrics: &StoreMetrics,
+        store_id: &str,
+        expected_partition: Option<u32>,
+    ) -> Result<Self> {
+        let store = Self::open(
             dir,
             total_capacity,
             config.segment_size_bytes,
             config.index_max_inmem_elements,
         )?;
-        store
-            .io_error_threshold
-            .store(config.io_error_count_to_trigger_shutdown, Ordering::Relaxed);
-        store.metrics = metrics.for_store(store_id);
-        store.refresh_gauges();
-        Ok(store)
+        check_partition(&store, expected_partition)?;
+        Self::finish_di(store, config, metrics, store_id)
     }
 
     /// 依赖注入版的重建打开(装载物理拷贝的段文件后用,S3b):同 [`open_with`](Self::open_with),
@@ -533,18 +630,79 @@ impl BlobStore {
         metrics: &StoreMetrics,
         store_id: &str,
     ) -> Result<Self> {
-        let mut store = Self::open_rebuild_index(
+        Self::open_rebuild_di(dir, total_capacity, config, metrics, store_id, None)
+    }
+
+    /// [`open_rebuild_index_with`](Self::open_rebuild_index_with) + **校验**盘上段头的 key 前缀正是
+    /// `partition_id`:物理 bootstrap 收到的封存段必须属于本分区(拷错分区的段会被当场拒掉)。
+    pub fn open_rebuild_index_with_partition(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        config: &StoreConfig,
+        metrics: &StoreMetrics,
+        store_id: &str,
+        partition_id: u32,
+    ) -> Result<Self> {
+        Self::open_rebuild_di(
+            dir,
+            total_capacity,
+            config,
+            metrics,
+            store_id,
+            Some(partition_id),
+        )
+    }
+
+    fn open_rebuild_di(
+        dir: impl AsRef<Path>,
+        total_capacity: u64,
+        config: &StoreConfig,
+        metrics: &StoreMetrics,
+        store_id: &str,
+        expected_partition: Option<u32>,
+    ) -> Result<Self> {
+        let store = Self::open_rebuild_index(
             dir,
             total_capacity,
             config.segment_size_bytes,
             config.index_max_inmem_elements,
         )?;
+        check_partition(&store, expected_partition)?;
+        Self::finish_di(store, config, metrics, store_id)
+    }
+
+    /// `*_with` 家族的公共收尾:注入 IO-error 阈值与指标 label、上报开库损伤、刷新 gauge。
+    fn finish_di(
+        mut store: Self,
+        config: &StoreConfig,
+        metrics: &StoreMetrics,
+        store_id: &str,
+    ) -> Result<Self> {
         store
             .io_error_threshold
             .store(config.io_error_count_to_trigger_shutdown, Ordering::Relaxed);
         store.metrics = metrics.for_store(store_id);
+        store.report_open_damage();
         store.refresh_gauges();
         Ok(store)
+    }
+
+    /// 本副本负责的 key 前缀(blobId 高 32bit = partitionId),来自构造参数或盘上段头。
+    pub fn key_prefix(&self) -> u32 {
+        self.key_prefix
+    }
+
+    /// 记录只存 key 的低 32bit,高 32bit 由段头承载 —— 写进来的 key 必须属于本副本分区,
+    /// 否则落盘后读不回来。宁可在此拒绝,也不写一条解不出来的记录。
+    fn check_key(&self, key: &StoreKey) -> Result<()> {
+        if key.partition_id() != self.key_prefix {
+            return Err(Error::BadArgument(format!(
+                "key {key:?} is in partition {} but this replica stores partition {}",
+                key.partition_id(),
+                self.key_prefix
+            )));
+        }
+        Ok(())
     }
 
     /// 封存段(不可变,除活跃段外)的 `(position, data_end)`,S3b 物理拷贝发送方枚举。
@@ -557,7 +715,26 @@ impl BlobStore {
         self.inner().log.read_segment_prefix(position)
     }
 
-    /// 从容量/段容量/gauge 刷新容量类指标(在写/compaction/hard_delete/flush 后调用)。
+    /// 打开时的容错恢复报告(空 = 干净副本)。`store` 经 `scrub-report` 把它转给运维,
+    /// 使"带伤启动"在 admin 的一致性巡检里立刻表现为差异。
+    pub fn open_damage(&self) -> OpenDamage {
+        self.open_damage
+    }
+
+    /// 把打开时的损伤推到注入的指标上(`*_with` 构造在注入 metrics 后调用;干净副本零副作用)。
+    fn report_open_damage(&self) {
+        if self.open_damage.is_clean() {
+            return;
+        }
+        self.metrics
+            .open_bad_records
+            .inc_by(self.open_damage.bad_records);
+        self.metrics
+            .open_abandoned_segments
+            .inc_by(self.open_damage.abandoned_segments);
+    }
+
+    /// 从容量/段容量/gauge 刷新容量类指标(在写/compaction/flush 后调用)。
     fn refresh_gauges(&self) {
         let (mut live, mut dead) = (0u64, 0u64);
         let count = {
@@ -599,7 +776,12 @@ impl BlobStore {
         let count = self.io_error_count.fetch_add(1, Ordering::Relaxed) + 1;
         // swap 保证只在首次跨阈值触发回调(后续 IO 错误 available 已为 false)。
         if threshold > 0 && count >= threshold && self.available.swap(false, Ordering::Relaxed) {
-            if let Some(hook) = self.io_error_hook.lock().expect("io_error_hook poisoned").clone() {
+            if let Some(hook) = self
+                .io_error_hook
+                .lock()
+                .expect("io_error_hook poisoned")
+                .clone()
+            {
                 hook();
             }
         }
@@ -627,8 +809,8 @@ impl BlobStore {
     /// 写入一个对象并设定过期时间(`expiration_ms`,`NO_EXPIRATION` 表示不过期)。
     ///
     /// 对齐 Ambry:blob id 永久占用——命中任何已存在条目(PUT 或 DELETE 墓碑)一律
-    /// [`Error::AlreadyExists`](crate::error::Error::AlreadyExists);复活已删除对象须走
-    /// undelete/lifeVersion(后续实现),普通 put 不允许删后重写。
+    /// [`Error::AlreadyExists`](crate::error::Error::AlreadyExists)。对象不可变且**删除不可逆**,
+    /// 故没有"删后重写/复活"这条路。
     pub fn put_ttl(&self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
         if !self.is_available() {
             return Err(Error::Unavailable);
@@ -667,6 +849,7 @@ impl BlobStore {
     ) -> Result<()> {
         let _t = self.metrics.op_timer("put");
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
+        self.check_key(&key)?;
         // 与整块写路径共用同一条长度策略(记录内 data_len 是 u32):超限直接拒,**绝不写回绕的记录**。
         let data_len = record_data_len(len)?;
         let inner = self.inner();
@@ -674,9 +857,8 @@ impl BlobStore {
             self.metrics.already_exists.inc();
             return Err(Error::AlreadyExists);
         }
-        let op_time = now_ms();
         let mut header = [0u8; RECORD_HEADER];
-        encode_header_into(&mut header, &key, 0, expiration_ms, op_time, 0, data_len);
+        encode_header_into(&mut header, key.object_id(), 0, expiration_ms, data_len);
         let total = RECORD_OVERHEAD as u64 + len;
         // 预留整段后分块写入:crc 边写边算,最后补写尾部 crc 再 commit 发布。
         let reserved = inner.log.reserve(total).map_err(to_store_full)?;
@@ -694,7 +876,7 @@ impl BlobStore {
         }
         reserved.write(rec::DATA as u64 + len, &hasher.finalize().to_le_bytes())?;
         let offset = reserved.commit()?;
-        self.publish_put(key, offset, total, op_time, expiration_ms)
+        self.publish_put(key, offset, record_size_u32(total)?, expiration_ms)
     }
 
     /// 记录已落 log 后的统一发布:索引 + 每段存活字节 + 有效数据统计。
@@ -704,12 +886,11 @@ impl BlobStore {
         &self,
         key: StoreKey,
         offset: LogOffset,
-        size: u64,
-        operation_time_ms: u64,
+        size: u32,
         expiration_ms: i64,
     ) -> Result<()> {
         let inner = self.inner();
-        let mut value = IndexValue::put(offset, size, operation_time_ms);
+        let mut value = IndexValue::put(offset, size);
         value.expiration_ms = expiration_ms;
         inner.index.add(key, value)?;
         self.seg_bytes
@@ -717,7 +898,7 @@ impl BlobStore {
             .expect("blob seg_bytes poisoned")
             .entry(offset.segment)
             .or_default()
-            .live += size;
+            .live += u64::from(size);
         self.valid_stats
             .lock()
             .expect("blob valid_stats poisoned")
@@ -728,47 +909,43 @@ impl BlobStore {
     fn put_ttl_inner(&self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
         let _t = self.metrics.op_timer("put");
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
+        self.check_key(&key)?;
         let inner = self.inner();
         if inner.index.find(&key).is_some() {
             self.metrics.already_exists.inc();
             return Err(Error::AlreadyExists);
         }
-        let op_time = now_ms();
-        let record = encode_record(&key, 0, expiration_ms, op_time, 0, data)?;
+        let record = encode_record(&key, 0, expiration_ms, data)?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
-        self.publish_put(key, offset, record.len() as u64, op_time, expiration_ms)
+        self.publish_put(
+            key,
+            offset,
+            record_size_u32(record.len() as u64)?,
+            expiration_ms,
+        )
     }
 
     /// 读取一个对象。不存在/已删除/已过期分别返回对应错误。
     pub fn get(&self, key: &StoreKey) -> Result<Vec<u8>> {
-        self.get_with_options(key, false, false)
+        self.get_with_options(key, false)
     }
 
-    /// `get` 的可选版本(对齐 Ambry `StoreGetOptions`):`include_deleted`/`include_expired`
-    /// 为真时分别返回已删除/已过期对象的数据。已删除对象的数据从其原 PUT 读取,若 PUT 已被
-    /// compaction 回收则报 [`NotFound`](crate::error::Error::NotFound)。
-    pub fn get_with_options(
-        &self,
-        key: &StoreKey,
-        include_deleted: bool,
-        include_expired: bool,
-    ) -> Result<Vec<u8>> {
+    /// `get` 的可选版本:`include_expired` 为真时返回**已过期**对象的数据(复制拉取需要 ——
+    /// 过期但尚未被 compaction 回收的对象仍要被对端忠实 apply)。
+    ///
+    /// 已删除对象**无法**读取:删除不可逆,墓碑不保留原数据位置(对齐"删了就删了")。
+    pub fn get_with_options(&self, key: &StoreKey, include_expired: bool) -> Result<Vec<u8>> {
         if !self.is_available() {
             return Err(Error::Unavailable);
         }
-        self.track(self.get_with_options_inner(key, include_deleted, include_expired))
+        self.track(self.get_with_options_inner(key, include_expired))
     }
 
-    fn get_with_options_inner(
-        &self,
-        key: &StoreKey,
-        include_deleted: bool,
-        include_expired: bool,
-    ) -> Result<Vec<u8>> {
+    fn get_with_options_inner(&self, key: &StoreKey, include_expired: bool) -> Result<Vec<u8>> {
         let _t = self.metrics.op_timer("get");
         let inner = self.inner();
         let value = inner.index.find(key).ok_or(Error::NotFound)?;
-        if value.is_deleted() && !include_deleted {
+        if value.is_deleted() {
             return Err(Error::Deleted);
         }
         if value.expiration_ms != NO_EXPIRATION
@@ -777,36 +954,32 @@ impl BlobStore {
         {
             return Err(Error::Expired);
         }
-        // 墓碑无数据,取原 PUT 位置;其余赢家(PUT/UNDELETE/TTL_UPDATE)自带数据。
-        let data_off = if value.is_deleted() {
-            value.original_offset
-        } else {
-            value.offset
-        };
-        let (_, decoded) = read_full_record(&inner.log, data_off).map_err(|_| Error::NotFound)?;
+        let (_, decoded) =
+            read_full_record(&inner.log, value.offset).map_err(|_| Error::NotFound)?;
         if &decoded.key != key {
-            return Err(Error::Corrupt(format!("record key mismatch at {data_off}")));
-        }
-        if !value.is_deleted() && decoded.flags & FLAG_DELETED != 0 {
             return Err(Error::Corrupt(format!(
-                "live index points at a tombstone record at {data_off}"
+                "record key mismatch at {}",
+                value.offset
+            )));
+        }
+        if decoded.flags & FLAG_DELETED != 0 {
+            return Err(Error::Corrupt(format!(
+                "live index points at a tombstone record at {}",
+                value.offset
             )));
         }
         Ok(decoded.data)
     }
 
-    /// 查询 blob 元数据(状态/TTL/生命版本/数据长度),**不读数据体**(对齐 Ambry `findKey`)。
+    /// 查询 blob 元数据(状态/TTL/数据长度),**不读数据体**(对齐 Ambry `findKey`)。
     /// key 不存在报 [`NotFound`](crate::error::Error::NotFound);已删除/已过期仍返回其元数据。
     pub fn stat(&self, key: &StoreKey) -> Result<BlobMeta> {
         let v = self.inner().index.find(key).ok_or(Error::NotFound)?;
         Ok(BlobMeta {
             deleted: v.is_deleted(),
-            undeleted: v.is_undeleted(),
-            ttl_updated: v.is_ttl_updated(),
             expired: v.expiration_ms != NO_EXPIRATION && now_ms() as i64 >= v.expiration_ms,
             expiration_ms: v.expiration_ms,
-            life_version: v.life_version,
-            data_len: v.size.saturating_sub(RECORD_OVERHEAD as u64),
+            data_len: v.size_bytes().saturating_sub(RECORD_OVERHEAD as u64),
         })
     }
 
@@ -893,15 +1066,11 @@ impl BlobStore {
             if let Some(v) = inner.index.find(&key) {
                 entries.push(MessageInfo {
                     key,
-                    size: v.size,
+                    size: v.size_bytes(),
                     expiration_ms: v.expiration_ms,
                     deleted: v.is_deleted(),
-                    ttl_updated: v.is_ttl_updated(),
-                    undeleted: v.is_undeleted(),
-                    life_version: v.life_version,
-                    operation_time_ms: v.operation_time_ms,
                 });
-                total += v.size;
+                total += v.size_bytes();
                 if total >= max_total_size {
                     break;
                 }
@@ -917,11 +1086,19 @@ impl BlobStore {
         })
     }
 
-    /// 忠实应用一条来自 peer 的复制记录(拉复制 apply,承 Ambry replication + newest-wins/lifeVersion)。
+    /// 忠实应用一条来自 peer 的复制记录(拉复制 apply,承 Ambry replication)。
     ///
-    /// 与发起者 op(`put`/`delete`/… 用本地 `now_ms`/推导 lifeVersion)不同:本方法**原样保留** peer 的
-    /// flags/lifeVersion/expiration/op_time,以免副本间 lifeVersion 发散(如复制一个已 undelete 的对象)。
-    /// **只增不删**(幂等,守 §3.1):本地已 ≥ peer 状态则 [`Skipped`](ApplyOutcome::Skipped),部分失败重试安全。
+    /// 合并规则(**墓碑恒胜**)—— 对象不可变 + 删除不可逆,故每个 key 的状态单调向前:
+    ///
+    /// | 本地现状 | peer 记录 | 结果 |
+    /// |---|---|---|
+    /// | 不存在 | PUT | 写入(数据体取自 peer,缺则 `Corrupt`) |
+    /// | 不存在 | 墓碑 | 写入墓碑(确认该 key 已删除) |
+    /// | PUT | PUT | `Skipped`(同一 key 内容不可变) |
+    /// | PUT | 墓碑 | 写入墓碑(覆盖) |
+    /// | 墓碑 | 任意 | `Skipped`(删除不可逆) |
+    ///
+    /// **只增不删**(幂等):同一批记录重复 apply、或部分失败后重试,都安全。
     pub fn apply_replicated(&self, rec: ReplicatedRecord) -> Result<ApplyOutcome> {
         if !self.is_available() {
             return Err(Error::Unavailable);
@@ -932,62 +1109,42 @@ impl BlobStore {
     fn apply_replicated_inner(&self, rec: ReplicatedRecord) -> Result<ApplyOutcome> {
         let _t = self.metrics.op_timer("replicate");
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
+        self.check_key(&rec.key)?;
         let inner = self.inner();
         let cur = inner.index.find(&rec.key);
 
         let rec_deleted = rec.flags & FLAG_DELETED != 0;
-        let rec_ttl = rec.flags & FLAG_TTL_UPDATED != 0;
-        // newest-wins + lifeVersion:更高 lifeVersion 恒赢;同 lifeVersion 下 peer 引入新 flag(删/TTL)才赢。
         if let Some(c) = cur {
-            let newer = rec.life_version > c.life_version
-                || (rec.life_version == c.life_version
-                    && ((rec_deleted && !c.is_deleted())
-                        || (rec_ttl && !c.is_ttl_updated() && !c.is_deleted())));
-            if !newer {
+            // 墓碑恒胜:本地已是墓碑就无物可推进;本地是 PUT 时只有 peer 的墓碑能推进它。
+            if c.is_deleted() || !rec_deleted {
                 return Ok(ApplyOutcome::Skipped);
             }
         }
 
-        // 组装要落的整记录数据体:墓碑无数据;存活赢家的数据体来自 peer(本地缺失)或本地(已有 key 的变更)。
-        // `tomb_orig`:墓碑指向被删前 PUT 的位置(None = 无本地 PUT,落后指向墓碑自身)。
-        let (data, tomb_orig): (Vec<u8>, Option<LogOffset>) = if rec_deleted {
-            let orig = cur.map(|c| if c.is_deleted() { c.original_offset } else { c.offset });
-            (Vec::new(), orig)
-        } else if let Some(d) = rec.data {
-            (d, None)
-        } else if let Some(c) = cur {
-            let src = if c.is_deleted() { c.original_offset } else { c.offset };
-            let (_, decoded) = read_full_record(&inner.log, src)?;
-            (decoded.data, None)
+        // 墓碑无数据体;存活记录的数据体必须由 peer 带来(本地缺这条 key 时才可能走到这里)。
+        let data = if rec_deleted {
+            Vec::new()
         } else {
-            return Err(Error::Corrupt(
-                "apply_replicated: alive record missing data for absent key".to_string(),
-            ));
+            rec.data.ok_or_else(|| {
+                Error::Corrupt(
+                    "apply_replicated: alive record missing data for an absent key".to_string(),
+                )
+            })?
         };
 
-        let record = encode_record(
-            &rec.key,
-            rec.flags,
-            rec.expiration_ms,
-            rec.operation_time_ms,
-            rec.life_version,
-            &data,
-        )?;
+        let record = encode_record(&rec.key, rec.flags, rec.expiration_ms, &data)?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
-        let mut value = IndexValue::put(offset, record.len() as u64, rec.operation_time_ms);
+        let mut value = IndexValue::put(offset, record_size_u32(record.len() as u64)?);
         value.flags = rec.flags;
         value.expiration_ms = rec.expiration_ms;
-        value.life_version = rec.life_version;
-        // 墓碑指向被删前的 PUT(取数据用);存活赢家自带数据故指向自身。
-        value.original_offset = if rec_deleted { tomb_orig.unwrap_or(offset) } else { offset };
         inner.index.add(rec.key, value)?;
 
         let mut seg_bytes = self.seg_bytes.lock().expect("blob seg_bytes poisoned");
         seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
         if let Some(c) = cur {
             let e = seg_bytes.entry(c.offset.segment).or_default();
-            e.live = e.live.saturating_sub(c.size);
-            e.dead += c.size;
+            e.live = e.live.saturating_sub(c.size_bytes());
+            e.dead += c.size_bytes();
         }
         drop(seg_bytes);
         let mut vs = self.valid_stats.lock().expect("blob valid_stats poisoned");
@@ -1007,7 +1164,7 @@ impl BlobStore {
     /// 口径:
     /// - 坏记录后尝试从记录头读出 `data_len` 以重同步到下一条;头也读不出则本段止步并把 `truncated` 置真。
     /// - `index_mismatch`:对**活记录**(索引当前赢家,即 `find(key).offset == 本记录 offset`)比对索引里的
-    ///   `size`/`flags`/`life_version` 与记录实际值,不一致即计 1。它只能发现"索引与 log 对不上"的这一类漂移,
+    ///   `size`/`flags` 与记录实际值,不一致即计 1。它只能发现"索引与 log 对不上"的这一类漂移,
     ///   **发现不了**"索引里指向了 log 中并不存在的 offset"(那需要遍历索引反向核对,属后续增强)。
     /// - `max_bytes` 是本次扫描的**读取字节上限**(到点返回部分结果 + `truncated=true`),供深扫限流用。
     pub fn verify(&self, max_bytes: u64) -> Result<VerifyReport> {
@@ -1029,9 +1186,8 @@ impl BlobStore {
                         report.records += 1;
                         if let Some(v) = inner.index.find(&decoded.key) {
                             if v.offset == at
-                                && (v.size != raw.len() as u64
-                                    || v.flags != decoded.flags
-                                    || v.life_version != decoded.life_version)
+                                && (u64::from(v.size) != raw.len() as u64
+                                    || v.flags != decoded.flags)
                             {
                                 report.index_mismatch += 1;
                             }
@@ -1087,7 +1243,7 @@ impl BlobStore {
                 stats.tombstones += 1;
             } else {
                 stats.live_records += 1;
-                stats.live_bytes += v.size.saturating_sub(RECORD_OVERHEAD as u64);
+                stats.live_bytes += v.size_bytes().saturating_sub(RECORD_OVERHEAD as u64);
             }
         });
         stats
@@ -1108,7 +1264,7 @@ impl BlobStore {
         for_each_record(&inner.log, |off, _raw, decoded| {
             if let Some(v) = inner.index.find(&decoded.key) {
                 if v.offset == off && !v.is_deleted() {
-                    total += v.size;
+                    total += v.size_bytes();
                 }
             }
             Ok(())
@@ -1117,97 +1273,8 @@ impl BlobStore {
         total
     }
 
-    /// 硬删除:把已软删(墓碑)对象的原 PUT 数据字节**就地清零**(对齐 Ambry `HardDeleter` 的隐私擦除),
-    /// 在 compaction 回收前即抹除明文。返回被擦除的对象数;幂等(已擦除的跳过)。
-    /// 硬删除:把已软删(墓碑)对象的原 PUT 数据字节**清零**(对齐 Ambry `HardDeleter` 的隐私擦除),
-    /// 在 compaction 回收前即抹除明文。返回被擦除的对象数;幂等(已擦除的跳过)。
-    ///
-    /// COW(非就地改):逐个受影响段重写为「目标 PUT 数据清零 + `FLAG_HARD_DELETED`」的新段
-    /// (tmp→fsync→原子 rename 覆盖,段位置/记录偏移不变),再原子换入新 Inner。避免就地
-    /// `overwrite_at` 与无锁读者并发导致撕裂读(crc mismatch 误报 `Corrupt`)。老读者持有的旧
-    /// Inner 经旧段 fd 仍读到擦前明文(Unix open-fd 语义),故保证是**最终**擦除。
-    pub fn hard_delete(&self) -> Result<usize> {
-        let _t = self.metrics.hard_delete_duration.start_timer();
-        let _w = self.write_lock.lock().expect("blob write_lock poisoned");
-        let old = self.inner();
-
-        // 收集需擦除的原 PUT 位置(其墓碑为当前索引赢家、原 PUT 存在且未擦),按段分组。
-        let mut targets: BTreeMap<u64, std::collections::HashSet<u64>> = BTreeMap::new();
-        for_each_record(&old.log, |off, _raw, decoded| {
-            if decoded.flags & FLAG_DELETED != 0 {
-                if let Some(v) = old.index.find(&decoded.key) {
-                    if v.is_deleted() && v.offset == off {
-                        if let Ok((_, put)) = read_full_record(&old.log, v.original_offset) {
-                            if put.flags & (FLAG_DELETED | FLAG_HARD_DELETED) == 0 {
-                                targets
-                                    .entry(v.original_offset.segment)
-                                    .or_default()
-                                    .insert(v.original_offset.offset);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        if targets.is_empty() {
-            return Ok(0);
-        }
-
-        let (log_dir, index_dir) = sub_dirs(&self.dir);
-        let spans = old.log.segment_spans();
-        let mut scrubbed = 0usize;
-        for (&pos, scrub) in &targets {
-            let data_end = spans
-                .iter()
-                .find(|(p, _)| *p == pos)
-                .map(|(_, e)| *e)
-                .unwrap_or(0);
-            let final_path = log_dir.join(LogSegmentName(pos).filename());
-            let mut tmp = final_path.as_os_str().to_owned();
-            tmp.push(".tmp");
-            let tmp = PathBuf::from(tmp);
-            let seg = LogSegment::create(&tmp, self.segment_capacity)?;
-            scan_segment(&old.log, pos, data_end, |off, raw, decoded| {
-                let mut rec = raw.to_vec();
-                if scrub.contains(&off.offset)
-                    && decoded.flags & (FLAG_DELETED | FLAG_HARD_DELETED) == 0
-                {
-                    let crc_at = rec::DATA + decoded.data.len();
-                    for b in rec[rec::DATA..crc_at].iter_mut() {
-                        *b = 0;
-                    }
-                    rec[rec::FLAGS] |= FLAG_HARD_DELETED;
-                    let crc = crc32fast::hash(&rec[..crc_at]);
-                    rec[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
-                    scrubbed += 1;
-                }
-                seg.append(&rec)?;
-                Ok(())
-            })?;
-            seg.flush()?;
-            seg.close()?;
-            // 原子 rename 覆盖原段(偏移不变);老 Inner 读者的旧 fd 仍指向擦前 inode(Unix)。
-            std::fs::rename(&tmp, &final_path)?;
-        }
-
-        // 重开 log(新 fd 指向已擦除文件)+ 重建索引(偏移不变)+ 原子换入新 Inner。
-        let new_log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
-        let new_index = rebuild_index(&new_log, &index_dir, self.max_index_entries_per_segment)?;
-        let new_seg_bytes = scan_seg_bytes(&new_log, &new_index)?;
-        let new_valid = compute_valid_stats(&new_log, &new_index)?;
-        *self.seg_bytes.lock().expect("blob seg_bytes poisoned") = new_seg_bytes;
-        *self.valid_stats.lock().expect("blob valid_stats poisoned") = new_valid;
-        *self.inner.write().expect("blob inner poisoned") = Arc::new(Inner {
-            log: new_log,
-            index: new_index,
-        });
-        self.metrics.hard_delete_total.inc_by(scrubbed as u64);
-        self.refresh_gauges();
-        Ok(scrubbed)
-    }
-
-    /// 删除一个对象:追加墓碑记录并在索引写入删除条目。不存在/已删除报错。
+    /// 删除一个对象:追加墓碑记录并在索引写入删除条目。
+    /// 不存在报 NotFound;已删除(墓碑)幂等成功(不写第二条墓碑),对应 HTTP 204。
     pub fn delete(&self, key: StoreKey) -> Result<()> {
         if !self.is_available() {
             return Err(Error::Unavailable);
@@ -1218,148 +1285,28 @@ impl BlobStore {
     fn delete_inner(&self, key: StoreKey) -> Result<()> {
         let _t = self.metrics.op_timer("delete");
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
+        self.check_key(&key)?;
         let inner = self.inner();
         let old = match inner.index.find(&key) {
             None => return Err(Error::NotFound),
-            Some(v) if v.is_deleted() => return Err(Error::Deleted),
+            // 幂等:墓碑已是终态,重复删视为成功(204);不再写第二条墓碑,索引/统计不变。
+            Some(v) if v.is_deleted() => return Ok(()),
             Some(v) => v,
         };
-        let op_time = now_ms();
-        let record = encode_record(
-            &key,
-            FLAG_DELETED,
-            NO_EXPIRATION,
-            op_time,
-            old.life_version,
-            &[],
-        )?;
+        let record = encode_record(&key, FLAG_DELETED, NO_EXPIRATION, &[])?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
-        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
+        let mut value = IndexValue::put(offset, record_size_u32(record.len() as u64)?);
         value.flags = FLAG_DELETED;
-        value.life_version = old.life_version;
-        value.original_offset = old.original_offset; // 墓碑无数据,指向被删前的 PUT
         inner.index.add(key, value)?;
         // 墓碑成为新赢家(live);被取代的旧 PUT 转为该段的死数据。
         let mut seg_bytes = self.seg_bytes.lock().expect("blob seg_bytes poisoned");
         seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
         let e = seg_bytes.entry(old.offset.segment).or_default();
-        e.live = e.live.saturating_sub(old.size);
-        e.dead += old.size;
+        e.live = e.live.saturating_sub(old.size_bytes());
+        e.dead += old.size_bytes();
         // 有效数据:旧赢家(未删)移除,新墓碑不计。
         let mut vs = self.valid_stats.lock().expect("blob valid_stats poisoned");
         vs.remove(&old);
-        vs.add(&value);
-        Ok(())
-    }
-
-    /// 复活一个已删除对象(对齐 Ambry `undelete`):写一条 `FLAG_UNDELETED`、复制原数据、
-    /// `life_version+1` 的整记录并指回它自身,返回新的 life_version。
-    ///
-    /// 状态机:仅当当前为**已删除**才可复活;不存在报 [`NotFound`](crate::error::Error::NotFound),
-    /// 未删除(存活/已复活)报 [`NotDeleted`](crate::error::Error::NotDeleted)。若被删对象的 PUT
-    /// 已被 compaction 回收(数据不存在),报 [`NotFound`](crate::error::Error::NotFound)
-    /// (对齐 Ambry `IDDeletedPermanently`:PUT 被压走后不可复活)。
-    pub fn undelete(&self, key: StoreKey) -> Result<u16> {
-        if !self.is_available() {
-            return Err(Error::Unavailable);
-        }
-        self.track(self.undelete_inner(key))
-    }
-
-    fn undelete_inner(&self, key: StoreKey) -> Result<u16> {
-        let _t = self.metrics.op_timer("undelete");
-        let _w = self.write_lock.lock().expect("blob write_lock poisoned");
-        let inner = self.inner();
-        let cur = match inner.index.find(&key) {
-            None => return Err(Error::NotFound),
-            Some(v) if !v.is_deleted() => return Err(Error::NotDeleted),
-            Some(v) => v,
-        };
-        // 取原 PUT 数据(墓碑 original_offset 指向它)。被 compaction 回收则视为数据不存在。
-        let (put_raw, put) =
-            read_full_record(&inner.log, cur.original_offset).map_err(|_| Error::NotFound)?;
-        if put.key != key || put.flags & FLAG_DELETED != 0 {
-            return Err(Error::NotFound);
-        }
-        let _ = put_raw;
-        let new_life = cur.life_version + 1;
-        let op_time = now_ms();
-        let record = encode_record(
-            &key,
-            FLAG_UNDELETED,
-            put.expiration_ms,
-            op_time,
-            new_life,
-            &put.data,
-        )?;
-        let offset = inner.log.append(&record).map_err(to_store_full)?;
-        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
-        value.flags = FLAG_UNDELETED;
-        value.expiration_ms = put.expiration_ms;
-        value.life_version = new_life;
-        inner.index.add(key, value)?;
-        // 复活整记录成为新赢家(live);被取代的旧墓碑转死(原 PUT 早在 delete 时已计死)。
-        let mut seg_bytes = self.seg_bytes.lock().expect("blob seg_bytes poisoned");
-        seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
-        let e = seg_bytes.entry(cur.offset.segment).or_default();
-        e.live = e.live.saturating_sub(cur.size);
-        e.dead += cur.size;
-        // 有效数据:旧墓碑(不计)移除,新复活赢家计入。
-        let mut vs = self.valid_stats.lock().expect("blob valid_stats poisoned");
-        vs.remove(&cur);
-        vs.add(&value);
-        Ok(new_life)
-    }
-
-    /// 更新已存在对象的过期时间(对齐 Ambry `updateTtl`):`expiration_ms` 传
-    /// [`NO_EXPIRATION`](crate::index::value::NO_EXPIRATION) 即永久化(最常见用法),也可设任意时刻。
-    ///
-    /// 写一条 `FLAG_TTL_UPDATED`、复制原数据、`expiration=expiration_ms`、`life_version` 不变的
-    /// 整记录成为新赢家。不存在→[`NotFound`](crate::error::Error::NotFound);已删除→
-    /// [`Deleted`](crate::error::Error::Deleted);TTL 已更新→[`AlreadyUpdated`](crate::error::Error::AlreadyUpdated)。
-    pub fn update_ttl(&self, key: StoreKey, expiration_ms: i64) -> Result<()> {
-        if !self.is_available() {
-            return Err(Error::Unavailable);
-        }
-        self.track(self.update_ttl_inner(key, expiration_ms))
-    }
-
-    fn update_ttl_inner(&self, key: StoreKey, expiration_ms: i64) -> Result<()> {
-        let _t = self.metrics.op_timer("ttl_update");
-        let _w = self.write_lock.lock().expect("blob write_lock poisoned");
-        let inner = self.inner();
-        let cur = match inner.index.find(&key) {
-            None => return Err(Error::NotFound),
-            Some(v) if v.is_deleted() => return Err(Error::Deleted),
-            Some(v) if v.is_ttl_updated() => return Err(Error::AlreadyUpdated),
-            Some(v) => v,
-        };
-        // 未删除的赢家(PUT/UNDELETE)自带数据,从其 offset 读回原数据。
-        let (_, rec) = read_full_record(&inner.log, cur.offset)?;
-        let op_time = now_ms();
-        let flags = (cur.flags | FLAG_TTL_UPDATED) & !FLAG_DELETED;
-        let record = encode_record(
-            &key,
-            flags,
-            expiration_ms,
-            op_time,
-            cur.life_version,
-            &rec.data,
-        )?;
-        let offset = inner.log.append(&record).map_err(to_store_full)?;
-        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
-        value.flags = flags;
-        value.expiration_ms = expiration_ms;
-        value.life_version = cur.life_version;
-        inner.index.add(key, value)?;
-        let mut seg_bytes = self.seg_bytes.lock().expect("blob seg_bytes poisoned");
-        seg_bytes.entry(offset.segment).or_default().live += record.len() as u64;
-        let e = seg_bytes.entry(cur.offset.segment).or_default();
-        e.live = e.live.saturating_sub(cur.size);
-        e.dead += cur.size;
-        // 有效数据:旧赢家移除,新 TTL 赢家(可能改了过期时刻)计入对应桶。
-        let mut vs = self.valid_stats.lock().expect("blob valid_stats poisoned");
-        vs.remove(&cur);
         vs.add(&value);
         Ok(())
     }
@@ -1406,11 +1353,6 @@ impl BlobStore {
     #[cfg(test)]
     fn log_segment_count_for_test(&self) -> usize {
         self.inner().log.segment_count()
-    }
-
-    #[cfg(test)]
-    fn life_version_of(&self, key: &StoreKey) -> Option<u16> {
-        self.inner().index.find(key).map(|v| v.life_version)
     }
 
     #[cfg(test)]
@@ -1483,7 +1425,12 @@ impl BlobStore {
         rm_rf(&log_old)?;
 
         // COPY:扫旧 log,存活记录(当前赢家)重写进 log.new。
-        let new_log = Log::create(&log_new, self.total_capacity, self.segment_capacity)?;
+        let new_log = Log::create(
+            &log_new,
+            self.total_capacity,
+            self.segment_capacity,
+            self.key_prefix,
+        )?;
         let mut live = 0u64;
         let mut dead = 0u64;
         for_each_record(&old.log, |off, raw, decoded| {
@@ -1687,7 +1634,11 @@ impl BlobStore {
                     tmp.push(".tmp");
                     let tmp = PathBuf::from(tmp);
                     next_pos += 1;
-                    cur = Some(LogSegment::create(&tmp, self.segment_capacity)?);
+                    cur = Some(LogSegment::create(
+                        &tmp,
+                        self.segment_capacity,
+                        self.key_prefix,
+                    )?);
                     tmp_paths.push((tmp, final_path));
                 }
                 cur.as_ref().unwrap().append(raw)?;
@@ -1734,6 +1685,22 @@ fn sub_dirs(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join("log"), dir.join("index"))
 }
 
+/// `expected` 非空时校验盘上副本的 key 前缀正是它 —— 不符即 [`Corrupt`](Error::Corrupt)。
+///
+/// 用在"打开一个已存在的副本"的三条路径上(`open_with_partition` / `open_rebuild_index_with_partition`):
+/// 分区目录放错位置或被替换时,必须大声失败,而不是按错误的前缀去解释盘上的记录。
+fn check_partition(store: &BlobStore, expected: Option<u32>) -> Result<()> {
+    if let Some(want) = expected {
+        if store.key_prefix != want {
+            return Err(Error::Corrupt(format!(
+                "replica on disk holds partition {:#x} but {want:#x} was expected",
+                store.key_prefix
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 写路径把「log 追加因段用尽/无法滚动」的 `SegmentFull` 归一为面向调用方的 `StoreFull`;其余原样。
 fn to_store_full(e: Error) -> Error {
     match e {
@@ -1754,13 +1721,15 @@ fn for_each_record(
 }
 
 /// 读取 `at` 处一条完整记录(先读头拿 data_len,再读整条并校验 crc)。
+///
+/// key 的前缀来自段头(`log.key_prefix()`),记录体里只有低 32bit 后缀。
 fn read_full_record(log: &Log, at: LogOffset) -> Result<(Vec<u8>, DecodedRecord)> {
     let head = log.read(at, rec::DATA)?;
     let data_len =
         u32::from_le_bytes(head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap()) as usize;
     let total = RECORD_OVERHEAD + data_len;
     let raw = log.read(at, total)?;
-    let decoded = decode_record(&raw)?;
+    let decoded = decode_record(&raw, log.key_prefix())?;
     Ok((raw, decoded))
 }
 
@@ -1837,63 +1806,195 @@ fn scan_segment(
     Ok(())
 }
 
-/// 从一条记录构造索引值,继承 `life_version`;墓碑(无数据)的 `original_offset` 沿用该 key
-/// 已入索引的数据位置(扫描旧→新,PUT/UNDELETE 先入),否则指向自身。
-fn index_value_from_record(
-    index: &PersistentIndex,
-    off: LogOffset,
-    raw_len: usize,
-    decoded: &DecodedRecord,
-) -> IndexValue {
-    let mut value = IndexValue::put(off, raw_len as u64, decoded.operation_time_ms);
+/// 从一条记录构造索引值(记录自描述 flags/expiration)。
+///
+/// `raw_len` 是整条记录的字节数;段 ≤ 4 GiB ⇒ 它必然放得进索引的 u32 `size` 字段。
+fn index_value_from_record(off: LogOffset, raw_len: usize, decoded: &DecodedRecord) -> IndexValue {
+    let mut value = IndexValue::put(
+        off,
+        u32::try_from(raw_len).expect("record length must fit u32 (segment ≤ 4 GiB)"),
+    );
     value.flags = decoded.flags;
     value.expiration_ms = decoded.expiration_ms;
-    value.life_version = decoded.life_version;
-    value.original_offset = if decoded.flags & FLAG_DELETED != 0 {
-        index
-            .find(&decoded.key)
-            .map(|v| v.original_offset)
-            .unwrap_or(off)
-    } else {
-        off
-    };
     value
 }
 
 /// 全量扫 log 计算每段 `(live, dead)` 字节。冷路径:open/compact/rebuild 后重算,及测试对拍基准。
 fn scan_seg_bytes(log: &Log, index: &PersistentIndex) -> Result<BTreeMap<u64, SegBytes>> {
+    Ok(scan_seg_bytes_tolerant(log, index)?.0)
+}
+
+/// 容错版段字节核算:**坏记录跳过**(既不记 live 也不记 dead —— 其字节归属未知),
+/// 并把它作为 [`OpenDamage`] 返回给调用方去大声报错。
+fn scan_seg_bytes_tolerant(
+    log: &Log,
+    index: &PersistentIndex,
+) -> Result<(BTreeMap<u64, SegBytes>, OpenDamage)> {
     let mut m: BTreeMap<u64, SegBytes> = BTreeMap::new();
     for (pos, _) in log.segment_spans() {
         m.entry(pos).or_default();
     }
-    for_each_record(log, |off, raw, decoded| {
-        let e = m.entry(off.segment).or_default();
-        if matches!(index.find(&decoded.key), Some(v) if v.offset == off) {
-            e.live += raw.len() as u64;
-        } else {
-            e.dead += raw.len() as u64;
+    let mut damage = OpenDamage::default();
+    for (position, data_end) in log.segment_spans() {
+        let mut off = 0u64;
+        while off < data_end {
+            let at = LogOffset::new(position, off);
+            match read_full_record(log, at) {
+                Ok((raw, decoded)) => {
+                    let e = m.entry(position).or_default();
+                    if matches!(index.find(&decoded.key), Some(v) if v.offset == at) {
+                        e.live += raw.len() as u64;
+                    } else {
+                        e.dead += raw.len() as u64;
+                    }
+                    off += raw.len() as u64;
+                }
+                Err(_) => {
+                    damage.bad_records += 1;
+                    if damage.first_bad_offset.is_none() {
+                        damage.first_bad_offset = Some((position, off));
+                    }
+                    match resync_skip(log, at, data_end) {
+                        Some(skip) => off += skip,
+                        None => {
+                            damage.abandoned_segments += 1;
+                            break;
+                        }
+                    }
+                }
+            }
         }
-        Ok(())
-    })?;
-    Ok(m)
+    }
+    Ok((m, damage))
+}
+
+/// 坏记录后按记录头重同步:读得出**可信的** `data_len` 就返回跳过长度,否则 `None`(本段剩余部分放弃)。
+///
+/// "可信" 必须同时满足两条,否则长度字段本身就不可信、继续往下扫只会扫出垃圾:
+/// 1. 跳过长度大于记录头(即 `data_len > 0` 之外还要求长度非零);
+/// 2. **跳过后不越过段尾**(`off + skip <= data_end`)—— 少了这条,一个被写坏的长度字段会把
+///    "本段剩余内容"静默带走却不算"放弃",等于把损伤瞒下来。
+fn resync_skip(log: &Log, at: LogOffset, data_end: u64) -> Option<u64> {
+    let head = log.read(at, RECORD_OVERHEAD).ok()?;
+    let data_len = u32::from_le_bytes(head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().ok()?);
+    let skip = RECORD_OVERHEAD as u64 + data_len as u64;
+    (skip > RECORD_OVERHEAD as u64 && at.offset + skip <= data_end).then_some(skip)
 }
 
 /// 全量扫 log 重算有效数据核算([`ValidStats`]):对每个索引赢家记录累加。冷路径:open/compact/
-/// rebuild/hard_delete 后重建,及测试对拍基准。
+/// rebuild 后重建,及测试对拍基准。
 fn compute_valid_stats(log: &Log, index: &PersistentIndex) -> Result<ValidStats> {
     let mut stats = ValidStats::default();
-    for_each_record(log, |off, _raw, decoded| {
-        if let Some(v) = index.find(&decoded.key) {
-            if v.offset == off {
-                stats.add(&v);
+    for (position, data_end) in log.segment_spans() {
+        let mut off = 0u64;
+        while off < data_end {
+            let at = LogOffset::new(position, off);
+            match read_full_record(log, at) {
+                Ok((raw, decoded)) => {
+                    if let Some(v) = index.find(&decoded.key) {
+                        if v.offset == at {
+                            stats.add(&v);
+                        }
+                    }
+                    off += raw.len() as u64;
+                }
+                // 坏记录:其字节归属未知,跳过(损伤由 `scan_seg_bytes_tolerant` 统一上报)。
+                Err(_) => match resync_skip(log, at, data_end) {
+                    Some(skip) => off += skip,
+                    None => break,
+                },
             }
         }
-        Ok(())
-    })?;
+    }
     Ok(stats)
 }
 
 /// 清空索引目录并顺序扫描 Log 重建索引(旧→新,天然 newest-wins)。
+/// 容错版索引重建:`open` 的恢复路径用它 —— **坏记录跳过并记录,而不是让整副本起不来**。
+///
+/// 每条坏记录后尝试从记录头读出 `data_len` 重同步到下一条;读不出(头也坏了)则放弃该段剩余部分
+/// (记 `abandoned_segments`)并继续下**一段**。不删不改写任何盘上字节。
+fn rebuild_index_tolerant(
+    log: &Log,
+    index_dir: &Path,
+    max_entries: usize,
+) -> Result<(PersistentIndex, OpenDamage)> {
+    std::fs::create_dir_all(index_dir)?;
+    for ent in std::fs::read_dir(index_dir)? {
+        let ent = ent?;
+        if let Some(n) = ent.file_name().to_str() {
+            if n.ends_with(".idx") || n.ends_with(".fuse") {
+                std::fs::remove_file(ent.path())?;
+            }
+        }
+    }
+    let index = PersistentIndex::create(index_dir, max_entries)?;
+    let mut damage = OpenDamage::default();
+    for (position, data_end) in log.segment_spans() {
+        let mut off = 0u64;
+        while off < data_end {
+            let at = LogOffset::new(position, off);
+            match read_full_record(log, at) {
+                Ok((raw, decoded)) => {
+                    let value = index_value_from_record(at, raw.len(), &decoded);
+                    index.add(decoded.key, value)?;
+                    off += raw.len() as u64;
+                }
+                Err(e) => {
+                    damage.bad_records += 1;
+                    if damage.first_bad_offset.is_none() {
+                        damage.first_bad_offset = Some((position, off));
+                    }
+                    // 尝试按记录头重同步;头读不出/长度不可信 → 放弃本段剩余部分(不改盘)。
+                    let resync = resync_skip(log, at, data_end);
+                    match resync {
+                        Some(skip) => {
+                            tracing::error!(
+                                segment = position,
+                                offset = off,
+                                error = %e,
+                                "damaged record skipped during index rebuild"
+                            );
+                            off += skip;
+                        }
+                        None => {
+                            damage.abandoned_segments += 1;
+                            tracing::error!(
+                                segment = position,
+                                offset = off,
+                                error = %e,
+                                "damaged record is not resyncable; abandoning the rest of this segment"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    index.flush()?;
+    // 重建覆盖了整个 log(除被放弃的段),水位推进到当前末尾。
+    write_watermark(index_dir, log.end_offset())?;
+    Ok((index, damage))
+}
+
+/// 打开时若发生损伤,打一条汇总 ERROR(逐条坏记录的明细已在重建过程中打好)。
+///
+/// **大声报错**是这条容错路径的硬要求:宁可日志刺眼,也不能让"带伤启动"悄悄发生。
+fn log_open_damage(dir: &Path, damage: &OpenDamage) {
+    if damage.is_clean() {
+        return;
+    }
+    tracing::error!(
+        dir = %dir.display(),
+        bad_records = damage.bad_records,
+        abandoned_segments = damage.abandoned_segments,
+        first_bad = ?damage.first_bad_offset,
+        "opened store with damaged records: unusable records were skipped (bytes left untouched on disk); \
+         run `GET /partitions/{{pid}}/verify` for details and consider rebuilding this replica"
+    );
+}
+
 fn rebuild_index(log: &Log, index_dir: &Path, max_entries: usize) -> Result<PersistentIndex> {
     std::fs::create_dir_all(index_dir)?;
     for ent in std::fs::read_dir(index_dir)? {
@@ -1906,7 +2007,7 @@ fn rebuild_index(log: &Log, index_dir: &Path, max_entries: usize) -> Result<Pers
     }
     let index = PersistentIndex::create(index_dir, max_entries)?;
     for_each_record(log, |off, raw, decoded| {
-        let value = index_value_from_record(&index, off, raw.len(), decoded);
+        let value = index_value_from_record(off, raw.len(), decoded);
         index.add(decoded.key, value)?;
         Ok(())
     })?;
@@ -1932,7 +2033,7 @@ fn load_index_with_replay(
 fn replay_from(log: &Log, index: &PersistentIndex, watermark: LogOffset) -> Result<()> {
     for_each_record(log, |off, raw, decoded| {
         if off >= watermark {
-            let value = index_value_from_record(index, off, raw.len(), decoded);
+            let value = index_value_from_record(off, raw.len(), decoded);
             index.add(decoded.key, value)?;
         }
         Ok(())
@@ -2102,7 +2203,10 @@ mod tests {
         assert!(!store.is_available());
         assert!(fired.load(Ordering::Relaxed));
         // 自关后拒绝服务。
-        assert!(matches!(store.put(key(1), b"data"), Err(Error::Unavailable)));
+        assert!(matches!(
+            store.put(key(1), b"data"),
+            Err(Error::Unavailable)
+        ));
     }
 
     #[test]
@@ -2113,7 +2217,10 @@ mod tests {
         for _ in 0..100 {
             store.record_io_error();
         }
-        assert!(store.is_available(), "threshold 0 (disabled) must never trip");
+        assert!(
+            store.is_available(),
+            "threshold 0 (disabled) must never trip"
+        );
     }
 
     #[test]
@@ -2156,10 +2263,11 @@ mod tests {
         store.put(key(1), b"v1").unwrap();
         store.delete(key(1)).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
-        assert!(matches!(store.delete(key(1)), Err(Error::Deleted)));
+        // 重复删幂等成功(204);不存在仍报 NotFound。
+        store.delete(key(1)).unwrap();
         assert!(matches!(store.delete(key(2)), Err(Error::NotFound)));
 
-        // 对齐 Ambry:blob id 永久占用,删除后普通 put 仍报 AlreadyExists(复活须走 undelete)。
+        // blob id 永久占用:删除后普通 put 仍报 AlreadyExists,墓碑不可复活。
         assert!(matches!(
             store.put(key(1), b"v2"),
             Err(Error::AlreadyExists)
@@ -2289,21 +2397,45 @@ mod tests {
     }
 
     #[test]
-    fn record_roundtrip_and_crc_guard() {
-        let k = key(42);
+    fn record_roundtrip_layout_and_crc_guard() {
+        // 记录头 24B = magic2 + version1 + flags1 + key_suffix4 + expiration8 + data_len4 + crc4。
+        assert_eq!(RECORD_OVERHEAD, 24);
+        assert_eq!(rec::KEY_SUFFIX, 4, "key 只存低 32bit 后缀");
+        assert_eq!(rec::DATA, 20);
+
+        let k = StoreKey::from_parts(7, 42);
         let data = b"payload".to_vec();
-        let mut buf = encode_record(&k, 0, 1_700_000_000_000, 1_699_000_000_000, 7, &data).unwrap();
-        let d = decode_record(&buf).unwrap();
+        let buf = encode_record(&k, 0, 1_700_000_000_000, &data).unwrap();
+        assert_eq!(buf.len(), RECORD_OVERHEAD + data.len());
+        // 记录体里**不含** partition 前缀:只有 4B 后缀(高 32bit 在段头)。
+        assert_eq!(
+            &buf[rec::KEY_SUFFIX..rec::KEY_SUFFIX + 4],
+            &42u32.to_be_bytes()
+        );
+
+        // 前缀来自段头:同一段字节按不同前缀解出不同的完整 key。
+        let d = decode_record(&buf, 7).unwrap();
         assert_eq!(d.flags, 0);
         assert_eq!(d.key, k);
         assert_eq!(d.data, data);
         assert_eq!(d.expiration_ms, 1_700_000_000_000);
-        assert_eq!(d.operation_time_ms, 1_699_000_000_000);
-        assert_eq!(d.life_version, 7);
+        assert_eq!(
+            decode_record(&buf, 9).unwrap().key,
+            StoreKey::from_parts(9, 42)
+        );
+
+        // 版本不符 → Corrupt(换版后旧字节绝不会被按新布局静默解释)。
+        let mut bad_version = buf.clone();
+        bad_version[rec::VERSION] = REC_VERSION - 1;
+        assert!(matches!(
+            decode_record(&bad_version, 7),
+            Err(Error::Corrupt(_))
+        ));
 
         // 翻转一个数据字节,crc 必须失败。
-        buf[rec::DATA] ^= 0xFF;
-        assert!(matches!(decode_record(&buf), Err(Error::Corrupt(_))));
+        let mut flipped = buf.clone();
+        flipped[rec::DATA] ^= 0xFF;
+        assert!(matches!(decode_record(&flipped, 7), Err(Error::Corrupt(_))));
     }
 
     #[test]
@@ -2639,183 +2771,126 @@ mod tests {
     }
 
     #[test]
-    fn undelete_restores_deleted_blob_and_bumps_lifeversion() {
-        let dir = temp_dir("undel");
+    fn delete_is_irreversible_and_key_stays_occupied() {
+        let dir = temp_dir("irreversible");
         let seg = seg_cap(16);
         let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
         store.put(key(1), b"hello").unwrap();
+
         store.delete(key(1)).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
+        let m = store.stat(&key(1)).unwrap();
+        assert!(m.deleted && m.data_len == 0, "墓碑无数据长度");
 
-        assert_eq!(
-            store.undelete(key(1)).unwrap(),
-            1,
-            "undelete bumps life_version to 1"
-        );
-        assert_eq!(
-            store.get(&key(1)).unwrap(),
-            b"hello".to_vec(),
-            "data restored"
-        );
-        assert_eq!(store.life_version_of(&key(1)), Some(1));
-
-        // 复活后可再删、再复活,life_version 继续递增。
+        // 墓碑是终态:重复删幂等成功(204),且不写第二条墓碑;重写(等价"复活")报 AlreadyExists。
+        let size_before = store.size_in_bytes();
+        let tombs_before = store.index_stats().tombstones;
         store.delete(key(1)).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
-        assert_eq!(store.undelete(key(1)).unwrap(), 2);
-        assert_eq!(store.get(&key(1)).unwrap(), b"hello".to_vec());
-        store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn undelete_rejects_non_deleted_states() {
-        let dir = temp_dir("undel_rej");
-        let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
-        assert!(
-            matches!(store.undelete(key(1)), Err(Error::NotFound)),
-            "absent"
-        );
-        store.put(key(1), b"v").unwrap();
-        assert!(
-            matches!(store.undelete(key(1)), Err(Error::NotDeleted)),
-            "live key"
-        );
-        store.delete(key(1)).unwrap();
-        store.undelete(key(1)).unwrap();
-        assert!(
-            matches!(store.undelete(key(1)), Err(Error::NotDeleted)),
-            "already undeleted"
-        );
-        store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn undelete_survives_reopen_and_rebuild() {
-        let dir = temp_dir("undel_reopen");
-        let seg = seg_cap(16);
-        {
-            let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
-            for i in 0..10u64 {
-                store.put(key(i), format!("v-{i}").as_bytes()).unwrap();
-            }
-            store.delete(key(3)).unwrap();
-            store.undelete(key(3)).unwrap();
-            store.close().unwrap();
-        }
-        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        assert!(store.stat(&key(1)).unwrap().deleted);
         assert_eq!(
-            store.get(&key(3)).unwrap(),
-            b"v-3".to_vec(),
-            "watermark replay keeps undelete"
+            store.index_stats().tombstones,
+            tombs_before,
+            "幂等 delete 不得新增墓碑条目"
         );
-        assert_eq!(store.life_version_of(&key(3)), Some(1));
-        store.close().unwrap();
-        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
         assert_eq!(
-            store.get(&key(3)).unwrap(),
-            b"v-3".to_vec(),
-            "log rebuild keeps undelete"
+            store.size_in_bytes(),
+            size_before,
+            "幂等 delete 不得追加 log 记录"
         );
-        assert_eq!(store.life_version_of(&key(3)), Some(1));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn undeleted_blob_survives_compaction() {
-        let dir = temp_dir("undel_compact");
-        let seg = seg_cap(2);
-        let store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
-        for i in 0..20u64 {
-            store.put(key(i), format!("data-{i}").as_bytes()).unwrap();
-        }
-        store.delete(key(5)).unwrap();
-        store.undelete(key(5)).unwrap();
-        store.compact().unwrap();
-        assert_eq!(
-            store.get(&key(5)).unwrap(),
-            b"data-5".to_vec(),
-            "undeleted data survives compaction"
-        );
-        store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
-        assert_eq!(store.get(&key(5)).unwrap(), b"data-5".to_vec());
-        assert_eq!(store.life_version_of(&key(5)), Some(1));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn undelete_after_put_reclaimed_by_compaction_is_permanent() {
-        let dir = temp_dir("undel_perm");
-        let seg = seg_cap(2);
-        let store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
-        for i in 0..30u64 {
-            store.put(key(i), &[b'x'; 200]).unwrap();
-        }
-        store.delete(key(0)).unwrap();
-        store.compact().unwrap(); // 回收死 PUT(含 key0 被删前的原 PUT)
-        assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
-        // 原 PUT 数据已被回收 → 不可复活(对齐 Ambry IDDeletedPermanently)。
-        assert!(matches!(store.undelete(key(0)), Err(Error::NotFound)));
-        store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn update_ttl_removes_expiration() {
-        let dir = temp_dir("ttl_upd");
-        let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
-        // 过期时间设在过去 → get 立即 Expired。
-        store.put_ttl(key(1), b"payload", 1).unwrap();
-        assert!(matches!(store.get(&key(1)), Err(Error::Expired)));
-
-        store.update_ttl(key(1), NO_EXPIRATION).unwrap();
-        assert_eq!(
-            store.get(&key(1)).unwrap(),
-            b"payload".to_vec(),
-            "TTL removed → readable"
-        );
-        assert_eq!(store.expiration_of(&key(1)), Some(NO_EXPIRATION));
-
-        // 幂等冲突:再次更新报 AlreadyUpdated。
         assert!(matches!(
-            store.update_ttl(key(1), NO_EXPIRATION),
-            Err(Error::AlreadyUpdated)
+            store.put(key(1), b"hello"),
+            Err(Error::AlreadyExists)
+        ));
+        let mut src = &b"hello"[..];
+        assert!(matches!(
+            store.put_from_reader(key(1), 5, &mut src, NO_EXPIRATION),
+            Err(Error::AlreadyExists)
         ));
 
-        // 重开 + 扫 log 重建都保留永久 TTL。
+        // 墓碑跨重开与扫 log 重建仍是终态。
         store.close().unwrap();
         let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
-        assert_eq!(store.get(&key(1)).unwrap(), b"payload".to_vec());
-        assert_eq!(store.expiration_of(&key(1)), Some(NO_EXPIRATION));
+        assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
         store.close().unwrap();
         let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
-        assert_eq!(store.expiration_of(&key(1)), Some(NO_EXPIRATION));
+        assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
+        assert!(store.stat(&key(1)).unwrap().deleted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn update_ttl_rejects_absent_and_deleted() {
-        let dir = temp_dir("ttl_rej");
+    fn ttl_is_fixed_at_write_time() {
+        let dir = temp_dir("ttl_write_only");
         let seg = seg_cap(16);
         let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
-        assert!(
-            matches!(
-                store.update_ttl(key(1), NO_EXPIRATION),
-                Err(Error::NotFound)
-            ),
-            "absent"
+        // 过期时刻设在过去 → 立即过期。
+        store.put_ttl(key(1), b"payload", 1).unwrap();
+        assert!(matches!(store.get(&key(1)), Err(Error::Expired)));
+        assert!(store.stat(&key(1)).unwrap().expired);
+        // 没有"改期"这条路:过期对象仍是已占用 key。
+        assert!(matches!(
+            store.put_ttl(key(1), b"payload", NO_EXPIRATION),
+            Err(Error::AlreadyExists)
+        ));
+        // 复制读可以看到过期数据(接收端据此忠实 apply)。
+        assert_eq!(
+            store.get_with_options(&key(1), true).unwrap(),
+            b"payload".to_vec()
         );
-        store.put(key(1), b"v").unwrap();
-        store.delete(key(1)).unwrap();
-        assert!(
-            matches!(store.update_ttl(key(1), NO_EXPIRATION), Err(Error::Deleted)),
-            "deleted"
-        );
+        // TTL 落记录体内,故扫 log 全量重建后仍过期(不只活在索引里)。
         store.close().unwrap();
+        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
+        assert_eq!(store.expiration_of(&key(1)), Some(1));
+        assert!(matches!(store.get(&key(1)), Err(Error::Expired)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_partition_key_is_rejected() {
+        let dir = temp_dir("prefix_reject");
+        let seg = seg_cap(16);
+        let store = BlobStore::create_for_partition(&dir, seg * 8, seg, 4, 7).unwrap();
+        assert_eq!(store.key_prefix(), 7);
+        let mine = StoreKey::from_parts(7, 1);
+        let other = StoreKey::from_parts(8, 1);
+        store.put(mine, b"ok").unwrap();
+        assert_eq!(store.get(&mine).unwrap(), b"ok".to_vec());
+
+        // 记录只存 key 的低 32bit:别的 partition 的 key 写进去就再也读不回来,必须当场拒。
+        assert!(matches!(store.put(other, b"x"), Err(Error::BadArgument(_))));
+        let mut src = &b"x"[..];
+        assert!(matches!(
+            store.put_from_reader(other, 1, &mut src, NO_EXPIRATION),
+            Err(Error::BadArgument(_))
+        ));
+        assert!(matches!(store.delete(other), Err(Error::BadArgument(_))));
+        assert!(matches!(
+            store.apply_replicated(ReplicatedRecord {
+                key: other,
+                flags: 0,
+                expiration_ms: NO_EXPIRATION,
+                data: Some(b"x".to_vec()),
+            }),
+            Err(Error::BadArgument(_))
+        ));
+
+        // 前缀从段头读回(重开后仍知道自己是 partition 7)。
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        assert_eq!(store.key_prefix(), 7);
+        assert_eq!(store.get(&mine).unwrap(), b"ok".to_vec());
+        store.close().unwrap();
+
+        // `open_with_partition` 校验盘上分区,不符即拒(目录放错分区必须大声失败)。
+        let registry = crate::metrics::StoreMetrics::new(&antfs_metric::Registry::new()).unwrap();
+        let cfg = crate::config::StoreConfig::default();
+        assert!(matches!(
+            BlobStore::open_with_partition(&dir, seg * 8, &cfg, &registry, "p7", 8),
+            Err(Error::Corrupt(_))
+        ));
+        let ok = BlobStore::open_with_partition(&dir, seg * 8, &cfg, &registry, "p7", 7).unwrap();
+        assert_eq!(ok.key_prefix(), 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2829,65 +2904,31 @@ mod tests {
 
         store.put(key(1), b"hello").unwrap();
         let m = store.stat(&key(1)).unwrap();
-        assert!(!m.deleted && !m.expired && m.life_version == 0);
+        assert!(!m.deleted && !m.expired);
         assert_eq!(
             m.data_len, 5,
             "payload length reported without reading data"
         );
         assert!(!store.is_empty() && store.size_in_bytes() > 0);
 
-        // 删除后 stat 仍可查状态;get 默认拒,include_deleted 从原 PUT 读回数据。
+        // 删除后 stat 仍可查状态;数据不再可取 —— 删除不可逆,没有 include_deleted 这条路。
         store.delete(key(1)).unwrap();
         assert!(store.stat(&key(1)).unwrap().deleted);
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
-        assert_eq!(
-            store.get_with_options(&key(1), true, false).unwrap(),
-            b"hello".to_vec()
-        );
+        assert!(matches!(
+            store.get_with_options(&key(1), true),
+            Err(Error::Deleted)
+        ));
 
-        // 过期对象:stat 标记 expired;include_expired 可读。
+        // 过期对象:stat 标记 expired;include_expired 可读(复制拉取需要)。
         store.put_ttl(key(2), b"temp", 1).unwrap();
         assert!(store.stat(&key(2)).unwrap().expired);
         assert!(matches!(store.get(&key(2)), Err(Error::Expired)));
         assert_eq!(
-            store.get_with_options(&key(2), false, true).unwrap(),
+            store.get_with_options(&key(2), true).unwrap(),
             b"temp".to_vec()
         );
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn hard_delete_scrubs_deleted_blob_data() {
-        let dir = temp_dir("hard");
-        let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
-        store.put(key(1), b"secret-data").unwrap();
-        store.put(key(2), b"keep-this").unwrap();
-        store.delete(key(1)).unwrap();
-        // 删除后 include_deleted 仍能读到明文。
-        assert_eq!(
-            store.get_with_options(&key(1), true, false).unwrap(),
-            b"secret-data".to_vec()
-        );
-
-        assert_eq!(store.hard_delete().unwrap(), 1, "one deleted blob scrubbed");
-        // 原数据被清零;未删除的 key(2) 不受影响;幂等。
-        assert_eq!(
-            store.get_with_options(&key(1), true, false).unwrap(),
-            vec![0u8; 11]
-        );
-        assert_eq!(store.get(&key(2)).unwrap(), b"keep-this".to_vec());
-        assert_eq!(store.hard_delete().unwrap(), 0, "idempotent");
-
-        // 重开后擦除持久。
-        store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
-        assert_eq!(
-            store.get_with_options(&key(1), true, false).unwrap(),
-            vec![0u8; 11]
-        );
-        assert_eq!(store.get(&key(2)).unwrap(), b"keep-this".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2996,8 +3037,8 @@ mod tests {
                                 "step {step}: del absent key {k}"
                             ),
                             ModelState::Deleted => assert!(
-                                matches!(res, Err(Error::Deleted)),
-                                "step {step}: del deleted key {k}"
+                                res.is_ok(),
+                                "step {step}: delete on tombstone key {k} must be idempotent Ok, got {res:?}"
                             ),
                             ModelState::Live(_) => {
                                 res.unwrap_or_else(|e| {
@@ -3152,82 +3193,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // D4 P3:并发 hard_delete(COW)与无锁读者——软删对象带 include_deleted 读其原 PUT,
-    // 全程只见「擦前明文」或「擦后全零」,绝不撕裂读(旧就地 overwrite_at 会偶发 NotFound/半擦)。
-    #[test]
-    fn concurrent_hard_delete_never_torn_reads() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let dir = temp_dir("hard_concurrent");
-        let seg = seg_cap(8);
-        let store = Arc::new(BlobStore::create(&dir, seg * 128, seg, 1000).unwrap());
-
-        const KEPT: u64 = 100;
-        const VICTIMS: u64 = 100;
-        for k in 0..KEPT {
-            store.put(key(k), &data_for(k, 0)).unwrap();
-        }
-        let victim_data = vec![7u8; 64]; // 非零,便于区分「擦前明文 / 擦后全零」
-        for k in KEPT..(KEPT + VICTIMS) {
-            store.put(key(k), &victim_data).unwrap();
-            store.delete(key(k)).unwrap();
-        }
-
-        let done = Arc::new(AtomicBool::new(false));
-        let zeroed = vec![0u8; victim_data.len()];
-        std::thread::scope(|s| {
-            for _ in 0..4 {
-                let store = Arc::clone(&store);
-                let done = Arc::clone(&done);
-                let victim_data = victim_data.clone();
-                let zeroed = zeroed.clone();
-                s.spawn(move || {
-                    while !done.load(Ordering::Acquire) {
-                        for k in 0..KEPT {
-                            assert_eq!(store.get(&key(k)).unwrap(), data_for(k, 0), "kept {k}");
-                        }
-                        for k in KEPT..(KEPT + VICTIMS) {
-                            let got = store.get_with_options(&key(k), true, false).unwrap();
-                            assert!(
-                                got == victim_data || got == zeroed,
-                                "victim {k} torn read: {got:?}"
-                            );
-                        }
-                    }
-                });
-            }
-            {
-                let store = Arc::clone(&store);
-                let done = Arc::clone(&done);
-                s.spawn(move || {
-                    let n = store.hard_delete().unwrap();
-                    assert_eq!(n, VICTIMS as usize, "all victims scrubbed");
-                    done.store(true, Ordering::Release);
-                });
-            }
-        });
-
-        for k in KEPT..(KEPT + VICTIMS) {
-            assert_eq!(
-                store.get_with_options(&key(k), true, false).unwrap(),
-                zeroed,
-                "final victim {k} zeroed"
-            );
-        }
-        for k in 0..KEPT {
-            assert_eq!(
-                store.get(&key(k)).unwrap(),
-                data_for(k, 0),
-                "final kept {k}"
-            );
-        }
-        assert_eq!(store.hard_delete().unwrap(), 0, "idempotent hard_delete");
-
-        Arc::into_inner(store).unwrap().close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     // 汇总分批拉取的全部条目到「key → 最新 MessageInfo」(find 恒返回最新态,跨批同 key 合并)。
     #[cfg(test)]
     fn drain_all(
@@ -3363,23 +3328,20 @@ mod tests {
         let store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
         let mut rng = Rng(0x51ED_C0DE);
 
-        // 混合 put(部分带 TTL)/delete/undelete/update_ttl,穿插 compaction,
-        // 每步后增量计数须与全扫基准相等。
+        // 混合 put(部分带 TTL)/delete,穿插 compaction,每步后增量计数须与全扫基准相等。
         for step in 0..300u64 {
             let k = rng.below(40);
-            match rng.below(5) {
+            match rng.below(4) {
                 0 => {
-                    let ttl = if k % 2 == 0 { 1000 } else { NO_EXPIRATION };
+                    let ttl = if k.is_multiple_of(2) {
+                        1000
+                    } else {
+                        NO_EXPIRATION
+                    };
                     let _ = store.put_ttl(key(k), &data_for(k, step), ttl);
                 }
                 1 => {
                     let _ = store.delete(key(k));
-                }
-                2 => {
-                    let _ = store.undelete(key(k));
-                }
-                3 => {
-                    let _ = store.update_ttl(key(k), NO_EXPIRATION);
                 }
                 _ => {
                     if step % 40 == 39 {
@@ -3406,23 +3368,17 @@ mod tests {
     }
 
     #[test]
-    fn update_ttl_sets_arbitrary_expiration() {
+    fn put_ttl_records_arbitrary_expiration() {
         let dir = temp_dir("ttl_set");
         let seg = seg_cap(16);
         let store = BlobStore::create(&dir, seg * 8, seg, 100).unwrap();
-        store.put(key(1), b"payload").unwrap();
-        // 设一个未来的过期时刻(非永久)。
+        // 未来的过期时刻(非永久)—— 写入时一次定下,没有后续"改期"。
         let future = now_ms() as i64 + 1_000_000;
-        store.update_ttl(key(1), future).unwrap();
+        store.put_ttl(key(1), b"payload", future).unwrap();
         let m = store.stat(&key(1)).unwrap();
-        assert!(m.ttl_updated, "ttl_updated flag set");
-        assert_eq!(m.expiration_ms, future, "arbitrary expiration recorded");
+        assert_eq!(m.expiration_ms, future, "expiration comes from the write");
         assert!(!m.expired, "not yet expired");
-        // 一次性:再更新报 AlreadyUpdated。
-        assert!(matches!(
-            store.update_ttl(key(1), NO_EXPIRATION),
-            Err(Error::AlreadyUpdated)
-        ));
+        assert!(!m.deleted);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3462,21 +3418,17 @@ mod tests {
                 break;
             }
             for m in &info.entries {
-                let flags = (if m.deleted { FLAG_DELETED } else { 0 })
-                    | (if m.ttl_updated { FLAG_TTL_UPDATED } else { 0 })
-                    | (if m.undeleted { FLAG_UNDELETED } else { 0 });
+                let flags = if m.deleted { FLAG_DELETED } else { 0 };
                 let data = if m.deleted {
                     None
                 } else {
-                    Some(peer.get_with_options(&m.key, true, true).unwrap())
+                    Some(peer.get_with_options(&m.key, true).unwrap())
                 };
                 local
                     .apply_replicated(ReplicatedRecord {
                         key: m.key,
                         flags,
                         expiration_ms: m.expiration_ms,
-                        operation_time_ms: m.operation_time_ms,
-                        life_version: m.life_version,
                         data,
                     })
                     .unwrap();
@@ -3496,7 +3448,7 @@ mod tests {
 
         replicate_all(&peer, &local);
         assert_eq!(local.get(&key(1)).unwrap(), payload, "PUT propagated");
-        assert_eq!(local.stat(&key(1)).unwrap().life_version, 0);
+        assert!(!local.stat(&key(1)).unwrap().deleted);
 
         let bytes = local.size_in_bytes();
         replicate_all(&peer, &local); // 再来一轮
@@ -3508,31 +3460,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dl);
     }
 
+    /// 墓碑恒胜:对象不可变 + 删除不可逆 ⇒ 每个 key 的状态单调向前。
+    /// 本地已有的 PUT 不会被 peer 的 PUT 覆盖(内容相同),被 peer 的墓碑推进;墓碑不再后退。
     #[test]
-    fn apply_replicated_preserves_high_life_version() {
-        let (dp, dl) = (temp_dir("repl_lv_peer"), temp_dir("repl_lv_local"));
+    fn apply_replicated_is_tombstone_wins_and_never_regresses() {
+        let (dp, dl) = (temp_dir("repl_tw_peer"), temp_dir("repl_tw_local"));
         let seg = seg_cap(64);
         let peer = BlobStore::create(&dp, seg * 4, seg, 1000).unwrap();
         let local = BlobStore::create(&dl, seg * 4, seg, 1000).unwrap();
-        // put→delete→undelete(lv1)→delete→undelete(lv2)。
-        peer.put(key(2), &[1, 2, 3]).unwrap();
-        peer.delete(key(2)).unwrap();
-        assert_eq!(peer.undelete(key(2)).unwrap(), 1);
-        peer.delete(key(2)).unwrap();
-        assert_eq!(peer.undelete(key(2)).unwrap(), 2);
 
+        // 1) peer 的 PUT 进本地(PUT + 本地不存在 → Applied)。
+        peer.put(key(1), &[1, 2, 3]).unwrap();
         replicate_all(&peer, &local);
+        assert_eq!(local.get(&key(1)).unwrap(), vec![1, 2, 3]);
+
+        // 2) 本地已有同名 key 时,peer 的 PUT 一律 Skipped(内容不可变,无需覆盖)。
+        let before = local.size_in_bytes();
+        let out = local
+            .apply_replicated(ReplicatedRecord {
+                key: key(1),
+                flags: 0,
+                expiration_ms: NO_EXPIRATION,
+                data: Some(vec![9, 9, 9]),
+            })
+            .unwrap();
+        assert_eq!(out, ApplyOutcome::Skipped, "PUT over PUT skips");
+        assert_eq!(local.size_in_bytes(), before, "内容未被改写");
+
+        // 3) peer 的墓碑覆盖本地 PUT(tombstone wins)。
+        peer.delete(key(1)).unwrap();
+        replicate_all(&peer, &local);
+        assert!(matches!(local.get(&key(1)), Err(Error::Deleted)));
+
+        // 4) 本地已是墓碑 → peer 的 PUT 不再生效(删除不可逆,不回归)。
+        let out = local
+            .apply_replicated(ReplicatedRecord {
+                key: key(1),
+                flags: 0,
+                expiration_ms: NO_EXPIRATION,
+                data: Some(vec![4, 5, 6]),
+            })
+            .unwrap();
         assert_eq!(
-            local.stat(&key(2)).unwrap().life_version,
-            2,
-            "复制后 lifeVersion 忠实保留为 2,不退回 0"
+            out,
+            ApplyOutcome::Skipped,
+            "tombstone never regresses to PUT"
         );
-        assert_eq!(local.get(&key(2)).unwrap(), vec![1, 2, 3]);
+        assert!(matches!(local.get(&key(1)), Err(Error::Deleted)));
+        // peer 的墓碑再 apply 也 Skipped(幂等)。
+        let out = local
+            .apply_replicated(ReplicatedRecord {
+                key: key(1),
+                flags: FLAG_DELETED,
+                expiration_ms: NO_EXPIRATION,
+                data: None,
+            })
+            .unwrap();
+        assert_eq!(out, ApplyOutcome::Skipped, "tombstone over tombstone skips");
 
         peer.close().unwrap();
         local.close().unwrap();
         let _ = std::fs::remove_dir_all(&dp);
         let _ = std::fs::remove_dir_all(&dl);
+    }
+
+    /// 存活记录缺数据体且本地也缺该 key → `Corrupt`(不能凭空造一条没有数据的活记录)。
+    #[test]
+    fn apply_replicated_alive_without_data_is_corrupt() {
+        let dir = temp_dir("repl_no_data");
+        let seg = seg_cap(64);
+        let local = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let r = local.apply_replicated(ReplicatedRecord {
+            key: key(1),
+            flags: 0,
+            expiration_ms: NO_EXPIRATION,
+            data: None,
+        });
+        assert!(matches!(r, Err(Error::Corrupt(_))), "got {r:?}");
+        // 墓碑则不需要数据体,照常落盘。
+        let ok = local.apply_replicated(ReplicatedRecord {
+            key: key(1),
+            flags: FLAG_DELETED,
+            expiration_ms: NO_EXPIRATION,
+            data: None,
+        });
+        assert_eq!(ok.unwrap(), ApplyOutcome::Applied);
+        assert!(matches!(local.get(&key(1)), Err(Error::Deleted)));
+        local.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3568,8 +3583,6 @@ mod tests {
             key: key(4),
             flags: 0,
             expiration_ms: NO_EXPIRATION,
-            operation_time_ms: 1,
-            life_version: 0,
             data: Some(vec![1]),
         });
         assert!(matches!(r, Err(Error::Unavailable)), "自关后 apply 拒绝");
@@ -3605,7 +3618,11 @@ mod tests {
             let bytes = store.read_segment_prefix(*pos).unwrap();
             std::fs::write(log_dir.join(LogSegmentName(*pos).filename()), &bytes).unwrap();
         }
-        let cfg = StoreConfig { segment_size_bytes: seg, index_max_inmem_elements: 1000, io_error_count_to_trigger_shutdown: 0 };
+        let cfg = StoreConfig {
+            segment_size_bytes: seg,
+            index_max_inmem_elements: 1000,
+            io_error_count_to_trigger_shutdown: 0,
+        };
         let reg = crate::StoreMetrics::new(&antfs_metric::Registry::new()).unwrap();
         let copied = BlobStore::open_rebuild_index_with(&dst, seg * 8, &cfg, &reg, "s3b").unwrap();
         // 封存段覆盖的 key(排除落在活跃段的)应可读。
@@ -3639,7 +3656,10 @@ mod record_len_tests {
         assert_eq!(record_data_len(u32::MAX as u64).unwrap(), u32::MAX);
         let err = record_data_len(u32::MAX as u64 + 1).unwrap_err();
         assert!(matches!(err, Error::BadArgument(_)), "got {err:?}");
-        assert!(err.to_string().contains("exceeds"), "报错要说清是长度超限: {err}");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "报错要说清是长度超限: {err}"
+        );
     }
 
     /// 64 位平台才存在"超过 u32 的 `usize`";16/32 位平台该分支不可达,故不测。
@@ -3651,6 +3671,10 @@ mod record_len_tests {
         // 做 `u32::try_from`(截断所需的 `as u32` 已从代码里删除),而 6 个调用点都写了 `?` ——
         // 任何人把它改回"静默截断"都会**编不过**,不依赖这条测试去发现。
         assert!(record_data_len(u32::MAX as u64 + 1).is_err(), "策略必须拒");
-        assert_eq!(record_data_len((1 << 20) as u64).unwrap(), 1 << 20, "常规大小照常放行");
+        assert_eq!(
+            record_data_len((1 << 20) as u64).unwrap(),
+            1 << 20,
+            "常规大小照常放行"
+        );
     }
 }

@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 240" width="680" height="240">
+  <defs>
+    <linearGradient id="bodyGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFB25C"/>
+      <stop offset="0.55" stop-color="#FF8A5C"/>
+      <stop offset="1" stop-color="#FF6B6B"/>
+    </linearGradient>
+    <linearGradient id="gasterGrad" x1="0" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#FF9F68"/>
+      <stop offset="1" stop-color="#F2577B"/>
+    </linearGradient>
+    <linearGradient id="textGradA" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FF8A5C"/>
+      <stop offset="1" stop-color="#F2577B"/>
+    </linearGradient>
+    <linearGradient id="textGradB" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2BC5B4"/>
+      <stop offset="1" stop-color="#4E9AF1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ground shadow -->
+  <ellipse cx="132" cy="216" rx="92" ry="12" fill="#1B2340" opacity="0.10"/>
+
+  <!-- data blocks carried on the back -->
+  <g stroke="#FFFFFF" stroke-width="3">
+    <rect x="66" y="74" width="34" height="34" rx="8" fill="#2BC5B4" transform="rotate(-9 83 91)"/>
+    <rect x="102" y="70" width="34" height="34" rx="8" fill="#A78BFA" transform="rotate(7 119 87)"/>
+    <rect x="84" y="40" width="34" height="34" rx="8" fill="#FFD93D" transform="rotate(-3 101 57)"/>
+  </g>
+  <!-- sparkles -->
+  <circle cx="56" cy="46" r="4" fill="#FFD93D"/>
+  <circle cx="142" cy="40" r="4" fill="#2BC5B4"/>
+  <circle cx="152" cy="72" r="3" fill="#F2577B"/>
+
+  <!-- legs -->
+  <g fill="none" stroke="#D96A4B" stroke-width="8" stroke-linecap="round">
+    <path d="M170 166 L 178 196 L 196 206"/>
+    <path d="M150 172 L 150 202 L 132 212"/>
+    <path d="M108 184 L 100 208 L 82 214"/>
+  </g>
+
+  <!-- gaster (rear body) -->
+  <ellipse cx="96" cy="150" rx="54" ry="47" fill="url(#gasterGrad)"/>
+  <ellipse cx="80" cy="132" rx="18" ry="12" fill="#FFFFFF" opacity="0.28" transform="rotate(-24 80 132)"/>
+
+  <!-- thorax -->
+  <ellipse cx="162" cy="150" rx="27" ry="24" fill="url(#bodyGrad)"/>
+
+  <!-- head -->
+  <circle cx="204" cy="136" r="32" fill="url(#bodyGrad)"/>
+
+  <!-- antennae -->
+  <g fill="none" stroke="#E86A5E" stroke-width="7" stroke-linecap="round">
+    <path d="M186 106 C 180 86, 168 82, 162 66"/>
+    <path d="M222 106 C 228 86, 240 82, 246 66"/>
+  </g>
+  <circle cx="160" cy="61" r="7.5" fill="#F2577B"/>
+  <circle cx="248" cy="61" r="7.5" fill="#F2577B"/>
+
+  <!-- eyes -->
+  <ellipse cx="193" cy="133" rx="10" ry="11" fill="#FFFFFF"/>
+  <ellipse cx="215" cy="133" rx="10" ry="11" fill="#FFFFFF"/>
+  <circle cx="195" cy="135" r="5" fill="#33304A"/>
+  <circle cx="217" cy="135" r="5" fill="#33304A"/>
+  <circle cx="193.5" cy="132" r="1.8" fill="#FFFFFF"/>
+  <circle cx="215.5" cy="132" r="1.8" fill="#FFFFFF"/>
+
+  <!-- blush -->
+  <ellipse cx="180" cy="149" rx="6" ry="3.6" fill="#F2577B" opacity="0.45"/>
+  <ellipse cx="228" cy="149" rx="6" ry="3.6" fill="#F2577B" opacity="0.45"/>
+
+  <!-- smile -->
+  <path d="M195 150 Q 204 158 213 150" fill="none" stroke="#B14A52" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- wordmark -->
+  <text x="282" y="160" font-family="'Arial Rounded MT Bold','Nunito','Quicksand','Segoe UI',Verdana,sans-serif" font-size="86" font-weight="800" letter-spacing="-1">
+    <tspan fill="url(#textGradA)">ant</tspan><tspan fill="url(#textGradB)">fs</tspan>
+  </text>
+  <text x="288" y="196" font-family="'Segoe UI',Verdana,sans-serif" font-size="21" font-weight="600" fill="#8A90A8" letter-spacing="2.5">tiny ants · massive files</text>
+</svg>

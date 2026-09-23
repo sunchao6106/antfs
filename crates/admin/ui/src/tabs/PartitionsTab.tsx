@@ -537,6 +537,11 @@ export function PartitionsTab({
                                   <>
                                     {`records=${r.report.live_records} bytes=${fmtBytes(r.report.live_bytes)} tombstones=${r.report.tombstones} segs=${r.report.sealed_segments}`}
                                     {r.key_count != null && ` keys=${r.key_count}`}
+                                    {r.report.damaged_records > 0 && (
+                                      <span className="pill small down">
+                                        {t("scrubDamaged", { n: r.report.damaged_records })}
+                                      </span>
+                                    )}
                                     {r.partial && <span className="pill small warn">{t("scrubPartial")}</span>}
                                     {r.verify &&
                                       ` · ${t("scrubVerify")} bad=${r.verify.bad_records} idx=${r.verify.index_mismatch}${r.verify.truncated ? " (truncated)" : ""}`}

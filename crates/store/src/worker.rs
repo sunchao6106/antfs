@@ -1,4 +1,4 @@
-//! S4 本地维护 worker:数据节点常驻后台,周期性驱动 `blob` 引擎的 flush / compaction / hard_delete。
+//! S4 本地维护 worker:数据节点常驻后台,周期性驱动 `blob` 引擎的 flush / compaction。
 //!
 //! 对齐 Ambry `CompactionManager` 跑在 `StorageManager` 里的定位:**本地、轻、常驻**,只维护本节点
 //! 自己的 replica,不做集群级再复制/再平衡(那是 master 的 reconciler)。周期时长全部可配置。
@@ -40,19 +40,7 @@ pub fn compact_all(replicas: &ReplicaManager, dead_ratio: f64) -> usize {
     n
 }
 
-/// 对本节点每个 replica 擦除已删除对象数据体,返回擦除的记录总数。
-pub fn hard_delete_all(replicas: &ReplicaManager) -> u64 {
-    let mut n = 0u64;
-    for (pid, h) in replicas.handles() {
-        match h.store.hard_delete() {
-            Ok(count) => n += count as u64,
-            Err(e) => tracing::warn!(partition = pid, error = %e, "local-worker hard_delete failed"),
-        }
-    }
-    n
-}
-
-/// 起三条独立周期的后台维护 loop(flush / compaction / hard_delete),各自节拍由配置控制。
+/// 起两条独立周期的后台维护 loop(flush / compaction),各自节拍由配置控制。
 ///
 /// 仅在 `local_worker_enabled` 时由 [`crate::server::StoreServer::serve`] 调用。
 pub fn spawn_local_worker(
@@ -69,15 +57,9 @@ pub fn spawn_local_worker(
     let dead_ratio = config.compaction_dead_ratio;
     spawn_loop(
         Duration::from_secs(config.compaction_interval_secs),
-        replicas.clone(),
-        metrics.clone(),
-        move |r, m| m.compactions.inc_by(compact_all(&r, dead_ratio) as u64),
-    );
-    spawn_loop(
-        Duration::from_secs(config.hard_delete_interval_secs),
         replicas,
         metrics,
-        |r, m| m.hard_deleted.inc_by(hard_delete_all(&r)),
+        move |r, m| m.compactions.inc_by(compact_all(&r, dead_ratio) as u64),
     );
 }
 
@@ -110,8 +92,9 @@ mod tests {
 
     use crate::disk::DiskManager;
 
+    /// 本模块的副本都建在 `pid = 1` 上 —— key 前缀必须跟着走(记录只存低 32bit)。
     fn key(n: u8) -> StoreKey {
-        StoreKey::new([n; 8])
+        StoreKey::from_parts(1, n as u32)
     }
 
     fn manager(dir: &std::path::Path) -> ReplicaManager {
@@ -137,7 +120,10 @@ mod tests {
 
         rm.remove_replica(1);
         let h2 = rm.ensure_replica(1).unwrap();
-        assert_eq!(h2.store.get(&key(1)).unwrap().as_slice(), b"durable payload");
+        assert_eq!(
+            h2.store.get(&key(1)).unwrap().as_slice(),
+            b"durable payload"
+        );
     }
 
     #[test]
@@ -158,19 +144,9 @@ mod tests {
         compact_all(&rm, 0.1);
 
         let after = h.store.stats().unwrap().dead_bytes;
-        assert!(after < before, "compaction must reduce dead bytes: {before} -> {after}");
-    }
-
-    #[test]
-    fn hard_delete_all_counts_erased_records() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rm = manager(tmp.path());
-        let h = rm.ensure_replica(1).unwrap();
-        h.store.put(key(1), b"secret to erase").unwrap();
-        h.store.delete(key(1)).unwrap();
-        h.store.flush().unwrap();
-
-        assert_eq!(hard_delete_all(&rm), 1, "one deleted record hard-deleted");
-        assert_eq!(hard_delete_all(&rm), 0, "idempotent: nothing left to hard-delete");
+        assert!(
+            after < before,
+            "compaction must reduce dead bytes: {before} -> {after}"
+        );
     }
 }

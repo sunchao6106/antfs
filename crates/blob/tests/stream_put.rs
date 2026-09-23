@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use antfs_blob::{BlobStore, Error, StoreKey};
 
-// `seg_data` = **段容量**(含 64B 段头,故数据容量 = `seg_data - 64`);总容量须是段容量的整数倍。
+// `seg_data` = **段容量**(含 64B 段头,故数据容量 = `seg_data - 64`)。
+// (总容量不必是段容量的整数倍 —— 末段可为残段,见 `tests/segment_tail.rs`;这里仍取整数倍保持简单。)
 
 fn tmpdir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -141,8 +142,13 @@ fn read_error_leaves_no_record_and_store_stays_usable() {
         pos: 0,
         fail_at: 1000,
     };
-    let err = store.put_from_reader(key(1), 4096, &mut bad, -1).unwrap_err();
-    assert!(matches!(err, Error::Io(_)), "read failure must surface as Io, got {err:?}");
+    let err = store
+        .put_from_reader(key(1), 4096, &mut bad, -1)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Io(_)),
+        "read failure must surface as Io, got {err:?}"
+    );
 
     // 未发布的记录对索引不可见。
     assert!(matches!(store.get(&key(1)), Err(Error::NotFound)));
@@ -176,7 +182,11 @@ fn stream_rejects_illegal_len() {
         .put_from_reader(key(1), u32::MAX as u64 + 1, &mut src, -1)
         .unwrap_err();
     assert!(matches!(err, Error::BadArgument(_)), "got {err:?}");
-    assert_eq!(store.size_in_bytes(), 0, "rejected put must not consume log space");
+    assert_eq!(
+        store.size_in_bytes(),
+        0,
+        "rejected put must not consume log space"
+    );
 
     // 单条记录不得跨段:超段数据容量同样拒。
     let mut src = &b"xyz"[..];

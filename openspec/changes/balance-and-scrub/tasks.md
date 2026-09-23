@@ -37,3 +37,20 @@
 - UI:分区页行内「一致性」面板(结论徽标 + 逐副本记录数/字节/墓碑/段数/keys/partial + verify 摘要 + 差异明细 + 深度校验开关 + 重新巡检)、运维页「最近一致性巡检」列表(10s 轮询);i18n en/zh 双份。
 - **真集群验证(3 store,15/15 PASS)**:① 写入收敛 → 一致;② 暂停 102 拉复制后写新 key → 检出 key 级差异(`n102=missing`)+ 摘要差异;③ `deep=1` 带回各副本 verify;④ **在线翻转 103 段文件字节** → deep 报 `bad_records=1`、该副本标 `partial`、结论含 `verify` 差异(**即使其元数据窗口已因坏记录读不出来**——这正是"素材取不全不致命"那条设计要覆盖的场景);⑤ `/api/scrub` 最近列表;⑥ viewer 触发 403 / 读列表 200;UI 面板与运维页在浏览器核对通过。
 - 已知缺口(已写入 store.md §12.10):记录损坏会让 `BlobStore::open`(索引重建)整体失败 → 该副本起不来,因而无法经端点检查;修它需改恢复路径语义(Ambry `IndexRecovery` 方向),属后续增强。
+
+## B 节追加:带伤启动(容错恢复,已完成)
+
+原"已知缺口:记录损坏让 `open` 整体失败 → 副本起不来也无法被 scrub 检查"已修:
+
+- `BlobStore::open` / `open_rebuild_index` 的**三处全量扫描全部容错**(索引重建、段字节核算、有效数据核算):
+  坏记录跳过并记录,能重同步就重同步,不能则放弃该段剩余部分(其它段仍恢复);**不删不改写不截断盘上字节**。
+- 大声报错:逐条 + 汇总 ERROR 日志、`OpenDamage`(`bad_records`/`first_bad_offset`/`abandoned_segments`)、
+  指标 `store_open_bad_records_total`/`store_open_abandoned_segments_total`、经 `scrub-report` 的
+  `damaged_records`/`abandoned_segments` 暴露 → admin 一致性巡检算作**摘要级差异**;UI 副本行显示"带伤启动"红标。
+- 测试:blob 3 例(可重同步跳过并暴露 / 不可重同步放弃该段但恢复后续段 / 干净副本零副作用)+ store 1 例
+  (损坏后重开装载成功、健康记录仍可读、`scrub-report` 与指标如实上报)+ admin 1 例(带伤算摘要差异)。
+- 顺带修一个真 bug:重同步未校验"跳过长度是否越过段尾",被写坏的长度字段会把整段剩余内容**静默带走**却不计
+  `abandoned_segments`;另 `open` 的容错回退原先只认 `Corrupt`,漏掉长度字段损坏时的 `OutOfRange`。
+- 残留边界(真集群实测校准):带伤副本仍被 master 当正常副本计数;**逻辑数据可能被拉复制补回(自愈)**,
+  但**盘上坏字节不删不改**,`verify` 与 `damaged_records` 永远如实报告 —— 两者不互相掩盖;
+  peer 也丢了该记录时才需人工 `verify` 定位 + `RepairPartition`/`MoveReplica` 处置。已写入 store.md §12.10。

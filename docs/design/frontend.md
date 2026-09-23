@@ -26,10 +26,8 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 |---|---|---|---|---|
 | `POST` | `/blobs` | body = blob 裸字节;可选 `x-ambry-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405) | **201** + `Location: /blobs/{blobId}` + `x-ambry-blob-id: {16 hex}` + `x-ambry-blob-size: {n}` | 400(非法 id)/ 413(超 `max_body_bytes`)/ 507(分区写满)/ 503(未达多数派) |
 | `GET` | `/blobs/{blobId}` | — | **200** + 原始字节 | 404(所有副本都没有)/ 400(非法 id)/ 502(分片描述符损坏或片缺失)/ 503(副本不可达) |
-| `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-ambry-blob-size`/`-deleted`/`-expired`/`-undeleted`/`-ttl-updated`/`-life-version`/`-expiration-ms`。**拼装对象额外带 `x-ambry-blob-stitched: true` + `x-ambry-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
-| `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑) | 404 / 503 / 400 |
-| `POST` | `/blobs/{blobId}/undelete` | — | **200** + `x-ambry-blob-life-version: {n}` | 404 / 503(未处于已删态也会收敛成 503,见下) |
-| `POST` | `/blobs/{blobId}/ttl?expiration_ms=<i64>` | 查询参数必填 | **204** | 400(缺参数)/ 404 / 503(已更新过同样收敛成 503) |
+| `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-ambry-blob-size`/`-deleted`/`-expired`/`-expiration-ms`。**拼装对象额外带 `x-ambry-blob-stitched: true` + `x-ambry-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
+| `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑;**删除不可逆**;重复删**幂等**,仍 204) | 404 / 503 / 400 |
 | `POST` | `/stitch` | body `{"signedChunkIds":["<16 hex>",…]}`;头 `x-ambry-session: <opaque>` 必填 | **201** + 同 `POST /blobs` 三个头 | 400(session 缺失/空列表/片数 >4096/非法 id/片不可读) |
 | `GET` | `/metrics` | — | **200** + Prometheus 文本 | — |
 
@@ -40,8 +38,10 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 - **副本状态码按语义透传**(不再一律 500):副本回的 `400/413/503/507` 分别映射成同名状态码 —— 这些是
   调用方可控的 payload/容量问题(如"对象太大放不进一个段"是 400、"分区写满"是 507),混进 500 会让
   调用方与压测误判成服务端故障。
-- ⚠ **409 在当前分层下不可达**:store 对「undelete 目标未处于已删态」「ttl 已更新过」回 409,但 router 的多副本变更把
-  单副本失败收敛成 `Quorum` → 本层只能给 503。要精确出 409 需扩 router 暴露单副本状态(记入待办)。
+- ⚠ **409(冲突)在当前分层下大多不可达**:副本对「已存在 key(存活或已墓碑)的再次 `put`」回 409,
+  但 router 的多副本变更把单副本失败收敛成 `Quorum` → 本层**看不到**这个 409(表现为 503)。
+  **`DELETE` 已幂等(2026-09-23 拍板)**:墓碑 key 的重复删由副本直接回 204(不写第二条墓碑)→ 多数派达成 → 本层 204;
+  从未存在的 key 仍 404(经多数派聚合为 503,既有口径)。
 - **`x-ambry-*` 头命名**:沿用 Ambry 的既有头名(`x-ambry-blob-id` / `x-ambry-blob-size` / `x-ambry-session` …),
   便于熟悉 Ambry 的人上手。
 - **不带 account/container**:blobId 64 位无租户位(D7/D8),路径里不放一个"存不下来又不管事"的段;多租户将来落在
@@ -51,15 +51,14 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 | 端点 | 内部动作 |
 |---|---|
-| `POST /blobs` | `allocate_one()` 取 blobId → `put(key, bytes)`(**W = 副本数/2+1**,收满即返回,其余靠拉复制补) |
+| `POST /blobs` | `allocate_one()` 取 blobId → 带 `x-ambry-ttl-ms` 时 `put_with_ttl(key, bytes, expiration_ms)`,否则 `put(key, bytes)`(**W = 副本数/2+1**,收满即返回,其余靠拉复制补) |
 | `GET /blobs/{id}` | `get(&key)`(**R=1**,副本按 `up` 排序,首个 200 即返回) |
 | `HEAD /blobs/{id}` | `stat(&key)`(元数据不读数据体) |
-| `DELETE` / `ttl` | `delete` / `update_ttl`(多数派) |
-| `POST /undelete` | `undelete`(多数派,回 life version) |
+| `DELETE` | `delete`(多数派写墓碑,**不可逆**) |
 
-- `x-ambry-ttl-ms` 的落地方式:**先 `put` 再 `update_ttl`**(两次多数派写)。取舍:SDK 的 `put` 没有 TTL 参数,
-  本次不扩 SDK 的写签名(避免为一个头改公共 API);代价是"非原子"(极端情况下对象已写成功但 TTL 没设上)。
-  数据面 `PUT ...?expiration_ms=` 已支持原子写,后续把 `Router::put*` 加一个 `expiration_ms` 参数即可收口(待办)。
+- `x-ambry-ttl-ms` 的落地方式:**同一次写** —— frontend 把该头解析成绝对 `expiration_ms` 交给 SDK(`Router::put_with_ttl` /
+  `put_file_with_ttl`),数据面 `PUT ...?expiration_ms=` 原子承接,故 TTL 是**单次多数派写**。
+  **写入之后没有任何改 TTL 的接口**(不能续期、不能作废、不能永久化)。
 
 ## 4. 分片拼装(`POST /stitch`)——**无状态**设计
 
@@ -111,7 +110,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 
 `frontend.cors_allowed_origins` 给出**白名单**才挂 `CorsLayer`(非空时才挂);默认 `[]` = 不挂。
 **不用 `permissive()`**:默认放开跨域的 API 是安全问题。放开的方法 `GET/POST/HEAD/DELETE`,
-允许的请求头 `x-ambry-session` / `x-ambry-ttl-ms` / `content-type`,暴露响应头 `x-ambry-*` 与 `location`。
+允许的请求头 `x-ambry-session` / `x-ambry-ttl-ms` / `content-type`,暴露响应头 `x-ambry-*` 与 `location`,共 **8 项**(`CORS_EXPOSED_HEADERS`)。
 
 ## 7. 与 Ambry frontend 的对照
 
@@ -162,7 +161,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend_download_total` | counter | `outcome` | 次 | 下载请求数 | `FrontendMetrics.getBlobRequestMetrics` |
 | `frontend_download_bytes_total` | counter | — | 字节 | 下载字节数(成功) | 无 |
 | `frontend_delete_total` | counter | `outcome` | 次 | 删除请求数 | `FrontendMetrics.deleteBlobRequestMetrics` |
-| `frontend_mutation_total` | counter | `op`, `outcome` | 次 | `head`/`undelete`/`ttl`/`stitch` 请求数 | `FrontendMetrics.*RequestMetrics` |
+| `frontend_mutation_total` | counter | `op`, `outcome` | 次 | `head`/`stitch` 请求数 | `FrontendMetrics.*RequestMetrics` |
 | `frontend_request_duration_seconds` | histogram | `op` | 秒 | 请求延迟(含取号段与副本扇出) | `FrontendMetrics.*RequestTimeInMs` |
 | `frontend_in_flight_requests` | gauge | `op` | 个 | 在途请求数 | 无 |
 | `frontend_replica_errors_total` | counter | `kind` | 次 | 副本侧失败分类(kind 同 SDK 错误表) | 无 |
@@ -182,8 +181,8 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
       数据面**:推荐在 store 记录头的 `flags` 里加一个"composed"位(SeaweedFS needle `FlagIsChunkManifest` 同款),
       之后 HEAD/GET 只看标志、不再嗅探(顺带省掉 HEAD 对小对象的那次数据体读取)。
       完整复现、三个选项与先例出处见 `openspec/changes/blob-io-end-to-end/tasks.md` 的待办首条。
-- [ ] `Router::put*` 增加 `expiration_ms` 参数,让 `x-ambry-ttl-ms` 变成**原子**写(现在先 put 再 update_ttl)。
+- [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**,`x-ambry-ttl-ms` 现为单次多数派写。
 - [ ] **store 侧真流式 GET**(把数据体整个读进内存的是 store;frontend 侧已落暂存再流式回)。
-- [ ] router 暴露单副本状态,让 `undelete`/`ttl` 的 409 语义能透传到 REST 层(现在收敛成 503)。
+- [ ] router 暴露单副本状态,让副本的 409(重复 `put` 命中已存在 key)能透传到 REST 层(现在收敛成 503;重复 `DELETE` 已幂等 204,不在此列)。
 - [ ] S3 兼容层(与 frontend 同层)。
 - [ ] 多租户:account/container + ACL + 配额(网关层)。

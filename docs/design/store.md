@@ -29,11 +29,40 @@
 ```
 [ Header ] [ 数据区(变长记录顺序打包) ]
 ```
-Header(小端 + crc32 覆盖其前):`magic("AMBS") | version | capacity | data_end | created_ns | crc`
+**段头(v2)** —— 物理固定 64 B(其中 40 B 有意义),小端;末尾 crc32 覆盖其前:
+
+| 偏移 | 字段 | 长度 | 说明 |
+|---|---|---|---|
+| 0..4 | `magic("AMBS")` | u32 | |
+| 4..6 | `version` | u16 | `= 2` |
+| 6..8 | `reserved` | 2 | |
+| 8..16 | `capacity` | u64 | 段容量 |
+| 16..24 | `data_end` | u64 | 持久化水位 |
+| 24..32 | `created_ns` | u64 | |
+| 32..36 | `key_prefix` | u32 | blobId **高 32bit**(该副本的 partitionId) |
+| 36..40 | `crc` | u32 | 覆盖 `[0,36)` |
+
+- `key_prefix` **每段一份、整副本恒定**:一个 log 段只属于一个 partition-replica。`create` 时写入,rollover 建新段继承同一前缀;`open` 时读回并核对(**所有段必须一致,否则 `Corrupt`**)。
 - 追加走 buffered `write_at`,推进内存 `data_end`;对象 offset 0 映射到物理 `HEADER_SIZE`。
 - `flush()` = 写 header(data_end)+ `sync_all`;恢复时按 header 的 data_end 还原。
 - 未 flush 数据恢复时不可见(header 未更新)——刻意的持久化契约。
-- `overwrite_at`:就地覆盖已写区间(不改 data_end),供 hard_delete 原地擦除。
+- **段容量硬上界 4 GiB**(`log_segment::MAX_CAPACITY`,亦由 `StoreConfig::validate` 的 `MAX_SEGMENT_SIZE_BYTES` 校验,见 §10.1)。理由是**格式不变量而非调优旋钮**:段内偏移要放进索引条目 u32 的偏移半区,且"单条记录 ≤ 段 − 64 < `u32::MAX`"使记录的 u32 `data_len` 结构性无法回绕。
+
+**记录(v4)** —— `magic(2) | version(1) | flags(1) | key_suffix(4) | expiration_ms(8) | data_len(4) | data | crc(4)`,固定开销 **24 B**(一条记录的物理总长 = `24 + data_len`):
+
+| 偏移 | 字段 | 长度 | 说明 |
+|---|---|---|---|
+| 0..2 | `magic` | u16 | `"MB"` |
+| 2 | `version` | u8 | `= 4` |
+| 3 | `flags` | u8 | 0 = PUT,`FLAG_DELETED` = 墓碑(**唯一**保留的标志) |
+| 4..8 | `key_suffix` | u32 | 大端 = blobId **低 32bit**(objectId) |
+| 8..16 | `expiration_ms` | i64 | `-1` = 不过期 |
+| 16..20 | `data_len` | u32 | 数据体长度 |
+| 20.. | `data` | | 数据体 |
+| 末尾 4 B | `crc` | u32 | 覆盖其前所有字节 |
+
+- **key 高 32bit 不在记录里,只在段头存一次**:同一副本(同一分区)内所有 key 的高 4B 恒等 = 段头的 `key_prefix`,故记录只存 4B 后缀;读取方用 `key_prefix ‖ key_suffix` 拼回完整 8B blobId。**写路径校验 key 的 partition 与该副本前缀一致,不一致 → `BadArgument`**(绝不静默拼出一个错 key)。
+- `expiration_ms` **只在写入时给定**(`-1` = 不过期),写完即定、之后无处可改。
 
 ### 3.1 记录不做对齐 padding、offset 全宽存储(选型 + 被否决方案)
 
@@ -44,7 +73,7 @@ Header(小端 + crc32 覆盖其前):`magic("AMBS") | version | capacity | data_e
 | 方案 | 数据浪费 | 索引 offset 占用 | 寻址范围 | 复杂度 | 代表 |
 |---|---|---|---|---|---|
 | ① ÷N 对齐(存 `offset/N`,强制记录起点 N 对齐) | 平均 ~N/2 B/对象 padding | 最小(如 4B) | `2^(8·宽) · N` | 中(维护"必须对齐"不变量) | SeaweedFS(N=8→32GiB) |
-| **② 全宽 offset(直接存字节号,不对齐)** | **0** | 大(8/16B) | 近乎无限(u64=16EiB) | **最简单** | **Ambry / antfs 本方案** |
+| **② 全宽 offset(直接存字节号,不对齐)** | **0** | 大(8B:段号 u32 ‖ 段内偏移 u32) | 近乎无限 | **最简单** | **Ambry / antfs 本方案** |
 | ③ 余数塞索引(存 `offset/N` + 低位余数进空闲 bit) | **0** | 小(4B + ~3bit) | `2^(8·宽) · N` | 高(需腾空闲位 + 破坏扫描步进) | — |
 
 **分水岭是「索引驻留在 RAM 还是磁盘」,不是 key 长度**:
@@ -57,20 +86,31 @@ Header(小端 + crc32 覆盖其前):`magic("AMBS") | version | capacity | data_e
 
 ## 4. Log(多段)
 
-- 总容量须为段容量整数倍;单条记录不超过一个段的数据容量(与 Ambry 一致)。
+- 单条记录不超过一个段的数据容量(与 Ambry 一致);**总容量不必是段容量的整数倍** —— 末段为"残段"
+  (容量 = `total − k × segment`),装不下记录时该部分空间按写满处理(`SegmentFull` → `StoreFull`),
+  故配置项之间解耦(如 100 GiB 分区 + 3 GiB 段 = 33 整段 + 1 个 1 GiB 残段;段上限 4 GiB,见 §10.1),`total < segment` 亦退化为单段。
 - 活跃段放不下 → 先 flush 旧段 → 滚动到新段;段文件名 `{position}_log.seg`。
 - `LogOffset { segment, offset }` 为跨段全局地址(PersistentIndex 引用它)。
 - `open()` 扫描目录、按位置排序恢复所有段。
 
 ## 5. PersistentIndex(索引)
 
-key(`StoreKey`,**8B** = 64bit blobId:高 32bit partitionId + 低 32bit objectId,见 cluster.md §8 / `openspec/changes/blobid-master-assign`)→ `IndexValue`(定长 **59B**:offset(16)/size(8)/flags(1)/expiration(8)/op_time(8)/life_version(2)/original_offset(16))。较原 32B StoreKey 方案索引每条省 24B(10¹¹ 省 ~2.4TB)。
+key(`StoreKey`,**8B** = 64bit blobId:高 32bit partitionId + 低 32bit objectId,见 cluster.md §8 / `openspec/changes/blobid-master-assign`)→ `IndexValue`(**定长 21B**,小端):
+
+```
+0..8   offset        u64 = (段号 u32 << 32) | 段内偏移 u32
+8..12  size          u32 = 整条记录的字节数(记录头 + 数据体 + crc)
+12     flags         u8  (目前只有 FLAG_DELETED)
+13..21 expiration_ms i64 (-1 = 不过期)
+```
+
+索引条目 = 8B key + 21B value = **29B**(`VALUE_SIZE = 21`、`ENTRY_SIZE = 29`、`RECORD_OVERHEAD = 24`),较上一版 67B(59B value + 8B key)每条省 38B。**索引的 key 仍是完整 8B blobId**(它是跨段的全局查找键;段内前缀只有 log 段才知道,故只有记录里才缩成 4B 后缀,见 §3)。
 
 - **活跃段**:并发 `SkipMap`,写入即插入;无过滤器。
 - **封存段**:活跃段达阈值 → 写 `.idx`(排序条目)+ `.fuse`(**Binary Fuse 过滤器持久化**:
   descriptor+fingerprints,`BinaryFuse8Ref` 零拷贝引用)→ **mmap(`memmap2`)载入**。
-- **newest-wins**:同一 key 在 log 里可能有多条记录(PUT/DELETE/UNDELETE/TTL_UPDATE),索引只留**最新一条**作为赢家;查找先活跃段、再封存段按 seq 从新到旧,首个命中返回。重建时按 log 追加顺序(旧→新)插入,后者覆盖前者,天然还原 newest-wins。
-- **单值索引 + 数据重写**:每 key 只存一个 `IndexValue`(不同于 Ambry 的每 key 多值)。故 undelete/updateTtl **复制整条数据**写成新赢家(保 offset-相等的 compaction/rebuild/seg_bytes 机制不变);`original_offset` 记录承载数据的位置(墓碑指向被删前 PUT,供 undelete 取原数据)。
+- **newest-wins**:对象不可变 + 删除不可逆 ⇒ 同一 key 在 log 里**至多两条**记录(PUT、墓碑),索引只留**最新一条**作为赢家;查找先活跃段、再封存段按 seq 从新到旧,首个命中返回。重建时按 log 追加顺序(旧→新)插入,后者覆盖前者,天然还原 newest-wins。
+- **单值索引、无"数据重写"**:每 key 只存一个 `IndexValue`(不同于 Ambry 的每 key 多值)。`put`/`delete` 都是"往 log 尾部追加一条新记录 + 覆盖索引赢家",**永不改写已提交字节**。故 `IndexValue.offset` 恒等于承载该状态的那条记录的位置,不破坏"offset 相等的 compaction/rebuild/seg_bytes"机制。
 - **IO**:同步 `std::fs`;**写走 tmp → fsync → rename → fsync 目录**,先 fsync 再 rename;header/body 各带 crc32。
 
 ## 6. 持久化 / 崩溃语义
@@ -82,20 +122,20 @@ key(`StoreKey`,**8B** = 64bit blobId:高 32bit partitionId + 低 32bit objectId,
 
 ## 7. 测试策略(学 ShardStore)
 
-- 单元测试:round-trip、段满、重开恢复、rollover、log 满、索引增删查/重开、undelete/updateTtl/hard_delete。
+- 单元测试:round-trip、段满、重开恢复、rollover、log 满、索引增删查/重开、put/delete(墓碑恒胜、删除不可逆)。
 - **崩溃一致性属性测试**:随机 Append/Flush → 关闭 → 重开 → 断言「flush 是持久化边界」。
 - **内存参考模型全量对拍**:确定性 PRNG 随机穿插 put/delete/flush/reopen/compact,每步全量比对 `get()` 与纯内存模型,并对拍增量 seg_bytes vs 全量扫。
 
 ## 8. 并发模型(D4):快照式无锁读 + COW compaction(设计,未实现)
 
 > 目标:多线程服务下**读全程无锁、与写/compaction 互不阻塞**;仅在极小范围内串行。
-> 现状:`BlobStore` 是 `&mut self` 单写者——写方法(`put`/`delete`/`undelete`/`update_ttl`/`compact`/`hard_delete`)独占,`get` 是 `&self`,靠 Rust 借用规则在**编译期**保证互斥,代价是零并发。D4 用运行时结构替换这个编译期保证,同时放开并发。
+> 现状:`BlobStore` 是 `&mut self` 单写者——写方法(`put`/`delete`/`compact`)独占,`get` 是 `&self`,靠 Rust 借用规则在**编译期**保证互斥,代价是零并发。D4 用运行时结构替换这个编译期保证,同时放开并发。
 
 ### 8.1 核心不变式
 
 append-only 日志的地基不变式:**已提交的字节永不改变**。因此:
-- 普通写(put/delete/undelete/update_ttl)只在活跃段**尾部追加** + 原子换索引指针,**从不动老字节** → 读老记录永远安全,**读与普通写天然并发,无需锁**(活跃段是无锁 `SkipMap`,日志是定位读写,读的 offset 恒 < data_end,永不追着尾巴跑)。
-- 只有两类操作打破不变式,需要额外协调:**compaction**(搬走/删已提交段)、**hard_delete**(就地改已提交字节)。
+- 普通写(put/delete)只在活跃段**尾部追加** + 原子换索引指针,**从不动老字节** → 读老记录永远安全,**读与普通写天然并发,无需锁**(活跃段是无锁 `SkipMap`,日志是定位读写,读的 offset 恒 < data_end,永不追着尾巴跑)。
+- 只有 **compaction** 打破不变式(搬走/删已提交段),需要额外协调。写入与删除都只追加,**已提交字节永不改写**。
 
 ### 8.2 读:不可变快照(RCU 读侧)
 
@@ -126,13 +166,12 @@ snap.log.read(v.offset, len)     // 老快照 Arc 还活着,老文件就还在
 
 ### 8.4 需要串行/排他的极小范围
 
-- **写 vs 写**:两个写者同时追加活跃段会争 `data_end`/写位置;`delete` 的"已删?"检查、`undelete`/`update_ttl` 的读改写都是 RMW → **写者互斥**(单写锁 or 单写线程)。读不受影响。
+- **写 vs 写**:两个写者同时追加活跃段会争 `data_end`/写位置;`delete` 的"是否已墓碑?"检查(读索引再追加墓碑)是 RMW → **写者互斥**(单写锁 or 单写线程)。读不受影响。
 - **compaction 换入的并发写边界**:构造新版期间前台仍在往活跃段追加。换入时须把这些并发新写带进新版(Ambry 做法:compaction 只处理到某固定 offset,该点之后的写落活跃段,活跃段整体延续进新版)。这是"写 vs swap",**读仍不进锁**。
-- **hard_delete**:就地改已提交字节,不吃 COW 红利。两个选项:(a) 改成 COW——把整段拷出、擦除后写成新段再 swap;(b) 保留对**目标记录读者**的排斥。倾向 (a),与 compaction 统一到"造新换旧"。
 
 ### 8.5 为什么不用一把对称 `RwLock`
 
-对称读写锁会让读在写期间被挡 → **过度串行化**,浪费了活跃段无锁 SkipMap + append-only 的并发潜力。正确形状是**非对称**:读无锁(快照)、写者之间互斥、结构性重写(compaction/hard_delete)走 COW+原子换入。对齐 Ambry:一把 `storeWriteLock` 只串行化写,读基本畅通,compaction 靠 RW 锁 + 段 refcount 协调。
+对称读写锁会让读在写期间被挡 → **过度串行化**,浪费了活跃段无锁 SkipMap + append-only 的并发潜力。正确形状是**非对称**:读无锁(快照)、写者之间互斥、结构性重写(仅剩 compaction)走 COW+原子换入。对齐 Ambry:一把 `storeWriteLock` 只串行化写,读基本畅通,compaction 靠 RW 锁 + 段 refcount 协调。
 
 ### 8.6 Open Question(实现前需拍板)
 
@@ -155,17 +194,16 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 **对 §8.1–8.6 的关键修正**:
 1. **seg_bytes 不放 Inner**:它每写都变、但只被 stats 读,放 Inner 会逼每写换 Inner。用独立 `Mutex`,不在 get 路径上。
 2. **reader 必须有重试循环(§8.2 遗漏的最关键一点)**:活跃段 SkipMap 跨 Inner 版本共享,可能返回一条指向「比 reader 快照更新的段」的条目(rollover 竞态)→ 读取时该段不在快照 → **重载快照重试**(罕见,仍无锁)。compaction 因换的是**全新 index**(offset 全变、非共享 SkipMap),老 index+老段 / 新 index+新段各自自洽,**不需重试**。
-3. **活跃段共享 + `AtomicU64` data_end**:活跃段不随每写换 Inner;`append/flush/overwrite_at` 改 `&self`(`write_all_at` 本就是 `&self`),data_end 用 `AtomicU64`(reader acquire-load、writer release-store,配合 write_at 系统调用形成 happens-before,读 offset<data_end 安全无撕裂)。
+3. **活跃段共享 + `AtomicU64` data_end**:活跃段不随每写换 Inner;`append/flush` 改 `&self`(`write_all_at` 本就是 `&self`),data_end 用 `AtomicU64`(reader acquire-load、writer release-store,配合 write_at 系统调用形成 happens-before,读 offset<data_end 安全无撕裂)。
 4. **索引封存也需内部可变**:`sealed: ArcSwap<Vec<SealedSegment>>` + `active_seq/next_seq: AtomicU64`;`seal_active` 必须**先 swap sealed 再 clear active**(否则 reader 丢条目)。`add/find` 改 `&self`。
 5. **compaction 持 `write_lock`**:期间无并发写 → §8.4 的「并发写边界」问题消失,reader 全程不阻塞。是**简化选择**(Ambry 允许写中 compaction),写中可 compaction 留作 P4+。
-6. **hard_delete 必须 COW**(非可选):就地改与无锁读并发 → 撕裂读(crc mismatch 误报 Corrupt)。改为「拷段→擦除→写新段→swap」。隐私注记:RCU 下老快照/page cache 仍可能读到擦前数据,保证是**最终**擦除。
-7. **compaction 放弃目录 rename**:改同目录建新段 + 段 `Drop` 时 `unlink`(容忍 ENOENT);`COMPACT_COMMIT` 恢复相应改写。`LogSegment` 需记 `path`(供 Drop-unlink)。
-8. reader 用 `ArcSwap::load_full()`(持真 Arc,避免跨 syscall 钉住 slot)。
+6. **compaction 放弃目录 rename**:改同目录建新段 + 段 `Drop` 时 `unlink`(容忍 ENOENT);`COMPACT_COMMIT` 恢复相应改写。`LogSegment` 需记 `path`(供 Drop-unlink)。
+7. reader 用 `ArcSwap::load_full()`(持真 Arc,避免跨 syscall 钉住 slot)。
 
 **分阶段(先易后难,每阶段全测试绿)**:
-- **P1 内部可变性重构(无语义变更,现有测试即验收)**:`LogSegment` data_end→`AtomicU64`、`append/flush/overwrite_at`→`&self`、记 `path`;`PersistentIndex` `sealed`→`ArcSwap`、seqs→`AtomicU64`、`add/find`→`&self`(先 swap 后 clear)。`BlobStore` 仍 `&mut self`。
+- **P1 内部可变性重构(无语义变更,现有测试即验收)**:`LogSegment` data_end→`AtomicU64`、`append/flush`→`&self`、记 `path`;`PersistentIndex` `sealed`→`ArcSwap`、seqs→`AtomicU64`、`add/find`→`&self`(先 swap 后 clear)。`BlobStore` 仍 `&mut self`。
 - **P2 并发读写**:引入 `Inner`+`ArcSwap<Inner>`+`write_lock`+`seg_bytes: Mutex`;`BlobStore` 方法→`&self`;writer 走写锁(rollover 时先 `inner.store` 再 `index.add`),reader 走重试循环。
-- **P3 COW compaction + hard_delete**:compaction 持写锁、同目录建新段 + fresh index + `inner.store` + 段 Drop-unlink;重做 `COMPACT_COMMIT` 恢复;hard_delete 改 COW。
+- **P3 COW compaction**:compaction 持写锁、同目录建新段 + fresh index + `inner.store` + 段 Drop-unlink;重做 `COMPACT_COMMIT` 恢复。
 - **~~P4 后台调度器 + 性能~~(移出 store 层)**:见下「P4 归属」。
 
 **实现落地对上述计划的偏差(Option B,已实现 P1 + P2 + P3,较原案更简)**:
@@ -173,10 +211,10 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 原案(P2 上面)让 `Inner` 每次 rollover 也换、活跃段 SkipMap 跨版本共享,故需 reader 重试循环(修正 2);并依赖 `arc-swap` crate。落地改为等价但更简的 **Option B**:
 
 1. **`Log` 段表自带内部锁**:`entries: RwLock<Vec<Arc<LogSegment>>>`;`append/read/flush/roll_over/…` 全 `&self`。rollover 在**写正常记录之前**就把新段 push 进共享段表(写锁),故读者一旦经索引看到某条目,其目标段必已在段表 → **无需重试循环**(消解修正 2)。段内可见性仍由 `LogSegment` 的 `AtomicU64` data_end 保证(修正 3)。
-2. **`Inner` 仅 compaction/hard_delete 换**(非每 rollover):正常写经**当前** `Inner` 的内部可变 `log`/`index` 就地改,不换 `Inner`。`Inner{log, index}` 整体只在 compaction / COW hard_delete 时构建新的并原子换入,读者不见「新 log + 旧 index」撕裂态。
+2. **`Inner` 仅 compaction 换**(非每 rollover):正常写经**当前** `Inner` 的内部可变 `log`/`index` 就地改,不换 `Inner`。`Inner{log, index}` 整体只在 compaction 时构建新的并原子换入,读者不见「新 log + 旧 index」撕裂态。
 3. **不引 `arc-swap`**:`inner: RwLock<Arc<Inner>>`,读者取读锁**仅克隆 `Arc`**(纳秒级)后即释放、无锁读;写者/compaction 取写锁换 `Arc`。避免动共享 `Cargo.toml`/`Cargo.lock`;真无锁的 `arc-swap` 留作后续按压测决定。`PersistentIndex.sealed` 同理用 std `RwLock`(非 `ArcSwap`)。
-4. **compaction 用 RCU + Unix open-fd 语义**(替代修正 7 的 Drop-unlink):持 `write_lock`,建新段/rename/`remove_file` 旧段后原子换 `Inner`。老读者持有的旧 `Arc<Inner>` 握有旧段 fd,Unix 下 rename/unlink 不影响其读,末次释放后 inode 才回收。CompactAll 保留目录 rename,增量 compaction 同目录建新段。
-5. **hard_delete 改 COW(P3 已完成,修正 6 消解)**:逐个受影响段重写为「目标 PUT 数据清零 + `FLAG_HARD_DELETED`」的新段(tmp→fsync→原子 rename 覆盖,段位置/记录偏移不变),再原子换 `Inner`——**不再就地 `overwrite_at`**(该原语已从 `Log`/`LogSegment` 删除,杜绝与无锁读并发的撕裂读footgun)。老读者经旧 Inner 的旧段 fd 仍读到擦前明文(Unix open-fd),故保证是**最终**擦除。幂等(已擦记录带 `FLAG_HARD_DELETED`,重入跳过)。并发正确性由 `blob.rs` 的 `concurrent_shared_access_*` 与 `concurrent_hard_delete_never_torn_reads` 测试守护。
+4. **compaction 用 RCU + Unix open-fd 语义**(替代修正 6 的 Drop-unlink):持 `write_lock`,建新段/rename/`remove_file` 旧段后原子换 `Inner`。老读者持有的旧 `Arc<Inner>` 握有旧段 fd,Unix 下 rename/unlink 不影响其读,末次释放后 inode 才回收。CompactAll 保留目录 rename,增量 compaction 同目录建新段。
+5. **`Inner` 的原子换入只发生在 compaction**:正常写只就地改当前 `Inner`,"已提交字节永不改写"无例外;并发正确性由 `blob.rs` 的 `concurrent_shared_access_*` 测试守护。
 
 **P4 归属:后台调度移出 store 层 → 抽象 blob-server 角色**(对齐 Ambry:`BlobStore` 只提供 compaction 机制,`CompactionManager`/`StorageManager` 才做调度)。`store::BlobStore` 层**只需暴露 compact/flush 能力**(已具备:`compact` / `compact_incremental` / `compact_cost_benefit` / `flush`,均 `&self` 可被后台线程调用);**周期 flush/compaction 线程、触发策略、多 store 编排** 属上层 blob-server 组件(待建),不在 store crate 内实现。故 **D4 在 store 层到 P3 即完成**;stress/loom/基准随 blob-server 或后续性能阶段再做。
 
@@ -191,18 +229,16 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] PersistentIndex(并发活跃段 + mmap 封存段 + 持久化 Fuse filter + add/find/recover)
 - [x] BlobStore(串起 Log + Index;自描述记录 + put/get/delete/flush/recover)
 - [x] 从 log 扫描重建索引(`open_rebuild_index`)+ open 索引损坏自动回退重建
-- [x] 记录落 expiration/op_time/life_version(重建不丢 TTL 与生命版本)
+- [x] 记录落 `expiration_ms`(重建不丢**写入时定的** TTL)
 - [x] 索引持久化水位回放(对齐 Ambry `recover()`,替代每次全量重建)
 - [x] compaction/GC:CompactAll + 按段增量(死占比阈值触发)+ 标记式崩溃修复
 - [x] 死数据统计增量维护(seg_bytes,对齐 `BlobStoreStats`)
-- [x] undelete / lifeVersion(复活已删除对象)
-- [x] updateTtl(设/移除过期时间,支持任意 expiration,一次性 + 已删/不存在守卫)
 - [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty / is_key_deleted)
 - [x] 有效数据字节(`valid_data_size()`:未删除赢家 size 之和,墓碑不计;**不区分过期**——过期但未回收对象仍占盘故计入,避免按过期时刻分桶的复杂度)。增量计数 O(1) 查询,写路径维护、compaction/open 重算,全扫基准差分对拍守护
-- [x] HardDeleter(软删对象数据就地清零,隐私擦除)
 - [x] 内存参考模型全量对拍
 - [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 简化:`FindToken` 仅 offset 游标,sessionId/incarnationId/resetKey(重启/compaction 失效重定位)属复制层职责,待其落地补
-- [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction/COW hard_delete 换入、无重试循环、不引 `arc-swap`;hard_delete 改 COW、删除就地 `overwrite_at` footgun;并发测试守护)
+- [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction 换入、无重试循环、不引 `arc-swap`;并发测试守护)
+- [x] **存储模型简化:对象不可变 + 删除不可逆**(去掉复活/改 TTL/硬删;**段头 v2**(每段 4B `key_prefix`)、**记录 v4**(24B 开销)、**索引 v2**(29B 条目);复制合并改为**墓碑恒胜**;TTL 只在写入时定)—— 见 `openspec/changes/simplify-delete-model/`
 - [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [x] 每 Log 定容上界(store 层):`total_capacity`(per-replica 构造参数,对齐 Ambry `capacityInBytes`)+ 写满归一为 `Error::StoreFull` + 容量自省(`total_capacity`/`available_capacity`/`is_full`)。**「写满自动滚动新 partition」是集群/路由层职责,不在 store**
@@ -227,8 +263,8 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.index_max_inmem_elements` | u64 | 10000 | ≥1 | 活跃索引内存条目上限 | `store.index.max.number.of.inmem.elements` |
 | `store.io_error_count_to_trigger_shutdown` | u32 | 0(=禁用) | 任意(0 禁用,≥1 阈值) | **已接入**:连续 IO 错误达此值则 store 自关(被动磁盘检测)+ 触发回调;0=禁用,对齐 Ambry 默认 `MAX_VALUE` | `store.io.error.count.to.trigger.shutdown` |
 | `store.max_journal_entries_to_return` | u32 | 5000 | 1–10000 | journal 单次返回上限 | `store.max.number.of.entries.to.return.from.journal` |
-| `store.index_persisted_entry_min_bytes` | u32 | 115 | ≥1 | 索引条目持久化最小字节(注:Rust `IndexValue` 定长 59B,值需按实际布局重定) | `store.index.persisted.entry.min.bytes` |
-| `store.segment_size_bytes` | u64 | **4 GiB** | ≥1 | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;antfs 取段级定容,**默认 4 GiB 使"单条记录 ≤ 段 − 102 < `u32::MAX`"成为结构性不变量** —— 记录内 `data_len` 是 u32;把段配到 >4 GiB 时单条超过 4 GiB 的对象会被 `record_data_len` 拒掉而非写出回绕记录) | `store.segment.size.in.bytes` |
+| `store.index_persisted_entry_min_bytes` | u32 | 115 | ≥1 | 索引条目持久化最小字节(注:Rust 索引条目为 8B key + `IndexValue` 21B = **29B**,值需按实际布局重定) | `store.index.persisted.entry.min.bytes` |
+| `store.segment_size_bytes` | u64 | **4 GiB** | ≥1 且 **≤ 4 GiB** | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;antfs 取段级定容)。**4 GiB 是格式不变量而非调优旋钮**:① 段内偏移要放进索引条目 u32 的偏移半区;② "单条记录 ≤ 段 − 64 < `u32::MAX`"使记录的 u32 `data_len` 结构性无法回绕(`record_data_len` 只是第二道保险)。上界由 `StoreConfig::validate`(`MAX_SEGMENT_SIZE_BYTES`)与 `log_segment::MAX_CAPACITY` 共同强制 | `store.segment.size.in.bytes` |
 | `store.index_mem_state` | enum | `mmap_without_force_load` | 枚举 | 索引内存策略 | `store.index.mem.state` |
 
 ### 10.2 `[store.compaction]`
@@ -262,22 +298,14 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.stats.wait_timeout_secs` | u64 | 120 | 0–1800 | 等待分桶构建上限 | `store.stats.wait.timeout.in.secs` |
 | `store.stats.index_entries_per_second` | u32 | 240000 | ≥1 | stats 扫描限速 | `store.stats.index.entries.per.second` |
 
-### 10.4 `[store.hard_delete]` / TTL / 保留期
-| key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
-|---|---|---|---|---|---|
-| `store.hard_delete.enabled` | bool | false | — | 是否启用硬删(数据擦除) | `store.enable.hard.delete` |
-| `store.hard_delete.operations_bytes_per_sec` | u64 | 102400 | ≥1 | 硬删 IO 限速 | `store.hard.delete.operations.bytes.per.sec` |
-| `store.hard_delete.deleted_message_retention_minutes` | u64 | 10080 | ≥1 | 软删后多久可硬删(Ambry 默认 168h) | `store.deleted.message.retention.hours/minutes` |
-| `store.hard_delete.ttl_update_buffer_seconds` | u32 | 86400 | ≥0 | TTL 更新须早于过期的缓冲 | `store.ttl.update.buffer.time.seconds` |
-
-### 10.5 `[store.filter]`(存在性过滤器;antfs 用 Binary Fuse 替 Bloom)
+### 10.4 `[store.filter]`(存在性过滤器;antfs 用 Binary Fuse 替 Bloom)
 | key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
 |---|---|---|---|---|---|
 | `store.filter.rebuild_on_startup` | bool | false | — | 启动时重建 `.fuse`(损坏兜底) | `store.index.rebuild.bloom.filter.enabled` |
 
 > Ambry 的 `bloom.max.false.positive.probability` / `uuid.based.bloom.filter.enabled` / `bloom.filter.maximum.page.count` 是 Bloom 专属参数;Binary Fuse 的假阳率与体积由构造固定(~1.08 B/key),**无对应项**。
 
-### 10.6 `[store.files]`(权限 / IO 错误 / 部分恢复)
+### 10.5 `[store.files]`(权限 / IO 错误 / 部分恢复)
 | key | 类型 | 默认 | 范围/校验 | 含义 | 对齐 Ambry |
 |---|---|---|---|---|---|
 | `store.files.set_permission_enabled` | bool | false | — | 是否设置文件权限 | `store.set.file.permission.enabled` |
@@ -291,10 +319,9 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 
 > **状态:部分接入**。[`StoreMetrics`](../../crates/blob/src/metrics.rs) 已落地 **BlobStore 层子集**,经
 > `BlobStore::create_with/open_with` 注入,按 `store="<id>"` label 区分多实例(见 [`common.md` §2.2](./common.md))。
-> **已接入**:`store_request_duration_seconds{store,op}`(op = put/get/delete/undelete/ttl_update/flush)、
+> **已接入**:`store_request_duration_seconds{store,op}`(op = put/get/delete/flush)、
 > `store_already_exists_total`、`store_compaction_reclaimed_bytes_total`、`store_compaction_duration_seconds`、
-> `store_hard_delete_total`、`store_hard_delete_duration_seconds`、`store_log_used_capacity_bytes`、
-> `store_log_invalid_data_bytes`、`store_log_segment_count`。
+> `store_log_used_capacity_bytes`、`store_log_invalid_data_bytes`、`store_log_segment_count`。
 > **仍规划**:Log 的 overflow、PersistentIndex 的 recovery/find/flush 计时与 token 计数、封存段/Fuse 过滤器命中、
 > BlobStoreStats 扫描等——这些打点在 `Log`/`PersistentIndex`/`IndexSegment` 内部,需把 handle 透传进这些模块后接入。
 > 命名规范见 [`common.md` §2](./common.md)。裸构造器(`create`/`open`)用一个丢弃的私有 Registry(打点不导出),仅测试/无监控场景。
@@ -304,7 +331,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 ### 11.1 BlobStore(顶层操作)
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
 |---|---|---|---|---|---|
-| `store_request_duration_seconds` | histogram | `store`,`op`(get/put/delete/undelete/ttl_update/find_key…) | 秒 | 各操作耗时(合并 Ambry 的分操作 Timer) | `Store{Op}Response` 系列 |
+| `store_request_duration_seconds` | histogram | `store`,`op`(get/put/delete/find_key…) | 秒 | 各操作耗时(合并 Ambry 的分操作 Timer) | `Store{Op}Response` 系列 |
 | `store_start_duration_seconds` | histogram | `store` | 秒 | 启动耗时 | `StoreStartTime` |
 | `store_shutdown_duration_seconds` | histogram | `store` | 秒 | 关闭耗时 | `StoreShutdownTimeInMs` |
 | `store_start_failure_total` | counter | `store` | 次 | 启动失败 | `StoreStartFailure` |
@@ -319,6 +346,8 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store_log_segment_count` | gauge | `store` | 个 | 段数 | `CurrentSegmentCount` |
 | `store_log_invalid_data_bytes` | gauge | `store` | 字节 | 死数据量(seg_bytes 推导) | `CurrentInvalidDataSize` |
 | `store_log_overflow_error_total` | counter | `store`,`kind`(read/write) | 次 | 读/写越界错误 | `OverflowReadError`/`OverflowWriteError` |
+| `store_open_bad_records_total` | counter | `store` | 条 | 打开副本时跳过的坏记录数(无法解码/CRC 不符);盘上字节未被删改 | 无(容错恢复,Ambry `IndexRecovery` 方向) |
+| `store_open_abandoned_segments_total` | counter | `store` | 个 | 打开时因不可重同步而放弃扫描剩余部分的段数(其它段仍恢复) | 无 |
 
 ### 11.3 PersistentIndex(索引)
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
@@ -338,14 +367,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store_sealed_segment_mmap_loaded_total` | counter | `store`,`loaded`(yes/no) | 次 | 查找时封存段是否已 mmap 载入 | `MappedSegmentIsLoaded/NotLoadedDuringFindCount` |
 | `store_segments_accessed_per_blob` | histogram | `store` | 个 | 每次查找访问的段数 | `SegmentsAccessedPerBlobCount` |
 
-### 11.5 HardDeleter
-| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
-|---|---|---|---|---|---|
-| `store_hard_delete_duration_seconds` | histogram | `store` | 秒 | 硬删耗时 | `HardDeleteTime` |
-| `store_hard_delete_total` | counter | `store`,`result`(done/failed) | 次 | 硬删完成/失败 | `HardDeleteDoneCount`/`HardDeleteFailedCount` |
-| `store_hard_delete_progress_bytes` | gauge | `store` | 字节 | 硬删进度 | `CurrentHardDeleteProgress` |
-
-### 11.6 Compaction(对齐 Ambry `BlobStoreCompactor`)
+### 11.5 Compaction(对齐 Ambry `BlobStoreCompactor`)
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
 |---|---|---|---|---|---|
 | `store_compaction_in_progress` | gauge | `store` | 0/1 | 是否正在 compaction | `CompactionInProgress` |
@@ -354,7 +376,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store_compaction_duration_seconds` | histogram | `store`,`kind`(full/partial) | 秒 | 单次 compaction 耗时 | `CompactionFinishedForAStoreTimeInMs`/`PartialRange…` |
 | `store_compaction_cost` / `store_compaction_benefit` | gauge | `store` | — | 选段 cost/benefit | `CompactionCost`/`CompactionBenefit` |
 
-### 11.7 BlobStoreStats(死数据扫描)
+### 11.6 BlobStoreStats(死数据扫描)
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
 |---|---|---|---|---|---|
 | `store_stats_scan_duration_seconds` | histogram | `store`,`kind`(on_demand/bucketing) | 秒 | 扫描耗时 | `StatsOnDemandScanTotalTimeMs`/`StatsBucketingScanTotalTimeMs` |
@@ -412,7 +434,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 
 ### 12.3 RequestControl(节点级请求静默,对标 Ambry `RequestControl`)
 
-运维可在**节点级**或**分区级**临时静默 5 类数据面操作(`put`/`get`/`delete`/`undelete`/`ttl_update`),
+运维可在**节点级**或**分区级**临时静默 3 类数据面操作(`put`/`get`/`delete`),
 命中即 `503 SERVICE_UNAVAILABLE` + 说明文本(有 TTL 时带 `Retry-After`,秒数向上取整),**在 extractor
 之前短路**(被禁的 put 连 body 都不缓冲)。被拒请求只计 `store_server_rejected_requests_total{op,reason}`,
 **不进** `errors_total`、**不计** `request_duration`/`in_flight`(那三个记的是真正进到引擎的请求)。
@@ -641,7 +663,7 @@ job 形状(未完成字段**不出现在 JSON 里** —— 是缺 key,不是 `nu
 - 逐记录读 log 并验 CRC,但**遇到坏记录"记下继续"**而不是整体失败(生产读路径仍是坏即 `Err(Corrupt)`):
   坏记录后尝试从记录头读 `data_len` 重同步到下一条;头也读不出则本段止步并置 `truncated`。
   这样运维能拿到"坏在哪个段/偏移"(`first_bad_offset`),而不是只知道"这副本坏了"。
-- `index_mismatch`:对**活记录**(索引当前赢家)比对索引里的 `size`/`flags`/`life_version` 与实际记录值,
+- `index_mismatch`:对**活记录**(索引当前赢家)比对索引里的 `size`/`flags` 与实际记录值,
   不一致即计 1。**只能发现"索引与 log 对不上"这一类漂移;发现不了"索引指向了 log 中不存在的 offset"**(需反向遍历索引,属后续增强)。
 - `BlobStore::index_stats()`(scrub-report 的数据源):`live_records`/`tombstones`/`live_bytes`(活记录数据字节,不含记录头/CRC)/`sealed_segments`。
 
@@ -650,15 +672,34 @@ job 形状(未完成字段**不出现在 JSON 里** —— 是缺 key,不是 `nu
 | 手段 | 能发现 | 发现不了 |
 |---|---|---|
 | `scrub-report` 摘要比对 | 副本整体落后/缺失(记录数、字节数、墓碑数、段数不同) | 具体哪一个 key 不同 |
-| 元数据窗口 key 级比对(admin 侧) | 某副本缺 key、生命版本/标志位不一致 | 窗口外的老 key(受 `max_bytes` 限制,报告里以 `partial` 标注) |
+| 元数据窗口 key 级比对(admin 侧) | 某副本缺 key、标志位不一致 | 窗口外的老 key(受 `max_bytes` 限制,报告里以 `partial` 标注) |
 | `verify`(deep) | **本地静默损坏**(CRC 坏)、索引与 log 漂移 | 数据"内容不同但长度/CRC 都对"的情形;跨副本字节级差异 |
 
 **假不一致**:扫描期间有并发写时,两侧窗口末端本就不同 → 报告会带各副本 `token`/`bytes_read`,
 `partial` 为真时结论只作"部分比对";判为不一致后建议**重跑一次**再定论。
 
-**已知缺口(未修,需产品决策)**:记录损坏会让 `BlobStore::open`(索引重建)整体失败 → 该副本**起不来**,
-因而也无法经这两个端点检查。若要"坏记录也允许启动并大声报错"(对齐 Ambry `IndexRecovery` 的容错方向),
-需改恢复路径语义,属后续增强。
+**带伤启动(容错恢复,已实现)**:记录损坏**不再让副本起不来** —— `BlobStore::open` / `open_rebuild_index`
+走容错扫描(索引重建、段字节核算、有效数据核算三处都容错):
+
+- 坏记录**跳过并记录**(可读的其余记录照常进索引、照常可读可写);
+- 能从头读出可信 `data_len` 就重同步到下一条;长度字段也坏了(或跳过会越过段尾)则**放弃该段剩余部分**
+  并计入 `abandoned_segments` —— 该段之后的**其它段仍会被恢复**;
+- **不删、不改写、不截断**盘上任何字节(保留证据);
+- **大声报错**:每条坏记录一条 `error!` 日志 + 打开时一条汇总 `error!`;损伤进
+  `BlobStore::open_damage()` → 经 `GET /partitions/{pid}/scrub-report` 的
+  `damaged_records` / `abandoned_segments` 暴露给运维 → **admin 的一致性巡检直接把它算成摘要级差异**
+  (健康副本这两个值必为 0);指标 `store_open_bad_records_total` / `store_open_abandoned_segments_total`。
+
+残留边界(如实记录):
+
+- 带伤副本仍会被 master 当作正常副本计数(心跳不携带损伤信息);
+- **逻辑数据可能自愈,但字节损伤不会**:拉复制比对 peer 的元数据窗口时,若 peer 仍持有该 key,
+  会把它重新 apply 到本地(实测:重启后一个小分区里坏掉的那条被拉复制补回),于是**逻辑上恢复完整**;
+  但盘上那串坏字节**不会被改写或删除**,`verify` 永远能看到它(`bad_records ≥ 1`),
+  `open_damage`/`scrub-report` 的 `damaged_records` 也保留"曾带伤启动"的记录 —— 两者都如实呈现,不互相掩盖。
+- 若 peer 也已丢失该记录(或损坏点落在 token 游标之后、不在拉取窗口内),则该 key **不会自愈**,
+  需人工处置:先 `verify` 定位,再用 `RepairPartition`/`MoveReplica` 把副本迁走或让 master 重新补齐,
+  之后下线该节点上的这份数据。
 
 **指标**(§12.5 同步登记):`store_server_verify_runs_total`(counter)、`store_server_verify_bad_records_total`(counter)、
 `store_server_verify_duration_seconds`(histogram)、`store_server_scrub_reports_total`(counter)。

@@ -25,14 +25,11 @@ pub enum DataOp {
     Put,
     Get,
     Delete,
-    Undelete,
-    TtlUpdate,
 }
 
 impl DataOp {
     /// 全部可选值(声明顺序;`parse` 与测试用)。
-    pub const ALL: [DataOp; 5] =
-        [DataOp::Put, DataOp::Get, DataOp::Delete, DataOp::Undelete, DataOp::TtlUpdate];
+    pub const ALL: [DataOp; 3] = [DataOp::Put, DataOp::Get, DataOp::Delete];
 
     /// 对外名称(admin API 的 `op` 字段、指标标签、日志字段的**唯一真值**)。
     pub fn as_str(self) -> &'static str {
@@ -40,8 +37,6 @@ impl DataOp {
             DataOp::Put => "put",
             DataOp::Get => "get",
             DataOp::Delete => "delete",
-            DataOp::Undelete => "undelete",
-            DataOp::TtlUpdate => "ttl_update",
         }
     }
 
@@ -53,7 +48,7 @@ impl DataOp {
 
 /// 把 HTTP 请求判为「可被静默的数据面操作」;返回 `None` = **豁免**(永不静默)。
 ///
-/// 只有 5 类数据面请求可禁,其余一律豁免。豁免清单及理由(新增端点必须在此显式归类,
+/// 只有 3 类数据面请求可禁,其余一律豁免。豁免清单及理由(新增端点必须在此显式归类,
 /// **默认豁免**是刻意的失败方向:宁可禁不掉,也不可禁出数据问题或做出不可运维的节点):
 /// - `GET /partitions/{pid}/blobs/{key}?replication=1`:与普通 GET **同 method + 同 path**,
 ///   只能按 query 区分。它是拉复制 step-2 取数据体的通道,挡掉它 = 副本永久不收敛/掉数据。
@@ -66,7 +61,11 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Data
     if path == "/metrics" || path.starts_with("/admin/") {
         return None;
     }
-    let tail: Vec<&str> = path.strip_prefix("/partitions/")?.split('/').skip(1).collect();
+    let tail: Vec<&str> = path
+        .strip_prefix("/partitions/")?
+        .split('/')
+        .skip(1)
+        .collect();
     match (method, tail.as_slice()) {
         (&Method::PUT, ["blobs", _key]) => Some(DataOp::Put),
         (&Method::DELETE, ["blobs", _key]) => Some(DataOp::Delete),
@@ -77,8 +76,6 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Data
                 Some(DataOp::Get)
             }
         }
-        (&Method::POST, ["blobs", _key, "undelete"]) => Some(DataOp::Undelete),
-        (&Method::POST, ["blobs", _key, "ttl"]) => Some(DataOp::TtlUpdate),
         // replica-metadata / segments / segments/{position} 与任何未知路径:豁免。
         _ => None,
     }
@@ -97,7 +94,11 @@ fn replication_query(query: Option<&str>) -> bool {
 
 /// 从数据面路径取 `{pid}`(`/partitions/{pid}/...`);非数据面路径/不可解析 → `None`(只按节点级判定)。
 pub fn partition_of_path(path: &str) -> Option<PartitionId> {
-    path.strip_prefix("/partitions/")?.split('/').next()?.parse().ok()
+    path.strip_prefix("/partitions/")?
+        .split('/')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// 判定结果。
@@ -119,7 +120,9 @@ struct Disable {
 impl Disable {
     /// `ttl: None` = 永久;`Some(d)` = d 之后到期(`Some(Duration::ZERO)` 立即到期)。
     fn new(ttl: Option<Duration>) -> Self {
-        Disable { deadline: ttl.map(|d| Instant::now() + d) }
+        Disable {
+            deadline: ttl.map(|d| Instant::now() + d),
+        }
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -155,7 +158,9 @@ impl Scope {
             if d.expired(now) {
                 self.node = None;
             } else {
-                return Gate::Disabled { retry_after_secs: d.retry_after_secs(now) };
+                return Gate::Disabled {
+                    retry_after_secs: d.retry_after_secs(now),
+                };
             }
         }
         if let Some(pid) = partition {
@@ -163,7 +168,9 @@ impl Scope {
                 if d.expired(now) {
                     self.partitions.remove(&pid);
                 } else {
-                    return Gate::Disabled { retry_after_secs: d.retry_after_secs(now) };
+                    return Gate::Disabled {
+                        retry_after_secs: d.retry_after_secs(now),
+                    };
                 }
             }
         }
@@ -230,8 +237,7 @@ impl RequestControl {
             }
             return;
         }
-        let disable =
-            Disable::new(ttl_secs.map(Duration::from_secs).or(self.default_ttl));
+        let disable = Disable::new(ttl_secs.map(Duration::from_secs).or(self.default_ttl));
         let scope = scopes.entry(op).or_default();
         match partition {
             Some(pid) => {
@@ -260,8 +266,14 @@ impl RequestControl {
         let scope = scopes.get(&op)?;
         let node = scope.node;
         let partitioned = partition.and_then(|pid| scope.partitions.get(&pid).copied());
-        if let Some(d) = [node, partitioned].into_iter().flatten().find(|d| !d.expired(now)) {
-            return Some(Gate::Disabled { retry_after_secs: d.retry_after_secs(now) });
+        if let Some(d) = [node, partitioned]
+            .into_iter()
+            .flatten()
+            .find(|d| !d.expired(now))
+        {
+            return Some(Gate::Disabled {
+                retry_after_secs: d.retry_after_secs(now),
+            });
         }
         // 本次不适用:两个候选都存在过(且都已过期)才值得取写锁摘除,否则直接放行。
         if node.is_some() || partitioned.is_some() {
@@ -330,17 +342,18 @@ mod tests {
     /// `router()` 里每条路由的归类(防止后人加端点被默认挡掉、或把复制/运维端点误挡)。
     #[test]
     fn classify_covers_every_router_route() {
-        // 可禁用的 5 类。
-        assert_eq!(classify(&m("PUT"), "/partitions/0/blobs/0011223344556677", None), Some(DataOp::Put));
-        assert_eq!(classify(&m("GET"), "/partitions/0/blobs/0011223344556677", None), Some(DataOp::Get));
-        assert_eq!(classify(&m("DELETE"), "/partitions/0/blobs/0011223344556677", None), Some(DataOp::Delete));
+        // 可禁用的 3 类。
         assert_eq!(
-            classify(&m("POST"), "/partitions/0/blobs/0011223344556677/undelete", None),
-            Some(DataOp::Undelete)
+            classify(&m("PUT"), "/partitions/0/blobs/0011223344556677", None),
+            Some(DataOp::Put)
         );
         assert_eq!(
-            classify(&m("POST"), "/partitions/0/blobs/0011223344556677/ttl", Some("expiration_ms=1")),
-            Some(DataOp::TtlUpdate)
+            classify(&m("GET"), "/partitions/0/blobs/0011223344556677", None),
+            Some(DataOp::Get)
+        );
+        assert_eq!(
+            classify(&m("DELETE"), "/partitions/0/blobs/0011223344556677", None),
+            Some(DataOp::Delete)
         );
 
         // 白名单:router() 里其余每条路由 × 每种方法都必须判 None。
@@ -357,7 +370,11 @@ mod tests {
             "/admin/compactions/7",
         ] {
             for method in ["GET", "POST", "PUT", "DELETE"] {
-                assert_eq!(classify(&m(method), path, None), None, "{method} {path} 必须豁免");
+                assert_eq!(
+                    classify(&m(method), path, None),
+                    None,
+                    "{method} {path} 必须豁免"
+                );
             }
         }
     }
@@ -366,12 +383,25 @@ mod tests {
     #[test]
     fn classify_splits_replication_read_from_plain_read_by_query() {
         let path = "/partitions/0/blobs/0011223344556677";
-        assert_eq!(classify(&m("GET"), path, Some("replication=1")), None, "复制读必须放行");
+        assert_eq!(
+            classify(&m("GET"), path, Some("replication=1")),
+            None,
+            "复制读必须放行"
+        );
         assert_eq!(classify(&m("GET"), path, Some("replication=2")), None);
         assert_eq!(classify(&m("GET"), path, Some("x=1&replication=1")), None);
-        assert_eq!(classify(&m("GET"), path, Some("replication=1&max_bytes=9")), None);
-        assert_eq!(classify(&m("GET"), path, Some("replication=0")), Some(DataOp::Get));
-        assert_eq!(classify(&m("GET"), path, Some("other=1")), Some(DataOp::Get));
+        assert_eq!(
+            classify(&m("GET"), path, Some("replication=1&max_bytes=9")),
+            None
+        );
+        assert_eq!(
+            classify(&m("GET"), path, Some("replication=0")),
+            Some(DataOp::Get)
+        );
+        assert_eq!(
+            classify(&m("GET"), path, Some("other=1")),
+            Some(DataOp::Get)
+        );
         assert_eq!(classify(&m("GET"), path, None), Some(DataOp::Get));
     }
 
@@ -382,8 +412,18 @@ mod tests {
         assert_eq!(classify(&m("PUT"), "/partitions", None), None);
         assert_eq!(classify(&m("PUT"), "/partitions/0", None), None);
         assert_eq!(classify(&m("PUT"), "/partitions/0/blobs", None), None);
-        assert_eq!(classify(&m("POST"), "/partitions/0/blobs/0011223344556677", None), None);
-        assert_eq!(classify(&m("GET"), "/partitions/0/blobs/0011223344556677/undelete", None), None);
+        assert_eq!(
+            classify(&m("POST"), "/partitions/0/blobs/0011223344556677", None),
+            None
+        );
+        assert_eq!(
+            classify(
+                &m("GET"),
+                "/partitions/0/blobs/0011223344556677/nosuchop",
+                None
+            ),
+            None
+        );
         assert_eq!(partition_of_path("/partitions/7/blobs/00"), Some(7));
         assert_eq!(partition_of_path("/metrics"), None);
         assert_eq!(partition_of_path("/partitions/x/blobs/00"), None);
@@ -403,8 +443,15 @@ mod tests {
     fn check_fast_path_treats_expired_as_open_then_prunes() {
         let rc = RequestControl::new(0);
         rc.set(DataOp::Put, None, true, Some(0)); // 立即到期
-        assert_eq!(rc.check(DataOp::Put, None), Gate::Open, "过期 = 启用(快路径也不得误挡)");
-        assert!(rc.scopes.read().expect("lock").is_empty(), "慢路径必须摘除过期条目");
+        assert_eq!(
+            rc.check(DataOp::Put, None),
+            Gate::Open,
+            "过期 = 启用(快路径也不得误挡)"
+        );
+        assert!(
+            rc.scopes.read().expect("lock").is_empty(),
+            "慢路径必须摘除过期条目"
+        );
 
         rc.set(DataOp::Put, None, true, None); // 永久
         assert!(
@@ -415,8 +462,15 @@ mod tests {
         // 只禁了分区 3:其他分区/其他 op 由快路径直接放行。
         rc.set(DataOp::Get, Some(3), true, None);
         assert_eq!(rc.check(DataOp::Get, Some(4)), Gate::Open);
-        assert!(matches!(rc.check(DataOp::Get, Some(3)), Gate::Disabled { .. }));
-        assert_eq!(rc.check(DataOp::Delete, None), Gate::Open, "该 op 无任何记录");
+        assert!(matches!(
+            rc.check(DataOp::Get, Some(3)),
+            Gate::Disabled { .. }
+        ));
+        assert_eq!(
+            rc.check(DataOp::Delete, None),
+            Gate::Open,
+            "该 op 无任何记录"
+        );
     }
 
     /// 节点级禁用 → 所有分区都挡;解除后放行。
@@ -425,8 +479,14 @@ mod tests {
         let rc = RequestControl::new(1800);
         assert_eq!(rc.check(DataOp::Put, Some(0)), Gate::Open);
         rc.set(DataOp::Put, None, true, None);
-        assert!(matches!(rc.check(DataOp::Put, Some(0)), Gate::Disabled { .. }));
-        assert!(matches!(rc.check(DataOp::Put, Some(99)), Gate::Disabled { .. }));
+        assert!(matches!(
+            rc.check(DataOp::Put, Some(0)),
+            Gate::Disabled { .. }
+        ));
+        assert!(matches!(
+            rc.check(DataOp::Put, Some(99)),
+            Gate::Disabled { .. }
+        ));
         assert!(matches!(rc.check(DataOp::Put, None), Gate::Disabled { .. }));
         // 别的 op 不受影响。
         assert_eq!(rc.check(DataOp::Get, Some(0)), Gate::Open);
@@ -439,9 +499,16 @@ mod tests {
     fn partition_level_scope_is_narrow_and_fully_cleared_on_node_re_enable() {
         let rc = RequestControl::new(1800);
         rc.set(DataOp::Put, Some(1), true, None);
-        assert!(matches!(rc.check(DataOp::Put, Some(1)), Gate::Disabled { .. }));
+        assert!(matches!(
+            rc.check(DataOp::Put, Some(1)),
+            Gate::Disabled { .. }
+        ));
         assert_eq!(rc.check(DataOp::Put, Some(2)), Gate::Open);
-        assert_eq!(rc.check(DataOp::Put, None), Gate::Open, "分区级不挡节点级判定");
+        assert_eq!(
+            rc.check(DataOp::Put, None),
+            Gate::Open,
+            "分区级不挡节点级判定"
+        );
 
         rc.set(DataOp::Put, Some(2), true, None);
         rc.set(DataOp::Put, None, false, None);
@@ -453,7 +520,10 @@ mod tests {
         rc.set(DataOp::Put, Some(2), true, None);
         rc.set(DataOp::Put, Some(1), false, None);
         assert_eq!(rc.check(DataOp::Put, Some(1)), Gate::Open);
-        assert!(matches!(rc.check(DataOp::Put, Some(2)), Gate::Disabled { .. }));
+        assert!(matches!(
+            rc.check(DataOp::Put, Some(2)),
+            Gate::Disabled { .. }
+        ));
     }
 
     /// 惰性过期:判定时比较 deadline,过期即视为启用并摘除条目(注入 now,不 sleep)。
@@ -463,12 +533,18 @@ mod tests {
         let t0 = Instant::now();
         rc.set(DataOp::Put, None, true, Some(60));
         rc.set(DataOp::Get, Some(3), true, Some(60));
-        assert!(matches!(rc.check_at(DataOp::Put, None, t0), Gate::Disabled { .. }));
+        assert!(matches!(
+            rc.check_at(DataOp::Put, None, t0),
+            Gate::Disabled { .. }
+        ));
         // 60 秒后:过期 → 放行,且条目已被摘除(不留空壳)。
         let later = t0 + Duration::from_secs(61);
         assert_eq!(rc.check_at(DataOp::Put, None, later), Gate::Open);
         assert_eq!(rc.check_at(DataOp::Get, Some(3), later), Gate::Open);
-        assert!(rc.scopes.read().expect("lock").is_empty(), "过期条目必须被摘除");
+        assert!(
+            rc.scopes.read().expect("lock").is_empty(),
+            "过期条目必须被摘除"
+        );
         assert!(rc.snapshot().is_empty());
     }
 
@@ -477,8 +553,18 @@ mod tests {
     fn permanent_disable_has_no_deadline() {
         let rc = RequestControl::new(0);
         rc.set(DataOp::Put, None, true, None);
-        assert_eq!(rc.check(DataOp::Put, None), Gate::Disabled { retry_after_secs: None });
-        assert!(matches!(rc.check(DataOp::Put, None), Gate::Disabled { retry_after_secs: None }));
+        assert_eq!(
+            rc.check(DataOp::Put, None),
+            Gate::Disabled {
+                retry_after_secs: None
+            }
+        );
+        assert!(matches!(
+            rc.check(DataOp::Put, None),
+            Gate::Disabled {
+                retry_after_secs: None
+            }
+        ));
     }
 
     /// 配置默认 TTL 生效;请求显式 `ttl_secs = 0` = 0 秒有效期(立即到期)。
@@ -490,7 +576,11 @@ mod tests {
         assert!(matches!(entry.remaining_secs, Some(s) if s <= 120 && s > 0));
 
         rc.set(DataOp::Put, None, true, Some(0));
-        assert_eq!(rc.check(DataOp::Put, None), Gate::Open, "0 秒有效期立即到期");
+        assert_eq!(
+            rc.check(DataOp::Put, None),
+            Gate::Open,
+            "0 秒有效期立即到期"
+        );
         assert_eq!(rc.snapshot().len(), 1, "只留 Delete 那条");
     }
 
@@ -522,8 +612,16 @@ mod tests {
         assert_eq!(
             snap,
             vec![
-                DisableEntry { op: "get".to_string(), partition_id: Some(4), remaining_secs: None },
-                DisableEntry { op: "put".to_string(), partition_id: None, remaining_secs: None },
+                DisableEntry {
+                    op: "get".to_string(),
+                    partition_id: Some(4),
+                    remaining_secs: None
+                },
+                DisableEntry {
+                    op: "put".to_string(),
+                    partition_id: None,
+                    remaining_secs: None
+                },
             ]
         );
     }

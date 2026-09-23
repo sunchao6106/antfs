@@ -6,8 +6,8 @@
 //! W = 实际副本数/2+1、R = 1 是 SDK 的正确性约束,frontend 只是"HTTP ↔ SDK 调用"的翻译层,
 //! 不重复表达、也不外露成配置(见 `crates/common/router/src/config.rs`)。
 
-use antfs_router::RouterConfig;
 use antfs_config::{at_least, Result, Validate};
+use antfs_router::RouterConfig;
 use serde::Deserialize;
 
 /// frontend 配置。
@@ -100,7 +100,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_values() {
-        let mut cfg = FrontendConfig { listen_addr: String::new(), ..Default::default() };
+        let mut cfg = FrontendConfig {
+            listen_addr: String::new(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err(), "空监听地址必须拒");
 
         cfg.listen_addr = "127.0.0.1:7400".into();
@@ -141,10 +144,15 @@ mod tests {
         assert_eq!(cfg.router.master_addr, "127.0.0.1:7999");
         assert_eq!(cfg.router.id_segment_size, 8);
         // 未出现的字段回落到默认值。
-        assert_eq!(cfg.router.request_timeout_secs, RouterConfig::default().request_timeout_secs);
+        assert_eq!(
+            cfg.router.request_timeout_secs,
+            RouterConfig::default().request_timeout_secs
+        );
 
         // 空配置 → 整表默认。
-        let empty: FrontendToml = antfs_config::Loader::new().load().expect("空配置必须能加载");
+        let empty: FrontendToml = antfs_config::Loader::new()
+            .load()
+            .expect("空配置必须能加载");
         assert_eq!(empty.frontend, FrontendConfig::default());
     }
 }

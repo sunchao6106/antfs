@@ -6,9 +6,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use antfs_blob::{BlobStore, StoreConfig, StoreKey, StoreMetrics};
 use antfs_config::{Loader, Validate};
 use antfs_metric::{gather, Registry};
-use antfs_blob::{BlobStore, StoreConfig, StoreKey, StoreMetrics};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -25,7 +25,7 @@ fn unique_dir() -> std::path::PathBuf {
 }
 
 fn key(n: u8) -> StoreKey {
-    StoreKey::new([n; 8])
+    StoreKey::from_parts(0, n as u32)
 }
 
 #[test]
@@ -93,8 +93,8 @@ fn two_stores_share_registry_distinguished_by_label() {
         io_error_count_to_trigger_shutdown: 0,
     };
 
-    let s1 = BlobStore::create_with(&unique_dir(), 4096 * 8, &cfg, &metrics, "p1").unwrap();
-    let s2 = BlobStore::create_with(&unique_dir(), 4096 * 8, &cfg, &metrics, "p2").unwrap();
+    let s1 = BlobStore::create_with(unique_dir(), 4096 * 8, &cfg, &metrics, "p1").unwrap();
+    let s2 = BlobStore::create_with(unique_dir(), 4096 * 8, &cfg, &metrics, "p2").unwrap();
     s1.put(key(1), b"a").unwrap();
     s1.put(key(2), b"b").unwrap();
     s2.put(key(1), b"c").unwrap();
@@ -104,7 +104,7 @@ fn two_stores_share_registry_distinguished_by_label() {
     assert!(text.contains("store_request_duration_seconds_count{op=\"put\",store=\"p2\"} 1"));
 }
 
-/// 默认段大小的**结构性不变量**:段 ≤ 4 GiB 时,单条记录 ≤ `段 − 64(段头) − 38(记录头尾) < u32::MAX`,
+/// 默认段大小的**结构性不变量**:段 ≤ 4 GiB 时,单条记录 ≤ `段 − 64(段头) − 24(记录头尾) < u32::MAX`,
 /// 故"`data_len` 只有 u32 → 长度回绕写出坏记录"在默认配置下**不可能发生**
 /// (`record_data_len` 的显式校验是第二道保险,供把段配大时兜底)。
 ///
@@ -113,8 +113,8 @@ fn two_stores_share_registry_distinguished_by_label() {
 #[test]
 fn default_segment_size_keeps_single_record_under_u32() {
     const SEG_HEADER: u64 = 64; // `log_segment.rs::HEADER_SIZE`
-    const RECORD_OVERHEAD: u64 = 38; // `blob.rs::RECORD_OVERHEAD`(KEY_SIZE = 8)
-    // 硬编码 4 GiB,而不用 `StoreConfig::default()` —— 这样"默认被改"必然让本测试变红。
+    const RECORD_OVERHEAD: u64 = 24; // `blob.rs::RECORD_OVERHEAD`
+                                     // 硬编码 4 GiB,而不用 `StoreConfig::default()` —— 这样"默认被改"必然让本测试变红。
     let seg = 4 * 1024 * 1024 * 1024u64;
     assert_eq!(
         StoreConfig::default().segment_size_bytes,
@@ -126,5 +126,25 @@ fn default_segment_size_keeps_single_record_under_u32() {
     assert!(
         max_data < u32::MAX as u64,
         "默认段下单条数据体必须 < u32::MAX,实际上限 {max_data}"
+    );
+}
+
+/// 段大小有硬上界 **4 GiB**:段内偏移要放进索引条目的 u32 字段,记录头里的 `data_len` 也要放得下。
+/// 超限即**校验期拒绝**(而不是等到运行期写坏记录)。
+#[test]
+fn segment_size_above_four_gib_is_rejected() {
+    let ok: StoreConfig = Loader::new()
+        .with_inline_toml("segment_size_bytes = 4294967296")
+        .load()
+        .unwrap();
+    assert!(ok.validate().is_ok(), "4 GiB 恰好是允许的上界");
+
+    let too_big: StoreConfig = Loader::new()
+        .with_inline_toml("segment_size_bytes = 4294967297")
+        .load()
+        .unwrap();
+    assert!(
+        too_big.validate().is_err(),
+        "超过 4 GiB 必须被拒(否则索引 u32 偏移会截断)"
     );
 }

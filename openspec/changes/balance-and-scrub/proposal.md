@@ -23,11 +23,11 @@
 
 ### B. 副本一致性 scrub(逻辑比对 + 本地 verify)
 
-- **逻辑一致性比对(admin 编排)**:admin 对指定分区 fan-out 到各副本,拉元数据流比对 key/flags/lifeVersion + 各副本摘要(记录数/字节/段清单);完全复用现有 `GET /partitions/{pid}/replica-metadata` 与 `HttpPeer`/`MetadataEntry`(无需新 blob API)。发现"漏写/落后";**注意**:数据面没有 quorum 写,三副本靠拉复制收敛,必须在 `replication_enabled` 下才有意义;扫描期并发写会产生假不一致 → 报告需带各副本 log 末尾 token/bytes_read 以判定可比性,并支持"重跑再判定"。
+- **逻辑一致性比对(admin 编排)**:admin 对指定分区 fan-out 到各副本,拉元数据流比对 key/flags + 各副本摘要(记录数/字节/段清单);完全复用现有 `GET /partitions/{pid}/replica-metadata` 与 `HttpPeer`/`MetadataEntry`(无需新 blob API)。发现"漏写/落后";**注意**:数据面没有 quorum 写,三副本靠拉复制收敛,必须在 `replication_enabled` 下才有意义;扫描期并发写会产生假不一致 → 报告需带各副本 log 末尾 token/bytes_read 以判定可比性,并支持"重跑再判定"。
 - **本地完整性校验**(新 blob API `verify() -> VerifyReport`):逐记录读并验 CRC32 + 索引↔log 对拍,报告坏记录位置(段/offset);内部复用现有私有扫描(`for_each_record` / `scan_segment` / `rebuild_index`)。动机:一条坏记录当前会让整个副本的复制/重建失败而无任何定位手段。代价是读全量盘 → 需限流/错峰(`scrub_max_batch_bytes`、可选后台周期 `scrub_interval_secs`)。
 - **store 端点**:`GET /partitions/{pid}/scrub-report`(摘要)、`GET /partitions/{pid}/verify`(本地完整性,只读)、可选 `GET /partitions/{pid}/entries?from_key=&limit=`(逐 key 对拍,blob 需新增按键有序区间遍历,索引层 `SkipMap` + 各封存段 mmap 已有序,属增量工作)。
 - **admin 路由**:`POST /api/partitions/{id}/scrub`(逐副本比对 + 报告,仿 compact 的 fan-out 聚合)、`GET /api/scrub`(最近结果);指标 `store_server_scrub_runs_total`/`scrub_divergent_keys`/`scrub_bad_records`。
-- **明确不做**:段级字节 CRC 跨副本比对 —— 副本各自 append 顺序不同 + compaction/hard_delete 会重写段与 offset,段字节天然不等,**语义上不成立**(段级校验只作本地自检)。
+- **明确不做**:段级字节 CRC 跨副本比对 —— 副本各自 append 顺序不同 + compaction 会重写段与 offset,段字节天然不等,**语义上不成立**(段级校验只作本地自检)。
 
 ## Capabilities
 

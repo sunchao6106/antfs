@@ -28,10 +28,20 @@ fn used_of(pid: u32) -> u64 {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
-fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16, move_timeout_secs: u64) -> MasterConfig {
+fn cfg(
+    id: u64,
+    dir: &std::path::Path,
+    raft: u16,
+    grpc: u16,
+    move_timeout_secs: u64,
+) -> MasterConfig {
     MasterConfig {
         node_id: id,
         raft_addr: format!("127.0.0.1:{raft}"),
@@ -47,7 +57,7 @@ fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16, move_timeout_secs: 
         auto_grow_max_partitions: 100_000,
         auto_grow_interval_secs: 30,
         auto_grow_batch: 4,
-        reconcile_interval_secs: 1, // 快速调谐,便于测试
+        reconcile_interval_secs: 1,      // 快速调谐,便于测试
         reconcile_startup_grace_secs: 0, // 测试免宽限,立即调谐
         id_alloc_segment_size: 1024,
         id_alloc_raft_batch_multiple: 2,
@@ -84,8 +94,16 @@ async fn start_masters(tmp: &std::path::Path, move_timeout_secs: u64) -> Vec<Mas
 }
 
 fn leader_of(nodes: &[MasterNode]) -> &MasterNode {
-    let leader_id = nodes[0].raft.metrics().borrow().current_leader.expect("leader elected");
-    nodes.iter().find(|n| n.config.node_id == leader_id).expect("leader in set")
+    let leader_id = nodes[0]
+        .raft
+        .metrics()
+        .borrow()
+        .current_leader
+        .expect("leader elected");
+    nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .expect("leader in set")
 }
 
 async fn connect(node: &MasterNode) -> MasterClient<tonic::transport::Channel> {
@@ -101,7 +119,12 @@ async fn register_data_nodes(leader: &MasterNode) {
             dc: "dc1".into(),
             rack: format!("r{}", (b'A' + i as u8) as char),
             addr: format!("127.0.0.1:{}", free_port()),
-            disks: BTreeMap::from([("d0".to_string(), DiskSpec { capacity_bytes: DISK_CAPACITY })]),
+            disks: BTreeMap::from([(
+                "d0".to_string(),
+                DiskSpec {
+                    capacity_bytes: DISK_CAPACITY,
+                },
+            )]),
             registered_at_ms: 1,
         };
         leader
@@ -264,58 +287,117 @@ async fn balance_eval_start_executes_to_done() {
     drive_beats(&mut client, leader, &all_active).await;
 
     // 非 leader:回 leader_addr 供重定向。
-    let follower = nodes.iter().find(|n| n.config.node_id != leader.config.node_id).expect("follower");
+    let follower = nodes
+        .iter()
+        .find(|n| n.config.node_id != leader.config.node_id)
+        .expect("follower");
     let mut fclient = connect(follower).await;
     let f = fclient
-        .eval_balance(EvalBalanceRequest { version: 1, cluster_secret: SECRET.into(), max_moves: 0 })
+        .eval_balance(EvalBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            max_moves: 0,
+        })
         .await
         .expect("eval on follower")
         .into_inner();
-    assert!(!f.ok && f.error == "not leader", "got ok={} err={}", f.ok, f.error);
-    assert_eq!(f.leader_addr, leader.config.raft_addr, "follower must redirect to the leader");
+    assert!(
+        !f.ok && f.error == "not leader",
+        "got ok={} err={}",
+        f.ok,
+        f.error
+    );
+    assert_eq!(
+        f.leader_addr, leader.config.raft_addr,
+        "follower must redirect to the leader"
+    );
 
     // max_moves=1 → 截断为 1 条(顺带覆盖截断语义;随后重新 eval 覆盖该计划)。
     let e1 = client
-        .eval_balance(EvalBalanceRequest { version: 1, cluster_secret: SECRET.into(), max_moves: 1 })
+        .eval_balance(EvalBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            max_moves: 1,
+        })
         .await
         .expect("eval")
         .into_inner();
     assert!(e1.ok, "eval must succeed: {}", e1.error);
-    assert_eq!(e1.plan.as_ref().expect("plan").total, 1, "max_moves must truncate");
+    assert_eq!(
+        e1.plan.as_ref().expect("plan").total,
+        1,
+        "max_moves must truncate"
+    );
 
     // 正式评估:9 副本 4 节点(3,3,3,0)→ 恰 2 条 move(2,2,3,2 即收敛,改善护栏拦下第 3 条)。
     let e = client
-        .eval_balance(EvalBalanceRequest { version: 1, cluster_secret: SECRET.into(), max_moves: 0 })
+        .eval_balance(EvalBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            max_moves: 0,
+        })
         .await
         .expect("eval")
         .into_inner();
     assert!(e.ok, "eval must succeed: {}", e.error);
     let plan = e.plan.expect("plan");
     assert_eq!(plan.status, "PREVIEW");
-    assert_eq!((plan.total, plan.pending, plan.in_flight, plan.done, plan.failed), (2, 2, 0, 0, 0));
+    assert_eq!(
+        (
+            plan.total,
+            plan.pending,
+            plan.in_flight,
+            plan.done,
+            plan.failed
+        ),
+        (2, 2, 0, 0, 0)
+    );
     // 确定性:源盘按 node asc、同盘按占用 desc → (pid2: 101→104),(pid1: 102→104)。
     assert_eq!(
-        (plan.moves[0].partition_id, plan.moves[0].from_node_id, plan.moves[0].to_node_id),
+        (
+            plan.moves[0].partition_id,
+            plan.moves[0].from_node_id,
+            plan.moves[0].to_node_id
+        ),
         (pids[2], 101, 104)
     );
     assert_eq!(
-        (plan.moves[1].partition_id, plan.moves[1].from_node_id, plan.moves[1].to_node_id),
+        (
+            plan.moves[1].partition_id,
+            plan.moves[1].from_node_id,
+            plan.moves[1].to_node_id
+        ),
         (pids[1], 102, 104)
     );
-    assert!(plan.moves.iter().all(|m| m.from_disk_id == "d0" && m.to_disk_id == "d0"
-        && m.status == "pending" && m.error.is_empty()));
+    assert!(plan.moves.iter().all(|m| m.from_disk_id == "d0"
+        && m.to_disk_id == "d0"
+        && m.status == "pending"
+        && m.error.is_empty()));
 
     // plan_id 不匹配 → 拒绝(防陈旧确认)。
     let s = client
-        .start_balance(StartBalanceRequest { version: 1, cluster_secret: SECRET.into(), plan_id: plan.plan_id + 1 })
+        .start_balance(StartBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            plan_id: plan.plan_id + 1,
+        })
         .await
         .expect("start")
         .into_inner();
-    assert!(!s.ok && s.error.contains("not found"), "got ok={} err={}", s.ok, s.error);
+    assert!(
+        !s.ok && s.error.contains("not found"),
+        "got ok={} err={}",
+        s.ok,
+        s.error
+    );
 
     // 确认启动。
     let s = client
-        .start_balance(StartBalanceRequest { version: 1, cluster_secret: SECRET.into(), plan_id: plan.plan_id })
+        .start_balance(StartBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            plan_id: plan.plan_id,
+        })
         .await
         .expect("start")
         .into_inner();
@@ -330,7 +412,11 @@ async fn balance_eval_start_executes_to_done() {
         let st = balance_state(&mut client).await;
         assert!(st.present, "plan must stay present while running");
         let p = st.plan.expect("plan");
-        assert!(p.in_flight <= 1, "max_in_flight=1 must cap concurrency, got {}", p.in_flight);
+        assert!(
+            p.in_flight <= 1,
+            "max_in_flight=1 must cap concurrency, got {}",
+            p.in_flight
+        );
         saw_in_flight |= p.in_flight == 1;
         if p.status == "DONE" {
             final_state = Some(p);
@@ -339,8 +425,15 @@ async fn balance_eval_start_executes_to_done() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let p = final_state.expect("plan must reach DONE within timeout");
-    assert!(saw_in_flight, "at least one move must have been observed in flight");
-    assert_eq!((p.done, p.failed, p.pending, p.in_flight), (2, 0, 0, 0), "all moves done: {p:?}");
+    assert!(
+        saw_in_flight,
+        "at least one move must have been observed in flight"
+    );
+    assert_eq!(
+        (p.done, p.failed, p.pending, p.in_flight),
+        (2, 0, 0, 0),
+        "all moves done: {p:?}"
+    );
     assert!(p.moves.iter().all(|m| m.status == "done"));
 
     // 分布收敛:pid2 从 101、pid1 从 102 迁到 104 → 每节点 2,2,3,2(不可整除均分的收敛态)。
@@ -352,23 +445,33 @@ async fn balance_eval_start_executes_to_done() {
     // A6 记账清理生效:moving / pending_drop 全空。
     {
         let g = leader.sm_data.read().expect("sm");
-        assert!(g.state.moving.is_empty(), "moving must drain, got {:?}", g.state.moving);
+        assert!(
+            g.state.moving.is_empty(),
+            "moving must drain, got {:?}",
+            g.state.moving
+        );
         assert!(g.state.pending_drop.is_empty(), "pending_drop must drain");
     }
 
     // 指标:gauge 归零 + 完成计数 = 2(reconciler 周期刷新,轮询等待)。
     let start = Instant::now();
     loop {
-        let gauges_ok =
-            gauge(leader, "master_balance_pending") == Some(0) && gauge(leader, "master_balance_in_flight") == Some(0);
+        let gauges_ok = gauge(leader, "master_balance_pending") == Some(0)
+            && gauge(leader, "master_balance_in_flight") == Some(0);
         if gauges_ok && any_node_has(&nodes, "master_balance_moves_total", 2) {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "balance metrics must converge, dump:\n{}",
-            antfs_metric::gather(&leader.registry).unwrap_or_default());
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "balance metrics must converge, dump:\n{}",
+            antfs_metric::gather(&leader.registry).unwrap_or_default()
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!any_node_has(&nodes, "master_balance_failed_total", 1), "no move may fail");
+    assert!(
+        !any_node_has(&nodes, "master_balance_failed_total", 1),
+        "no move may fail"
+    );
 }
 
 /// cancel:计划清空(present=false)、在途 move **不回滚**、由既有 reconciler 自然收敛。
@@ -386,14 +489,22 @@ async fn balance_cancel_clears_plan_and_in_flight_converges() {
     drive_beats(&mut client, leader, &target_bootstrapping).await;
 
     let e = client
-        .eval_balance(EvalBalanceRequest { version: 1, cluster_secret: SECRET.into(), max_moves: 0 })
+        .eval_balance(EvalBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            max_moves: 0,
+        })
         .await
         .expect("eval")
         .into_inner();
     assert!(e.ok, "eval: {}", e.error);
     let plan = e.plan.expect("plan");
     let s = client
-        .start_balance(StartBalanceRequest { version: 1, cluster_secret: SECRET.into(), plan_id: plan.plan_id })
+        .start_balance(StartBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            plan_id: plan.plan_id,
+        })
         .await
         .expect("start")
         .into_inner();
@@ -408,29 +519,54 @@ async fn balance_cancel_clears_plan_and_in_flight_converges() {
             assert_eq!(p.pending, 1, "second move must wait for the budget");
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "first move must go in flight");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "first move must go in flight"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let in_flight_pid = pids[2]; // 第一条 move(见上一测试的确定性顺序)
     assert!(
-        leader.sm_data.read().expect("sm").state.moving.contains(&(in_flight_pid, 101)),
+        leader
+            .sm_data
+            .read()
+            .expect("sm")
+            .state
+            .moving
+            .contains(&(in_flight_pid, 101)),
         "move must be accepted (source marked moving-out)"
     );
 
     // plan_id 不匹配 → 拒绝;匹配 → 清计划。
     let c = client
-        .cancel_balance(CancelBalanceRequest { version: 1, cluster_secret: SECRET.into(), plan_id: plan.plan_id + 9 })
+        .cancel_balance(CancelBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            plan_id: plan.plan_id + 9,
+        })
         .await
         .expect("cancel")
         .into_inner();
-    assert!(!c.ok && c.error.contains("not found"), "got ok={} err={}", c.ok, c.error);
+    assert!(
+        !c.ok && c.error.contains("not found"),
+        "got ok={} err={}",
+        c.ok,
+        c.error
+    );
     let c = client
-        .cancel_balance(CancelBalanceRequest { version: 1, cluster_secret: SECRET.into(), plan_id: plan.plan_id })
+        .cancel_balance(CancelBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            plan_id: plan.plan_id,
+        })
         .await
         .expect("cancel")
         .into_inner();
     assert!(c.ok, "cancel: {}", c.error);
-    assert!(!balance_state(&mut client).await.present, "cancel must clear the plan");
+    assert!(
+        !balance_state(&mut client).await.present,
+        "cancel must clear the plan"
+    );
 
     // 计划已清:第二条 move 不再推进(仍 pending 的事不会发生——在途那条继续自然收敛)。
     // 让 104 追平(报 ACTIVE)→ 在途 move 走既有"后删 + DROPPED + 记账清理"收敛。
@@ -449,14 +585,20 @@ async fn balance_cancel_clears_plan_and_in_flight_converges() {
         if converged {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20),
-            "in-flight move must converge naturally after cancel; holdings={:?}", holdings(leader));
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "in-flight move must converge naturally after cancel; holdings={:?}",
+            holdings(leader)
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // 计划保持清空;第二条 move 从未投递:102 仍持有 pid1,104 只有 pid2。
     assert!(!balance_state(&mut client).await.present);
     let h = holdings(leader);
-    assert!(h[&102].contains(&pids[1]), "pending move must NOT have been dispatched after cancel");
+    assert!(
+        h[&102].contains(&pids[1]),
+        "pending move must NOT have been dispatched after cancel"
+    );
     assert!(!h[&104].contains(&pids[1]));
 }
 
@@ -470,25 +612,42 @@ async fn balance_eval_without_skew_returns_empty_plan() {
 
     register_data_nodes(leader).await;
     // 4 个 RF=3 分区轮转放置:每节点恰 3 副本,无倾斜。
-    for replicas in [[101, 102, 103], [102, 103, 104], [103, 104, 101], [104, 101, 102]] {
+    for replicas in [
+        [101, 102, 103],
+        [102, 103, 104],
+        [103, 104, 101],
+        [104, 101, 102],
+    ] {
         create_partition(leader, &replicas).await;
     }
     let all_active = |_| "ACTIVE";
     drive_beats(&mut client, leader, &all_active).await;
 
     let e = client
-        .eval_balance(EvalBalanceRequest { version: 1, cluster_secret: SECRET.into(), max_moves: 0 })
+        .eval_balance(EvalBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            max_moves: 0,
+        })
         .await
         .expect("eval")
         .into_inner();
-    assert!(e.ok, "eval must succeed even with nothing to do: {}", e.error);
+    assert!(
+        e.ok,
+        "eval must succeed even with nothing to do: {}",
+        e.error
+    );
     let plan = e.plan.expect("plan");
     assert_eq!(plan.status, "PREVIEW");
     assert_eq!(plan.total, 0, "uniform cluster must yield an empty plan");
     assert!(plan.moves.is_empty());
 
     let s = client
-        .start_balance(StartBalanceRequest { version: 1, cluster_secret: SECRET.into(), plan_id: plan.plan_id })
+        .start_balance(StartBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            plan_id: plan.plan_id,
+        })
         .await
         .expect("start")
         .into_inner();
@@ -501,7 +660,10 @@ async fn balance_eval_without_skew_returns_empty_plan() {
         if p.status == "DONE" {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "empty plan must complete immediately");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "empty plan must complete immediately"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -521,7 +683,11 @@ async fn balance_stuck_move_fails_and_plan_completes() {
     drive_beats(&mut client, leader, &target_bootstrapping).await;
 
     let e = client
-        .eval_balance(EvalBalanceRequest { version: 1, cluster_secret: SECRET.into(), max_moves: 0 })
+        .eval_balance(EvalBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            max_moves: 0,
+        })
         .await
         .expect("eval")
         .into_inner();
@@ -529,7 +695,11 @@ async fn balance_stuck_move_fails_and_plan_completes() {
     let plan = e.plan.expect("plan");
     assert_eq!(plan.total, 2);
     let s = client
-        .start_balance(StartBalanceRequest { version: 1, cluster_secret: SECRET.into(), plan_id: plan.plan_id })
+        .start_balance(StartBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            plan_id: plan.plan_id,
+        })
         .await
         .expect("start")
         .into_inner();
@@ -548,13 +718,26 @@ async fn balance_stuck_move_fails_and_plan_completes() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let p = final_plan.expect("plan must reach DONE via failures");
-    assert_eq!((p.failed, p.done), (2, 0), "both moves must fail as stuck: {p:?}");
-    assert!(p.moves.iter().all(|m| m.status == "failed" && m.error.contains("stuck")));
+    assert_eq!(
+        (p.failed, p.done),
+        (2, 0),
+        "both moves must fail as stuck: {p:?}"
+    );
+    assert!(p
+        .moves
+        .iter()
+        .all(|m| m.status == "failed" && m.error.contains("stuck")));
 
     let start = Instant::now();
     while !any_node_has(&nodes, "master_balance_failed_total", 2) {
-        assert!(start.elapsed() < Duration::from_secs(20), "failed counter must reach 2");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "failed counter must reach 2"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!any_node_has(&nodes, "master_balance_moves_total", 1), "no move completed");
+    assert!(
+        !any_node_has(&nodes, "master_balance_moves_total", 1),
+        "no move completed"
+    );
 }

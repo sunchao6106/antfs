@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,13 +25,12 @@ use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use antfs_router::{BlobStat, Error as RouterError, Router as BlobRouter, StoreKey};
 use antfs_metric::IntCounterVec;
+use antfs_router::{BlobStat, Error as RouterError, Router as BlobRouter, StoreKey, NO_EXPIRATION};
 
 use crate::config::FrontendConfig;
 use crate::metrics::{
-    FrontendMetrics, OUTCOME_OK, OP_DELETE, OP_DOWNLOAD, OP_HEAD, OP_STITCH, OP_TTL, OP_UNDELETE,
-    OP_UPLOAD,
+    FrontendMetrics, OP_DELETE, OP_DOWNLOAD, OP_HEAD, OP_STITCH, OP_UPLOAD, OUTCOME_OK,
 };
 
 // ── 请求/响应头(对齐 Ambry frontend 的 `x-ambry-*` 契约)────────────────────────────────────
@@ -48,19 +47,12 @@ const HEADER_BLOB_SIZE: HeaderName = HeaderName::from_static("x-ambry-blob-size"
 const HEADER_BLOB_DELETED: HeaderName = HeaderName::from_static("x-ambry-blob-deleted");
 /// `x-ambry-blob-expired`:`"true"`/`"false"`。
 const HEADER_BLOB_EXPIRED: HeaderName = HeaderName::from_static("x-ambry-blob-expired");
-/// `x-ambry-blob-undeleted`:`"true"`/`"false"`。
-const HEADER_BLOB_UNDELETED: HeaderName = HeaderName::from_static("x-ambry-blob-undeleted");
-/// `x-ambry-blob-ttl-updated`:`"true"`/`"false"`。
-const HEADER_BLOB_TTL_UPDATED: HeaderName = HeaderName::from_static("x-ambry-blob-ttl-updated");
-/// `x-ambry-blob-life-version`:生命版本(解"删除/复活"冲突)。
-const HEADER_BLOB_LIFE_VERSION: HeaderName = HeaderName::from_static("x-ambry-blob-life-version");
 /// `x-ambry-blob-expiration-ms`:过期时刻(epoch 毫秒;`-1` = 不过期)。
 const HEADER_BLOB_EXPIRATION_MS: HeaderName = HeaderName::from_static("x-ambry-blob-expiration-ms");
 /// `x-ambry-blob-stitched`:该对象是否为分片拼装(`HEAD` 专用;`GET` 会拼装成逻辑字节流)。
 const HEADER_BLOB_STITCHED: HeaderName = HeaderName::from_static("x-ambry-blob-stitched");
 /// `x-ambry-blob-stitch-chunks`:拼装的片数(`HEAD` 专用,仅拼装对象有)。
-const HEADER_BLOB_STITCH_CHUNKS: HeaderName =
-    HeaderName::from_static("x-ambry-blob-stitch-chunks");
+const HEADER_BLOB_STITCH_CHUNKS: HeaderName = HeaderName::from_static("x-ambry-blob-stitch-chunks");
 
 /// **直接进内存**的 body 上界:≤ 该值走内存路径(`Bytes` → `Router::put`),> 该值(或未声明长度)
 /// 才落盘暂存 + [`Router::put_file`] 流式写。
@@ -71,18 +63,14 @@ const HEADER_BLOB_STITCH_CHUNKS: HeaderName =
 const INLINE_BODY_MAX: u64 = 1024 * 1024;
 
 /// 跨域时允许的请求头(仅本接口真正用到的三个)。
-const CORS_ALLOWED_HEADERS: [HeaderName; 3] =
-    [header::CONTENT_TYPE, HEADER_SESSION, HEADER_TTL_MS];
+const CORS_ALLOWED_HEADERS: [HeaderName; 3] = [header::CONTENT_TYPE, HEADER_SESSION, HEADER_TTL_MS];
 /// 跨域时暴露给浏览器的响应头(全部 `x-ambry-*` + `Location`)。
-const CORS_EXPOSED_HEADERS: [HeaderName; 11] = [
+const CORS_EXPOSED_HEADERS: [HeaderName; 8] = [
     header::LOCATION,
     HEADER_BLOB_ID,
     HEADER_BLOB_SIZE,
     HEADER_BLOB_DELETED,
     HEADER_BLOB_EXPIRED,
-    HEADER_BLOB_UNDELETED,
-    HEADER_BLOB_TTL_UPDATED,
-    HEADER_BLOB_LIFE_VERSION,
     HEADER_BLOB_EXPIRATION_MS,
     HEADER_BLOB_STITCHED,
     HEADER_BLOB_STITCH_CHUNKS,
@@ -172,7 +160,9 @@ impl Error {
     /// 透传 `Retry-After`(仅在副本**请求静默**且给了剩余秒数时;`None` = 不带头)。
     fn retry_after_secs(&self) -> Option<u64> {
         match self {
-            Error::Router(RouterError::Silenced { retry_after_secs, .. }) => *retry_after_secs,
+            Error::Router(RouterError::Silenced {
+                retry_after_secs, ..
+            }) => *retry_after_secs,
             _ => None,
         }
     }
@@ -271,8 +261,6 @@ pub fn build_router(state: AppState) -> Router {
             "/blobs/{blob_id}",
             get(get_blob).head(head_blob).delete(delete_blob),
         )
-        .route("/blobs/{blob_id}/undelete", post(undelete_blob))
-        .route("/blobs/{blob_id}/ttl", post(update_ttl))
         .route("/stitch", post(stitch))
         .route("/metrics", get(get_metrics))
         .layer(DefaultBodyLimit::max(body_limit(state.max_body_bytes)))
@@ -315,7 +303,10 @@ async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_UPLOAD);
     match upload(&st, req).await {
         Ok((key, len)) => {
-            st.metrics.upload_total.with_label_values(&[OUTCOME_OK]).inc();
+            st.metrics
+                .upload_total
+                .with_label_values(&[OUTCOME_OK])
+                .inc();
             st.metrics.upload_bytes.inc_by(len);
             // 每请求成功的细节走 debug:压测下 2 万次上传会在 INFO 打出 2 万行,日志本身成为热点。
             tracing::debug!(
@@ -333,18 +324,24 @@ async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
     }
 }
 
-/// 上传实现:边界校验 → 流式落暂存文件 → `put_file`(W 多数派)→ 可选 TTL。
+/// 上传实现:边界校验 → 小 body 进内存([`INLINE_BODY_MAX`] 内)/大 body 落暂存流式 → 写入时定 TTL
+/// (`x-ambry-ttl-ms`,缺省不过期)→ **一次**多数派写。
 async fn upload(st: &AppState, req: Request) -> Result<(StoreKey, u64), Error> {
     // 先解析 TTL 头:非法立即 400,不白读一遍 body。
-    let expiration_ms = ttl_header(req.headers())?;
+    let expiration_ms = ttl_header(req.headers())?.unwrap_or(NO_EXPIRATION);
     let declared = content_length(&req);
     if let Some(len) = declared {
         if len > st.max_body_bytes {
-            return Err(Error::TooLarge { len, max: st.max_body_bytes });
+            return Err(Error::TooLarge {
+                len,
+                max: st.max_body_bytes,
+            });
         }
     }
     // 小 body 直接进内存(有界):见 `INLINE_BODY_MAX` —— 每个小对象都落一个暂存文件在 macOS 上
     // 代价过高(实测 PUT p50 ~1ms → ~9ms)。大 body(或未声明长度)才落盘 + 流式,内存不随大小涨。
+    //
+    // TTL 随**同一次**写请求下发(`PUT ?expiration_ms=`),故不存在"对象已创建但没带 TTL"的中间态。
     let (key, written) = match declared {
         Some(len) if len <= INLINE_BODY_MAX => {
             let bytes = axum::body::to_bytes(req.into_body(), INLINE_BODY_MAX as usize)
@@ -358,31 +355,20 @@ async fn upload(st: &AppState, req: Request) -> Result<(StoreKey, u64), Error> {
                 )));
             }
             let key = st.router.allocate_one().await?;
-            st.router.put(key, bytes).await?;
+            st.router.put_with_ttl(key, bytes, expiration_ms).await?;
             (key, len)
         }
         _ => {
             let staging = TempFile::create();
             let written =
                 stage_body(req.into_body(), staging.path(), declared, st.max_body_bytes).await?;
-            let (key, _report) = st.router.put_file(staging.path()).await?;
+            let (key, _report) = st
+                .router
+                .put_file_with_ttl(staging.path(), expiration_ms)
+                .await?;
             (key, written)
         }
     };
-    if let Some(expiration_ms) = expiration_ms {
-        // 已知取舍:SDK 的 `put` 不带 TTL 参数,故这里**先 put 再 update_ttl**(两次多数派写)。
-        // 本次不动 SDK 的 put 签名(改动面更大、且 W 逻辑只有一份实现,扩签名要连带动 CLI/压测)。
-        // 代价:第二步失败时对象**已创建但没带 TTL**,故报错让调用方知情(而非假装成功),
-        // 并用 warn 留下可清理的线索(承 CLAUDE.md §3.1:不静默降级)。
-        if let Err(e) = st.router.update_ttl(&key, expiration_ms).await {
-            tracing::warn!(
-                blob_id = %hex::encode(key.as_bytes()),
-                error = %e,
-                "ttl update after put failed; blob exists without ttl"
-            );
-            return Err(Error::Router(e));
-        }
-    }
     Ok((key, written))
 }
 
@@ -391,7 +377,10 @@ async fn get_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<String
     let _timer = RequestTimer::start(&st.metrics, OP_DOWNLOAD);
     match download(&st, &blob_id).await {
         Ok((resp, len)) => {
-            st.metrics.download_total.with_label_values(&[OUTCOME_OK]).inc();
+            st.metrics
+                .download_total
+                .with_label_values(&[OUTCOME_OK])
+                .inc();
             st.metrics.download_bytes.inc_by(len);
             resp
         }
@@ -490,75 +479,14 @@ async fn delete_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<Str
     .await;
     match result {
         Ok(()) => {
-            st.metrics.delete_total.with_label_values(&[OUTCOME_OK]).inc();
+            st.metrics
+                .delete_total
+                .with_label_values(&[OUTCOME_OK])
+                .inc();
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
             fail(&st.metrics, &st.metrics.delete_total, &[], &e);
-            e.into_response()
-        }
-    }
-}
-
-/// `POST /blobs/{blobId}/undelete`:多数派复活 → 200 + `x-ambry-blob-life-version`。
-async fn undelete_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<String>) -> Response {
-    let _timer = RequestTimer::start(&st.metrics, OP_UNDELETE);
-    let result = async {
-        let key = parse_blob_id(&blob_id)?;
-        let (_report, life_version) = st.router.undelete(&key).await?;
-        Ok(life_version)
-    }
-    .await;
-    match result {
-        Ok(life_version) => {
-            st.metrics
-                .mutation_total
-                .with_label_values(&[OP_UNDELETE, OUTCOME_OK])
-                .inc();
-            let mut resp = StatusCode::OK.into_response();
-            put_header(&mut resp, HEADER_BLOB_LIFE_VERSION, &life_version.to_string());
-            resp
-        }
-        Err(e) => {
-            fail(&st.metrics, &st.metrics.mutation_total, &[OP_UNDELETE], &e);
-            e.into_response()
-        }
-    }
-}
-
-/// `POST /blobs/{blobId}/ttl` 的查询参数。
-#[derive(Deserialize)]
-struct TtlParams {
-    /// 新的过期时刻(epoch 毫秒);缺省 → 400(不静默当成"不过期")。
-    expiration_ms: Option<i64>,
-}
-
-/// `POST /blobs/{blobId}/ttl?expiration_ms=<i64>`:多数派更新过期时刻 → 204。
-async fn update_ttl(
-    State(st): State<AppState>,
-    AxumPath(blob_id): AxumPath<String>,
-    Query(params): Query<TtlParams>,
-) -> Response {
-    let _timer = RequestTimer::start(&st.metrics, OP_TTL);
-    let result = async {
-        let expiration_ms = params
-            .expiration_ms
-            .ok_or_else(|| Error::Invalid("missing query parameter expiration_ms".into()))?;
-        let key = parse_blob_id(&blob_id)?;
-        st.router.update_ttl(&key, expiration_ms).await?;
-        Ok(())
-    }
-    .await;
-    match result {
-        Ok(()) => {
-            st.metrics
-                .mutation_total
-                .with_label_values(&[OP_TTL, OUTCOME_OK])
-                .inc();
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => {
-            fail(&st.metrics, &st.metrics.mutation_total, &[OP_TTL], &e);
             e.into_response()
         }
     }
@@ -629,9 +557,11 @@ async fn stitch_inner(
         let key = parse_blob_id(id)
             .map_err(|_| Error::Invalid(format!("chunk {id}: {BLOB_ID_INVALID}")))?;
         // 提交时校验每个片可读,并记下它的长度/过期时刻(读路径据此核对,见 `fetch_chunk`)。
-        let meta = st.router.stat(&key).await.map_err(|e| {
-            Error::Invalid(format!("chunk {id} is not readable: {e}"))
-        })?;
+        let meta = st
+            .router
+            .stat(&key)
+            .await
+            .map_err(|e| Error::Invalid(format!("chunk {id} is not readable: {e}")))?;
         chunks.push(DescriptorChunk {
             id: key,
             size: meta.size,
@@ -711,7 +641,10 @@ fn decode_descriptor(buf: &[u8]) -> Result<Vec<DescriptorChunk>, Error> {
     if !buf.starts_with(DESCRIPTOR_MAGIC) {
         return Err(bad("bad magic"));
     }
-    let mut cur = Cursor { buf, pos: DESCRIPTOR_MAGIC.len() };
+    let mut cur = Cursor {
+        buf,
+        pos: DESCRIPTOR_MAGIC.len(),
+    };
     let version = cur.u8()?;
     if version != DESCRIPTOR_VERSION {
         return Err(bad(&format!("unsupported descriptor version {version}")));
@@ -746,8 +679,14 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         let bad = |msg: &str| Error::Upstream(format!("corrupt stitch descriptor: {msg}"));
-        let end = self.pos.checked_add(n).ok_or_else(|| bad("length overflow"))?;
-        let out = self.buf.get(self.pos..end).ok_or_else(|| bad("truncated"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| bad("length overflow"))?;
+        let out = self
+            .buf
+            .get(self.pos..end)
+            .ok_or_else(|| bad("truncated"))?;
         self.pos = end;
         Ok(out)
     }
@@ -839,7 +778,11 @@ fn file_stream(
         _guard: TempFile,
         buf: Vec<u8>,
     }
-    let init = State { file, _guard: guard, buf: vec![0u8; buf_bytes] };
+    let init = State {
+        file,
+        _guard: guard,
+        buf: vec![0u8; buf_bytes],
+    };
     stream::try_unfold(init, |mut st| async move {
         let n = st.file.read(&mut st.buf).await?;
         if n == 0 {
@@ -863,7 +806,10 @@ impl RequestTimer {
         in_flight.inc();
         RequestTimer {
             in_flight,
-            _duration: metrics.request_duration.with_label_values(&[op]).start_timer(),
+            _duration: metrics
+                .request_duration
+                .with_label_values(&[op])
+                .start_timer(),
         }
     }
 }
@@ -904,14 +850,11 @@ fn created_response(key: StoreKey, len: u64) -> Response {
 }
 
 /// `HEAD` 的状态头(布尔值用 `"true"`/`"false"`)。
-fn stat_headers(meta: &BlobStat) -> [(HeaderName, String); 7] {
+fn stat_headers(meta: &BlobStat) -> [(HeaderName, String); 4] {
     [
         (HEADER_BLOB_SIZE, meta.size.to_string()),
         (HEADER_BLOB_DELETED, meta.deleted.to_string()),
         (HEADER_BLOB_EXPIRED, meta.expired.to_string()),
-        (HEADER_BLOB_UNDELETED, meta.undeleted.to_string()),
-        (HEADER_BLOB_TTL_UPDATED, meta.ttl_updated.to_string()),
-        (HEADER_BLOB_LIFE_VERSION, meta.life_version.to_string()),
         (HEADER_BLOB_EXPIRATION_MS, meta.expiration_ms.to_string()),
     ]
 }
@@ -931,9 +874,9 @@ fn ttl_header(headers: &HeaderMap) -> Result<Option<i64>, Error> {
     match headers.get(HEADER_TTL_MS) {
         None => Ok(None),
         Some(raw) => {
-            let text = raw
-                .to_str()
-                .map_err(|_| Error::Invalid("x-ambry-ttl-ms must be an integer (epoch ms)".into()))?;
+            let text = raw.to_str().map_err(|_| {
+                Error::Invalid("x-ambry-ttl-ms must be an integer (epoch ms)".into())
+            })?;
             text.trim()
                 .parse::<i64>()
                 .map(Some)
@@ -1023,7 +966,10 @@ async fn stage_body(
         let chunk = chunk.map_err(|e| Error::Invalid(format!("body stream: {e}")))?;
         written += chunk.len() as u64;
         if written > max_body_bytes {
-            return Err(Error::TooLarge { len: written, max: max_body_bytes });
+            return Err(Error::TooLarge {
+                len: written,
+                max: max_body_bytes,
+            });
         }
         if let Some(declared) = declared {
             if written > declared {
@@ -1073,7 +1019,10 @@ mod tests {
             assert_eq!(got.expiration_ms, want.expiration_ms);
         }
         // 头长 + session + 每条目定长:描述符长度可精确算出。
-        assert_eq!(buf.len(), DESCRIPTOR_HEADER_BYTES + "session-abc".len() + 3 * DESCRIPTOR_ENTRY_BYTES);
+        assert_eq!(
+            buf.len(),
+            DESCRIPTOR_HEADER_BYTES + "session-abc".len() + 3 * DESCRIPTOR_ENTRY_BYTES
+        );
     }
 
     /// 编解码的边界:空片列表、片数超上限、session 超长、截断/多余字节、版本不认识。
@@ -1082,7 +1031,10 @@ mod tests {
         assert!(encode_descriptor(b"s", &[]).is_err(), "0 片必须拒");
         let too_many: Vec<DescriptorChunk> =
             (0..MAX_CHUNKS + 1).map(|i| chunk(1, i as u32, 1)).collect();
-        assert!(encode_descriptor(b"s", &too_many).is_err(), "片数超上限必须拒");
+        assert!(
+            encode_descriptor(b"s", &too_many).is_err(),
+            "片数超上限必须拒"
+        );
         let long_session = vec![b'x'; 70_000];
         assert!(
             encode_descriptor(&long_session, &[chunk(1, 1, 1)]).is_err(),
@@ -1090,15 +1042,24 @@ mod tests {
         );
 
         let buf = encode_descriptor(b"s", &[chunk(1, 1, 5)]).expect("encode");
-        assert!(decode_descriptor(&buf[..buf.len() - 1]).is_err(), "截断必须拒");
+        assert!(
+            decode_descriptor(&buf[..buf.len() - 1]).is_err(),
+            "截断必须拒"
+        );
         let mut trailing = buf.clone();
         trailing.push(0);
         assert!(decode_descriptor(&trailing).is_err(), "多余字节必须拒");
         let mut bad_version = buf.clone();
         bad_version[4] = DESCRIPTOR_VERSION + 1;
         assert!(decode_descriptor(&bad_version).is_err(), "未知版本必须拒");
-        assert!(decode_descriptor(b"nope-nope-nope").is_err(), "无 MAGIC 必须拒");
-        assert!(decode_descriptor(DESCRIPTOR_MAGIC).is_err(), "只有 MAGIC 必须拒");
+        assert!(
+            decode_descriptor(b"nope-nope-nope").is_err(),
+            "无 MAGIC 必须拒"
+        );
+        assert!(
+            decode_descriptor(DESCRIPTOR_MAGIC).is_err(),
+            "只有 MAGIC 必须拒"
+        );
     }
 
     /// blobId 文本形式:非 hex / 长度不是 8 字节都归 400,且文案固定。
@@ -1109,7 +1070,10 @@ mod tests {
         for bad in ["zz", "", "0f", "000000010000000200"] {
             let err = parse_blob_id(bad).expect_err("必须拒");
             assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-            assert!(err.to_string().contains(BLOB_ID_INVALID), "文案必须稳定: {err}");
+            assert!(
+                err.to_string().contains(BLOB_ID_INVALID),
+                "文案必须稳定: {err}"
+            );
         }
     }
 
@@ -1117,16 +1081,30 @@ mod tests {
     #[test]
     fn status_mapping() {
         use antfs_router::Error as E;
-        assert_eq!(router_status(&E::NotFound { pid: 1 }), StatusCode::NOT_FOUND);
+        assert_eq!(
+            router_status(&E::NotFound { pid: 1 }),
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(
             router_status(&E::StoreFull { addr: "a:1".into() }),
             StatusCode::INSUFFICIENT_STORAGE,
             "分区写满必须 507,不混进 500"
         );
         for e in [
-            E::Quorum { acks: 1, required: 2, total: 3, detail: "d".into() },
-            E::NoReplica { addr: "a:1".into(), pid: 2 },
-            E::Silenced { addr: "a:1".into(), retry_after_secs: Some(30) },
+            E::Quorum {
+                acks: 1,
+                required: 2,
+                total: 3,
+                detail: "d".into(),
+            },
+            E::NoReplica {
+                addr: "a:1".into(),
+                pid: 2,
+            },
+            E::Silenced {
+                addr: "a:1".into(),
+                retry_after_secs: Some(30),
+            },
             E::Rejected("not leader".into()),
             E::NoWritablePartition,
             E::IdExhausted(3),
@@ -1149,19 +1127,36 @@ mod tests {
             "超 body 上限必须 413"
         );
         assert_eq!(Error::NotFound.status(), StatusCode::NOT_FOUND);
-        assert_eq!(Error::Upstream("x".into()).status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            Error::Upstream("x".into()).status(),
+            StatusCode::BAD_GATEWAY
+        );
         assert_eq!(
             Error::Io(std::io::Error::other("x")).status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
         // `Silenced` 必须把剩余秒数透传成 `Retry-After`;缺省则不带该头。
-        let resp = Error::Router(E::Silenced { addr: "a:1".into(), retry_after_secs: Some(30) })
-            .into_response();
+        let resp = Error::Router(E::Silenced {
+            addr: "a:1".into(),
+            retry_after_secs: Some(30),
+        })
+        .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(resp.headers().get(header::RETRY_AFTER).map(|v| v.as_bytes()), Some(b"30".as_slice()));
-        let resp = Error::Router(E::Silenced { addr: "a:1".into(), retry_after_secs: None })
-            .into_response();
-        assert!(resp.headers().get(header::RETRY_AFTER).is_none(), "永久静默不带 Retry-After");
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.as_bytes()),
+            Some(b"30".as_slice())
+        );
+        let resp = Error::Router(E::Silenced {
+            addr: "a:1".into(),
+            retry_after_secs: None,
+        })
+        .into_response();
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_none(),
+            "永久静默不带 Retry-After"
+        );
     }
 
     /// `outcome` label 是稳定取值:SDK 错误沿用 `Error::kind()`,本层错误用固定分类。
@@ -1186,6 +1181,9 @@ mod tests {
     #[test]
     fn cors_layer_is_absent_by_default() {
         assert!(cors_layer(&[]).is_none(), "默认不挂 CORS 层");
-        assert!(cors_layer(&["https://a.example".into()]).is_some(), "显式来源才挂");
+        assert!(
+            cors_layer(&["https://a.example".into()]).is_some(),
+            "显式来源才挂"
+        );
     }
 }

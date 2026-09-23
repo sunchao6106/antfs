@@ -242,6 +242,10 @@ export interface ScrubReportSummary {
   segments: { position: number; data_end: number }[];
   token_seg: number | null;
   token_off: number | null;
+  /** 打开时跳过的坏记录数(>0 = 该副本带伤启动;盘上字节未被删改)。 */
+  damaged_records: number;
+  /** 打开时放弃扫描剩余部分的段数。 */
+  abandoned_segments: number;
 }
 export interface ScrubVerifySummary {
   records: number;
@@ -462,7 +466,7 @@ export const api = {
 };
 
 /** 数据面可被静默的操作名(store 侧 `DataOp::ALL` 的对外真值,顺序一致)。 */
-export const DATA_OPS = ["put", "get", "delete", "undelete", "ttl_update"] as const;
+export const DATA_OPS = ["put", "get", "delete"] as const;
 
 /** 秒 → 人读时长("-" = 永久)。 */
 export function fmtSecs(secs: number | null): string {

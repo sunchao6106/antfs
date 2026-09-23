@@ -22,7 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let registry = antfs_metric::Registry::new();
     let metrics = Arc::new(AdminMetrics::new(&registry)?);
-    let master = Arc::new(GrpcMasterApi::connect(&cfg.master_addr, cfg.cluster_secret.clone()).await?);
+    let master =
+        Arc::new(GrpcMasterApi::connect(&cfg.master_addr, cfg.cluster_secret.clone()).await?);
 
     let state = AppState {
         master,

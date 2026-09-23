@@ -1,43 +1,44 @@
 //! `IndexValue`:索引条目的值,定长序列化到磁盘。
+//!
+//! 布局(小端,共 21B):
+//! ```text
+//! [ offset(8) | size(4) | flags(1) | expiration_ms(8) ]
+//! ```
+//! - `offset`:记录位置,`LogOffset::pack()`(段号 u32 ‖ 段内偏移 u32);
+//! - `size`:**整条记录**的字节数(记录头 + 数据体 + crc),用于跳过/统计;段 ≤ 4 GiB 故 u32 够;
+//! - `flags`:目前只有 `DELETED`(墓碑没有数据体);
+//! - `expiration_ms`:TTL,`NO_EXPIRATION` = 不过期。
+//!
+//! 索引的 key 是 8B blobId(`KEY_SIZE`),即每条目 29B。
 
 use crate::types::LogOffset;
 
+/// 该 key 的当前赢家是墓碑(对象已删除,数据体不存在)。
 pub const FLAG_DELETED: u8 = 1 << 0;
-pub const FLAG_TTL_UPDATED: u8 = 1 << 1;
-pub const FLAG_UNDELETED: u8 = 1 << 2;
-/// 记录的数据体已被硬删除清零(隐私擦除),用于幂等跳过已擦除记录。
-pub const FLAG_HARD_DELETED: u8 = 1 << 3;
 
 /// 无过期时间。
 pub const NO_EXPIRATION: i64 = -1;
 
-/// 定长值大小(字节):offset(16) + size(8) + flags(1) + expiration(8) + op_time(8)
-/// + life_version(2) + original_offset(16)。
-pub const VALUE_SIZE: usize = 59;
+/// 定长值大小(字节):offset(8) + size(4) + flags(1) + expiration(8)。
+pub const VALUE_SIZE: usize = 21;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexValue {
+    /// 记录位置(段号 + 段内偏移)。
     pub offset: LogOffset,
-    pub size: u64,
+    /// 整条记录的字节数(含记录头与尾部 crc)。
+    pub size: u32,
     pub flags: u8,
     pub expiration_ms: i64,
-    pub operation_time_ms: u64,
-    pub life_version: u16,
-    /// 承载 blob 数据的记录位置(读/复活取数据用)。PUT/UNDELETE 记录自带数据故 == `offset`;
-    /// DELETE 墓碑无数据,指向被删前的 PUT。
-    pub original_offset: LogOffset,
 }
 
 impl IndexValue {
-    pub fn put(offset: LogOffset, size: u64, operation_time_ms: u64) -> Self {
+    pub fn put(offset: LogOffset, size: u32) -> Self {
         Self {
             offset,
             size,
             flags: 0,
             expiration_ms: NO_EXPIRATION,
-            operation_time_ms,
-            life_version: 0,
-            original_offset: offset,
         }
     }
 
@@ -45,25 +46,18 @@ impl IndexValue {
         self.flags & FLAG_DELETED != 0
     }
 
-    pub fn is_undeleted(&self) -> bool {
-        self.flags & FLAG_UNDELETED != 0
-    }
-
-    pub fn is_ttl_updated(&self) -> bool {
-        self.flags & FLAG_TTL_UPDATED != 0
+    /// `size` 的 u64 视图(统计累加用)。
+    #[inline]
+    pub fn size_bytes(&self) -> u64 {
+        u64::from(self.size)
     }
 
     pub fn to_bytes(&self) -> [u8; VALUE_SIZE] {
         let mut b = [0u8; VALUE_SIZE];
-        b[0..8].copy_from_slice(&self.offset.segment.to_le_bytes());
-        b[8..16].copy_from_slice(&self.offset.offset.to_le_bytes());
-        b[16..24].copy_from_slice(&self.size.to_le_bytes());
-        b[24] = self.flags;
-        b[25..33].copy_from_slice(&self.expiration_ms.to_le_bytes());
-        b[33..41].copy_from_slice(&self.operation_time_ms.to_le_bytes());
-        b[41..43].copy_from_slice(&self.life_version.to_le_bytes());
-        b[43..51].copy_from_slice(&self.original_offset.segment.to_le_bytes());
-        b[51..59].copy_from_slice(&self.original_offset.offset.to_le_bytes());
+        b[0..8].copy_from_slice(&self.offset.pack().to_le_bytes());
+        b[8..12].copy_from_slice(&self.size.to_le_bytes());
+        b[12] = self.flags;
+        b[13..21].copy_from_slice(&self.expiration_ms.to_le_bytes());
         b
     }
 
@@ -72,19 +66,10 @@ impl IndexValue {
             return None;
         }
         Some(Self {
-            offset: LogOffset::new(
-                u64::from_le_bytes(b[0..8].try_into().unwrap()),
-                u64::from_le_bytes(b[8..16].try_into().unwrap()),
-            ),
-            size: u64::from_le_bytes(b[16..24].try_into().unwrap()),
-            flags: b[24],
-            expiration_ms: i64::from_le_bytes(b[25..33].try_into().unwrap()),
-            operation_time_ms: u64::from_le_bytes(b[33..41].try_into().unwrap()),
-            life_version: u16::from_le_bytes(b[41..43].try_into().unwrap()),
-            original_offset: LogOffset::new(
-                u64::from_le_bytes(b[43..51].try_into().unwrap()),
-                u64::from_le_bytes(b[51..59].try_into().unwrap()),
-            ),
+            offset: LogOffset::unpack(u64::from_le_bytes(b[0..8].try_into().unwrap())),
+            size: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+            flags: b[12],
+            expiration_ms: i64::from_le_bytes(b[13..21].try_into().unwrap()),
         })
     }
 }
@@ -98,15 +83,28 @@ mod tests {
         let v = IndexValue {
             offset: LogOffset::new(3, 4096),
             size: 12345,
-            flags: FLAG_DELETED | FLAG_TTL_UPDATED,
+            flags: FLAG_DELETED,
             expiration_ms: 1_700_000_000_000,
-            operation_time_ms: 1_699_000_000_000,
-            life_version: 2,
-            original_offset: LogOffset::new(1, 512),
         };
         let b = v.to_bytes();
         assert_eq!(b.len(), VALUE_SIZE);
+        assert_eq!(b.len(), 21);
         assert_eq!(IndexValue::from_bytes(&b).unwrap(), v);
         assert!(v.is_deleted());
+    }
+
+    #[test]
+    fn offset_packs_segment_and_offset_without_loss() {
+        let v = IndexValue::put(LogOffset::new(0xDEAD_BEEF, 0x0102_0304), 7);
+        let got = IndexValue::from_bytes(&v.to_bytes()).unwrap();
+        assert_eq!(got.offset, LogOffset::new(0xDEAD_BEEF, 0x0102_0304));
+        assert_eq!(got.size, 7);
+        assert!(!got.is_deleted());
+        assert_eq!(got.expiration_ms, NO_EXPIRATION);
+    }
+
+    #[test]
+    fn from_bytes_rejects_short_slice() {
+        assert!(IndexValue::from_bytes(&[0u8; VALUE_SIZE - 1]).is_none());
     }
 }

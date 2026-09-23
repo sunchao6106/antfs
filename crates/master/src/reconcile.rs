@@ -53,7 +53,6 @@ pub fn classify_partition(replicas: &[ReplicaHealth], rf: u8) -> (u32, Option<&'
     (healthy, Some(reason))
 }
 
-
 /// 一条状态转移指令:把某分区在某盘上的副本推向 `target_state`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transition {
@@ -101,7 +100,11 @@ pub fn plan_rereplication(
     let mut out = Vec::new();
     for (pid, info) in partitions {
         let is_healthy = |n: &NodeId| up_nodes.contains(n) && !errored.contains(&(*pid, *n));
-        let healthy = info.replicas.iter().filter(|r| is_healthy(&r.node_id)).count();
+        let healthy = info
+            .replicas
+            .iter()
+            .filter(|r| is_healthy(&r.node_id))
+            .count();
         let any_unhealthy = info.replicas.iter().any(|r| !is_healthy(&r.node_id));
         if any_unhealthy && healthy < info.replication_factor as usize {
             out.push(*pid);
@@ -130,7 +133,10 @@ pub fn plan_evacuation(
 ) -> Vec<EvacAction> {
     let mut out = Vec::new();
     for (pid, info) in partitions {
-        let has_decom = info.replicas.iter().any(|r| decommissioning.contains(&r.node_id));
+        let has_decom = info
+            .replicas
+            .iter()
+            .any(|r| decommissioning.contains(&r.node_id));
         if !has_decom {
             continue;
         }
@@ -168,7 +174,9 @@ pub fn plan_move(
 ) -> Vec<(PartitionId, NodeId)> {
     let mut out = Vec::new();
     for (pid, node) in moving {
-        let Some(info) = partitions.get(pid) else { continue };
+        let Some(info) = partitions.get(pid) else {
+            continue;
+        };
         if !successor_active.contains(&(*pid, *node)) {
             continue; // 继任者尚未 ACTIVE(追平中/未上报)→ 绝不删源
         }
@@ -217,7 +225,11 @@ pub fn drop_confirmed(
     if info.replicas.iter().any(|r| r.node_id == source) {
         return false;
     }
-    let others: Vec<_> = info.replicas.iter().filter(|r| r.node_id != source).collect();
+    let others: Vec<_> = info
+        .replicas
+        .iter()
+        .filter(|r| r.node_id != source)
+        .collect();
     match successor {
         SuccessorConfirm::Active => true,
         SuccessorConfirm::NotYetActive => false,
@@ -277,7 +289,14 @@ mod tests {
     fn rereplicate_when_replica_down_and_below_rf() {
         let parts = BTreeMap::from([(
             0,
-            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE")]),
+            part(
+                3,
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                ],
+            ),
         )]);
         let up = HashSet::from([1, 2]); // node3 down → live=2 < 3
         assert_eq!(plan_rereplication(&parts, &up, &HashSet::new()), vec![0]);
@@ -287,7 +306,14 @@ mod tests {
     fn no_rereplicate_when_all_up() {
         let parts = BTreeMap::from([(
             0,
-            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE")]),
+            part(
+                3,
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                ],
+            ),
         )]);
         let up = HashSet::from([1, 2, 3]);
         assert!(plan_rereplication(&parts, &up, &HashSet::new()).is_empty());
@@ -297,7 +323,14 @@ mod tests {
     fn rereplicate_when_replica_errored_though_node_up() {
         let parts = BTreeMap::from([(
             0,
-            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE")]),
+            part(
+                3,
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                ],
+            ),
         )]);
         let up = HashSet::from([1, 2, 3]); // 全存活
         let errored = HashSet::from([(0u32, 3u64)]); // 但 node3 的 replica 上报 ERROR
@@ -312,12 +345,22 @@ mod tests {
     fn evacuation_adds_before_removing() {
         let parts = BTreeMap::from([(
             0,
-            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE")]),
+            part(
+                3,
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                ],
+            ),
         )]);
         let up = HashSet::from([1, 2, 3]);
         // node3 下线:healthy(非下线且存活)=2 < 3 → 先 Add,不 Remove。
         let decom = BTreeSet::from([3]);
-        assert_eq!(plan_evacuation(&parts, &decom, &up), vec![EvacAction::Add(0)]);
+        assert_eq!(
+            plan_evacuation(&parts, &decom, &up),
+            vec![EvacAction::Add(0)]
+        );
     }
 
     #[test]
@@ -327,12 +370,20 @@ mod tests {
             0,
             part(
                 3,
-                &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")],
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                    (4, "d0", "ACTIVE"),
+                ],
             ),
         )]);
         let up = HashSet::from([1, 2, 3, 4]);
         let decom = BTreeSet::from([3]);
-        assert_eq!(plan_evacuation(&parts, &decom, &up), vec![EvacAction::Remove(0, 3)]);
+        assert_eq!(
+            plan_evacuation(&parts, &decom, &up),
+            vec![EvacAction::Remove(0, 3)]
+        );
     }
 
     #[test]
@@ -348,12 +399,23 @@ mod tests {
         // 且继任者 4 已 ACTIVE → 移除 3。
         let parts = BTreeMap::from([(
             0,
-            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]),
+            part(
+                3,
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                    (4, "d0", "ACTIVE"),
+                ],
+            ),
         )]);
         let moving = BTreeSet::from([(0u32, 3u64)]);
         let up = HashSet::from([1, 2, 3, 4]); // 迁出源 3 自己也 up,也要被移除
         let successor_active = HashSet::from([(0u32, 3u64)]);
-        assert_eq!(plan_move(&parts, &moving, &up, &successor_active), vec![(0, 3)]);
+        assert_eq!(
+            plan_move(&parts, &moving, &up, &successor_active),
+            vec![(0, 3)]
+        );
     }
 
     #[test]
@@ -361,12 +423,23 @@ mod tests {
         // 新副本节点 4 尚未 up:非迁出源存活 = {1,2} = 2 < RF=3 → 不移除。
         let parts = BTreeMap::from([(
             0,
-            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]),
+            part(
+                3,
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                    (4, "d0", "ACTIVE"),
+                ],
+            ),
         )]);
         let moving = BTreeSet::from([(0u32, 3u64)]);
         let up = HashSet::from([1, 2, 3]);
         let successor_active = HashSet::from([(0u32, 3u64)]); // 即便"已 ACTIVE"也要节点存活 ≥ RF
-        assert!(plan_move(&parts, &moving, &up, &successor_active).is_empty(), "replacement not up: must hold the source");
+        assert!(
+            plan_move(&parts, &moving, &up, &successor_active).is_empty(),
+            "replacement not up: must hold the source"
+        );
     }
 
     #[test]
@@ -374,7 +447,15 @@ mod tests {
         // 新副本 4 存活但仍在 BOOTSTRAP(未 ACTIVE):up 计数已够(3),闸门必须再拦住。
         let parts = BTreeMap::from([(
             0,
-            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]),
+            part(
+                3,
+                &[
+                    (1, "d0", "ACTIVE"),
+                    (2, "d0", "ACTIVE"),
+                    (3, "d0", "ACTIVE"),
+                    (4, "d0", "ACTIVE"),
+                ],
+            ),
         )]);
         let moving = BTreeSet::from([(0u32, 3u64)]);
         let up = HashSet::from([1, 2, 3, 4]);
@@ -388,46 +469,116 @@ mod tests {
     fn move_ignores_unknown_partition() {
         let moving = BTreeSet::from([(9u32, 1u64)]);
         let successor_active = HashSet::from([(9u32, 1u64)]);
-        assert!(plan_move(&BTreeMap::new(), &moving, &HashSet::from([1]), &successor_active).is_empty());
+        assert!(plan_move(
+            &BTreeMap::new(),
+            &moving,
+            &HashSet::from([1]),
+            &successor_active
+        )
+        .is_empty());
     }
 
     #[test]
     fn reconcile_gated_until_grace_elapsed() {
         let grace = Duration::from_secs(15);
-        assert!(!reconcile_ready(Duration::from_secs(0), grace), "just became leader: hold off");
-        assert!(!reconcile_ready(Duration::from_secs(14), grace), "still within grace");
-        assert!(reconcile_ready(Duration::from_secs(15), grace), "grace elapsed: reconcile");
+        assert!(
+            !reconcile_ready(Duration::from_secs(0), grace),
+            "just became leader: hold off"
+        );
+        assert!(
+            !reconcile_ready(Duration::from_secs(14), grace),
+            "still within grace"
+        );
+        assert!(
+            reconcile_ready(Duration::from_secs(15), grace),
+            "grace elapsed: reconcile"
+        );
         assert!(reconcile_ready(Duration::from_secs(60), grace));
     }
 
     fn rh(up: bool, state: &str, decom: bool) -> ReplicaHealth {
-        ReplicaHealth { up, current_state: state.to_string(), decommissioning: decom }
+        ReplicaHealth {
+            up,
+            current_state: state.to_string(),
+            decommissioning: decom,
+        }
     }
 
     #[test]
     fn drop_confirmed_requires_source_removed() {
         // 源 3 仍在 placement(还没"移除")→ 任何确认都不得放行。
-        let p = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE")]);
-        assert!(!drop_confirmed(0, &p, 3, SuccessorConfirm::Active, &HashSet::new()));
+        let p = part(
+            3,
+            &[
+                (1, "d0", "ACTIVE"),
+                (2, "d0", "ACTIVE"),
+                (3, "d0", "ACTIVE"),
+            ],
+        );
+        assert!(!drop_confirmed(
+            0,
+            &p,
+            3,
+            SuccessorConfirm::Active,
+            &HashSet::new()
+        ));
     }
 
     #[test]
     fn drop_confirmed_for_move_only_looks_at_successor() {
         // 源 3 已被移除;继任者 4 已 ACTIVE → 放行(其余副本是否失联不影响:不拖延删除)。
-        let p = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]);
-        assert!(drop_confirmed(0, &p, 3, SuccessorConfirm::Active, &HashSet::new()));
+        let p = part(
+            3,
+            &[
+                (1, "d0", "ACTIVE"),
+                (2, "d0", "ACTIVE"),
+                (4, "d0", "ACTIVE"),
+            ],
+        );
+        assert!(drop_confirmed(
+            0,
+            &p,
+            3,
+            SuccessorConfirm::Active,
+            &HashSet::new()
+        ));
         // 继任者尚未 ACTIVE → 继续等(哪怕冗余数已够)。
-        assert!(!drop_confirmed(0, &p, 3, SuccessorConfirm::NotYetActive, &HashSet::new()));
+        assert!(!drop_confirmed(
+            0,
+            &p,
+            3,
+            SuccessorConfirm::NotYetActive,
+            &HashSet::new()
+        ));
     }
 
     #[test]
     fn drop_confirmed_without_move_bookkeeping_uses_redundancy() {
         // evacuation 的"后删":无 move 记账 → 其余副本(排除源)≥ RF 且无 ERROR 才放行。
-        let enough = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]);
-        assert!(drop_confirmed(0, &enough, 3, SuccessorConfirm::Unrecorded, &HashSet::new()));
+        let enough = part(
+            3,
+            &[
+                (1, "d0", "ACTIVE"),
+                (2, "d0", "ACTIVE"),
+                (4, "d0", "ACTIVE"),
+            ],
+        );
+        assert!(drop_confirmed(
+            0,
+            &enough,
+            3,
+            SuccessorConfirm::Unrecorded,
+            &HashSet::new()
+        ));
         // 只有 2 份(< RF=3)→ 不放行。
         let short = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE")]);
-        assert!(!drop_confirmed(0, &short, 3, SuccessorConfirm::Unrecorded, &HashSet::new()));
+        assert!(!drop_confirmed(
+            0,
+            &short,
+            3,
+            SuccessorConfirm::Unrecorded,
+            &HashSet::new()
+        ));
         // 其余的有一份上报 ERROR → 不放行(那份数据不算数);ERROR 只在**别的分区**上 → 不影响。
         assert!(!drop_confirmed(
             0,
@@ -447,19 +598,55 @@ mod tests {
 
     #[test]
     fn classify_partition_reasons() {
-        let all_active = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "ACTIVE", false)];
-        assert_eq!(classify_partition(&all_active, 3), (3, None), "fully healthy");
+        let all_active = [
+            rh(true, "ACTIVE", false),
+            rh(true, "ACTIVE", false),
+            rh(true, "ACTIVE", false),
+        ];
+        assert_eq!(
+            classify_partition(&all_active, 3),
+            (3, None),
+            "fully healthy"
+        );
 
-        let one_down = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(false, "ACTIVE", false)];
-        assert_eq!(classify_partition(&one_down, 3), (2, Some(REASON_NODE_DOWN)));
+        let one_down = [
+            rh(true, "ACTIVE", false),
+            rh(true, "ACTIVE", false),
+            rh(false, "ACTIVE", false),
+        ];
+        assert_eq!(
+            classify_partition(&one_down, 3),
+            (2, Some(REASON_NODE_DOWN))
+        );
 
-        let one_err = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "ERROR", false)];
-        assert_eq!(classify_partition(&one_err, 3), (2, Some(REASON_REPLICA_ERROR)));
+        let one_err = [
+            rh(true, "ACTIVE", false),
+            rh(true, "ACTIVE", false),
+            rh(true, "ERROR", false),
+        ];
+        assert_eq!(
+            classify_partition(&one_err, 3),
+            (2, Some(REASON_REPLICA_ERROR))
+        );
 
-        let one_decom = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "ACTIVE", true)];
-        assert_eq!(classify_partition(&one_decom, 3), (2, Some(REASON_DECOMMISSIONING)));
+        let one_decom = [
+            rh(true, "ACTIVE", false),
+            rh(true, "ACTIVE", false),
+            rh(true, "ACTIVE", true),
+        ];
+        assert_eq!(
+            classify_partition(&one_decom, 3),
+            (2, Some(REASON_DECOMMISSIONING))
+        );
 
-        let one_boot = [rh(true, "ACTIVE", false), rh(true, "ACTIVE", false), rh(true, "BOOTSTRAP", false)];
-        assert_eq!(classify_partition(&one_boot, 3), (2, Some(REASON_BOOTSTRAPPING)));
+        let one_boot = [
+            rh(true, "ACTIVE", false),
+            rh(true, "ACTIVE", false),
+            rh(true, "BOOTSTRAP", false),
+        ];
+        assert_eq!(
+            classify_partition(&one_boot, 3),
+            (2, Some(REASON_BOOTSTRAPPING))
+        );
     }
 }

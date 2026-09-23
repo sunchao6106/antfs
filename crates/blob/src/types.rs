@@ -36,6 +36,27 @@ impl LogOffset {
     pub fn new(segment: u64, offset: u64) -> Self {
         Self { segment, offset }
     }
+
+    /// 打包成单个 u64:高 32bit 段号、低 32bit 段内偏移。供索引条目定长落盘(见
+    /// [`IndexValue`](crate::index::IndexValue))。
+    ///
+    /// 两个分量都在 u32 内是**结构性不变量**:段内偏移 < 段大小 ≤ 4 GiB(`StoreConfig::validate`
+    /// 强制),段号 ≥ 2³² 需要 2³² × 段大小 的总容量(不可达)。违反即 panic —— 宁可崩,
+    /// 也不把截断后的错地址落盘(持久性红线)。
+    pub fn pack(self) -> u64 {
+        let seg = u32::try_from(self.segment).expect("segment index must fit u32");
+        let off =
+            u32::try_from(self.offset).expect("in-segment offset must fit u32 (segment ≤ 4 GiB)");
+        ((seg as u64) << 32) | (off as u64)
+    }
+
+    /// [`pack`](Self::pack) 的逆。
+    pub fn unpack(v: u64) -> Self {
+        Self {
+            segment: (v >> 32) & 0xFFFF_FFFF,
+            offset: v & 0xFFFF_FFFF,
+        }
+    }
 }
 
 impl fmt::Display for LogOffset {

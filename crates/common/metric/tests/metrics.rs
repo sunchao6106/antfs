@@ -1,4 +1,6 @@
-use antfs_metric::{counter, gather, gauge, histogram, latency_seconds, Histogram, IntCounter, Registry};
+use antfs_metric::{
+    counter, gather, gauge, histogram, latency_seconds, Histogram, IntCounter, Registry,
+};
 
 struct StoreMetrics {
     get_response: Histogram,
@@ -43,7 +45,13 @@ fn gauge_goes_up_and_down() {
 #[test]
 fn histogram_records_observations() {
     let registry = Registry::new();
-    let h = histogram(&registry, "blob_size_bytes", "blob sizes", vec![10.0, 100.0, 1000.0]).unwrap();
+    let h = histogram(
+        &registry,
+        "blob_size_bytes",
+        "blob sizes",
+        vec![10.0, 100.0, 1000.0],
+    )
+    .unwrap();
     h.observe(5.0);
     h.observe(50.0);
     h.observe(500.0);
@@ -87,7 +95,8 @@ fn duplicate_registration_is_error() {
 #[test]
 fn labeled_vec_distinguishes_instances_on_shared_registry() {
     let registry = Registry::new();
-    let ops = antfs_metric::counter_vec(&registry, "store_ops_total", "ops", &["store", "op"]).unwrap();
+    let ops =
+        antfs_metric::counter_vec(&registry, "store_ops_total", "ops", &["store", "op"]).unwrap();
     // 两个 store 共享同一 Vec,用 label 区分(common.md §2.2)。
     ops.with_label_values(&["p1", "put"]).inc();
     ops.with_label_values(&["p1", "put"]).inc();
@@ -104,13 +113,18 @@ fn labeled_vec_distinguishes_instances_on_shared_registry() {
 #[test]
 fn labeled_gauge_and_histogram_vec() {
     let registry = Registry::new();
-    let cap = antfs_metric::gauge_vec(&registry, "store_capacity_bytes", "cap", &["store"]).unwrap();
+    let cap =
+        antfs_metric::gauge_vec(&registry, "store_capacity_bytes", "cap", &["store"]).unwrap();
     cap.with_label_values(&["p1"]).set(4096);
     assert_eq!(cap.with_label_values(&["p1"]).get(), 4096);
 
-    let lat =
-        antfs_metric::latency_seconds_vec(&registry, "store_req_seconds", "latency", &["store", "op"])
-            .unwrap();
+    let lat = antfs_metric::latency_seconds_vec(
+        &registry,
+        "store_req_seconds",
+        "latency",
+        &["store", "op"],
+    )
+    .unwrap();
     lat.with_label_values(&["p1", "get"]).observe(0.01);
     assert_eq!(lat.with_label_values(&["p1", "get"]).get_sample_count(), 1);
 }

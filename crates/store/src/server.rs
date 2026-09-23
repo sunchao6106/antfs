@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use antfs_blob::StoreKey;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use antfs_blob::StoreKey;
 use tokio_stream::StreamExt;
 
 use crate::compaction_jobs::{CompactionJob, CompactionJobs, CompactionResult};
@@ -110,15 +110,18 @@ impl StoreServer {
                 "/partitions/{pid}/blobs/{key}",
                 put(put_blob).get(get_blob).delete(delete_blob),
             )
-            .route("/partitions/{pid}/blobs/{key}/undelete", post(undelete_blob))
-            .route("/partitions/{pid}/blobs/{key}/ttl", post(update_ttl_blob))
-            .route("/partitions/{pid}/blobs/{key}/metadata", get(get_blob_metadata))
+            .route(
+                "/partitions/{pid}/blobs/{key}/metadata",
+                get(get_blob_metadata),
+            )
             .route("/partitions/{pid}/replica-metadata", get(replica_metadata))
             .route("/partitions/{pid}/scrub-report", get(scrub_report))
             .route("/partitions/{pid}/verify", get(verify_partition))
             .route("/partitions/{pid}/segments", get(list_segments))
             .route("/partitions/{pid}/segments/{position}", get(get_segment))
-            .layer(DefaultBodyLimit::max(body_limit(self.config.max_body_bytes)))
+            .layer(DefaultBodyLimit::max(body_limit(
+                self.config.max_body_bytes,
+            )))
             .layer(middleware::from_fn_with_state(self.state.clone(), gate));
         Router::new()
             .route("/metrics", get(metrics_handler))
@@ -203,11 +206,11 @@ fn body_limit(max_body_bytes: u64) -> usize {
 /// 被拒请求**不**计入 `errors_total` / `request_duration` / `in_flight`——那三个记的是真正进到引擎的
 /// 请求;静默只计 `rejected_requests_total{op,reason="disabled"}`。
 async fn gate(State(st): State<AppState>, req: axum::extract::Request, next: Next) -> Response {
-    let (op, partition) = match request_control::classify(req.method(), req.uri().path(), req.uri().query())
-    {
-        Some(op) => (op, request_control::partition_of_path(req.uri().path())),
-        None => return next.run(req).await,
-    };
+    let (op, partition) =
+        match request_control::classify(req.method(), req.uri().path(), req.uri().query()) {
+            Some(op) => (op, request_control::partition_of_path(req.uri().path())),
+            None => return next.run(req).await,
+        };
     match st.request_control.check(op, partition) {
         Gate::Open => next.run(req).await,
         Gate::Disabled { retry_after_secs } => {
@@ -219,7 +222,8 @@ async fn gate(State(st): State<AppState>, req: axum::extract::Request, next: Nex
             let mut resp = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
             if let Some(secs) = retry_after_secs {
                 if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-                    resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, v);
                 }
             }
             resp
@@ -244,10 +248,7 @@ fn parse_key(key_hex: &str) -> Option<StoreKey> {
 fn map_mut_err(e: &antfs_blob::Error) -> StatusCode {
     match e {
         antfs_blob::Error::NotFound => StatusCode::NOT_FOUND,
-        antfs_blob::Error::Deleted
-        | antfs_blob::Error::NotDeleted
-        | antfs_blob::Error::AlreadyExists
-        | antfs_blob::Error::AlreadyUpdated => StatusCode::CONFLICT,
+        antfs_blob::Error::Deleted | antfs_blob::Error::AlreadyExists => StatusCode::CONFLICT,
         antfs_blob::Error::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         // 分区写满:507 让压测/运维一眼看出"该加分区了",别混在 500 里(承 Ambry `Store_Full`)。
         antfs_blob::Error::StoreFull => StatusCode::INSUFFICIENT_STORAGE,
@@ -271,8 +272,15 @@ impl OpTimer {
     fn start(metrics: &StoreServerMetrics, op: &str) -> Self {
         let in_flight = metrics.in_flight.with_label_values(&[op]);
         in_flight.inc();
-        let timer = metrics.request_duration.with_label_values(&[op]).start_timer();
-        OpTimer { started: Instant::now(), _timer: timer, in_flight }
+        let timer = metrics
+            .request_duration
+            .with_label_values(&[op])
+            .start_timer();
+        OpTimer {
+            started: Instant::now(),
+            _timer: timer,
+            in_flight,
+        }
     }
 
     /// 自 handler 入口起的耗时(秒);对齐 Ambry「只在 NoError 时按大小分类计数」的口径,
@@ -309,15 +317,9 @@ fn record_err(metrics: &StoreServerMetrics, kind: &str) {
     metrics.errors.with_label_values(&[kind]).inc();
 }
 
-/// TTL 更新的查询参数。
-#[derive(serde::Deserialize)]
-struct TtlParams {
-    expiration_ms: i64,
-}
-
 /// blob 写的查询参数:`expiration_ms` 给定则**写入时即带 TTL**(缺省 = 不过期)。
 ///
-/// 之前只能在 PUT 之后调 `/ttl` 才能设过期,建对象时设不了 —— 分片上传的孤儿回收正需要"出生即带 TTL"。
+/// 对象不可变,TTL **只在写入时设定**,写后不可改 —— 分片上传的孤儿回收正需要"出生即带 TTL"。
 #[derive(serde::Deserialize, Default)]
 struct PutParams {
     #[serde(default)]
@@ -356,7 +358,9 @@ struct StagedFile {
 
 impl StagedFile {
     fn new(dir: &std::path::Path, pid: PartitionId) -> Self {
-        Self { path: dir.join(format!("put_{pid}_{}.tmp", unique_suffix())) }
+        Self {
+            path: dir.join(format!("put_{pid}_{}.tmp", unique_suffix())),
+        }
     }
 
     fn path(&self) -> &std::path::Path {
@@ -482,10 +486,7 @@ fn default_max_bytes() -> u64 {
     4 * 1024 * 1024
 }
 
-async fn create_replica(
-    State(st): State<AppState>,
-    Path(pid): Path<PartitionId>,
-) -> Response {
+async fn create_replica(State(st): State<AppState>, Path(pid): Path<PartitionId>) -> Response {
     let replicas = st.replicas.clone();
     match tokio::task::spawn_blocking(move || replicas.ensure_replica(pid)).await {
         Ok(Ok(_)) => {
@@ -561,9 +562,16 @@ struct CompactionsResponse {
 ///
 /// 任务表是内存态(重启即丢);`store` 用 `Arc` 抓住,即便期间该副本被摘除,compaction 也在原
 /// 句柄上跑完(结果只进台账,不改语义)。
-fn submit_compaction(st: &AppState, pid: PartitionId, store: Arc<antfs_blob::BlobStore>) -> Response {
+fn submit_compaction(
+    st: &AppState,
+    pid: PartitionId,
+    store: Arc<antfs_blob::BlobStore>,
+) -> Response {
     let job_id = st.compactions.submit(pid);
-    st.metrics.compaction_jobs.with_label_values(&["running"]).inc();
+    st.metrics
+        .compaction_jobs
+        .with_label_values(&["running"])
+        .inc();
     let jobs = st.compactions.clone();
     let metrics = st.metrics.clone();
     tokio::spawn(async move {
@@ -589,7 +597,10 @@ fn submit_compaction(st: &AppState, pid: PartitionId, store: Arc<antfs_blob::Blo
 
 /// `GET /admin/compactions`:最近 32 条 compaction 任务(最新在前;更早的已淘汰)。
 async fn list_compactions(State(st): State<AppState>) -> Response {
-    Json(CompactionsResponse { jobs: st.compactions.snapshot() }).into_response()
+    Json(CompactionsResponse {
+        jobs: st.compactions.snapshot(),
+    })
+    .into_response()
 }
 
 /// `GET /admin/compactions/{job_id}`:单条任务;**未知(或已被淘汰的)`job_id` → 404**。
@@ -629,7 +640,10 @@ async fn set_replication_control(
     } else {
         tracing::info!("pull replication resumed by operator");
     }
-    Json(ReplicationControlResponse { paused: body.paused }).into_response()
+    Json(ReplicationControlResponse {
+        paused: body.paused,
+    })
+    .into_response()
 }
 
 /// `GET /admin/replication-control`:当前复制开关状态。
@@ -674,7 +688,8 @@ async fn set_request_control(
             return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
         }
     }
-    st.request_control.set(op, body.partition_id, body.enable, body.ttl_secs);
+    st.request_control
+        .set(op, body.partition_id, body.enable, body.ttl_secs);
     Json(st.request_control.snapshot()).into_response()
 }
 
@@ -715,7 +730,10 @@ async fn put_blob(
     match content_length(&req) {
         Some(len) if len > st.max_body_bytes => (
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("body {len} exceeds store_server.max_body_bytes {}", st.max_body_bytes),
+            format!(
+                "body {len} exceeds store_server.max_body_bytes {}",
+                st.max_body_bytes
+            ),
         )
             .into_response(),
         // 小对象走内存(有界):落盘暂存要 create/write/close/unlink 一个文件,小对象是绝对主流,
@@ -775,18 +793,17 @@ async fn put_blob(
             joined_put(&st, &t, len, joined)
         }
         None => {
-            let body = match axum::body::to_bytes(req.into_body(), body_limit(st.max_body_bytes))
-                .await
-            {
-                Ok(b) => b,
-                Err(_) => {
-                    return (
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "body exceeds store_server.max_body_bytes (or stream error)",
-                    )
-                        .into_response()
-                }
-            };
+            let body =
+                match axum::body::to_bytes(req.into_body(), body_limit(st.max_body_bytes)).await {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "body exceeds store_server.max_body_bytes (or stream error)",
+                        )
+                            .into_response()
+                    }
+                };
             let len = body.len() as u64;
             let joined =
                 tokio::task::spawn_blocking(move || store.put_ttl(key, &body, expiration_ms)).await;
@@ -808,10 +825,10 @@ async fn get_blob(
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
     };
     let store = handle.store.clone();
-    // replication=1:复制读,连已删除/过期对象的数据体也返回(供接收方忠实 apply)。
+    // replication=1:复制读,连**已过期**对象的数据体也返回(供接收方忠实 apply)。
+    // 已删除对象的数据体读不到了(墓碑不保留旧记录指针),复制靠 peer 间的墓碑元数据即可。
     let for_repl = params.replication.unwrap_or(0) != 0;
-    match tokio::task::spawn_blocking(move || store.get_with_options(&key, for_repl, for_repl)).await
-    {
+    match tokio::task::spawn_blocking(move || store.get_with_options(&key, for_repl)).await {
         Ok(Ok(data)) => {
             let len = data.len() as u64;
             st.metrics.get_total.inc();
@@ -823,9 +840,9 @@ async fn get_blob(
                 .observe(t.elapsed());
             (StatusCode::OK, data).into_response()
         }
-        Ok(Err(antfs_blob::Error::NotFound | antfs_blob::Error::Deleted | antfs_blob::Error::Expired)) => {
-            StatusCode::NOT_FOUND.into_response()
-        }
+        Ok(Err(
+            antfs_blob::Error::NotFound | antfs_blob::Error::Deleted | antfs_blob::Error::Expired,
+        )) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
             record_err(&st.metrics, err_kind(&e));
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
@@ -846,14 +863,8 @@ struct MetadataDto {
     expiration_ms: i64,
     /// 已删除(墓碑)。
     deleted: bool,
-    /// 曾复活过。
-    undeleted: bool,
-    /// TTL 被更新过。
-    ttl_updated: bool,
     /// 已过期(按当前时间判定)。
     expired: bool,
-    /// 生命版本(解除删除冲突用)。
-    life_version: u16,
 }
 
 /// `GET /partitions/{pid}/blobs/{key}/metadata`:只读元数据,**不读数据体**(对齐 Ambry `GetBlobInfo`)。
@@ -877,10 +888,7 @@ async fn get_blob_metadata(
             size: m.data_len,
             expiration_ms: m.expiration_ms,
             deleted: m.deleted,
-            undeleted: m.undeleted,
-            ttl_updated: m.ttl_updated,
             expired: m.expired,
-            life_version: m.life_version,
         })
         .into_response(),
         Ok(Err(antfs_blob::Error::NotFound)) => StatusCode::NOT_FOUND.into_response(),
@@ -916,6 +924,8 @@ async fn scrub_report(State(st): State<AppState>, Path(pid): Path<PartitionId>) 
             Some((position, data_end)) => (Some(position), Some(data_end)),
             None => (None, None),
         };
+        // 打开时的容错恢复报告:带伤启动的副本在这里如实暴露,admin 的一致性比对会直接把它算成差异。
+        let damage = store.open_damage();
         serde_json::json!({
             "partition_id": pid,
             "live_records": stats.live_records,
@@ -925,6 +935,8 @@ async fn scrub_report(State(st): State<AppState>, Path(pid): Path<PartitionId>) 
             "segments": segments,
             "token_seg": token_seg,
             "token_off": token_off,
+            "damaged_records": damage.bad_records,
+            "abandoned_segments": damage.abandoned_segments,
         })
     })
     .await;
@@ -957,13 +969,15 @@ async fn verify_partition(
     let out = tokio::task::spawn_blocking(move || store.verify(max_bytes)).await;
     match out {
         Ok(Ok(r)) => {
-            metrics.verify_duration.observe(started.elapsed().as_secs_f64());
+            metrics
+                .verify_duration
+                .observe(started.elapsed().as_secs_f64());
             if r.bad_records > 0 {
                 metrics.verify_bad_records.inc_by(r.bad_records);
             }
-            let first = r.first_bad_offset.map(|(segment, offset)| {
-                serde_json::json!({ "segment": segment, "offset": offset })
-            });
+            let first = r.first_bad_offset.map(
+                |(segment, offset)| serde_json::json!({ "segment": segment, "offset": offset }),
+            );
             Json(serde_json::json!({
                 "partition_id": pid,
                 "records": r.records,
@@ -1059,70 +1073,6 @@ async fn delete_blob(
     };
     let store = handle.store.clone();
     match tokio::task::spawn_blocking(move || store.delete(key)).await {
-        Ok(Ok(())) => {
-            st.metrics.mutations.inc();
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(Err(e)) => {
-            let code = map_mut_err(&e);
-            if code == StatusCode::INTERNAL_SERVER_ERROR {
-                record_err(&st.metrics, err_kind(&e));
-            }
-            code.into_response()
-        }
-        Err(_) => {
-            record_err(&st.metrics, "join_error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "join error").into_response()
-        }
-    }
-}
-
-async fn undelete_blob(
-    State(st): State<AppState>,
-    Path((pid, key_hex)): Path<(PartitionId, String)>,
-) -> Response {
-    let _t = OpTimer::start(&st.metrics, "undelete");
-    let Some(key) = parse_key(&key_hex) else {
-        return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
-    };
-    let Some(handle) = st.replicas.get(pid) else {
-        return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
-    };
-    let store = handle.store.clone();
-    match tokio::task::spawn_blocking(move || store.undelete(key)).await {
-        Ok(Ok(life_version)) => {
-            st.metrics.mutations.inc();
-            (StatusCode::OK, life_version.to_string()).into_response()
-        }
-        Ok(Err(e)) => {
-            let code = map_mut_err(&e);
-            if code == StatusCode::INTERNAL_SERVER_ERROR {
-                record_err(&st.metrics, err_kind(&e));
-            }
-            code.into_response()
-        }
-        Err(_) => {
-            record_err(&st.metrics, "join_error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "join error").into_response()
-        }
-    }
-}
-
-async fn update_ttl_blob(
-    State(st): State<AppState>,
-    Path((pid, key_hex)): Path<(PartitionId, String)>,
-    Query(params): Query<TtlParams>,
-) -> Response {
-    let _t = OpTimer::start(&st.metrics, "ttl_update");
-    let Some(key) = parse_key(&key_hex) else {
-        return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
-    };
-    let Some(handle) = st.replicas.get(pid) else {
-        return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
-    };
-    let store = handle.store.clone();
-    let exp = params.expiration_ms;
-    match tokio::task::spawn_blocking(move || store.update_ttl(key, exp)).await {
         Ok(Ok(())) => {
             st.metrics.mutations.inc();
             StatusCode::NO_CONTENT.into_response()

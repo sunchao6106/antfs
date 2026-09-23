@@ -55,7 +55,9 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         ..Default::default()
     };
     let registry = antfs_metric::Registry::new();
-    let node = MasterNode::start(cfg, &registry).await.expect("start master");
+    let node = MasterNode::start(cfg, &registry)
+        .await
+        .expect("start master");
     node.serve().expect("serve master");
     node.initialize(BTreeMap::from([(1u64, BasicNode::new(raft_addr))]))
         .await
@@ -101,7 +103,12 @@ async fn register_node(master: &MasterNode, node_id: u64, http_addr: &str) {
         dc: "dc1".into(),
         rack: "r1".into(),
         addr: http_addr.to_string(),
-        disks: BTreeMap::from([(DISK.to_string(), DiskSpec { capacity_bytes: 1 << 40 })]),
+        disks: BTreeMap::from([(
+            DISK.to_string(),
+            DiskSpec {
+                capacity_bytes: 1 << 40,
+            },
+        )]),
         registered_at_ms: 1,
     };
     master
@@ -143,7 +150,11 @@ async fn ensure_replica(store_addr: &str, pid: u32) {
         .send()
         .await
         .expect("admin create replica");
-    assert_eq!(resp.status().as_u16(), 201, "create replica on {store_addr}");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "create replica on {store_addr}"
+    );
 }
 
 /// 一套进程内集群:1 master + 3 store(+ 可选一个无监听的假副本)+ 1 frontend。
@@ -167,7 +178,11 @@ struct Fixture {
 impl Fixture {
     /// 起集群并建一个分区:`replica_nodes` 是放置的节点清单,其中**真实存在**的节点会建出本地副本;
     /// `max_body_bytes` 为 frontend 的 body 上限;`cors_origins` 空 = 不挂 CORS 层。
-    async fn start(max_body_bytes: u64, replica_nodes: &[u64], cors_origins: Vec<String>) -> Fixture {
+    async fn start(
+        max_body_bytes: u64,
+        replica_nodes: &[u64],
+        cors_origins: Vec<String>,
+    ) -> Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (master, grpc_addr) = solo_master(&tmp.path().join("master")).await;
 
@@ -190,7 +205,11 @@ impl Fixture {
                 register_node(&master, *node_id, &addr(free_port())).await;
             }
         }
-        let pid = create_partition(&master, replica_nodes.iter().copied().map(placement).collect()).await;
+        let pid = create_partition(
+            &master,
+            replica_nodes.iter().copied().map(placement).collect(),
+        )
+        .await;
         for node_id in replica_nodes {
             if let Some(store_addr) = store_addrs.get(node_id) {
                 ensure_replica(store_addr, pid).await;
@@ -212,7 +231,9 @@ impl Fixture {
             },
         };
         cfg.validate().expect("frontend config");
-        let state = AppState::from_config(&cfg, &registry).await.expect("frontend state");
+        let state = AppState::from_config(&cfg, &registry)
+            .await
+            .expect("frontend state");
         let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)
             .await
             .expect("bind frontend");
@@ -347,19 +368,17 @@ async fn head_reports_size_without_body() {
     assert_eq!(header(&resp, "x-ambry-blob-size"), "4096");
     assert_eq!(header(&resp, "x-ambry-blob-deleted"), "false");
     assert_eq!(header(&resp, "x-ambry-blob-expired"), "false");
-    assert_eq!(header(&resp, "x-ambry-blob-undeleted"), "false");
-    assert_eq!(header(&resp, "x-ambry-blob-ttl-updated"), "false");
-    assert_eq!(header(&resp, "x-ambry-blob-life-version"), "0");
     assert_eq!(header(&resp, "x-ambry-blob-expiration-ms"), "-1");
     let body = resp.bytes().await.expect("head body");
     assert!(body.is_empty(), "HEAD 不得带 body");
 }
 
-// ── 3:删除 / 复活 ─────────────────────────────────────────────────────────────────────────
+// ── 3:删除 ────────────────────────────────────────────────────────────────────────────────
 
-/// 删除 → GET 404 → HEAD 仍 200 且 `deleted: true` → 复活 → GET 200 且内容不变。
+/// 删除**不可逆**:DELETE → 204 → GET 404 → HEAD 仍 200 且 `deleted: true`;
+/// 复活端点已不存在(404);重复删**幂等**(再回 204,墓碑是终态)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn delete_hides_blob_and_undelete_restores_it() {
+async fn delete_is_irreversible() {
     let fx = Fixture::quorum_cluster().await;
     let data = pencil(100 * 1024);
     let blob_id = fx.upload(&data).await;
@@ -372,7 +391,11 @@ async fn delete_hides_blob_and_undelete_restores_it() {
         .expect("delete request");
     assert_eq!(resp.status().as_u16(), 204, "删除必须 204");
 
-    assert_eq!(fx.get(&blob_id).await.status().as_u16(), 404, "删除后 GET 必须 404");
+    assert_eq!(
+        fx.get(&blob_id).await.status().as_u16(),
+        404,
+        "删除后 GET 必须 404"
+    );
 
     let resp = fx
         .http
@@ -383,19 +406,26 @@ async fn delete_hides_blob_and_undelete_restores_it() {
     assert_eq!(resp.status().as_u16(), 200, "墓碑的元数据仍可读(HEAD 200)");
     assert_eq!(header(&resp, "x-ambry-blob-deleted"), "true");
 
+    // 复活端点已删掉:路由不存在 → 404(而不是"以为能复活")。
     let resp = fx
         .http
         .post(fx.url(&format!("/blobs/{blob_id}/undelete")))
         .send()
         .await
         .expect("undelete request");
-    assert_eq!(resp.status().as_u16(), 200, "复活必须 200");
-    let life: u16 = header(&resp, "x-ambry-blob-life-version")
-        .parse()
-        .expect("life version is a number");
-    assert!(life >= 1, "复活后生命版本必须递增,实际 {life}");
+    assert_eq!(resp.status().as_u16(), 404, "undelete 端点必须不存在");
 
-    assert_eq!(fx.get_ok(&blob_id).await, data, "复活后内容不变");
+    // 重复删幂等:副本对墓碑 key 不再写第二条墓碑、回 204 → 多数派达成 → 204。
+    let resp = fx
+        .http
+        .delete(fx.url(&format!("/blobs/{blob_id}")))
+        .send()
+        .await
+        .expect("delete again");
+    assert_eq!(resp.status().as_u16(), 204, "重复删必须幂等 204");
+
+    // 数据仍然取不回来(没有 include_deleted 这条路)。
+    assert_eq!(fx.get(&blob_id).await.status().as_u16(), 404);
 }
 
 /// 一个可读的小负载(不是拼装描述符:开头不是 `ASTC`)。
@@ -405,42 +435,14 @@ fn pencil(len: usize) -> Vec<u8> {
 
 // ── 4:TTL ────────────────────────────────────────────────────────────────────────────────
 
-/// `expiration_ms` 设为已过去 → 204 → 对象随即 404(过期);缺参数 → 400。
-/// 上传时带 `x-ambry-ttl-ms`(已过去)→ 201 → 也立刻过期(走"put 再 update_ttl"）。
+/// TTL 只在**上传时**定(`x-ambry-ttl-ms` → `PUT ?expiration_ms=`,一次多数派写):
+/// 已过去的时刻 → 201 且随即 404 / HEAD `expired: true`;非法值 → 400;
+/// "改期"端点不存在(对象不可变)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ttl_update_expires_blob_and_missing_param_is_400() {
+async fn ttl_is_set_at_upload_time_only() {
     let fx = Fixture::quorum_cluster().await;
-    let blob_id = fx.upload(&pencil(1024)).await;
-
-    // 缺 expiration_ms → 400(不静默当成"不过期")。
-    let resp = fx
-        .http
-        .post(fx.url(&format!("/blobs/{blob_id}/ttl")))
-        .send()
-        .await
-        .expect("ttl without param");
-    assert_eq!(resp.status().as_u16(), 400, "缺 expiration_ms 必须 400");
 
     // 1970 年的过期时刻 = 早已过期。
-    let resp = fx
-        .http
-        .post(fx.url(&format!("/blobs/{blob_id}/ttl?expiration_ms=1000")))
-        .send()
-        .await
-        .expect("ttl request");
-    assert_eq!(resp.status().as_u16(), 204, "TTL 更新必须 204");
-    assert_eq!(fx.get(&blob_id).await.status().as_u16(), 404, "过期后 GET 必须 404");
-
-    let resp = fx
-        .http
-        .head(fx.url(&format!("/blobs/{blob_id}")))
-        .send()
-        .await
-        .expect("head expired");
-    assert_eq!(header(&resp, "x-ambry-blob-expired"), "true");
-    assert_eq!(header(&resp, "x-ambry-blob-ttl-updated"), "true");
-
-    // 上传时即带过期时刻(已知取舍:先 put 再 update_ttl,两次多数派写)。
     let resp = fx
         .http
         .post(fx.url("/blobs"))
@@ -450,8 +452,59 @@ async fn ttl_update_expires_blob_and_missing_param_is_400() {
         .await
         .expect("upload with ttl");
     assert_eq!(resp.status().as_u16(), 201, "带 TTL 的上传必须 201");
-    let with_ttl = header(&resp, "x-ambry-blob-id");
-    assert_eq!(fx.get(&with_ttl).await.status().as_u16(), 404, "带 TTL 上传的对象应已过期");
+    let blob_id = header(&resp, "x-ambry-blob-id");
+    assert_eq!(
+        fx.get(&blob_id).await.status().as_u16(),
+        404,
+        "带 TTL 上传的对象应已过期"
+    );
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{blob_id}")))
+        .send()
+        .await
+        .expect("head expired");
+    assert_eq!(resp.status().as_u16(), 200, "过期对象的元数据仍可读");
+    assert_eq!(header(&resp, "x-ambry-blob-expired"), "true");
+    assert_eq!(header(&resp, "x-ambry-blob-expiration-ms"), "1000");
+
+    // 非法 TTL → 400(不静默当成"不过期")。
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .header("x-ambry-ttl-ms", "not-a-number")
+        .body(pencil(8))
+        .send()
+        .await
+        .expect("bad ttl");
+    assert_eq!(resp.status().as_u16(), 400, "非法 x-ambry-ttl-ms 必须 400");
+
+    // 改 TTL 的端点不存在(带不带参数都不该有这条路)。
+    let live = fx.upload(&pencil(64)).await;
+    for path in [
+        format!("/blobs/{live}/ttl"),
+        format!("/blobs/{live}/ttl?expiration_ms=1000"),
+    ] {
+        let resp = fx
+            .http
+            .post(fx.url(&path))
+            .send()
+            .await
+            .expect("ttl endpoint");
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "TTL 更新端点必须不存在: {path}"
+        );
+    }
+    // 未带 TTL 上传的对象是永久的。
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{live}")))
+        .send()
+        .await
+        .expect("head live");
+    assert_eq!(header(&resp, "x-ambry-blob-expiration-ms"), "-1");
 }
 
 // ── 5:分片拼装 ────────────────────────────────────────────────────────────────────────────
@@ -462,7 +515,11 @@ async fn ttl_update_expires_blob_and_missing_param_is_400() {
 async fn stitch_concatenates_chunks_in_order() {
     let fx = Fixture::quorum_cluster().await;
     let session = "session-stitch-test";
-    let parts: Vec<Vec<u8>> = vec![pseudo_random(100 * 1024), pencil(70 * 1024), pseudo_random(33)];
+    let parts: Vec<Vec<u8>> = vec![
+        pseudo_random(100 * 1024),
+        pencil(70 * 1024),
+        pseudo_random(33),
+    ];
     let mut chunk_ids = Vec::new();
     for part in &parts {
         let resp = fx
@@ -495,7 +552,11 @@ async fn stitch_concatenates_chunks_in_order() {
     );
 
     let expected: Vec<u8> = parts.concat();
-    assert_eq!(fx.get_ok(&stitched).await, expected, "拼装结果必须等于原始数据");
+    assert_eq!(
+        fx.get_ok(&stitched).await,
+        expected,
+        "拼装结果必须等于原始数据"
+    );
 
     // HEAD 必须与 GET 一致:报**逻辑大小**(各片之和)+ 标记为拼装对象。
     // (曾报描述符自身那几百字节,导致 "HEAD 785 / GET 3145728" 的错配 —— 已修。)
@@ -507,7 +568,9 @@ async fn stitch_concatenates_chunks_in_order() {
         .expect("head stitched");
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        header(&resp, "x-ambry-blob-size").parse::<u64>().expect("number"),
+        header(&resp, "x-ambry-blob-size")
+            .parse::<u64>()
+            .expect("number"),
         expected.len() as u64,
         "HEAD 的 size 必须是逻辑大小,与 GET 返回的字节数一致"
     );
@@ -522,35 +585,35 @@ async fn stitch_concatenates_chunks_in_order() {
         .send()
         .await
         .expect("head plain");
-    assert_eq!(header(&resp, "x-ambry-blob-size").parse::<u64>().expect("number"), 4096);
-    assert!(resp.headers().get("x-ambry-blob-stitched").is_none(), "普通对象不带 stitched");
+    assert_eq!(
+        header(&resp, "x-ambry-blob-size")
+            .parse::<u64>()
+            .expect("number"),
+        4096
+    );
+    assert!(
+        resp.headers().get("x-ambry-blob-stitched").is_none(),
+        "普通对象不带 stitched"
+    );
 }
 
 // ── 6:边界校验 ────────────────────────────────────────────────────────────────────────────
 
-/// 非法 blobId(非 hex / 不是 8 字节)、缺 `expiration_ms`、`/stitch` 缺 session / 空片 / 非法片 id
+/// 非法 blobId(非 hex / 不是 8 字节)、`/stitch` 缺 session / 空片 / 非法片 id
 /// 一律 400,且 blobId 文案稳定。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_requests_are_rejected_with_400() {
     let fx = Fixture::quorum_cluster().await;
 
     for bad in ["zz", "0f", "000000010000000200", "0000000100000002ff"] {
-        for path in [
-            format!("/blobs/{bad}"),
-            format!("/blobs/{bad}/undelete"),
-        ] {
-            let resp = if path.ends_with("undelete") {
-                fx.http.post(fx.url(&path)).send().await.expect("request")
-            } else {
-                fx.http.get(fx.url(&path)).send().await.expect("request")
-            };
-            assert_eq!(resp.status().as_u16(), 400, "非法 blobId {bad} 必须 400");
-            let text = resp.text().await.expect("body");
-            assert!(
-                text.contains("blob id must be 8 bytes (16 hex)"),
-                "文案必须稳定,实际: {text}"
-            );
-        }
+        let path = format!("/blobs/{bad}");
+        let resp = fx.http.get(fx.url(&path)).send().await.expect("request");
+        assert_eq!(resp.status().as_u16(), 400, "非法 blobId {bad} 必须 400");
+        let text = resp.text().await.expect("body");
+        assert!(
+            text.contains("blob id must be 8 bytes (16 hex)"),
+            "文案必须稳定,实际: {text}"
+        );
     }
     // 合法但不存在:400 之外应是 404(证明 400 与 404 没混)。
     let missing_id = fx.missing_blob_id();
@@ -567,15 +630,6 @@ async fn bad_requests_are_rejected_with_400() {
         404,
         "HEAD 找不到也必须 404"
     );
-
-    // 缺 expiration_ms(ttl 端点)。
-    let resp = fx
-        .http
-        .post(fx.url(&format!("/blobs/{missing_id}/ttl")))
-        .send()
-        .await
-        .expect("ttl request");
-    assert_eq!(resp.status().as_u16(), 400);
 
     // /stitch:缺 session。
     let resp = fx
@@ -657,7 +711,11 @@ async fn body_limit_is_enforced_with_413() {
     // ③ 恰好等于上限:正常写入。
     let data = pseudo_random(LIMIT as usize);
     let blob_id = fx.upload(&data).await;
-    assert_eq!(fx.get_ok(&blob_id).await, data, "上限内的上传必须成功且一致");
+    assert_eq!(
+        fx.get_ok(&blob_id).await,
+        data,
+        "上限内的上传必须成功且一致"
+    );
 }
 
 /// 直连 frontend,只发请求头(声明超大 `Content-Length`)、不写 body,返回响应状态码。
@@ -744,14 +802,22 @@ async fn metrics_endpoint_exposes_counters() {
     let blob_id = fx.upload(&data).await;
     assert_eq!(fx.get_ok(&blob_id).await, data);
 
-    let resp = fx.http.get(fx.url("/metrics")).send().await.expect("metrics request");
+    let resp = fx
+        .http
+        .get(fx.url("/metrics"))
+        .send()
+        .await
+        .expect("metrics request");
     assert_eq!(resp.status().as_u16(), 200);
     let text = resp.text().await.expect("metrics text");
     assert!(
         text.contains("frontend_upload_total{outcome=\"ok\"} 1"),
         "/metrics 必须导出上传计数:\n{text}"
     );
-    assert!(text.contains("frontend_download_bytes_total 2048"), "下载字节数:\n{text}");
+    assert!(
+        text.contains("frontend_download_bytes_total 2048"),
+        "下载字节数:\n{text}"
+    );
     assert!(
         text.contains("frontend_request_duration_seconds_count{op=\"upload\"} 1"),
         "每个 op 都要有延迟观测:\n{text}"
@@ -828,7 +894,10 @@ async fn cors_allows_listed_origins_only() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    assert!(methods.contains("POST") && methods.contains("DELETE"), "{methods}");
+    assert!(
+        methods.contains("POST") && methods.contains("DELETE"),
+        "{methods}"
+    );
     assert!(
         resp.headers()
             .get("access-control-allow-headers")
@@ -850,7 +919,11 @@ async fn plain_blob_starting_with_magic_is_reported_as_broken_stitch() {
     data.extend_from_slice(b"ordinary bytes that are not a descriptor");
     let blob_id = fx.upload(&data).await;
     let resp = fx.get(&blob_id).await;
-    assert_eq!(resp.status().as_u16(), 502, "MAGIC 命中但结构不合法 → 上游数据不一致");
+    assert_eq!(
+        resp.status().as_u16(),
+        502,
+        "MAGIC 命中但结构不合法 → 上游数据不一致"
+    );
 }
 
 // ── 12:请求静默的透传(503 + Retry-After)───────────────────────────────────────────────
@@ -864,7 +937,11 @@ async fn plain_blob_starting_with_magic_is_reported_as_broken_stitch() {
 async fn silenced_replica_is_passed_through_with_retry_after() {
     let fx = Fixture::start(MAX_BODY_BYTES, &[101], Vec::new()).await;
     let blob_id = fx.upload(&pencil(256)).await;
-    assert_eq!(fx.get(&blob_id).await.status().as_u16(), 200, "静默前必须可读");
+    assert_eq!(
+        fx.get(&blob_id).await.status().as_u16(),
+        200,
+        "静默前必须可读"
+    );
 
     let store = fx.store_addrs.get(&101).expect("store 101 已启动").clone();
     let resp = fx

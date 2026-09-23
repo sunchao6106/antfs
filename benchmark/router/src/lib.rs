@@ -74,7 +74,8 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
     let router = Arc::new(router);
 
     let payload = Bytes::from(pattern_bytes(cfg.size));
-    let written: Arc<Mutex<Vec<StoreKey>>> = Arc::new(Mutex::new(Vec::with_capacity(cfg.ops as usize)));
+    let written: Arc<Mutex<Vec<StoreKey>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(cfg.ops as usize)));
     let next = AtomicU64::new(0);
     let started = Instant::now();
     let mut tasks = Vec::new();
@@ -162,7 +163,13 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
         for key in written.iter().take(64) {
             match router.get(key).await {
                 Ok(b) if b == payload => checked += 1,
-                Ok(b) => return Err(format!("verify {key:?}: size {} != {}", b.len(), payload.len())),
+                Ok(b) => {
+                    return Err(format!(
+                        "verify {key:?}: size {} != {}",
+                        b.len(),
+                        payload.len()
+                    ))
+                }
                 Err(e) => return Err(format!("verify {key:?}: {e}")),
             }
         }

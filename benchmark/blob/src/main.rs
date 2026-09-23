@@ -90,9 +90,11 @@ fn print_help() {
     );
 }
 
-/// 由序号生成 8 字节 key(黄金比奇常数乘法散列;u64 上的双射,保唯一且分布均匀,避免键分布退化)。
+/// 由序号生成 8 字节 key:**partition 0**(与 `BlobStore::create` 的默认 key 前缀一致 ——
+/// 记录只存低 32bit,前缀不符的 key 会被写路径拒掉)+ 黄金比奇数乘法散列取低 32bit
+/// (u32 上的双射,保唯一且分布均匀,避免键分布退化)。
 fn make_key(n: u64) -> StoreKey {
-    StoreKey::new(n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes())
+    StoreKey::from_parts(0, n.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u32)
 }
 
 /// xorshift64*,无依赖的确定性伪随机(GET 阶段选 key)。
@@ -268,10 +270,7 @@ fn main() {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/var/tmp".into());
-            (
-                PathBuf::from(format!("{base}/antfs_bench_blob_{ns}")),
-                true,
-            )
+            (PathBuf::from(format!("{base}/antfs_bench_blob_{ns}")), true)
         }
     };
 

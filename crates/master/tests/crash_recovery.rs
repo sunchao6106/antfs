@@ -14,14 +14,19 @@ use openraft::{Entry, EntryPayload};
 use proptest::prelude::*;
 
 fn normal_ent(index: u64, cmd: MasterCommand) -> Entry<TypeConfig> {
-    Entry { log_id: log_id(1, 0, index), payload: EntryPayload::Normal(cmd) }
+    Entry {
+        log_id: log_id(1, 0, index),
+        payload: EntryPayload::Normal(cmd),
+    }
 }
 
 fn arb_cmd() -> impl Strategy<Value = MasterCommand> {
     prop_oneof![
         Just(MasterCommand::AllocatePartitionId),
-        (0u32..4, 1u32..1000)
-            .prop_map(|(partition_id, count)| MasterCommand::AllocateObjectId { partition_id, count }),
+        (0u32..4, 1u32..1000).prop_map(|(partition_id, count)| MasterCommand::AllocateObjectId {
+            partition_id,
+            count
+        }),
         (0u64..8, 1u64..1000).prop_map(|(node_id, cap)| MasterCommand::RegisterNode {
             node_id,
             info: NodeInfo {
@@ -30,7 +35,9 @@ fn arb_cmd() -> impl Strategy<Value = MasterCommand> {
                 addr: format!("127.0.0.1:{}", 7000 + node_id),
                 disks: BTreeMap::from([(
                     "d0".to_string(),
-                    antfs_master::types::DiskSpec { capacity_bytes: cap },
+                    antfs_master::types::DiskSpec {
+                        capacity_bytes: cap
+                    },
                 )]),
                 registered_at_ms: 42,
             },

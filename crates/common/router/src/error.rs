@@ -91,7 +91,10 @@ pub enum Error {
 
     /// blobId 自带的 partition 与目标 partition 不一致(拼错了,会导致索引与 URL 对不上)。
     #[error("blob id partition {key_pid} does not match target partition {expected}")]
-    PartitionMismatch { key_pid: PartitionId, expected: PartitionId },
+    PartitionMismatch {
+        key_pid: PartitionId,
+        expected: PartitionId,
+    },
 
     /// 本地文件 IO(读写上传/下载的文件)。
     #[error("io: {0}")]

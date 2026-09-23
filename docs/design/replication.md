@@ -20,17 +20,17 @@
 
 ### 阶段 1 —— 换元数据(Ambry `exchangeMetadata`)
 1. 本机发 `ReplicaMetadataRequest`,带一个**每对端一个的 `FindToken`**(游标:"我上次读到你 log 的哪")。
-2. 远端 `store.findEntriesSince(token, maxSize)` → 返回该 token 之后一批 `MessageInfo`(key + put/delete/ttl/undelete 标志)+ 新 token + 落后字节数(lag)。
+2. 远端 `store.findEntriesSince(token, maxSize)` → 返回该 token 之后一批 `MessageInfo`(key + put/delete 标志 + expiration)+ 新 token + 落后字节数(lag)。
 3. 本机把这批 key 与自己索引对账(Ambry `getMissingStoreMessages` = 本项目 `find_missing_keys`)→ 得到**本地缺失 key 集合**。
 
 ### 阶段 2 —— 补数据(Ambry `fixMissingStoreKeys`)
 1. 仅对缺失 key 发 `GetRequest` → 远端回 `GetResponse` 带 blob 字节。
-2. 逐条写本地 store:PUT 数据 → `applyPut`→`store.put`;纯元数据操作 → `applyTtlUpdate`/`applyDelete`/`applyUndelete`(不用拉 blob 体)。
+2. 逐条写本地 store:`apply_replicated(rec)` —— 存活记录 → 写整记录(数据体即阶段 2 拉到的);墓碑 → 只写状态(墓碑恒胜,不拉数据体)。
 3. 写完**推进并持久化 token**,下轮从新位置续拉。
 
 ## 3. 两个"永不丢、可重来"的关键
 
-- **幂等 apply**:apply* 吞掉 `IDDeleted`/`AlreadyUpdated`/`IDUndeleted`/`LifeVersionConflict` 这类"已是该状态"的错误 → **重复拉、乱序拉都安全**,反复补齐最终收敛。合法性按"操作发生时"判(非当前时刻),故过期 TTL/迟到更新也照收。
+- **幂等 apply(墓碑恒胜)**:合并规则只有一条 —— 本地缺失 → 应用(peer 存活记录需把数据体一起拉过来);本地存活 + peer 墓碑 → 覆盖为墓碑;本地墓碑 → 一律 `Skipped`;两边都存活 → `Skipped`(对象不可变 ⇒ 同 key 不会有两次 PUT;peer 的 PUT 永不覆盖本地 PUT)。于是**重复拉、乱序拉都安全**,反复补齐最终收敛(状态沿 `无 → 存活 → 墓碑` 单向推进)。合并无需定序字段,也就没有版本竞态类错误。
 - **Token 持久化**:`FindToken` 落盘(Ambry `ReplicaTokenPersistor`/`DiskTokenPersistor`),重启从断点续拉。token 分两段:近期走 **journal**(offset 有序游标,快),落后过多退回**索引全扫 bootstrap**。
 
 ## 4. leader-based 跨 DC 优化
@@ -47,7 +47,7 @@
 
 ## 6. 对 antfs 的映射与缺口
 
-- **已就位(store 侧地基)**:`find_entries_since` / `FindToken` / `journal` / `find_missing_keys` / `is_key_deleted` / `update_ttl` —— 即未来复制线程要调的 store 原语。
+- **已就位(store 侧地基)**:`find_entries_since` / `FindToken` / `journal` / `find_missing_keys` / `is_key_deleted` / `apply_replicated`(墓碑恒胜的忠实 apply) —— 即复制线程要调的 store 原语。
 - **待实现(复制角色)**:`ReplicaThread` 等价物、`RemoteReplicaInfo`、token 持久化器、两阶段 RPC 端点、leader-based admin。归 server 内复制角色(cluster.md §1)。
 - **已知缺口**:当前 `FindToken` 是**简化版**(仅 offset 游标),Ambry 全保真 token 还含 `sessionId`/`incarnationId`/`resetKey`(用于检测远端 store 重建/日志重置、避免误读旧 offset)。做真复制层时须补齐,否则对端重建后续拉会读错位置。
 

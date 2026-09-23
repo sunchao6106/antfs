@@ -14,11 +14,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use antfs_router::{Error, Router, RouterConfig, StoreKey};
-use antfs_master::types::{
-    DiskSpec, MasterCommand, MasterResponse, NodeInfo, ReplicaPlacement,
-};
+use antfs_master::types::{DiskSpec, MasterCommand, MasterResponse, NodeInfo, ReplicaPlacement};
 use antfs_master::{MasterConfig, MasterNode};
+use antfs_router::{Error, Router, RouterConfig, StoreKey};
 use antfs_store::{StoreServer, StoreServerConfig};
 use openraft::BasicNode;
 
@@ -50,7 +48,9 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         ..Default::default()
     };
     let registry = antfs_metric::Registry::new();
-    let node = MasterNode::start(cfg, &registry).await.expect("start master");
+    let node = MasterNode::start(cfg, &registry)
+        .await
+        .expect("start master");
     node.serve().expect("serve master");
     node.initialize(BTreeMap::from([(1, BasicNode::new(raft_addr))]))
         .await
@@ -97,7 +97,12 @@ async fn register_node(node: &MasterNode, node_id: u64, http_addr: &str) {
         dc: "dc1".into(),
         rack: "r1".into(),
         addr: http_addr.to_string(),
-        disks: BTreeMap::from([("d0".to_string(), DiskSpec { capacity_bytes: 1 << 40 })]),
+        disks: BTreeMap::from([(
+            "d0".to_string(),
+            DiskSpec {
+                capacity_bytes: 1 << 40,
+            },
+        )]),
         registered_at_ms: 1,
     };
     node.raft
@@ -107,7 +112,11 @@ async fn register_node(node: &MasterNode, node_id: u64, http_addr: &str) {
 }
 
 fn placement(node_id: u64) -> ReplicaPlacement {
-    ReplicaPlacement { node_id, disk_id: "d0".to_string(), target_state: "ACTIVE".to_string() }
+    ReplicaPlacement {
+        node_id,
+        disk_id: "d0".to_string(),
+        target_state: "ACTIVE".to_string(),
+    }
 }
 
 /// 经 Raft 建分区(测试精确控制副本集合),返回 partition id。
@@ -115,7 +124,10 @@ async fn create_partition(node: &MasterNode, replicas: Vec<ReplicaPlacement>) ->
     let rf = replicas.len() as u8;
     let resp = node
         .raft
-        .client_write(MasterCommand::CreatePartition { replication_factor: rf, replicas })
+        .client_write(MasterCommand::CreatePartition {
+            replication_factor: rf,
+            replicas,
+        })
         .await
         .expect("create partition");
     match resp.data {
@@ -131,7 +143,11 @@ async fn ensure_replica(store_addr: &str, pid: u32) {
         .send()
         .await
         .expect("admin create replica");
-    assert_eq!(resp.status().as_u16(), 201, "create replica on {store_addr}");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "create replica on {store_addr}"
+    );
 }
 
 fn client_cfg(master_addr: &str) -> RouterConfig {
@@ -144,7 +160,9 @@ fn client_cfg(master_addr: &str) -> RouterConfig {
 }
 
 fn payload(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -164,7 +182,9 @@ async fn put_get_roundtrip_and_w_is_actual_majority() {
     ensure_replica(&addr_b, pid).await;
 
     let registry = antfs_metric::Registry::new();
-    let client = Router::connect(client_cfg(&grpc), &registry).await.expect("connect client");
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect client");
 
     for (i, len) in [1usize, 4096, 100 * 1024].into_iter().enumerate() {
         let key = client.allocate_one().await.expect("allocate");
@@ -174,7 +194,11 @@ async fn put_get_roundtrip_and_w_is_actual_majority() {
         assert_eq!(report.total, 2);
         assert_eq!(report.required, 2, "RF=2 → 多数派 2");
         assert_eq!(report.acks, 2, "两个真副本都应 ack");
-        assert_eq!(client.get(&key).await.expect("get"), data, "往返必须逐字节一致");
+        assert_eq!(
+            client.get(&key).await.expect("get"),
+            data,
+            "往返必须逐字节一致"
+        );
     }
 
     // 文件往返(流式):写本地文件 → 传 → 下载到另一个文件 → 比对。
@@ -186,18 +210,29 @@ async fn put_get_roundtrip_and_w_is_actual_majority() {
     assert_eq!(report.required, 2);
     let n = client.get_file(&key, &dst).await.expect("get_file");
     assert_eq!(n as usize, bytes.len());
-    assert_eq!(tokio::fs::read(&dst).await.unwrap(), bytes, "文件往返必须一致");
+    assert_eq!(
+        tokio::fs::read(&dst).await.unwrap(),
+        bytes,
+        "文件往返必须一致"
+    );
 
-    // 删 / 复活 / 元数据。
+    // 元数据 / 删除(删除不可逆:删了就取不回来了)。
     let stat = client.stat(&key).await.expect("stat");
     assert_eq!(stat.size, bytes.len() as u64);
     assert!(!stat.deleted);
     client.delete(&key).await.expect("delete");
-    assert!(matches!(client.get(&key).await, Err(Error::NotFound { .. })));
-    assert!(client.stat(&key).await.expect("stat after delete").deleted);
-    let (_r, life) = client.undelete(&key).await.expect("undelete");
-    assert!(life >= 1, "复活后 life version 必须递增,实际 {life}");
-    assert_eq!(client.get(&key).await.expect("get after undelete"), bytes);
+    assert!(matches!(
+        client.get(&key).await,
+        Err(Error::NotFound { .. })
+    ));
+    let after = client.stat(&key).await.expect("stat after delete");
+    assert!(after.deleted, "墓碑的元数据仍可读(deleted=true)");
+    assert!(!after.expired);
+
+    // 重复删幂等:墓碑 key 再删仍成功(204),且不改变状态。
+    client.delete(&key).await.expect("idempotent re-delete");
+    let still = client.stat(&key).await.expect("stat after re-delete");
+    assert!(still.deleted);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -221,7 +256,9 @@ async fn write_survives_one_dead_replica_and_read_fails_over() {
     ensure_replica(&addr_b, pid).await;
 
     let registry = antfs_metric::Registry::new();
-    let client = Router::connect(client_cfg(&grpc), &registry).await.expect("connect");
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect");
     let key = client.allocate_one().await.expect("allocate");
     let data = bytes::Bytes::from(payload(64 * 1024, 3));
     let report = client.put(key, data.clone()).await.expect("W=2 必须写成功");
@@ -246,10 +283,15 @@ async fn single_replica_partition_requires_one_ack() {
     ensure_replica(&addr_a, pid).await;
 
     let registry = antfs_metric::Registry::new();
-    let client = Router::connect(client_cfg(&grpc), &registry).await.expect("connect");
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect");
     let key = client.allocate_one().await.expect("allocate");
     let data = bytes::Bytes::from(payload(2048, 5));
-    let report = client.put(key, data.clone()).await.expect("RF=1 必须写得进");
+    let report = client
+        .put(key, data.clone())
+        .await
+        .expect("RF=1 必须写得进");
     assert_eq!((report.total, report.required, report.acks), (1, 1, 1));
     assert_eq!(client.get(&key).await.expect("get"), data);
 }
@@ -269,7 +311,9 @@ async fn allocated_ids_are_unique_and_partitioned() {
     ensure_replica(&addr_a, p1).await;
 
     let registry = antfs_metric::Registry::new();
-    let client = Router::connect(client_cfg(&grpc), &registry).await.expect("connect");
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect");
 
     // 号段 4:申请 10 个 → 跨 3 个号段。
     let ids = client.allocate_batch(10).await.expect("allocate_batch");
@@ -278,7 +322,10 @@ async fn allocated_ids_are_unique_and_partitioned() {
     for id in &ids {
         assert!(seen.insert(id.as_u64()), "blobId 不得重复: {id:?}");
         let pid = id.partition_id();
-        assert!(pid == p0 || pid == p1, "号必须来自已建的可写分区,实际 {pid}");
+        assert!(
+            pid == p0 || pid == p1,
+            "号必须来自已建的可写分区,实际 {pid}"
+        );
     }
     // 每个号都能真写进去(证明号段与副本位置自洽)。
     for (i, id) in ids.iter().enumerate() {
@@ -300,12 +347,20 @@ async fn missing_blob_is_not_found_and_unknown_partition_is_rejected() {
     ensure_replica(&addr_a, pid).await;
 
     let registry = antfs_metric::Registry::new();
-    let client = Router::connect(client_cfg(&grpc), &registry).await.expect("connect");
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect");
 
     // 没写过的号(在本分区内)→ 所有副本都 404 → 必须是 NotFound,不能报成传输故障。
     let key = StoreKey::from_parts(pid, 9999);
-    assert!(matches!(client.get(&key).await, Err(Error::NotFound { .. })));
-    assert!(matches!(client.stat(&key).await, Err(Error::NotFound { .. })));
+    assert!(matches!(
+        client.get(&key).await,
+        Err(Error::NotFound { .. })
+    ));
+    assert!(matches!(
+        client.stat(&key).await,
+        Err(Error::NotFound { .. })
+    ));
 
     // 不存在的分区 → master 查不到副本 → 明确拒绝(不是静默失败)。
     let ghost = StoreKey::from_parts(9_999, 1);
@@ -332,7 +387,9 @@ async fn concurrent_allocations_are_unique_and_writable() {
 
     let registry = antfs_metric::Registry::new();
     let router = std::sync::Arc::new(
-        Router::connect(client_cfg(&grpc), &registry).await.expect("connect"),
+        Router::connect(client_cfg(&grpc), &registry)
+            .await
+            .expect("connect"),
     );
 
     const TASKS: usize = 8;
@@ -364,7 +421,10 @@ async fn concurrent_allocations_are_unique_and_writable() {
     let mut written = Vec::new();
     for (i, k) in all.iter().enumerate().step_by(all.len() / 20) {
         let data = bytes::Bytes::from(payload(64, i as u8));
-        router.put(*k, data.clone()).await.unwrap_or_else(|e| panic!("put {k:?}: {e}"));
+        router
+            .put(*k, data.clone())
+            .await
+            .unwrap_or_else(|e| panic!("put {k:?}: {e}"));
         written.push((*k, data));
     }
     for (k, data) in written {

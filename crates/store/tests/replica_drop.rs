@@ -23,7 +23,11 @@ fn store_config() -> antfs_blob::StoreConfig {
 }
 
 fn dropped(pid: u32) -> Transition {
-    Transition { partition_id: pid, disk_id: String::new(), target_state: "DROPPED".to_string() }
+    Transition {
+        partition_id: pid,
+        disk_id: String::new(),
+        target_state: "DROPPED".to_string(),
+    }
 }
 
 /// 该节点 Prometheus 文本(用**它自己接入的那个** Registry,指标断言才有证明力)。
@@ -95,13 +99,19 @@ async fn dropped_directive_deletes_replica_data_and_is_idempotent() {
     // 等到节点再发一轮心跳(≈1 个心跳周期)后再断言:此时上面那条 directive 的整轮处理
     // (含两条重复 DROPPED)必已完成,断言是确定的而非"抢在第二次调用之前"。
     let beats = fake.beat_count();
-    assert!(wait_until(Duration::from_secs(15), || fake.beat_count() > beats).await, "心跳必须继续");
+    assert!(
+        wait_until(Duration::from_secs(15), || fake.beat_count() > beats).await,
+        "心跳必须继续"
+    );
     let text = metrics_text(&registry);
     assert!(
         text.contains("store_server_replicas_dropped_total 1"),
         "只该计 1 次成功删除(重复 DROPPED 被幂等忽略), got:\n{text}"
     );
-    assert!(text.contains("store_server_replicas 1"), "副本数 gauge 必须跟着降, got:\n{text}");
+    assert!(
+        text.contains("store_server_replicas 1"),
+        "副本数 gauge 必须跟着降, got:\n{text}"
+    );
     assert!(
         text.contains("store_server_heartbeats_total 1"),
         "心跳仍在跑(指令处理未把心跳 loop 卡死), got:\n{text}"

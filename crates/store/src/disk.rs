@@ -78,7 +78,12 @@ impl DiskManager {
                 .map(|s| s.to_string_lossy().into_owned())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("disk{i}"));
-            disks.push(Disk { id, dir, capacity_bytes, free_bytes });
+            disks.push(Disk {
+                id,
+                dir,
+                capacity_bytes,
+                free_bytes,
+            });
         }
         Ok(DiskManager { disks })
     }

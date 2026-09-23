@@ -28,7 +28,10 @@ fn disk_beats(disks: &DiskManager, health: &HealthMap) -> Vec<DiskBeat> {
             disk_id: d.id.clone(),
             capacity_bytes: d.capacity_bytes,
             free_bytes: d.free_bytes,
-            health: hm.get(&d.id).map(|h| h.as_str().to_string()).unwrap_or_default(),
+            health: hm
+                .get(&d.id)
+                .map(|h| h.as_str().to_string())
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -72,13 +75,22 @@ async fn run(
 
     // 双向流心跳:sender 周期推 NodeBeat;receiver 应用 transitions。
     let (tx, rx) = mpsc::channel::<NodeBeat>(16);
-    let mut inbound = client.heartbeat(ReceiverStream::new(rx)).await?.into_inner();
+    let mut inbound = client
+        .heartbeat(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
 
     {
-        let (config, disks, replicas, health, metrics) =
-            (config.clone(), disks.clone(), replicas.clone(), health.clone(), metrics.clone());
+        let (config, disks, replicas, health, metrics) = (
+            config.clone(),
+            disks.clone(),
+            replicas.clone(),
+            health.clone(),
+            metrics.clone(),
+        );
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(config.heartbeat_interval_secs));
+            let mut tick =
+                tokio::time::interval(Duration::from_secs(config.heartbeat_interval_secs));
             loop {
                 tick.tick().await;
                 let mut dm = disks.clone();

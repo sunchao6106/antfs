@@ -2,6 +2,11 @@
 
 承 cluster.md §10(数据面读写 + quorum)、§9(store server 角色 N2/N3)、D4(数据异步 + 拉复制)。本文档记两处对已锁目标的**分期/细化决策**(CLAUDE.md:偏离先记档,不在代码就地另选)。
 
+> **后续变更(2026-09-23,`simplify-delete-model`)**:下文「忠实 apply 语义」一节已作废 ——
+> 对象不可变 + 删除不可逆后,合并规则退化为**墓碑恒胜**(peer 墓碑覆盖本地 PUT;peer PUT 永不覆盖本地 PUT/墓碑;
+> 本地墓碑一律 `Skipped`),定序字段均已移除,墓碑也不再需要数据体。
+> 保留为当时的设计记录;当前语义见 `docs/design/replication.md` 与 `openspec/changes/simplify-delete-model/`。
+
 ## D-A. N3 分期:S3a 逻辑拉复制先行,S3b 物理段拷贝后补
 
 **已锁 N3** = bootstrap 拉全量走"混合"(封存段物理流式拷贝 + 活跃段尾 token 逻辑补,MTTR 优先,不推后)。
@@ -20,21 +25,20 @@
 - **D2 精神不违**:D2 的核心是"blob 字节走 HTTP 流式、结构化控制走 gRPC 且 master↔node 契约稳定"。复制元数据是 node↔node 数据面邻域,JSON over HTTP 足够;master↔node 仍严格 gRPC。
 - cluster.md §10 已把复制描述为"ReplicaMetadata 走 gRPC",本 change 在 §9.1/§10 标注:node↔node 复制元数据走 HTTP(S3a 决策)。
 
-## 忠实 apply 语义(newest-wins + lifeVersion)
+## 忠实 apply 语义(墓碑恒胜)
 
 `apply_replicated(rec)` 对本地赢家 `cur` 判定:
 
 | 本地 | peer rec | 动作 |
 |---|---|---|
-| 缺失 | 存活(PUT/UNDELETE/TTL 赢家,带 data)| 原样写整记录(peer flags/lv/exp/op_time + data),index 赢家 |
-| 缺失 | 墓碑(DELETE,无 data)| 原样写墓碑(original_offset=self,无 data;`get` 非 include_deleted → 404)|
-| 有 | `rec.life_version > cur.life_version` | 原样写(存活缺 data 时从本地 original PUT 取 data)|
-| 有 | `== lv` 且 rec 引入新 flag(DELETE/TTL)| 应用该变更(墓碑 original_offset 指本地 PUT;TTL data 取本地)|
-| 有 | `< lv` 或无新 flag | `Skipped`(幂等)|
+| 缺失 | 存活(PUT 赢家,带 data)| 写整记录(flags/expiration + data),index 赢家 |
+| 缺失 | 墓碑(DELETE,无 data)| 写墓碑(无 data;`get` → 404)|
+| 有 | peer 墓碑、本地存活 | 覆盖为墓碑(墓碑只需写状态)|
+| 有 | 本地墓碑 | `Skipped` |
+| 有 | 两边都存活 | `Skipped`(对象不可变 ⇒ 同 key 不会有两次 PUT)|
 
 - **只增不删**:apply 绝不删除本地已有更"新"的记录 → 部分失败可安全重试(§3.1 幂等)。
-- **op_time 漂移**:mutation 在本地/peer 的 op_time 可能微差(各自 `now_ms`),仅影响 hard-delete 保留窗口,不影响可见性/收敛;缺失+存活 case 保留 peer op_time。
-- **数据体来源**:仅"本地缺失 + peer 存活"需从 peer 拉 data;所有基于已有 key 的变更 data 均在本地(承既有 delete/undelete/update_ttl 的本地读法)。
+- **数据体来源**:仅"本地缺失 + peer 存活"需从 peer 拉 data;墓碑不传数据体。
 
 ## 收敛循环(per replica × per peer)
 

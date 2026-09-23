@@ -42,10 +42,16 @@ pub async fn get_text(client: &HttpClient, url: &str) -> Option<String> {
         if !resp.status().is_success() {
             return None;
         }
-        let bytes = http_body_util::BodyExt::collect(resp.into_body()).await.ok()?.to_bytes();
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .ok()?
+            .to_bytes();
         String::from_utf8(bytes.to_vec()).ok()
     };
-    tokio::time::timeout(SCRAPE_TIMEOUT, fetch).await.ok().flatten()
+    tokio::time::timeout(SCRAPE_TIMEOUT, fetch)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// `POST url`(空 body)→ `(状态码, 去空白的响应文本)`;超时 / 连接失败 → `Err(人读原因)`。
@@ -96,7 +102,10 @@ async fn send(
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(body)
             .map_err(|e| format!("bad request: {e}"))?;
-        let resp = client.request(req).await.map_err(|e| format!("network error: {e}"))?;
+        let resp = client
+            .request(req)
+            .await
+            .map_err(|e| format!("network error: {e}"))?;
         let status = resp.status();
         let bytes = http_body_util::BodyExt::collect(resp.into_body())
             .await

@@ -74,7 +74,6 @@ pub struct StoreServerMetrics {
     pub bootstrap_bytes: IntCounter,
     pub flushes: IntCounter,
     pub compactions: IntCounter,
-    pub hard_deleted: IntCounter,
 }
 
 impl StoreServerMetrics {
@@ -84,20 +83,34 @@ impl StoreServerMetrics {
             get_total: counter(registry, "store_server_get_total", "blob get requests")?,
             put_bytes: counter(registry, "store_server_put_bytes_total", "bytes written")?,
             get_bytes: counter(registry, "store_server_get_bytes_total", "bytes read")?,
-            replicas: gauge(registry, "store_server_replicas", "local partition replicas")?,
+            replicas: gauge(
+                registry,
+                "store_server_replicas",
+                "local partition replicas",
+            )?,
             replicas_bootstrapping: gauge(
                 registry,
                 "store_server_replicas_bootstrapping",
                 "local replicas not yet caught up (current_state=BOOTSTRAP)",
             )?,
-            errors: counter_vec(registry, "store_server_errors_total", "data-plane errors", &["kind"])?,
+            errors: counter_vec(
+                registry,
+                "store_server_errors_total",
+                "data-plane errors",
+                &["kind"],
+            )?,
             request_duration: latency_seconds_vec(
                 registry,
                 "store_server_request_duration_seconds",
                 "data-plane request latency (handler entry to engine completion, incl. queueing)",
                 &["op"],
             )?,
-            in_flight: gauge_vec(registry, "store_server_in_flight_requests", "in-flight data-plane requests", &["op"])?,
+            in_flight: gauge_vec(
+                registry,
+                "store_server_in_flight_requests",
+                "in-flight data-plane requests",
+                &["op"],
+            )?,
             blob_request_duration: latency_seconds_vec(
                 registry,
                 "store_server_blob_request_duration_seconds",
@@ -110,16 +123,32 @@ impl StoreServerMetrics {
                 "data-plane requests rejected before reaching the engine",
                 &["op", "reason"],
             )?,
-            manual_compactions: counter(registry, "store_server_manual_compactions_total", "manual compaction endpoint calls")?,
-            replicas_dropped: counter(registry, "store_server_replicas_dropped_total", "local replicas whose data was dropped on master DROPPED directive")?,
-            replication_paused: gauge(registry, "store_server_replication_paused", "pull-replication paused by operator (1 = paused)")?,
+            manual_compactions: counter(
+                registry,
+                "store_server_manual_compactions_total",
+                "manual compaction endpoint calls",
+            )?,
+            replicas_dropped: counter(
+                registry,
+                "store_server_replicas_dropped_total",
+                "local replicas whose data was dropped on master DROPPED directive",
+            )?,
+            replication_paused: gauge(
+                registry,
+                "store_server_replication_paused",
+                "pull-replication paused by operator (1 = paused)",
+            )?,
             compaction_jobs: counter_vec(
                 registry,
                 "store_server_compaction_jobs_total",
                 "async manual compaction jobs by state",
                 &["state"],
             )?,
-            verify_runs: counter(registry, "store_server_verify_runs_total", "local integrity verify calls")?,
+            verify_runs: counter(
+                registry,
+                "store_server_verify_runs_total",
+                "local integrity verify calls",
+            )?,
             verify_bad_records: counter(
                 registry,
                 "store_server_verify_bad_records_total",
@@ -135,17 +164,52 @@ impl StoreServerMetrics {
                 "store_server_scrub_reports_total",
                 "scrub report endpoint calls",
             )?,
-            heartbeats: counter(registry, "store_server_heartbeats_total", "heartbeat directives received")?,
-            mutations: counter(registry, "store_server_mutations_total", "delete/undelete/ttl mutations")?,
-            replication_rounds: counter(registry, "store_server_replication_rounds_total", "pull-replication rounds run")?,
-            replication_applied: counter(registry, "store_server_replication_applied_total", "records applied from peers")?,
-            replication_bytes: counter(registry, "store_server_replication_bytes_total", "bytes applied from peers")?,
-            replication_errors: counter(registry, "store_server_replication_errors_total", "pull-replication errors")?,
-            bootstrap_segments: counter(registry, "store_server_bootstrap_segments_total", "sealed segments physically copied on bootstrap")?,
-            bootstrap_bytes: counter(registry, "store_server_bootstrap_bytes_total", "bytes physically copied on bootstrap")?,
-            flushes: counter(registry, "store_server_flushes_total", "local-worker flushes run")?,
-            compactions: counter(registry, "store_server_compactions_total", "local-worker segment compactions run")?,
-            hard_deleted: counter(registry, "store_server_hard_deleted_total", "records hard-deleted (data body erased) by local worker")?,
+            heartbeats: counter(
+                registry,
+                "store_server_heartbeats_total",
+                "heartbeat directives received",
+            )?,
+            mutations: counter(registry, "store_server_mutations_total", "delete mutations")?,
+            replication_rounds: counter(
+                registry,
+                "store_server_replication_rounds_total",
+                "pull-replication rounds run",
+            )?,
+            replication_applied: counter(
+                registry,
+                "store_server_replication_applied_total",
+                "records applied from peers",
+            )?,
+            replication_bytes: counter(
+                registry,
+                "store_server_replication_bytes_total",
+                "bytes applied from peers",
+            )?,
+            replication_errors: counter(
+                registry,
+                "store_server_replication_errors_total",
+                "pull-replication errors",
+            )?,
+            bootstrap_segments: counter(
+                registry,
+                "store_server_bootstrap_segments_total",
+                "sealed segments physically copied on bootstrap",
+            )?,
+            bootstrap_bytes: counter(
+                registry,
+                "store_server_bootstrap_bytes_total",
+                "bytes physically copied on bootstrap",
+            )?,
+            flushes: counter(
+                registry,
+                "store_server_flushes_total",
+                "local-worker flushes run",
+            )?,
+            compactions: counter(
+                registry,
+                "store_server_compactions_total",
+                "local-worker segment compactions run",
+            )?,
         })
     }
 
@@ -156,7 +220,10 @@ impl StoreServerMetrics {
     /// 刷新点:心跳每拍 + 心跳指令处理后(副本集/实然态可能刚变)+ 复制 loop 每 tick(刚转 `ACTIVE`
     /// 立刻反映在指标上,不必等下一拍心跳)。
     pub fn set_replica_gauges(&self, states: &[ReplicaState]) {
-        let bootstrapping = states.iter().filter(|s| s.current_state == STATE_BOOTSTRAP).count();
+        let bootstrapping = states
+            .iter()
+            .filter(|s| s.current_state == STATE_BOOTSTRAP)
+            .count();
         self.replicas.set(states.len() as i64);
         self.replicas_bootstrapping.set(bootstrapping as i64);
     }

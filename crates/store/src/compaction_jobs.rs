@@ -210,7 +210,10 @@ mod tests {
         let running = serde_json::to_value(jobs.get(ok).unwrap()).unwrap();
         assert_eq!(running["state"], "running");
         for absent in ["finished_at_ms", "result", "error"] {
-            assert!(running.get(absent).is_none(), "running 不该有 {absent}: {running}");
+            assert!(
+                running.get(absent).is_none(),
+                "running 不该有 {absent}: {running}"
+            );
         }
 
         jobs.finish(ok, Ok(stats(100, 20)));
@@ -220,13 +223,19 @@ mod tests {
         assert_eq!(done["result"]["dead_bytes"], 20);
         assert_eq!(done["result"]["segments_before"], 3);
         assert_eq!(done["result"]["segments_after"], 1);
-        assert!(done["finished_at_ms"].is_u64(), "done 必须带结束时刻: {done}");
+        assert!(
+            done["finished_at_ms"].is_u64(),
+            "done 必须带结束时刻: {done}"
+        );
 
         jobs.finish(bad, Err("io: disk on fire".to_string()));
         let failed = serde_json::to_value(jobs.get(bad).unwrap()).unwrap();
         assert_eq!(failed["state"], "failed");
         assert_eq!(failed["error"], "io: disk on fire");
-        assert!(failed.get("result").is_none(), "failed 不该有 result: {failed}");
+        assert!(
+            failed.get("result").is_none(),
+            "failed 不该有 result: {failed}"
+        );
 
         // 回写未知 job_id(已被淘汰/从未存在)不 panic、不改任何条目。
         jobs.finish(9999, Ok(stats(1, 1)));
@@ -236,8 +245,14 @@ mod tests {
     #[test]
     fn only_most_recent_jobs_are_kept_newest_first() {
         let jobs = CompactionJobs::new();
-        let ids: Vec<u64> = (0..MAX_TRACKED_JOBS as u32 + 5).map(|i| jobs.submit(i)).collect();
-        assert_eq!(jobs.snapshot().len(), MAX_TRACKED_JOBS, "超出上限必须淘汰最旧");
+        let ids: Vec<u64> = (0..MAX_TRACKED_JOBS as u32 + 5)
+            .map(|i| jobs.submit(i))
+            .collect();
+        assert_eq!(
+            jobs.snapshot().len(),
+            MAX_TRACKED_JOBS,
+            "超出上限必须淘汰最旧"
+        );
         assert!(jobs.get(ids[0]).is_none(), "最旧的 5 条应已被淘汰");
         assert!(jobs.get(ids[4]).is_none());
         assert!(jobs.get(ids[5]).is_some(), "边界:第 6 条仍在");
@@ -245,6 +260,9 @@ mod tests {
         let snap = jobs.snapshot();
         assert_eq!(snap[0].job_id, *ids.last().unwrap(), "快照最新在前");
         let ids_in_snap: Vec<u64> = snap.iter().map(|j| j.job_id).collect();
-        assert!(ids_in_snap.windows(2).all(|w| w[0] > w[1]), "必须严格降序: {ids_in_snap:?}");
+        assert!(
+            ids_in_snap.windows(2).all(|w| w[0] > w[1]),
+            "必须严格降序: {ids_in_snap:?}"
+        );
     }
 }

@@ -10,9 +10,9 @@ use tonic::transport::Channel;
 use antfs_master::pb::master_client::MasterClient;
 use antfs_master::pb::{
     BalanceStateRequest, CancelBalanceRequest, ClusterStateRequest, CreatePartitionsRequest,
-    DecommissionRequest, EvalBalanceRequest, ListNodesRequest, ListPartitionsRequest, MetricsRequest,
-    MoveReplicaRequest, RepairPartitionRequest, SetMaintenanceRequest, SetPartitionStateRequest,
-    StartBalanceRequest,
+    DecommissionRequest, EvalBalanceRequest, ListNodesRequest, ListPartitionsRequest,
+    MetricsRequest, MoveReplicaRequest, RepairPartitionRequest, SetMaintenanceRequest,
+    SetPartitionStateRequest, StartBalanceRequest,
 };
 
 use crate::error::{Error, Result};
@@ -164,7 +164,12 @@ pub trait MasterApi: Send + Sync {
     async fn cluster(&self) -> Result<ClusterDto>;
     async fn nodes(&self) -> Result<Vec<NodeDto>>;
     /// 分页列分区,返回 `(本页, 总数)`;`limit=0` 表示不限;`state` 空 = 全部,否则 RW/RO/SEALED。
-    async fn partitions(&self, state: &str, offset: u64, limit: u32) -> Result<(Vec<PartitionDto>, u64)>;
+    async fn partitions(
+        &self,
+        state: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<(Vec<PartitionDto>, u64)>;
     async fn create_partitions(&self, count: u32, replication_factor: u32) -> Result<Vec<u32>>;
     async fn decommission(&self, node_id: u64, force: bool) -> Result<()>;
     async fn set_partition_state(&self, partition_id: u32, state: &str) -> Result<()>;
@@ -177,7 +182,12 @@ pub trait MasterApi: Send + Sync {
     /// 手动立即补一个副本(`RepairPartition`);gRPC ok=false 不算传输错,回 Ok(outcome{ok:false})。
     async fn repair_partition(&self, partition_id: u32) -> Result<RepairOutcome>;
     /// 副本迁移(`MoveReplica`,add-before-remove);to_node_id=0 = 自动选目标。
-    async fn move_replica(&self, partition_id: u32, from_node_id: u64, to_node_id: u64) -> Result<MoveOutcome>;
+    async fn move_replica(
+        &self,
+        partition_id: u32,
+        from_node_id: u64,
+        to_node_id: u64,
+    ) -> Result<MoveOutcome>;
     /// 当前均衡计划 + 派生进度(`GetBalanceState`;任何节点可答)。
     async fn balance_state(&self) -> Result<BalanceStateDto>;
     /// 评估并落一份 PREVIEW 计划(`EvalBalance`);`max_moves=0` = 用 master 配置默认。
@@ -200,7 +210,10 @@ impl GrpcMasterApi {
         let client = MasterClient::connect(format!("http://{master_addr}"))
             .await
             .map_err(|e| Error::MasterRpc(e.to_string()))?;
-        Ok(GrpcMasterApi { client, cluster_secret })
+        Ok(GrpcMasterApi {
+            client,
+            cluster_secret,
+        })
     }
 }
 
@@ -216,13 +229,21 @@ impl MasterApi for GrpcMasterApi {
         // 容量/健康汇总:master 无现成聚合,由 admin 汇总节点盘容量 + 分区健康。
         let nodes = self.nodes().await?;
         let (partitions, _) = self.partitions("", 0, 0).await?;
-        let total_capacity_bytes: u64 =
-            nodes.iter().flat_map(|n| n.disks.iter()).map(|d| d.capacity_bytes).sum();
-        let free_bytes: u64 =
-            nodes.iter().flat_map(|n| n.disks.iter()).map(|d| d.free_bytes).sum();
+        let total_capacity_bytes: u64 = nodes
+            .iter()
+            .flat_map(|n| n.disks.iter())
+            .map(|d| d.capacity_bytes)
+            .sum();
+        let free_bytes: u64 = nodes
+            .iter()
+            .flat_map(|n| n.disks.iter())
+            .map(|d| d.free_bytes)
+            .sum();
         let nodes_up = nodes.iter().filter(|n| n.up).count() as u64;
-        let under_replicated_partitions =
-            partitions.iter().filter(|p| !p.under_replicated_reason.is_empty()).count() as u64;
+        let under_replicated_partitions = partitions
+            .iter()
+            .filter(|p| !p.under_replicated_reason.is_empty())
+            .count() as u64;
         Ok(ClusterDto {
             this_node: s.this_node,
             leader: s.leader,
@@ -270,7 +291,12 @@ impl MasterApi for GrpcMasterApi {
             .collect())
     }
 
-    async fn partitions(&self, state: &str, offset: u64, limit: u32) -> Result<(Vec<PartitionDto>, u64)> {
+    async fn partitions(
+        &self,
+        state: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<(Vec<PartitionDto>, u64)> {
         let mut c = self.client.clone();
         let resp = c
             .list_partitions(ListPartitionsRequest {
@@ -361,7 +387,10 @@ impl MasterApi for GrpcMasterApi {
             } else if resp.affected_partitions.is_empty() {
                 resp.error
             } else {
-                format!("{} (受影响分区: {:?})", resp.error, resp.affected_partitions)
+                format!(
+                    "{} (受影响分区: {:?})",
+                    resp.error, resp.affected_partitions
+                )
             };
             return Err(Error::MasterRejected(msg));
         }
@@ -471,7 +500,12 @@ impl MasterApi for GrpcMasterApi {
             .map_err(|e| Error::MasterRpc(e.to_string()))?
             .into_inner();
         let error = op_error(resp.ok, &resp.error, &resp.leader_addr);
-        Ok(MoveOutcome { ok: resp.ok, error, to_node_id: resp.to_node_id, to_disk_id: resp.to_disk_id })
+        Ok(MoveOutcome {
+            ok: resp.ok,
+            error,
+            to_node_id: resp.to_node_id,
+            to_disk_id: resp.to_disk_id,
+        })
     }
     async fn balance_state(&self) -> Result<BalanceStateDto> {
         let mut c = self.client.clone();
@@ -480,7 +514,10 @@ impl MasterApi for GrpcMasterApi {
             .await
             .map_err(|e| Error::MasterRpc(e.to_string()))?
             .into_inner();
-        Ok(BalanceStateDto { present: resp.present, plan: resp.plan.map(plan_dto) })
+        Ok(BalanceStateDto {
+            present: resp.present,
+            plan: resp.plan.map(plan_dto),
+        })
     }
 
     async fn balance_eval(&self, max_moves: u32) -> Result<BalanceOpOutcome> {
@@ -495,7 +532,11 @@ impl MasterApi for GrpcMasterApi {
             .map_err(|e| Error::MasterRpc(e.to_string()))?
             .into_inner();
         let error = op_error(resp.ok, &resp.error, &resp.leader_addr);
-        Ok(BalanceOpOutcome { ok: resp.ok, error, plan: resp.plan.map(plan_dto) })
+        Ok(BalanceOpOutcome {
+            ok: resp.ok,
+            error,
+            plan: resp.plan.map(plan_dto),
+        })
     }
 
     async fn balance_start(&self, plan_id: u64) -> Result<BalanceOpOutcome> {
@@ -510,7 +551,11 @@ impl MasterApi for GrpcMasterApi {
             .map_err(|e| Error::MasterRpc(e.to_string()))?
             .into_inner();
         let error = op_error(resp.ok, &resp.error, &resp.leader_addr);
-        Ok(BalanceOpOutcome { ok: resp.ok, error, plan: None })
+        Ok(BalanceOpOutcome {
+            ok: resp.ok,
+            error,
+            plan: None,
+        })
     }
 
     async fn balance_cancel(&self, plan_id: u64) -> Result<BalanceOpOutcome> {
@@ -525,7 +570,11 @@ impl MasterApi for GrpcMasterApi {
             .map_err(|e| Error::MasterRpc(e.to_string()))?
             .into_inner();
         let error = op_error(resp.ok, &resp.error, &resp.leader_addr);
-        Ok(BalanceOpOutcome { ok: resp.ok, error, plan: None })
+        Ok(BalanceOpOutcome {
+            ok: resp.ok,
+            error,
+            plan: None,
+        })
     }
 }
 

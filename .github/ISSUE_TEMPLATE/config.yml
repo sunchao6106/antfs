@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Design docs
+    url: https://github.com/sunchao6106/ambry-rs/tree/main/docs/design
+    about: Architecture overview and per-module designs — please check these first for design questions.
+  - name: OpenSpec decision archive
+    url: https://github.com/sunchao6106/ambry-rs/tree/main/openspec/changes
+    about: Records of past design decisions; useful context before proposing a change of direction.

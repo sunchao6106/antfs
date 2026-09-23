@@ -4,8 +4,15 @@
 //! 只收录**当前引擎真实消费**的项:段大小、活跃索引内存条目上限。总容量是 per-replica 属性
 //! (对齐 Ambry:`capacityInBytes` 由 replica 传入、不在 `StoreConfig`),故不在此,由构造参数传入。
 
-use antfs_config::{at_least, Result, Validate};
+use antfs_config::{at_least, in_range, Result, Validate};
 use serde::Deserialize;
+
+/// 单个 log 段容量的硬上界:4 GiB(唯一真源在 [`crate::log_segment::MAX_CAPACITY`])。
+///
+/// 这不是"调优建议"而是**格式不变量**:段内偏移必须放进索引条目的 u32 字段
+///([`LogOffset::pack`](crate::types::LogOffset::pack)),且"单条记录 ≤ 段 − 64 < `u32::MAX`"
+/// 让记录内的 u32 `data_len` 结构性地不可能回绕。
+pub const MAX_SEGMENT_SIZE_BYTES: u64 = crate::log_segment::MAX_CAPACITY;
 
 /// store 引擎配置。字段名即 TOML key(在 `[store]` 表下)。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -37,7 +44,12 @@ impl Default for StoreConfig {
 
 impl Validate for StoreConfig {
     fn validate(&self) -> Result<()> {
-        at_least("store.segment_size_bytes", self.segment_size_bytes, 1)?;
+        in_range(
+            "store.segment_size_bytes",
+            self.segment_size_bytes,
+            1,
+            MAX_SEGMENT_SIZE_BYTES,
+        )?;
         at_least(
             "store.index_max_inmem_elements",
             self.index_max_inmem_elements,

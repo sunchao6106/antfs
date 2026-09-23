@@ -48,7 +48,11 @@ pub struct Phase {
 
 impl Phase {
     pub fn new(label: impl Into<String>, ops: u64) -> Self {
-        Phase { label: label.into(), ops, ..Default::default() }
+        Phase {
+            label: label.into(),
+            ops,
+            ..Default::default()
+        }
     }
 
     pub fn record_ok(&mut self, nanos: u64) {
@@ -96,8 +100,11 @@ impl Phase {
             self.errors(),
         );
         if !self.err_kinds.is_empty() {
-            let detail: Vec<String> =
-                self.err_kinds.iter().map(|(k, n)| format!("{k}={n}")).collect();
+            let detail: Vec<String> = self
+                .err_kinds
+                .iter()
+                .map(|(k, n)| format!("{k}={n}"))
+                .collect();
             println!("        errors: {}", detail.join(" "));
         }
     }
@@ -108,7 +115,8 @@ pub fn percentile(sorted_ns: &[u64], p: f64) -> f64 {
     if sorted_ns.is_empty() {
         return 0.0;
     }
-    let idx = (((p / 100.0) * (sorted_ns.len() - 1) as f64).round() as usize).min(sorted_ns.len() - 1);
+    let idx =
+        (((p / 100.0) * (sorted_ns.len() - 1) as f64).round() as usize).min(sorted_ns.len() - 1);
     sorted_ns[idx] as f64 / 1000.0
 }
 

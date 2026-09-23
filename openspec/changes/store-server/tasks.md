@@ -30,7 +30,7 @@
 ## 后续(不在 S1)
 - [x] S2 HeartbeatClient + RegisterNode + ReplicaLifecycle(接 master transitions)。已落地 `crates/store/src/heartbeat.rs`。
 - [x] S3 ReplicationPuller + bootstrap(N3)。已落地 `crates/store/src/replication.rs`。
-- [x] S4 LocalWorker(flush/compaction/hard_delete)。已落地 `crates/store/src/worker.rs`。
-- [x] 变更类端点(delete/undelete/ttl)。已落地(详见 `openspec/changes/store-server-mutations/`)。
+- [x] S4 LocalWorker(flush/compaction)。已落地 `crates/store/src/worker.rs`。(原第三条「隐私擦除」loop 已于 2026-09-23 随"对象不可变 + 删除不可逆"移除,见 `openspec/changes/simplify-delete-model/`)。
+- [x] 变更类端点(delete)。已落地(详见 `openspec/changes/store-server-mutations/`)。(原「复活」/「改 TTL」两条已于 2026-09-23 移除,数据面只剩 `DELETE`;TTL 改为写入时经 `PUT ?expiration_ms=` 给定)
 - [x] 真流式 put(消除内存聚合)。已落地:`BlobStore::put_from_reader`(`crates/blob/src/blob.rs`:605)+ store 侧 `INLINE_BODY_MAX` 以内内联、超过走流式(`crates/store/src/server.rs` put handler)。
 - [ ] **EC 仍锁定**(暂不解锁)。

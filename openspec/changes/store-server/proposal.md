@@ -34,5 +34,7 @@ master(M1–M4)已能选主、放置、路由、调谐,但**数据面还不存�
 
 - **EC 暂不解锁**(D5):S1 不含任何纠删码 / 封存段转 EC 逻辑(依用户指示推迟)。
 - 不接 master:心跳 / 注册 / ReplicaLifecycle(消费 transitions)= **S2**。
-- 不做拉复制 / anti-entropy / bootstrap = **S3**;不做本地 worker(flush/compaction/hard_delete 编排)= **S4**。
-- 不做 delete/undelete/ttl 的 HTTP 端点(S1 只 put/get;变更类后续)。
+- 不做拉复制 / anti-entropy / bootstrap = **S3**;不做本地 worker(flush/compaction 编排)= **S4**。
+- 不做变更类 HTTP 端点(S1 只 put/get;变更类后续)。
+
+> **后续变更(2026-09-23,`simplify-delete-model`)**:上述 S4 与变更类端点后来都落地了;其中「隐私擦除」「复活」「改 TTL」又随"对象不可变 + 删除不可逆"**被移除**(数据面只剩 `DELETE`,TTL 改为写入时经 `PUT ?expiration_ms=` 给定)。

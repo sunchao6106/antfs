@@ -25,7 +25,7 @@ pub struct RouterMetrics {
     pub get_total: IntCounterVec,
     /// 读出的字节数(counter,只计成功)。
     pub get_bytes: IntCounter,
-    /// 其它数据面操作数,label `op`(delete/undelete/ttl/stat)+ `outcome`。
+    /// 其它数据面操作数,label `op`(delete/stat)+ `outcome`。
     pub mutation_total: IntCounterVec,
 }
 
@@ -48,7 +48,11 @@ impl RouterMetrics {
                 "blob put requests by outcome",
                 &["outcome"],
             )?,
-            put_bytes: counter(registry, "router_put_bytes_total", "bytes written (successful puts)")?,
+            put_bytes: counter(
+                registry,
+                "router_put_bytes_total",
+                "bytes written (successful puts)",
+            )?,
             put_seconds: histogram_vec(
                 registry,
                 "router_put_seconds",
@@ -68,11 +72,15 @@ impl RouterMetrics {
                 "blob get requests by outcome",
                 &["outcome"],
             )?,
-            get_bytes: counter(registry, "router_get_bytes_total", "bytes read (successful gets)")?,
+            get_bytes: counter(
+                registry,
+                "router_get_bytes_total",
+                "bytes read (successful gets)",
+            )?,
             mutation_total: counter_vec(
                 registry,
                 "router_mutation_total",
-                "delete/undelete/ttl/stat requests by op and outcome",
+                "delete/stat requests by op and outcome",
                 &["op", "outcome"],
             )?,
         })

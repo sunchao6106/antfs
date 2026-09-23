@@ -96,20 +96,48 @@ impl Default for MasterConfig {
 impl Validate for MasterConfig {
     fn validate(&self) -> Result<()> {
         at_least("master.node_id", self.node_id, 1)?;
-        at_least("master.heartbeat_timeout_secs", self.heartbeat_timeout_secs, 1)?;
-        at_least("master.partition_capacity_bytes", self.partition_capacity_bytes, 1)?;
+        at_least(
+            "master.heartbeat_timeout_secs",
+            self.heartbeat_timeout_secs,
+            1,
+        )?;
+        at_least(
+            "master.partition_capacity_bytes",
+            self.partition_capacity_bytes,
+            1,
+        )?;
         if !(self.disk_near_full_ratio > 0.0 && self.disk_near_full_ratio <= 1.0) {
             return Err(antfs_config::ConfigError::invalid(
                 "master.disk_near_full_ratio",
                 "must be in (0, 1]",
             ));
         }
-        at_least("master.auto_grow_interval_secs", self.auto_grow_interval_secs, 1)?;
+        at_least(
+            "master.auto_grow_interval_secs",
+            self.auto_grow_interval_secs,
+            1,
+        )?;
         at_least("master.auto_grow_batch", self.auto_grow_batch, 1)?;
-        at_least("master.reconcile_interval_secs", self.reconcile_interval_secs, 1)?;
-        at_least("master.id_alloc_segment_size", self.id_alloc_segment_size, 1)?;
-        at_least("master.id_alloc_raft_batch_multiple", self.id_alloc_raft_batch_multiple, 1)?;
-        at_least("master.balance_max_in_flight", self.balance_max_in_flight, 1)?;
+        at_least(
+            "master.reconcile_interval_secs",
+            self.reconcile_interval_secs,
+            1,
+        )?;
+        at_least(
+            "master.id_alloc_segment_size",
+            self.id_alloc_segment_size,
+            1,
+        )?;
+        at_least(
+            "master.id_alloc_raft_batch_multiple",
+            self.id_alloc_raft_batch_multiple,
+            1,
+        )?;
+        at_least(
+            "master.balance_max_in_flight",
+            self.balance_max_in_flight,
+            1,
+        )?;
         at_least("master.balance_max_moves", self.balance_max_moves, 1)?;
         if self.balance_skew_threshold <= 0.0 {
             return Err(antfs_config::ConfigError::invalid(
@@ -117,15 +145,28 @@ impl Validate for MasterConfig {
                 "must be > 0",
             ));
         }
-        at_least("master.balance_move_timeout_secs", self.balance_move_timeout_secs, 1)?;
+        at_least(
+            "master.balance_move_timeout_secs",
+            self.balance_move_timeout_secs,
+            1,
+        )?;
         if self.raft_addr.is_empty() {
-            return Err(antfs_config::ConfigError::invalid("master.raft_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid(
+                "master.raft_addr",
+                "must not be empty",
+            ));
         }
         if self.grpc_addr.is_empty() {
-            return Err(antfs_config::ConfigError::invalid("master.grpc_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid(
+                "master.grpc_addr",
+                "must not be empty",
+            ));
         }
         if self.data_dir.is_empty() {
-            return Err(antfs_config::ConfigError::invalid("master.data_dir", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid(
+                "master.data_dir",
+                "must not be empty",
+            ));
         }
         Ok(())
     }

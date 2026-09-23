@@ -84,7 +84,9 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         // 默认 3 副本(对齐 cluster.md §10 W=2/R=1 建立在 RF=3 之上)。
-        Self { default_replication_factor: 3 }
+        Self {
+            default_replication_factor: 3,
+        }
     }
 }
 
@@ -206,15 +208,24 @@ impl MasterState {
                 self.next_partition_id += 1;
                 MasterResponse::PartitionId(id)
             }
-            MasterCommand::AllocateObjectId { partition_id, count } => {
+            MasterCommand::AllocateObjectId {
+                partition_id,
+                count,
+            } => {
                 let start = self.object_next.get(partition_id).copied().unwrap_or(0);
                 // checked_add 兜住 u32 空间耗尽:宁可少发最顶端不足一段的号,绝不回绕复用(持久性红线)。
                 match start.checked_add(*count) {
                     Some(end) => {
                         self.object_next.insert(*partition_id, end);
-                        MasterResponse::ObjectIdRange { partition_id: *partition_id, start, count: *count }
+                        MasterResponse::ObjectIdRange {
+                            partition_id: *partition_id,
+                            start,
+                            count: *count,
+                        }
                     }
-                    None => MasterResponse::ObjectIdExhausted { partition_id: *partition_id },
+                    None => MasterResponse::ObjectIdExhausted {
+                        partition_id: *partition_id,
+                    },
                 }
             }
             MasterCommand::RegisterNode { node_id, info } => {
@@ -222,7 +233,10 @@ impl MasterState {
                 self.nodes.insert(*node_id, info.clone());
                 MasterResponse::Registered
             }
-            MasterCommand::CreatePartition { replication_factor, replicas } => {
+            MasterCommand::CreatePartition {
+                replication_factor,
+                replicas,
+            } => {
                 // 选盘在 leader 侧已算好(读软状态,非确定);apply 只做确定动作:分配 id + 写 placement。
                 let id = self.next_partition_id;
                 self.next_partition_id += 1;
@@ -236,7 +250,10 @@ impl MasterState {
                 );
                 MasterResponse::PartitionId(id)
             }
-            MasterCommand::AddReplica { partition_id, replica } => {
+            MasterCommand::AddReplica {
+                partition_id,
+                replica,
+            } => {
                 if let Some(p) = self.partitions.get_mut(partition_id) {
                     // 幂等:同 (node, disk) 已在该分区则不重复追加。
                     let exists = p
@@ -249,7 +266,11 @@ impl MasterState {
                 }
                 MasterResponse::Registered
             }
-            MasterCommand::MoveReplica { partition_id, from_node_id, replica } => {
+            MasterCommand::MoveReplica {
+                partition_id,
+                from_node_id,
+                replica,
+            } => {
                 // add-before-remove:先补新副本(同 AddReplica 幂等),from 源记入 moving,
                 // 由 reconciler 在新副本健康后 RemoveReplica(守 §3.1)。
                 if let Some(p) = self.partitions.get_mut(partition_id) {
@@ -274,7 +295,10 @@ impl MasterState {
                 self.decommissioning.insert(*node_id);
                 MasterResponse::Registered
             }
-            MasterCommand::RemoveReplica { partition_id, node_id } => {
+            MasterCommand::RemoveReplica {
+                partition_id,
+                node_id,
+            } => {
                 if let Some(p) = self.partitions.get_mut(partition_id) {
                     p.replicas.retain(|r| r.node_id != *node_id);
                 }
@@ -286,7 +310,10 @@ impl MasterState {
                 self.pending_drop.insert((*partition_id, *node_id));
                 MasterResponse::Registered
             }
-            MasterCommand::ConfirmDrop { partition_id, node_id } => {
+            MasterCommand::ConfirmDrop {
+                partition_id,
+                node_id,
+            } => {
                 // 源节点已不再上报该副本(= 盘上已删/已不再持有)→ 清两条记账。纯记账清理,不碰 placement。
                 self.pending_drop.remove(&(*partition_id, *node_id));
                 if let Some(m) = self.move_targets.get_mut(partition_id) {
@@ -297,13 +324,20 @@ impl MasterState {
                 }
                 MasterResponse::Registered
             }
-            MasterCommand::SetPartitionState { partition_id, state } => {
+            MasterCommand::SetPartitionState {
+                partition_id,
+                state,
+            } => {
                 if let Some(p) = self.partitions.get_mut(partition_id) {
                     p.state = *state;
                 }
                 MasterResponse::Registered
             }
-            MasterCommand::SetMaintenance { paused, pause_autogrow, .. } => {
+            MasterCommand::SetMaintenance {
+                paused,
+                pause_autogrow,
+                ..
+            } => {
                 // 纯赋值、幂等(重放同一 log 序列产出同一状态)。`set_at_ms` 只是 leader 的提案
                 // 时间戳(审计),apply 不取 `now()`——确定性铁律见模块头。
                 self.maintenance = *paused;
@@ -324,7 +358,12 @@ impl MasterState {
                 }
                 MasterResponse::Registered
             }
-            MasterCommand::FailBalanceMove { plan_id, partition_id, from_node_id, error } => {
+            MasterCommand::FailBalanceMove {
+                plan_id,
+                partition_id,
+                from_node_id,
+                error,
+            } => {
                 // 判败一条 move(执行器:在途超时/落点失效)。幂等:同 (pid, from) 已记败则覆盖
                 // error(重放同命令产出同状态);判败后执行器不再重试该条。
                 if let Some(p) = self.balance.as_mut() {
@@ -350,7 +389,10 @@ impl MasterState {
     /// 退化为"其余副本数 ≥ RF 且无 ERROR"的冗余判据,见
     /// [`reconcile::drop_confirmed`](crate::reconcile::drop_confirmed)。
     pub fn move_target_of(&self, pid: PartitionId, from: NodeId) -> Option<NodeId> {
-        self.move_targets.get(&pid).and_then(|m| m.get(&from)).copied()
+        self.move_targets
+            .get(&pid)
+            .and_then(|m| m.get(&from))
+            .copied()
     }
 }
 
@@ -361,36 +403,67 @@ pub enum MasterCommand {
     AllocatePartitionId,
     /// 为某 partition 预留一段 objectId `[start, start+count)`:先经 Raft 提交抬高水位,再由 leader
     /// 切成号段发给 client(两层批处理见 blobid-master-assign)。
-    AllocateObjectId { partition_id: PartitionId, count: u32 },
+    AllocateObjectId {
+        partition_id: PartitionId,
+        count: u32,
+    },
     /// 固化(或覆盖)一个节点的身份 + 容量。
     RegisterNode { node_id: NodeId, info: NodeInfo },
     /// 建分区:分配 id + 写入已选定的副本放置(选盘在 leader 侧先算,见 `placement`)。
-    CreatePartition { replication_factor: u8, replicas: Vec<ReplicaPlacement> },
+    CreatePartition {
+        replication_factor: u8,
+        replicas: Vec<ReplicaPlacement>,
+    },
     /// 再复制:向已有分区追加一个副本(恢复冗余,M3;选盘在 leader 侧先算)。
-    AddReplica { partition_id: PartitionId, replica: ReplicaPlacement },
+    AddReplica {
+        partition_id: PartitionId,
+        replica: ReplicaPlacement,
+    },
     /// 标记节点下线(M4):加入 `decommissioning`,不再作为放置候选。
     DecommissionNode { node_id: NodeId },
     /// 移除分区的一个副本(M4 evacuation 的"删",幂等)。
-    RemoveReplica { partition_id: PartitionId, node_id: NodeId },
+    RemoveReplica {
+        partition_id: PartitionId,
+        node_id: NodeId,
+    },
     /// 副本迁移(MoveReplica):追加新副本(replica)+ 把 from 源记入 `moving`(add-before-remove;
     /// 选盘在 leader 侧先算)。
-    MoveReplica { partition_id: PartitionId, from_node_id: NodeId, replica: ReplicaPlacement },
+    MoveReplica {
+        partition_id: PartitionId,
+        from_node_id: NodeId,
+        replica: ReplicaPlacement,
+    },
     /// 设置分区级写闸门状态(RW/RO/SEALED;admin 运维,对齐 §7.3 盘满转 RO)。
-    SetPartitionState { partition_id: PartitionId, state: PartitionState },
+    SetPartitionState {
+        partition_id: PartitionId,
+        state: PartitionState,
+    },
     /// 确认某源副本已删(A6):源节点心跳不再上报该 `(pid, node)` → 清 `pending_drop` 与
     /// `move_targets` 记账(纯记账清理,不改 placement;幂等)。
-    ConfirmDrop { partition_id: PartitionId, node_id: NodeId },
+    ConfirmDrop {
+        partition_id: PartitionId,
+        node_id: NodeId,
+    },
     /// 开关维护模式(对标 Ceph `osd set/unset noout`):`paused` 暂停自动调谐动作,
     /// `pause_autogrow` 是否连带暂停自动扩容。`set_at_ms` 由 **leader 提案时带入**
     /// (审计用;apply 内不取时钟,见模块头确定性铁律)。
-    SetMaintenance { paused: bool, pause_autogrow: bool, set_at_ms: u64 },
+    SetMaintenance {
+        paused: bool,
+        pause_autogrow: bool,
+        set_at_ms: u64,
+    },
     /// 写/清当前均衡计划(计划式均衡):`Some` = 写入(整体替换旧计划),`None` = 清除
     /// (CancelBalance;**不回滚**已受理的 move,在途迁移由 reconciler 既有"后删"自然收敛)。
     SetBalancePlan { plan: Option<BalancePlanRecord> },
     /// 推进当前计划状态(PREVIEW→RUNNING→DONE);`plan_id` 不匹配当前计划则忽略(防陈旧提案)。
     SetBalanceStatus { plan_id: u64, status: BalanceStatus },
     /// 判败计划内一条 move(记录 error;判败后不再重试)。`plan_id` 不匹配则忽略。
-    FailBalanceMove { plan_id: u64, partition_id: PartitionId, from_node_id: NodeId, error: String },
+    FailBalanceMove {
+        plan_id: u64,
+        partition_id: PartitionId,
+        from_node_id: NodeId,
+        error: String,
+    },
 }
 
 /// 状态机对每条已提交 log 的响应。
@@ -402,7 +475,11 @@ pub enum MasterResponse {
     /// `AllocatePartitionId` 分得的 id。
     PartitionId(PartitionId),
     /// `AllocateObjectId` 预留的 objectId 号段 `[start, start+count)`(已提交进水位)。
-    ObjectIdRange { partition_id: PartitionId, start: ObjectId, count: u32 },
+    ObjectIdRange {
+        partition_id: PartitionId,
+        start: ObjectId,
+        count: u32,
+    },
     /// `AllocateObjectId` 时该 partition 的 u32 objectId 空间已耗尽(应改为封存该 partition,不复用)。
     ObjectIdExhausted { partition_id: PartitionId },
     /// `RegisterNode` 成功。
@@ -427,9 +504,18 @@ mod tests {
     #[test]
     fn allocate_partition_id_is_monotonic() {
         let mut s = MasterState::default();
-        assert_eq!(s.apply_command(&MasterCommand::AllocatePartitionId), MasterResponse::PartitionId(0));
-        assert_eq!(s.apply_command(&MasterCommand::AllocatePartitionId), MasterResponse::PartitionId(1));
-        assert_eq!(s.apply_command(&MasterCommand::AllocatePartitionId), MasterResponse::PartitionId(2));
+        assert_eq!(
+            s.apply_command(&MasterCommand::AllocatePartitionId),
+            MasterResponse::PartitionId(0)
+        );
+        assert_eq!(
+            s.apply_command(&MasterCommand::AllocatePartitionId),
+            MasterResponse::PartitionId(1)
+        );
+        assert_eq!(
+            s.apply_command(&MasterCommand::AllocatePartitionId),
+            MasterResponse::PartitionId(2)
+        );
         assert_eq!(s.next_partition_id, 3);
     }
 
@@ -437,20 +523,35 @@ mod tests {
     fn allocate_object_id_is_monotonic_and_partition_scoped() {
         let mut s = MasterState::default();
         let alloc = |s: &mut MasterState, pid, n| {
-            s.apply_command(&MasterCommand::AllocateObjectId { partition_id: pid, count: n })
+            s.apply_command(&MasterCommand::AllocateObjectId {
+                partition_id: pid,
+                count: n,
+            })
         };
         assert_eq!(
             alloc(&mut s, 7, 1024),
-            MasterResponse::ObjectIdRange { partition_id: 7, start: 0, count: 1024 }
+            MasterResponse::ObjectIdRange {
+                partition_id: 7,
+                start: 0,
+                count: 1024
+            }
         );
         assert_eq!(
             alloc(&mut s, 7, 512),
-            MasterResponse::ObjectIdRange { partition_id: 7, start: 1024, count: 512 }
+            MasterResponse::ObjectIdRange {
+                partition_id: 7,
+                start: 1024,
+                count: 512
+            }
         );
         // 另一 partition 独立从 0 起,互不干扰。
         assert_eq!(
             alloc(&mut s, 9, 100),
-            MasterResponse::ObjectIdRange { partition_id: 9, start: 0, count: 100 }
+            MasterResponse::ObjectIdRange {
+                partition_id: 9,
+                start: 0,
+                count: 100
+            }
         );
         assert_eq!(s.object_next[&7], 1536);
         assert_eq!(s.object_next[&9], 100);
@@ -462,10 +563,17 @@ mod tests {
         s.object_next.insert(3, u32::MAX - 10);
         // 越界申请 → 报耗尽,水位不动(绝不回绕复用)。
         assert_eq!(
-            s.apply_command(&MasterCommand::AllocateObjectId { partition_id: 3, count: 100 }),
+            s.apply_command(&MasterCommand::AllocateObjectId {
+                partition_id: 3,
+                count: 100
+            }),
             MasterResponse::ObjectIdExhausted { partition_id: 3 }
         );
-        assert_eq!(s.object_next[&3], u32::MAX - 10, "exhausted alloc must not advance watermark");
+        assert_eq!(
+            s.object_next[&3],
+            u32::MAX - 10,
+            "exhausted alloc must not advance watermark"
+        );
     }
 
     #[test]
@@ -475,21 +583,43 @@ mod tests {
             dc: "dc1".into(),
             rack: "r1".into(),
             addr: "127.0.0.1:7000".into(),
-            disks: BTreeMap::from([("d0".to_string(), DiskSpec { capacity_bytes: cap })]),
+            disks: BTreeMap::from([(
+                "d0".to_string(),
+                DiskSpec {
+                    capacity_bytes: cap,
+                },
+            )]),
             registered_at_ms: 100,
         };
-        s.apply_command(&MasterCommand::RegisterNode { node_id: 7, info: mk(10) });
-        s.apply_command(&MasterCommand::RegisterNode { node_id: 7, info: mk(20) });
+        s.apply_command(&MasterCommand::RegisterNode {
+            node_id: 7,
+            info: mk(10),
+        });
+        s.apply_command(&MasterCommand::RegisterNode {
+            node_id: 7,
+            info: mk(20),
+        });
         assert_eq!(s.nodes.len(), 1, "same node_id must not duplicate");
-        assert_eq!(s.nodes[&7].disks["d0"].capacity_bytes, 20, "latest report wins");
+        assert_eq!(
+            s.nodes[&7].disks["d0"].capacity_bytes, 20,
+            "latest report wins"
+        );
     }
 
     #[test]
     fn create_partition_allocates_id_and_writes_placement() {
         let mut s = MasterState::default();
         let replicas = vec![
-            ReplicaPlacement { node_id: 1, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-            ReplicaPlacement { node_id: 2, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+            ReplicaPlacement {
+                node_id: 1,
+                disk_id: "d0".into(),
+                target_state: "ACTIVE".into(),
+            },
+            ReplicaPlacement {
+                node_id: 2,
+                disk_id: "d0".into(),
+                target_state: "ACTIVE".into(),
+            },
         ];
         let r = s.apply_command(&MasterCommand::CreatePartition {
             replication_factor: 2,
@@ -516,12 +646,20 @@ mod tests {
         });
         let add = MasterCommand::AddReplica {
             partition_id: 0,
-            replica: ReplicaPlacement { node_id: 2, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+            replica: ReplicaPlacement {
+                node_id: 2,
+                disk_id: "d0".into(),
+                target_state: "ACTIVE".into(),
+            },
         };
         s.apply_command(&add);
         assert_eq!(s.partitions[&0].replicas.len(), 2);
         s.apply_command(&add);
-        assert_eq!(s.partitions[&0].replicas.len(), 2, "AddReplica must be idempotent");
+        assert_eq!(
+            s.partitions[&0].replicas.len(),
+            2,
+            "AddReplica must be idempotent"
+        );
     }
 
     #[test]
@@ -530,18 +668,33 @@ mod tests {
         s.apply_command(&MasterCommand::CreatePartition {
             replication_factor: 2,
             replicas: vec![
-                ReplicaPlacement { node_id: 1, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 2, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 1,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 2,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         });
         s.apply_command(&MasterCommand::DecommissionNode { node_id: 2 });
         assert!(s.decommissioning.contains(&2));
-        let rm = MasterCommand::RemoveReplica { partition_id: 0, node_id: 2 };
+        let rm = MasterCommand::RemoveReplica {
+            partition_id: 0,
+            node_id: 2,
+        };
         s.apply_command(&rm);
         assert_eq!(s.partitions[&0].replicas.len(), 1);
         assert_eq!(s.partitions[&0].replicas[0].node_id, 1);
         s.apply_command(&rm);
-        assert_eq!(s.partitions[&0].replicas.len(), 1, "RemoveReplica must be idempotent");
+        assert_eq!(
+            s.partitions[&0].replicas.len(),
+            1,
+            "RemoveReplica must be idempotent"
+        );
     }
 
     #[test]
@@ -560,18 +713,32 @@ mod tests {
             partition_id: 0,
             state: PartitionState::ReadOnly,
         });
-        assert_eq!(s.partitions[&0].state, PartitionState::ReadOnly, "gate updated to RO");
+        assert_eq!(
+            s.partitions[&0].state,
+            PartitionState::ReadOnly,
+            "gate updated to RO"
+        );
     }
 
     #[test]
     fn set_maintenance_toggles_flags_and_is_idempotent() {
         let mut s = MasterState::default();
-        assert!(!s.maintenance && !s.pause_autogrow, "fresh state is not in maintenance");
+        assert!(
+            !s.maintenance && !s.pause_autogrow,
+            "fresh state is not in maintenance"
+        );
 
-        let on = MasterCommand::SetMaintenance { paused: true, pause_autogrow: false, set_at_ms: 7 };
+        let on = MasterCommand::SetMaintenance {
+            paused: true,
+            pause_autogrow: false,
+            set_at_ms: 7,
+        };
         s.apply_command(&on);
         assert!(s.maintenance, "maintenance must be on");
-        assert!(!s.pause_autogrow, "auto-grow stays enabled unless requested");
+        assert!(
+            !s.pause_autogrow,
+            "auto-grow stays enabled unless requested"
+        );
 
         // 幂等:重放同一命令不改变结果。
         s.apply_command(&on);
@@ -600,28 +767,60 @@ mod tests {
         s.apply_command(&MasterCommand::CreatePartition {
             replication_factor: 2,
             replicas: vec![
-                ReplicaPlacement { node_id: 1, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 2, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 1,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 2,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         });
         let mv = MasterCommand::MoveReplica {
             partition_id: 0,
             from_node_id: 2,
-            replica: ReplicaPlacement { node_id: 3, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+            replica: ReplicaPlacement {
+                node_id: 3,
+                disk_id: "d0".into(),
+                target_state: "ACTIVE".into(),
+            },
         };
         s.apply_command(&mv);
-        assert_eq!(s.partitions[&0].replicas.len(), 3, "new replica added before remove");
-        assert!(s.moving.contains(&(0, 2)), "source must be marked moving-out");
-        assert_eq!(s.move_target_of(0, 2), Some(3), "successor must be recorded for the later drop");
+        assert_eq!(
+            s.partitions[&0].replicas.len(),
+            3,
+            "new replica added before remove"
+        );
+        assert!(
+            s.moving.contains(&(0, 2)),
+            "source must be marked moving-out"
+        );
+        assert_eq!(
+            s.move_target_of(0, 2),
+            Some(3),
+            "successor must be recorded for the later drop"
+        );
         // 幂等:重放同命令不重复追加、不重复标记。
         s.apply_command(&mv);
         assert_eq!(s.partitions[&0].replicas.len(), 3);
         assert_eq!(s.moving.len(), 1);
         // RemoveReplica 顺带清 moving,并记一条待删源副本(等源节点不再上报后 ConfirmDrop 摘除)。
-        s.apply_command(&MasterCommand::RemoveReplica { partition_id: 0, node_id: 2 });
+        s.apply_command(&MasterCommand::RemoveReplica {
+            partition_id: 0,
+            node_id: 2,
+        });
         assert_eq!(s.partitions[&0].replicas.len(), 2);
-        assert!(s.moving.is_empty(), "removing the source must clear its moving mark");
-        assert!(s.pending_drop.contains(&(0, 2)), "removal must record a pending drop for the source");
+        assert!(
+            s.moving.is_empty(),
+            "removing the source must clear its moving mark"
+        );
+        assert!(
+            s.pending_drop.contains(&(0, 2)),
+            "removal must record a pending drop for the source"
+        );
         assert_eq!(
             s.move_target_of(0, 2),
             Some(3),
@@ -635,22 +834,49 @@ mod tests {
         s.apply_command(&MasterCommand::CreatePartition {
             replication_factor: 2,
             replicas: vec![
-                ReplicaPlacement { node_id: 1, disk_id: "d0".into(), target_state: "ACTIVE".into() },
-                ReplicaPlacement { node_id: 2, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+                ReplicaPlacement {
+                    node_id: 1,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
+                ReplicaPlacement {
+                    node_id: 2,
+                    disk_id: "d0".into(),
+                    target_state: "ACTIVE".into(),
+                },
             ],
         });
         // evacuation 式移除(无 move 记账):也要记待删,靠冗余判据确认。
-        s.apply_command(&MasterCommand::RemoveReplica { partition_id: 0, node_id: 2 });
-        assert_eq!(s.pending_drop.iter().copied().collect::<Vec<_>>(), vec![(0, 2)]);
-        assert_eq!(s.move_target_of(0, 2), None, "no move bookkeeping for an evacuation removal");
+        s.apply_command(&MasterCommand::RemoveReplica {
+            partition_id: 0,
+            node_id: 2,
+        });
+        assert_eq!(
+            s.pending_drop.iter().copied().collect::<Vec<_>>(),
+            vec![(0, 2)]
+        );
+        assert_eq!(
+            s.move_target_of(0, 2),
+            None,
+            "no move bookkeeping for an evacuation removal"
+        );
 
-        let confirm = MasterCommand::ConfirmDrop { partition_id: 0, node_id: 2 };
+        let confirm = MasterCommand::ConfirmDrop {
+            partition_id: 0,
+            node_id: 2,
+        };
         s.apply_command(&confirm);
-        assert!(s.pending_drop.is_empty(), "confirmed drop must clear pending_drop");
+        assert!(
+            s.pending_drop.is_empty(),
+            "confirmed drop must clear pending_drop"
+        );
         // 幂等:重放确认命令不改变状态。
         s.apply_command(&confirm);
         assert!(s.pending_drop.is_empty());
-        assert!(s.move_targets.is_empty(), "empty successor bookkeeping must be pruned");
+        assert!(
+            s.move_targets.is_empty(),
+            "empty successor bookkeeping must be pruned"
+        );
     }
 
     #[test]
@@ -668,8 +894,14 @@ mod tests {
             "pause_autogrow": false
         });
         let s: MasterState = serde_json::from_value(old_json).expect("old format must deserialize");
-        assert!(s.move_targets.is_empty(), "missing move_targets must default to empty");
-        assert!(s.pending_drop.is_empty(), "missing pending_drop must default to empty");
+        assert!(
+            s.move_targets.is_empty(),
+            "missing move_targets must default to empty"
+        );
+        assert!(
+            s.pending_drop.is_empty(),
+            "missing pending_drop must default to empty"
+        );
         assert!(s.moving.contains(&(0, 101)));
         assert!(s.maintenance);
     }
@@ -690,11 +922,19 @@ mod tests {
         s.apply_command(&MasterCommand::MoveReplica {
             partition_id: 0,
             from_node_id: 1,
-            replica: ReplicaPlacement { node_id: 2, disk_id: "d0".into(), target_state: "ACTIVE".into() },
+            replica: ReplicaPlacement {
+                node_id: 2,
+                disk_id: "d0".into(),
+                target_state: "ACTIVE".into(),
+            },
         });
-        s.apply_command(&MasterCommand::RemoveReplica { partition_id: 0, node_id: 1 });
+        s.apply_command(&MasterCommand::RemoveReplica {
+            partition_id: 0,
+            node_id: 1,
+        });
 
-        let bytes = serde_json::to_vec(&s).expect("state must serialize (nested map, no tuple keys)");
+        let bytes =
+            serde_json::to_vec(&s).expect("state must serialize (nested map, no tuple keys)");
         let back: MasterState = serde_json::from_slice(&bytes).expect("must deserialize");
         assert_eq!(back, s, "drop bookkeeping must survive a JSON round trip");
         assert_eq!(back.move_target_of(0, 1), Some(2));
@@ -732,7 +972,10 @@ mod tests {
         });
         let s: MasterState = serde_json::from_value(old_json).expect("old format must deserialize");
         assert!(!s.maintenance, "missing maintenance must default to false");
-        assert!(!s.pause_autogrow, "missing pause_autogrow must default to false");
+        assert!(
+            !s.pause_autogrow,
+            "missing pause_autogrow must default to false"
+        );
         assert!(s.moving.contains(&(0, 101)));
     }
 
@@ -775,14 +1018,31 @@ mod tests {
     fn balance_plan_commands_are_deterministic_and_plan_id_scoped() {
         let mut s = MasterState::default();
         // 写入计划。
-        s.apply_command(&MasterCommand::SetBalancePlan { plan: Some(preview_plan(1)) });
-        assert_eq!(s.balance.as_ref().map(|p| p.status), Some(BalanceStatus::Preview));
+        s.apply_command(&MasterCommand::SetBalancePlan {
+            plan: Some(preview_plan(1)),
+        });
+        assert_eq!(
+            s.balance.as_ref().map(|p| p.status),
+            Some(BalanceStatus::Preview)
+        );
         // 陈旧 plan_id 的状态推进被忽略。
-        s.apply_command(&MasterCommand::SetBalanceStatus { plan_id: 99, status: BalanceStatus::Running });
-        assert_eq!(s.balance.as_ref().map(|p| p.status), Some(BalanceStatus::Preview));
+        s.apply_command(&MasterCommand::SetBalanceStatus {
+            plan_id: 99,
+            status: BalanceStatus::Running,
+        });
+        assert_eq!(
+            s.balance.as_ref().map(|p| p.status),
+            Some(BalanceStatus::Preview)
+        );
         // 匹配 plan_id → 推进。
-        s.apply_command(&MasterCommand::SetBalanceStatus { plan_id: 1, status: BalanceStatus::Running });
-        assert_eq!(s.balance.as_ref().map(|p| p.status), Some(BalanceStatus::Running));
+        s.apply_command(&MasterCommand::SetBalanceStatus {
+            plan_id: 1,
+            status: BalanceStatus::Running,
+        });
+        assert_eq!(
+            s.balance.as_ref().map(|p| p.status),
+            Some(BalanceStatus::Running)
+        );
         // 判败一条 move;重放幂等(不重复追加)。
         let fail = MasterCommand::FailBalanceMove {
             plan_id: 1,
@@ -793,7 +1053,11 @@ mod tests {
         s.apply_command(&fail);
         s.apply_command(&fail);
         let p = s.balance.as_ref().expect("plan present");
-        assert_eq!(p.failed.len(), 1, "replay must not duplicate the failure record");
+        assert_eq!(
+            p.failed.len(),
+            1,
+            "replay must not duplicate the failure record"
+        );
         assert_eq!(p.failed[0], (7, 101, "move stuck".to_string()));
         // 陈旧 plan_id 的判败被忽略。
         s.apply_command(&MasterCommand::FailBalanceMove {
@@ -807,7 +1071,10 @@ mod tests {
         s.apply_command(&MasterCommand::SetBalancePlan { plan: None });
         assert_eq!(s.balance, None);
         // 计划已清:状态推进/判败都打不到任何计划。
-        s.apply_command(&MasterCommand::SetBalanceStatus { plan_id: 1, status: BalanceStatus::Done });
+        s.apply_command(&MasterCommand::SetBalanceStatus {
+            plan_id: 1,
+            status: BalanceStatus::Done,
+        });
         assert_eq!(s.balance, None);
     }
 
@@ -815,7 +1082,9 @@ mod tests {
     fn balance_plan_round_trips_through_json() {
         // 状态机经 JSON 落 redb:计划必须能序列化再读回。
         let mut s = MasterState::default();
-        s.apply_command(&MasterCommand::SetBalancePlan { plan: Some(preview_plan(3)) });
+        s.apply_command(&MasterCommand::SetBalancePlan {
+            plan: Some(preview_plan(3)),
+        });
         s.apply_command(&MasterCommand::FailBalanceMove {
             plan_id: 3,
             partition_id: 7,
@@ -834,8 +1103,11 @@ mod tests {
             MasterCommand::RegisterNode {
                 node_id: 1,
                 info: NodeInfo {
-                    dc: "d".into(), rack: "r".into(), addr: "a:1".into(),
-                    disks: BTreeMap::new(), registered_at_ms: 5,
+                    dc: "d".into(),
+                    rack: "r".into(),
+                    addr: "a:1".into(),
+                    disks: BTreeMap::new(),
+                    registered_at_ms: 5,
                 },
             },
             MasterCommand::AllocatePartitionId,

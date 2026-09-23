@@ -47,7 +47,10 @@ pub struct Actor {
 impl Actor {
     /// 关校验(仅本地)时的身份:名为 `local`,全权。
     fn local() -> Actor {
-        Actor { name: "local".into(), role: Role::Operator }
+        Actor {
+            name: "local".into(),
+            role: Role::Operator,
+        }
     }
 }
 
@@ -68,16 +71,29 @@ impl AuthConfig {
     /// 令牌 → 身份:**先查 `users`**(按 token 精确匹配),再回落旧的两个令牌
     /// (actor 名分别为 `operator` / `viewer`);都不匹配 → `None`(401)。
     fn resolve(&self, token: &str) -> Option<Actor> {
-        if let Some(u) = self.users.iter().find(|u| !u.token.is_empty() && u.token == token) {
+        if let Some(u) = self
+            .users
+            .iter()
+            .find(|u| !u.token.is_empty() && u.token == token)
+        {
             // 角色非法说明未过 `AdminConfig::validate`(直接构造 AuthConfig 的调用方);按最小权限处理。
             let role = Role::parse(&u.role).unwrap_or(Role::Viewer);
-            return Some(Actor { name: u.name.clone(), role });
+            return Some(Actor {
+                name: u.name.clone(),
+                role,
+            });
         }
         if !self.operator_token.is_empty() && token == self.operator_token {
-            return Some(Actor { name: "operator".into(), role: Role::Operator });
+            return Some(Actor {
+                name: "operator".into(),
+                role: Role::Operator,
+            });
         }
         if !self.viewer_token.is_empty() && token == self.viewer_token {
-            return Some(Actor { name: "viewer".into(), role: Role::Viewer });
+            return Some(Actor {
+                name: "viewer".into(),
+                role: Role::Viewer,
+            });
         }
         None
     }
@@ -92,7 +108,11 @@ struct ApiLayers {
 
 /// 取 `Authorization: Bearer <token>` 的令牌部分。
 fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 /// 请求 → 身份:关校验时 `local`;否则解析令牌(缺失/未知 → `None` → 401)。
@@ -121,7 +141,10 @@ fn audited(method: &Method, path: &str) -> bool {
 /// 建路由:`/api/*` 经审计(最外层)+ RBAC(GET=viewer|operator,写=operator);
 /// `/metrics` 无鉴权(Prometheus 抓取惯例);其余回退 SPA。
 pub fn build_router(state: AppState, auth: AuthConfig) -> Router {
-    let layers = ApiLayers { auth: auth.clone(), audit: state.audit.clone() };
+    let layers = ApiLayers {
+        auth: auth.clone(),
+        audit: state.audit.clone(),
+    };
     let api = Router::new()
         .route("/api/me", get(get_me))
         .route("/api/cluster", get(get_cluster))
@@ -217,8 +240,13 @@ async fn audit_requests(
         };
         layers.audit.record(&AuditEntry {
             ts_ms: now_ms(),
-            actor: actor.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "anonymous".into()),
-            role: actor.as_ref().map_or("none".to_string(), |a| a.role.as_str().to_string()),
+            actor: actor
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "anonymous".into()),
+            role: actor
+                .as_ref()
+                .map_or("none".to_string(), |a| a.role.as_str().to_string()),
             method: method.as_str().to_string(),
             path,
             status: resp.status().as_u16(),
@@ -299,7 +327,11 @@ async fn get_partitions(
         )
             .into_response();
     }
-    match st.master.partitions(&page.state, page.offset, page.limit).await {
+    match st
+        .master
+        .partitions(&page.state, page.offset, page.limit)
+        .await
+    {
         Ok((items, total)) => Json(json!({
             "items": items,
             "total": total,
@@ -342,7 +374,11 @@ async fn post_partitions(
 ) -> Response {
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
-    match st.master.create_partitions(body.count, body.replication_factor).await {
+    match st
+        .master
+        .create_partitions(body.count, body.replication_factor)
+        .await
+    {
         Ok(ids) => Json(json!({ "partition_ids": ids })).into_response(),
         Err(e) => map_err(&st, e).into_response(),
     }
@@ -389,16 +425,27 @@ async fn get_prometheus_metrics(State(st): State<AppState>) -> Response {
 
 /// 取第一个匹配 sample 的值(无 label 指标),缺省 0。
 fn pick(samples: &[antfs_metric::Sample], name: &str) -> u64 {
-    samples.iter().find(|s| s.name == name).map(|s| s.value as u64).unwrap_or(0)
+    samples
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.value as u64)
+        .unwrap_or(0)
 }
 
 /// 按指标名求和(同名带 label 变体也合并)。
 fn sum_by_name(samples: &[antfs_metric::Sample], name: &str) -> u64 {
-    samples.iter().filter(|s| s.name == name).map(|s| s.value as u64).sum()
+    samples
+        .iter()
+        .filter(|s| s.name == name)
+        .map(|s| s.value as u64)
+        .sum()
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// `GET /api/metrics`:聚合 JSON(master 段 + admin 段 + 各 store 抓取)。master/store
@@ -408,7 +455,11 @@ async fn get_api_metrics(State(st): State<AppState>) -> Response {
     st.metrics.api_requests.inc();
 
     let (master, master_ok, master_error) = match st.master.master_metrics_text().await {
-        Ok(text) => (master_json(&antfs_metric::parse(&text)), true, String::new()),
+        Ok(text) => (
+            master_json(&antfs_metric::parse(&text)),
+            true,
+            String::new(),
+        ),
         Err(e) => {
             st.metrics.master_rpc_errors.inc();
             tracing::warn!(error = %e, "master metrics unavailable");
@@ -497,7 +548,11 @@ type HttpClient = store_client::HttpClient;
 
 /// 抓一个 store 节点的 `/metrics` 并聚合成契约字段;失败/超时 → scrape_ok=false + 计 `store_scrape_errors`。
 /// `node.up=false` 也照抓(master 的心跳超时判定与 HTTP 活性可能不一致)。
-async fn scrape_store(client: HttpClient, metrics: Arc<AdminMetrics>, node: NodeDto) -> serde_json::Value {
+async fn scrape_store(
+    client: HttpClient,
+    metrics: Arc<AdminMetrics>,
+    node: NodeDto,
+) -> serde_json::Value {
     let url = format!("http://{}/metrics", node.addr);
     match store_client::get_text(&client, &url).await {
         Some(text) => {
@@ -554,7 +609,11 @@ async fn scrape_store(client: HttpClient, metrics: Arc<AdminMetrics>, node: Node
 /// 成功 blob 请求数,按 `op` × `size` **精确取自** `store_server_blob_request_duration_seconds_count`
 /// 的对应标签组合(该指标名下有 6 组 sample,按名求和会把这 6 组混成一锅)。
 fn blob_count(s: &[antfs_metric::Sample], op: &str, size: &str) -> u64 {
-    pick_labeled(s, "store_server_blob_request_duration_seconds_count", &[("op", op), ("size", size)])
+    pick_labeled(
+        s,
+        "store_server_blob_request_duration_seconds_count",
+        &[("op", op), ("size", size)],
+    )
 }
 
 /// 取同时匹配全部 `want` label 的样本值;取不到填 0(契约稳定,前端不做存在性判断)。
@@ -563,7 +622,9 @@ fn pick_labeled(samples: &[antfs_metric::Sample], name: &str, want: &[(&str, &st
         .iter()
         .find(|s| {
             s.name == name
-                && want.iter().all(|(k, v)| s.labels.iter().any(|(lk, lv)| lk == k && lv == v))
+                && want
+                    .iter()
+                    .all(|(k, v)| s.labels.iter().any(|(lk, lv)| lk == k && lv == v))
         })
         .map(|s| s.value as u64)
         .unwrap_or(0)
@@ -606,7 +667,11 @@ async fn post_move(
 ) -> Response {
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
-    match st.master.move_replica(id, body.from_node_id, body.to_node_id).await {
+    match st
+        .master
+        .move_replica(id, body.from_node_id, body.to_node_id)
+        .await
+    {
         Ok(o) => Json(o).into_response(),
         Err(e) => map_err(&st, e).into_response(),
     }
@@ -664,7 +729,9 @@ async fn post_scrub(
     let verdict = crate::scrub::compare(&facts);
     st.metrics.scrub_runs.inc();
     if !verdict.divergences.is_empty() {
-        st.metrics.scrub_divergences.inc_by(verdict.divergences.len() as u64);
+        st.metrics
+            .scrub_divergences
+            .inc_by(verdict.divergences.len() as u64);
     }
     let checked_at_ms = now_ms();
     st.scrub_runs.push(crate::scrub::ScrubRun {
@@ -743,7 +810,8 @@ async fn scrub_replica(
     };
 
     // ① 摘要
-    match store_client::get_status(&client, &format!("{base}/partitions/{pid}/scrub-report")).await {
+    match store_client::get_status(&client, &format!("{base}/partitions/{pid}/scrub-report")).await
+    {
         Ok((StatusCode::OK, body)) => match serde_json::from_str::<serde_json::Value>(&body) {
             Ok(v) => {
                 let segments = v["segments"]
@@ -764,6 +832,8 @@ async fn scrub_replica(
                     segments,
                     token_seg: v["token_seg"].as_u64(),
                     token_off: v["token_off"].as_u64(),
+                    damaged_records: v["damaged_records"].as_u64().unwrap_or(0),
+                    abandoned_segments: v["abandoned_segments"].as_u64().unwrap_or(0),
                 });
             }
             Err(e) => {
@@ -782,9 +852,8 @@ async fn scrub_replica(
     }
 
     // ② 元数据窗口(按 key 求最终态)
-    let url = format!(
-        "{base}/partitions/{pid}/replica-metadata?max_bytes={SCRUB_METADATA_MAX_BYTES}"
-    );
+    let url =
+        format!("{base}/partitions/{pid}/replica-metadata?max_bytes={SCRUB_METADATA_MAX_BYTES}");
     match store_client::get_status(&client, &url).await {
         Ok((StatusCode::OK, body)) => match serde_json::from_str::<serde_json::Value>(&body) {
             Ok(v) => {
@@ -792,12 +861,13 @@ async fn scrub_replica(
                     std::collections::BTreeMap::new();
                 if let Some(entries) = v["entries"].as_array() {
                     for e in entries {
-                        let Some(key) = e["key"].as_str() else { continue };
+                        let Some(key) = e["key"].as_str() else {
+                            continue;
+                        };
                         map.insert(
                             key.to_string(),
                             KeyState {
                                 deleted: e["deleted"].as_bool().unwrap_or(false),
-                                life_version: e["life_version"].as_u64().unwrap_or(0) as u16,
                                 size: e["size"].as_u64().unwrap_or(0),
                             },
                         );
@@ -872,6 +942,9 @@ fn scrub_report_json(
                     "segments": r.segments.iter().map(|(p, e)| json!({"position": p, "data_end": e})).collect::<Vec<_>>(),
                     "token_seg": r.token_seg,
                     "token_off": r.token_off,
+                    // 带伤启动计数:随报告一起给前端/运维看(0 = 干净)。
+                    "damaged_records": r.damaged_records,
+                    "abandoned_segments": r.abandoned_segments,
                 })),
                 "key_count": f.keys.as_ref().map(|m| m.len()),
                 "partial": f.partial,
@@ -1003,7 +1076,10 @@ async fn submit_compact_replica(
     pid: u32,
     replica: ReplicaDto,
 ) -> serde_json::Value {
-    let url = format!("http://{}/admin/partitions/{pid}/compact?async=1", replica.addr);
+    let url = format!(
+        "http://{}/admin/partitions/{pid}/compact?async=1",
+        replica.addr
+    );
     let node_id = replica.node_id;
     match store_client::post_empty(&client, &url).await {
         Ok((status, body)) if status.is_success() => {
@@ -1048,7 +1124,11 @@ async fn get_compact_jobs(State(st): State<AppState>, Path(id): Path<u32>) -> Re
 const MAX_COMPACT_JOBS_PER_NODE: usize = 5;
 
 /// 取一个副本节点上该分区的最近若干条 compact 任务(store `GET /admin/compactions` 后本地过滤)。
-async fn compact_jobs_replica(client: HttpClient, pid: u32, replica: ReplicaDto) -> serde_json::Value {
+async fn compact_jobs_replica(
+    client: HttpClient,
+    pid: u32,
+    replica: ReplicaDto,
+) -> serde_json::Value {
     let url = format!("http://{}/admin/compactions", replica.addr);
     let node_id = replica.node_id;
     match store_client::get_status(&client, &url).await {
@@ -1117,7 +1197,10 @@ struct BalancePlanIdBody {
 }
 
 /// `POST /api/balance/eval`(operator):评估并落一份 PREVIEW 计划。
-async fn post_balance_eval(State(st): State<AppState>, Json(body): Json<BalanceEvalBody>) -> Response {
+async fn post_balance_eval(
+    State(st): State<AppState>,
+    Json(body): Json<BalanceEvalBody>,
+) -> Response {
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
     match st.master.balance_eval(body.max_moves).await {
@@ -1127,7 +1210,10 @@ async fn post_balance_eval(State(st): State<AppState>, Json(body): Json<BalanceE
 }
 
 /// `POST /api/balance/start`(operator):确认执行指定计划(plan_id 防陈旧确认)。
-async fn post_balance_start(State(st): State<AppState>, Json(body): Json<BalancePlanIdBody>) -> Response {
+async fn post_balance_start(
+    State(st): State<AppState>,
+    Json(body): Json<BalancePlanIdBody>,
+) -> Response {
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
     match st.master.balance_start(body.plan_id).await {
@@ -1137,7 +1223,10 @@ async fn post_balance_start(State(st): State<AppState>, Json(body): Json<Balance
 }
 
 /// `POST /api/balance/cancel`(operator):取消计划(不回滚已 apply 的搬迁,在途由 reconciler 自然收敛)。
-async fn post_balance_cancel(State(st): State<AppState>, Json(body): Json<BalancePlanIdBody>) -> Response {
+async fn post_balance_cancel(
+    State(st): State<AppState>,
+    Json(body): Json<BalancePlanIdBody>,
+) -> Response {
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
     match st.master.balance_cancel(body.plan_id).await {
@@ -1147,17 +1236,27 @@ async fn post_balance_cancel(State(st): State<AppState>, Json(body): Json<Balanc
 }
 
 /// `POST /api/maintenance`(operator):维护模式开关,转发 master `SetMaintenance`。
-async fn post_maintenance(State(st): State<AppState>, Json(body): Json<MaintenanceBody>) -> Response {
+async fn post_maintenance(
+    State(st): State<AppState>,
+    Json(body): Json<MaintenanceBody>,
+) -> Response {
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
-    match st.master.set_maintenance(body.paused, body.pause_autogrow).await {
+    match st
+        .master
+        .set_maintenance(body.paused, body.pause_autogrow)
+        .await
+    {
         Ok(()) => (StatusCode::OK, "maintenance updated").into_response(),
         Err(e) => map_err(&st, e).into_response(),
     }
 }
 
 /// `node_id → addr`:从 master 节点清单里找;无此节点 → 404。
-async fn node_addr(st: &AppState, node_id: u64) -> std::result::Result<String, (StatusCode, String)> {
+async fn node_addr(
+    st: &AppState,
+    node_id: u64,
+) -> std::result::Result<String, (StatusCode, String)> {
     match st.master.nodes().await {
         Ok(nodes) => nodes
             .into_iter()
@@ -1187,7 +1286,10 @@ async fn post_store_request_control(
 }
 
 /// `GET /api/stores/{node_id}/request-control`:该 store 当前的禁用集(JSON 数组)。
-async fn get_store_request_control(State(st): State<AppState>, Path(node_id): Path<u64>) -> Response {
+async fn get_store_request_control(
+    State(st): State<AppState>,
+    Path(node_id): Path<u64>,
+) -> Response {
     st.metrics.api_requests.inc();
     let addr = match node_addr(&st, node_id).await {
         Ok(a) => a,
@@ -1217,7 +1319,10 @@ async fn post_store_replication_control(
 }
 
 /// `GET /api/stores/{node_id}/replication-control`:该 store 当前的复制开关(`{"paused":bool}`)。
-async fn get_store_replication_control(State(st): State<AppState>, Path(node_id): Path<u64>) -> Response {
+async fn get_store_replication_control(
+    State(st): State<AppState>,
+    Path(node_id): Path<u64>,
+) -> Response {
     st.metrics.api_requests.inc();
     let addr = match node_addr(&st, node_id).await {
         Ok(a) => a,
@@ -1353,7 +1458,11 @@ mod tests {
             let all: Vec<PartitionDto> = (0..5u32)
                 .map(|i| PartitionDto {
                     partition_id: i,
-                    state: if i == 0 { "RO".to_string() } else { "RW".to_string() },
+                    state: if i == 0 {
+                        "RO".to_string()
+                    } else {
+                        "RW".to_string()
+                    },
                     replication_factor: 3,
                     replicas: self.replicas.clone(),
                     used_bytes: self.used_bytes,
@@ -1364,8 +1473,17 @@ mod tests {
                 })
                 .filter(|p| state.is_empty() || p.state == state)
                 .collect();
-            let take = if limit == 0 { all.len() } else { limit as usize };
-            let page = all.iter().skip(offset as usize).take(take).cloned().collect();
+            let take = if limit == 0 {
+                all.len()
+            } else {
+                limit as usize
+            };
+            let page = all
+                .iter()
+                .skip(offset as usize)
+                .take(take)
+                .cloned()
+                .collect();
             Ok((page, all.len() as u64))
         }
         async fn create_partitions(&self, count: u32, _rf: u32) -> crate::error::Result<Vec<u32>> {
@@ -1399,8 +1517,16 @@ mod tests {
                 .ok_or(crate::error::Error::PartitionNotFound(partition_id))
         }
         async fn repair_partition(&self, partition_id: u32) -> crate::error::Result<RepairOutcome> {
-            self.calls.lock().unwrap_or_else(|p| p.into_inner()).push(format!("repair {partition_id}"));
-            Ok(RepairOutcome { ok: true, error: String::new(), added_node_id: 104, added_disk_id: "d1".into() })
+            self.calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(format!("repair {partition_id}"));
+            Ok(RepairOutcome {
+                ok: true,
+                error: String::new(),
+                added_node_id: 104,
+                added_disk_id: "d1".into(),
+            })
         }
         async fn move_replica(
             &self,
@@ -1412,7 +1538,12 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(format!("move {partition_id} {from_node_id} {to_node_id}"));
-            Ok(MoveOutcome { ok: true, error: String::new(), to_node_id, to_disk_id: "d2".into() })
+            Ok(MoveOutcome {
+                ok: true,
+                error: String::new(),
+                to_node_id,
+                to_disk_id: "d2".into(),
+            })
         }
 
         async fn balance_state(&self) -> crate::error::Result<BalanceStateDto> {
@@ -1447,7 +1578,11 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .push(format!("balance eval {max_moves}"));
             let state = self.balance_state().await?;
-            Ok(BalanceOpOutcome { ok: true, error: String::new(), plan: state.plan })
+            Ok(BalanceOpOutcome {
+                ok: true,
+                error: String::new(),
+                plan: state.plan,
+            })
         }
 
         async fn balance_start(&self, plan_id: u64) -> crate::error::Result<BalanceOpOutcome> {
@@ -1458,7 +1593,11 @@ mod tests {
             let ok = plan_id == 7;
             Ok(BalanceOpOutcome {
                 ok,
-                error: if ok { String::new() } else { format!("plan {plan_id} not found") },
+                error: if ok {
+                    String::new()
+                } else {
+                    format!("plan {plan_id} not found")
+                },
                 plan: None,
             })
         }
@@ -1468,18 +1607,25 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(format!("balance cancel {plan_id}"));
-            Ok(BalanceOpOutcome { ok: true, error: String::new(), plan: None })
+            Ok(BalanceOpOutcome {
+                ok: true,
+                error: String::new(),
+                plan: None,
+            })
         }
     }
 
     /// 测试用审计路径:父目录不存在 → 降级空实现(不产生文件,也不互相干扰)。
     fn no_audit() -> Arc<AuditLog> {
-        Arc::new(AuditLog::open(std::env::temp_dir().join("antfs-admin-audit-none/t.jsonl")))
+        Arc::new(AuditLog::open(
+            std::env::temp_dir().join("antfs-admin-audit-none/t.jsonl"),
+        ))
     }
 
     /// 每个测试独立的审计文件(并行测试 + 复用进程 pid,故带上 tag)。
     fn audit_file(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("antfs-admin-audit-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("antfs-admin-audit-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("audit.jsonl")
     }
@@ -1606,7 +1752,9 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["role"], "viewer");
     }
@@ -1614,10 +1762,14 @@ mod tests {
     #[tokio::test]
     async fn partitions_paginated_with_total() {
         let router = app("");
-        let req = Request::get("/api/partitions?offset=1&limit=2").body(Body::empty()).unwrap();
+        let req = Request::get("/api/partitions?offset=1&limit=2")
+            .body(Body::empty())
+            .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["total"], 5);
         assert_eq!(v["items"].as_array().unwrap().len(), 2);
@@ -1632,7 +1784,9 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["partition_ids"].as_array().unwrap().len(), 3);
     }
@@ -1646,7 +1800,9 @@ mod tests {
 
     async fn body_json(router: &Router, req: Request<Body>) -> serde_json::Value {
         let resp = router.clone().oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         serde_json::from_slice(&body).unwrap()
     }
 
@@ -1689,7 +1845,9 @@ mod tests {
                 let rec = rec.clone();
                 async move {
                     let text = String::from_utf8_lossy(&body).to_string();
-                    rec.lock().unwrap_or_else(|p| p.into_inner()).push(text.clone());
+                    rec.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(text.clone());
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                     if v["op"] == "bogus" {
                         return (StatusCode::BAD_REQUEST, "unknown op: bogus").into_response();
@@ -1714,10 +1872,18 @@ mod tests {
         let req = Request::get("/metrics").body(Body::empty()).unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("admin_api_requests_total"), "admin 自身指标: {text}");
-        assert!(text.contains("master_raft_term 3"), "master GetMetrics 文本: {text}");
+        assert!(
+            text.contains("admin_api_requests_total"),
+            "admin 自身指标: {text}"
+        );
+        assert!(
+            text.contains("master_raft_term 3"),
+            "master GetMetrics 文本: {text}"
+        );
     }
 
     #[tokio::test]
@@ -1768,11 +1934,16 @@ mod tests {
 
     #[tokio::test]
     async fn partitions_state_filter_is_forwarded_and_validated() {
-        let master = Arc::new(FakeMaster { used_bytes: 7, ..Default::default() });
+        let master = Arc::new(FakeMaster {
+            used_bytes: 7,
+            ..Default::default()
+        });
         let router = app_with(master.clone(), AuthConfig::default());
 
         // state=RW:透传给 master(过滤先于分页),DTO 带 used_bytes。
-        let req = Request::get("/api/partitions?state=RW&offset=0&limit=2").body(Body::empty()).unwrap();
+        let req = Request::get("/api/partitions?state=RW&offset=0&limit=2")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v["total"], 4, "假 master 里 5 个分区有 1 个 RO: {v}");
         assert_eq!(v["items"].as_array().unwrap().len(), 2);
@@ -1786,7 +1957,9 @@ mod tests {
         assert_eq!(master.take_calls(), vec!["partitions  0 0"]);
 
         // 非法 state 在 admin 边界即拒(不打扰 master)。
-        let req = Request::get("/api/partitions?state=BOGUS").body(Body::empty()).unwrap();
+        let req = Request::get("/api/partitions?state=BOGUS")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::BAD_REQUEST);
         assert_eq!(master.take_calls(), Vec::<String>::new());
     }
@@ -1810,16 +1983,24 @@ mod tests {
             .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::OK);
 
-        assert_eq!(master.take_calls(), vec!["maintenance true true", "maintenance false false"]);
+        assert_eq!(
+            master.take_calls(),
+            vec!["maintenance true true", "maintenance false false"]
+        );
     }
 
     #[tokio::test]
     async fn request_control_forwards_to_store_and_surfaces_errors() {
         let (addr, seen) = spawn_request_control_store().await;
-        let router = app_with(Arc::new(FakeMaster::default().with_node(101, &addr)), AuthConfig::default());
+        let router = app_with(
+            Arc::new(FakeMaster::default().with_node(101, &addr)),
+            AuthConfig::default(),
+        );
 
         // GET:store 当前禁用集原样透出。
-        let req = Request::get("/api/stores/101/request-control").body(Body::empty()).unwrap();
+        let req = Request::get("/api/stores/101/request-control")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v[0]["op"], "put");
         assert_eq!(v[0]["remaining_secs"], 900);
@@ -1827,13 +2008,18 @@ mod tests {
         // POST:body 原样转发到 store(含 partition_id / ttl_secs)。
         let req = Request::post("/api/stores/101/request-control")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"op":"put","partition_id":3,"enable":true,"ttl_secs":600}"#))
+            .body(Body::from(
+                r#"{"op":"put","partition_id":3,"enable":true,"ttl_secs":600}"#,
+            ))
             .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v[0]["op"], "put");
         assert_eq!(v[0]["remaining_secs"], 600);
         let sent: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
-        assert_eq!(sent, json!({ "op": "put", "partition_id": 3, "enable": true, "ttl_secs": 600 }));
+        assert_eq!(
+            sent,
+            json!({ "op": "put", "partition_id": 3, "enable": true, "ttl_secs": 600 })
+        );
 
         // store 的 400(未知 op)原样透出。
         let req = Request::post("/api/stores/101/request-control")
@@ -1842,11 +2028,18 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("unknown op"), "store 错误文本应透出");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("unknown op"),
+            "store 错误文本应透出"
+        );
 
         // master 无此节点 → 404(不发起转发)。
-        let req = Request::get("/api/stores/999/request-control").body(Body::empty()).unwrap();
+        let req = Request::get("/api/stores/999/request-control")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
 
         // 节点存在但连不上 → 502 + 原因。
@@ -1854,21 +2047,32 @@ mod tests {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap().to_string()
         };
-        let router = app_with(Arc::new(FakeMaster::default().with_node(102, &dead_addr)), AuthConfig::default());
+        let router = app_with(
+            Arc::new(FakeMaster::default().with_node(102, &dead_addr)),
+            AuthConfig::default(),
+        );
         let req = Request::post("/api/stores/102/request-control")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"op":"put","enable":true}"#))
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("network error"), "连接失败原因应透出");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("network error"),
+            "连接失败原因应透出"
+        );
     }
 
     /// 假 store 的复制开关端点:GET/POST `/admin/replication-control`(`{paused}` 进出 + 内部状态)。
     /// 返回 `(host:port, 收到的 body 列表, 当前开关)`。
-    async fn spawn_replication_store() -> (String, Arc<Mutex<Vec<String>>>, Arc<std::sync::atomic::AtomicBool>)
-    {
+    async fn spawn_replication_store() -> (
+        String,
+        Arc<Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1883,7 +2087,9 @@ mod tests {
                 let st = st_post.clone();
                 async move {
                     let text = String::from_utf8_lossy(&body).to_string();
-                    rec.lock().unwrap_or_else(|p| p.into_inner()).push(text.clone());
+                    rec.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(text.clone());
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                     let want = v["paused"].as_bool().unwrap_or(false);
                     st.store(want, std::sync::atomic::Ordering::Relaxed);
@@ -1893,7 +2099,8 @@ mod tests {
             .get(move || {
                 let st = st_get.clone();
                 async move {
-                    Json(json!({ "paused": st.load(std::sync::atomic::Ordering::Relaxed) })).into_response()
+                    Json(json!({ "paused": st.load(std::sync::atomic::Ordering::Relaxed) }))
+                        .into_response()
                 }
             }),
         );
@@ -1906,10 +2113,15 @@ mod tests {
     #[tokio::test]
     async fn replication_control_forwards_to_store_and_surfaces_errors() {
         let (addr, seen, paused) = spawn_replication_store().await;
-        let router = app_with(Arc::new(FakeMaster::default().with_node(101, &addr)), AuthConfig::default());
+        let router = app_with(
+            Arc::new(FakeMaster::default().with_node(101, &addr)),
+            AuthConfig::default(),
+        );
 
         // GET:store 当前开关原样透出(初始未暂停)。
-        let req = Request::get("/api/stores/101/replication-control").body(Body::empty()).unwrap();
+        let req = Request::get("/api/stores/101/replication-control")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v["paused"], false);
 
@@ -1922,10 +2134,15 @@ mod tests {
         assert_eq!(v["paused"], true);
         let sent: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
         assert_eq!(sent, json!({ "paused": true }));
-        assert!(paused.load(std::sync::atomic::Ordering::Relaxed), "假 store 内部状态应已暂停");
+        assert!(
+            paused.load(std::sync::atomic::Ordering::Relaxed),
+            "假 store 内部状态应已暂停"
+        );
 
         // 再 GET:反映暂停;恢复 → false。
-        let req = Request::get("/api/stores/101/replication-control").body(Body::empty()).unwrap();
+        let req = Request::get("/api/stores/101/replication-control")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(body_json(&router, req).await["paused"], true);
         let req = Request::post("/api/stores/101/replication-control")
             .header(header::CONTENT_TYPE, "application/json")
@@ -1934,7 +2151,9 @@ mod tests {
         assert_eq!(body_json(&router, req).await["paused"], false);
 
         // master 无此节点 → 404(不发起转发)。
-        let req = Request::get("/api/stores/999/replication-control").body(Body::empty()).unwrap();
+        let req = Request::get("/api/stores/999/replication-control")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
 
         // 节点存在但连不上 → 502 + 原因。
@@ -1942,16 +2161,23 @@ mod tests {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap().to_string()
         };
-        let router =
-            app_with(Arc::new(FakeMaster::default().with_node(102, &dead_addr)), AuthConfig::default());
+        let router = app_with(
+            Arc::new(FakeMaster::default().with_node(102, &dead_addr)),
+            AuthConfig::default(),
+        );
         let req = Request::post("/api/stores/102/replication-control")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"paused":true}"#))
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("network error"), "连接失败原因应透出");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("network error"),
+            "连接失败原因应透出"
+        );
     }
 
     #[tokio::test]
@@ -1968,7 +2194,10 @@ mod tests {
             false,
         )
         .await;
-        let router = app_with(Arc::new(FakeMaster::default().with_node(101, &addr)), AuthConfig::default());
+        let router = app_with(
+            Arc::new(FakeMaster::default().with_node(101, &addr)),
+            AuthConfig::default(),
+        );
 
         let req = Request::get("/api/metrics").body(Body::empty()).unwrap();
         let v = body_json(&router, req).await;
@@ -2000,22 +2229,31 @@ mod tests {
         let s = &v["stores"][0];
         assert_eq!(s["node_id"], 101);
         assert_eq!(s["scrape_ok"], true);
-        assert_eq!(s["errors_total"], 5, "带 kind label 的 counter 按名求和: {v}");
+        assert_eq!(
+            s["errors_total"], 5,
+            "带 kind label 的 counter 按名求和: {v}"
+        );
         assert_eq!(s["manual_compactions_total"], 7);
     }
 
     #[tokio::test]
     async fn partition_detail_200_and_404() {
         let router = app("");
-        let req = Request::get("/api/partitions/3").body(Body::empty()).unwrap();
+        let req = Request::get("/api/partitions/3")
+            .body(Body::empty())
+            .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["partition_id"], 3);
         assert_eq!(v["moving_out_nodes"].as_array().unwrap().len(), 0);
 
-        let req = Request::get("/api/partitions/999").body(Body::empty()).unwrap();
+        let req = Request::get("/api/partitions/999")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
     }
 
@@ -2024,7 +2262,9 @@ mod tests {
         let master = Arc::new(FakeMaster::default());
         let router = app_with(master.clone(), AuthConfig::default());
 
-        let req = Request::post("/api/partitions/7/repair").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/7/repair")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v["ok"], true);
         assert_eq!(v["added_node_id"], 104);
@@ -2048,7 +2288,10 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["to_node_id"], 0);
 
-        assert_eq!(master.take_calls(), vec!["repair 7", "move 7 101 102", "move 8 101 0"]);
+        assert_eq!(
+            master.take_calls(),
+            vec!["repair 7", "move 7 101 102", "move 8 101 0"]
+        );
     }
 
     #[tokio::test]
@@ -2056,11 +2299,15 @@ mod tests {
         let ok_addr = spawn_fake_store("", true).await;
         let miss_addr = spawn_fake_store("", false).await;
         let master = Arc::new(
-            FakeMaster::default().with_replica(101, &ok_addr).with_replica(102, &miss_addr),
+            FakeMaster::default()
+                .with_replica(101, &ok_addr)
+                .with_replica(102, &miss_addr),
         );
         let router = app_with(master, AuthConfig::default());
 
-        let req = Request::post("/api/partitions/3/compact").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/3/compact")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v["error"], "");
         let rs = v["results"].as_array().unwrap();
@@ -2091,23 +2338,32 @@ mod tests {
         };
         let master = Arc::new(FakeMaster::default().with_replica(103, &dead_addr));
         let router = app_with(master, AuthConfig::default());
-        let req = Request::post("/api/partitions/3/compact").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/3/compact")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v["results"][0]["node_id"], 103);
         assert_eq!(v["results"][0]["ok"], false);
         assert!(
-            v["results"][0]["error"].as_str().unwrap().contains("network error"),
+            v["results"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("network error"),
             "连接失败应带原因: {v}"
         );
 
         // 分区不存在 → 404(与 GET /api/partitions/{id} 同一判定)。
         let router = app("");
-        let req = Request::post("/api/partitions/999/compact").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/999/compact")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
 
         // 分区无副本 → 200 + 空结果 + 顶层 error。
         let router = app_with(Arc::new(FakeMaster::default()), AuthConfig::default());
-        let req = Request::post("/api/partitions/3/compact").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/3/compact")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v["results"].as_array().unwrap().len(), 0);
         assert!(v["error"].as_str().unwrap().contains("no replicas"), "{v}");
@@ -2175,33 +2431,47 @@ mod tests {
             l.local_addr().unwrap().to_string()
         };
         let master = Arc::new(
-            FakeMaster::default().with_replica(101, &ok_addr).with_replica(102, &dead_addr),
+            FakeMaster::default()
+                .with_replica(101, &ok_addr)
+                .with_replica(102, &dead_addr),
         );
         let router = app_with(master, AuthConfig::default());
 
         // mode=async:每副本回 job_id(单个节点连不上不中断其余)。
-        let req = Request::post("/api/partitions/3/compact?mode=async").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/3/compact?mode=async")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         assert_eq!(v["error"], "");
         let rs = v["results"].as_array().unwrap();
         assert_eq!(rs[0], json!({ "node_id": 101, "ok": true, "job_id": 42 }));
         assert_eq!(rs[1]["node_id"], 102);
         assert_eq!(rs[1]["ok"], false);
-        assert!(rs[1]["error"].as_str().unwrap().contains("network error"), "{v}");
+        assert!(
+            rs[1]["error"].as_str().unwrap().contains("network error"),
+            "{v}"
+        );
 
         // 同步路径不变(mode 缺省 / mode=sync 都是同步统计)。
-        for url in ["/api/partitions/3/compact", "/api/partitions/3/compact?mode=sync"] {
+        for url in [
+            "/api/partitions/3/compact",
+            "/api/partitions/3/compact?mode=sync",
+        ] {
             let req = Request::post(url).body(Body::empty()).unwrap();
             let v = body_json(&router, req).await;
             assert_eq!(v["results"][0]["live_bytes"], 1024, "{url}: {v}");
         }
 
         // 非法 mode 在 admin 边界即拒(与 state 过滤同一策略),不打扰 store。
-        let req = Request::post("/api/partitions/3/compact?mode=bogus").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/3/compact?mode=bogus")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::BAD_REQUEST);
 
         // 分区不存在 → 404。
-        let req = Request::post("/api/partitions/999/compact?mode=async").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/999/compact?mode=async")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
     }
 
@@ -2213,11 +2483,15 @@ mod tests {
             l.local_addr().unwrap().to_string()
         };
         let master = Arc::new(
-            FakeMaster::default().with_replica(101, &ok_addr).with_replica(102, &dead_addr),
+            FakeMaster::default()
+                .with_replica(101, &ok_addr)
+                .with_replica(102, &dead_addr),
         );
         let router = app_with(master, AuthConfig::default());
 
-        let req = Request::get("/api/partitions/3/compact-jobs").body(Body::empty()).unwrap();
+        let req = Request::get("/api/partitions/3/compact-jobs")
+            .body(Body::empty())
+            .unwrap();
         let v = body_json(&router, req).await;
         let rs = v["results"].as_array().unwrap();
         assert_eq!(rs.len(), 2, "每副本一行: {v}");
@@ -2231,36 +2505,63 @@ mod tests {
         assert!(jobs[0]["finished_at_ms"].is_u64());
         assert_eq!(jobs[1]["job_id"], 40);
         assert_eq!(jobs[1]["state"], "running");
-        assert!(jobs[1].get("result").is_none(), "running 不该有 result: {v}");
+        assert!(
+            jobs[1].get("result").is_none(),
+            "running 不该有 result: {v}"
+        );
         assert_eq!(jobs[2]["state"], "failed");
         assert_eq!(jobs[2]["error"], "io: disk on fire");
 
         // 连不上的节点 → ok:false + 原因(不中断整体)。
         assert_eq!(rs[1]["node_id"], 102);
         assert_eq!(rs[1]["ok"], false);
-        assert!(rs[1]["error"].as_str().unwrap().contains("network error"), "{v}");
+        assert!(
+            rs[1]["error"].as_str().unwrap().contains("network error"),
+            "{v}"
+        );
 
         // 分区不存在 → 404;无副本 → 空 results。
-        let req = Request::get("/api/partitions/999/compact-jobs").body(Body::empty()).unwrap();
+        let req = Request::get("/api/partitions/999/compact-jobs")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
         let router = app_with(Arc::new(FakeMaster::default()), AuthConfig::default());
-        let req = Request::get("/api/partitions/3/compact-jobs").body(Body::empty()).unwrap();
-        assert_eq!(body_json(&router, req).await["results"].as_array().unwrap().len(), 0);
+        let req = Request::get("/api/partitions/3/compact-jobs")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            body_json(&router, req).await["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     /// 多用户令牌表(与旧单令牌模式二选一/共存)。
     fn users_auth() -> AuthConfig {
         AuthConfig {
             users: vec![
-                AdminUser { name: "alice".into(), token: "tok-alice".into(), role: "operator".into() },
-                AdminUser { name: "bob".into(), token: "tok-bob".into(), role: "viewer".into() },
+                AdminUser {
+                    name: "alice".into(),
+                    token: "tok-alice".into(),
+                    role: "operator".into(),
+                },
+                AdminUser {
+                    name: "bob".into(),
+                    token: "tok-bob".into(),
+                    role: "viewer".into(),
+                },
             ],
             ..Default::default()
         }
     }
 
     fn with_bearer(mut req: Request<Body>, token: &str) -> Request<Body> {
-        req.headers_mut().insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
         req
     }
 
@@ -2283,20 +2584,37 @@ mod tests {
             )
         };
         assert_eq!(status(&router, post("tok-alice")).await, StatusCode::OK);
-        assert_eq!(status(&router, post("tok-bob")).await, StatusCode::FORBIDDEN);
-        assert_eq!(status(&router, post("nope")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(&router, post("tok-bob")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(&router, post("nope")).await,
+            StatusCode::UNAUTHORIZED
+        );
 
         // 审计日志只对 operator 开放(viewer 即使 GET 也 403)。
-        let audit = |token: &str| with_bearer(Request::get("/api/audit").body(Body::empty()).unwrap(), token);
+        let audit = |token: &str| {
+            with_bearer(
+                Request::get("/api/audit").body(Body::empty()).unwrap(),
+                token,
+            )
+        };
         assert_eq!(status(&router, audit("tok-alice")).await, StatusCode::OK);
-        assert_eq!(status(&router, audit("tok-bob")).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(&router, audit("tok-bob")).await,
+            StatusCode::FORBIDDEN
+        );
 
         // users 与旧单令牌可共存:旧令牌仍按原语义解析(actor 名 = operator)。
         let router = app_auth(AuthConfig {
             operator_token: "legacy-op".into(),
             ..users_auth()
         });
-        let req = with_bearer(Request::get("/api/me").body(Body::empty()).unwrap(), "legacy-op");
+        let req = with_bearer(
+            Request::get("/api/me").body(Body::empty()).unwrap(),
+            "legacy-op",
+        );
         assert_eq!(body_json(&router, req).await["role"], "operator");
     }
 
@@ -2311,7 +2629,10 @@ mod tests {
         );
 
         // 读操作不落档。
-        let req = with_bearer(Request::get("/api/cluster").body(Body::empty()).unwrap(), "tok-alice");
+        let req = with_bearer(
+            Request::get("/api/cluster").body(Body::empty()).unwrap(),
+            "tok-alice",
+        );
         assert_eq!(status(&router, req).await, StatusCode::OK);
         assert!(audit_lines(&path).is_empty(), "读操作不该落审计");
 
@@ -2326,7 +2647,10 @@ mod tests {
         assert_eq!(status(&router, req).await, StatusCode::OK);
 
         // /api/me:成功失败都记。
-        let req = with_bearer(Request::get("/api/me").body(Body::empty()).unwrap(), "tok-bob");
+        let req = with_bearer(
+            Request::get("/api/me").body(Body::empty()).unwrap(),
+            "tok-bob",
+        );
         assert_eq!(status(&router, req).await, StatusCode::OK);
         let req = with_bearer(Request::get("/api/me").body(Body::empty()).unwrap(), "bad");
         assert_eq!(status(&router, req).await, StatusCode::UNAUTHORIZED);
@@ -2360,7 +2684,12 @@ mod tests {
         assert_eq!(lines[3]["actor"], "bob");
 
         // GET /api/audit 本身是读:不落档;limit 生效且最新在前。
-        let req = with_bearer(Request::get("/api/audit?limit=2").body(Body::empty()).unwrap(), "tok-alice");
+        let req = with_bearer(
+            Request::get("/api/audit?limit=2")
+                .body(Body::empty())
+                .unwrap(),
+            "tok-alice",
+        );
         let v = body_json(&router, req).await;
         let entries = v["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "limit 生效: {v}");
@@ -2368,10 +2697,32 @@ mod tests {
         assert_eq!(entries[1]["status"], 401);
         assert_eq!(audit_lines(&path).len(), 4, "读 /api/audit 不落档");
         // limit 超上限只截断,不报错;limit=0 回空表。
-        let req = with_bearer(Request::get("/api/audit?limit=99999").body(Body::empty()).unwrap(), "tok-alice");
-        assert_eq!(body_json(&router, req).await["entries"].as_array().unwrap().len(), 4);
-        let req = with_bearer(Request::get("/api/audit?limit=0").body(Body::empty()).unwrap(), "tok-alice");
-        assert_eq!(body_json(&router, req).await["entries"].as_array().unwrap().len(), 0);
+        let req = with_bearer(
+            Request::get("/api/audit?limit=99999")
+                .body(Body::empty())
+                .unwrap(),
+            "tok-alice",
+        );
+        assert_eq!(
+            body_json(&router, req).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let req = with_bearer(
+            Request::get("/api/audit?limit=0")
+                .body(Body::empty())
+                .unwrap(),
+            "tok-alice",
+        );
+        assert_eq!(
+            body_json(&router, req).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2412,7 +2763,13 @@ mod tests {
             .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::OK);
         let req = Request::get("/api/audit").body(Body::empty()).unwrap();
-        assert_eq!(body_json(&router, req).await["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            body_json(&router, req).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         assert!(!bad.exists(), "降级实例不创建文件");
     }
 
@@ -2422,7 +2779,9 @@ mod tests {
         let req = Request::get("/api/balance").body(Body::empty()).unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["present"], true);
         assert_eq!(v["plan"]["plan_id"], 7);
@@ -2440,7 +2799,9 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["plan"]["plan_id"], 7);
@@ -2454,8 +2815,14 @@ mod tests {
             .body(Body::from(r#"{"plan_id":99}"#))
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "master ok=false 仍回 200,错误交前端");
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "master ok=false 仍回 200,错误交前端"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("plan 99 not found"));
@@ -2478,16 +2845,19 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from("{}"))
             .unwrap();
-        assert_eq!(status(&router, write).await, StatusCode::FORBIDDEN, "viewer 不能评估");
+        assert_eq!(
+            status(&router, write).await,
+            StatusCode::FORBIDDEN,
+            "viewer 不能评估"
+        );
     }
-
 
     /// 假 store 的 scrub 三类素材:`/partitions/{pid}/scrub-report`、`/replica-metadata`、`/verify`。
     ///
-    /// `keys` = `(key_hex, deleted, life_version, size)`;`bad_records` 用于 deep 校验场景。
+    /// `keys` = `(key_hex, deleted, size)`;`bad_records` 用于 deep 校验场景。
     async fn spawn_scrub_store(
         live_records: u64,
-        keys: Vec<(&'static str, bool, u16, u64)>,
+        keys: Vec<(&'static str, bool, u64)>,
         bad_records: u64,
     ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2507,16 +2877,12 @@ mod tests {
         let meta = move || async move {
             let entries: Vec<serde_json::Value> = keys
                 .iter()
-                .map(|(k, deleted, lv, size)| {
+                .map(|(k, deleted, size)| {
                     json!({
                         "key": k,
                         "size": size,
                         "expiration_ms": -1,
                         "deleted": deleted,
-                        "ttl_updated": false,
-                        "undeleted": false,
-                        "life_version": lv,
-                        "operation_time_ms": 1,
                     })
                 })
                 .collect();
@@ -2550,14 +2916,20 @@ mod tests {
 
     #[tokio::test]
     async fn scrub_reports_consistent_replicas() {
-        let a = spawn_scrub_store(2, vec![("aa", false, 0, 4)], 0).await;
-        let b = spawn_scrub_store(2, vec![("aa", false, 0, 4)], 0).await;
-        let master = Arc::new(FakeMaster::default().with_replica(101, &a).with_replica(102, &b));
+        let a = spawn_scrub_store(2, vec![("aa", false, 4)], 0).await;
+        let b = spawn_scrub_store(2, vec![("aa", false, 4)], 0).await;
+        let master = Arc::new(
+            FakeMaster::default()
+                .with_replica(101, &a)
+                .with_replica(102, &b),
+        );
         let router = app_with(master, AuthConfig::default());
 
         let v = body_json(
             &router,
-            Request::post("/api/partitions/3/scrub").body(Body::empty()).unwrap(),
+            Request::post("/api/partitions/3/scrub")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(v["error"], "");
@@ -2567,28 +2939,46 @@ mod tests {
         assert_eq!(v["replicas"][0]["node_id"], 101);
         assert_eq!(v["replicas"][0]["report"]["live_records"], 2);
         assert_eq!(v["replicas"][0]["key_count"], 1);
-        assert_eq!(v["replicas"][0]["verify"], serde_json::Value::Null, "非 deep 不取 verify");
+        assert_eq!(
+            v["replicas"][0]["verify"],
+            serde_json::Value::Null,
+            "非 deep 不取 verify"
+        );
     }
 
     #[tokio::test]
     async fn scrub_detects_missing_key_and_summary_mismatch() {
-        let a = spawn_scrub_store(2, vec![("aa", false, 0, 4), ("bb", false, 0, 4)], 0).await;
-        let b = spawn_scrub_store(1, vec![("aa", false, 0, 4)], 0).await; // 少一个 key + 摘要不同
-        let master = Arc::new(FakeMaster::default().with_replica(101, &a).with_replica(102, &b));
+        let a = spawn_scrub_store(2, vec![("aa", false, 4), ("bb", false, 4)], 0).await;
+        let b = spawn_scrub_store(1, vec![("aa", false, 4)], 0).await; // 少一个 key + 摘要不同
+        let master = Arc::new(
+            FakeMaster::default()
+                .with_replica(101, &a)
+                .with_replica(102, &b),
+        );
         let router = app_with(master, AuthConfig::default());
 
         let v = body_json(
             &router,
-            Request::post("/api/partitions/3/scrub").body(Body::empty()).unwrap(),
+            Request::post("/api/partitions/3/scrub")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(v["verdict"]["consistent"], false, "{v}");
         let divs = v["verdict"]["divergences"].as_array().unwrap();
-        assert!(divs.iter().any(|d| d["kind"] == "key" && d["key_hex"] == "bb"), "{v}");
+        assert!(
+            divs.iter()
+                .any(|d| d["kind"] == "key" && d["key_hex"] == "bb"),
+            "{v}"
+        );
         assert!(divs.iter().any(|d| d["kind"] == "summary"), "{v}");
 
         // 也进了最近列表(环形表在 AppState 内,必须用**同一个** router 读)
-        let runs = body_json(&router, Request::get("/api/scrub").body(Body::empty()).unwrap()).await;
+        let runs = body_json(
+            &router,
+            Request::get("/api/scrub").body(Body::empty()).unwrap(),
+        )
+        .await;
         assert_eq!(runs["runs"].as_array().unwrap().len(), 1, "{runs}");
         assert_eq!(runs["runs"][0]["partition_id"], 3);
         assert_eq!(runs["runs"][0]["consistent"], false);
@@ -2596,21 +2986,30 @@ mod tests {
 
     #[tokio::test]
     async fn scrub_deep_flags_bad_records_and_inconclusive_on_dead_replica() {
-        let a = spawn_scrub_store(2, vec![("aa", false, 0, 4)], 1).await; // 有坏记录
+        let a = spawn_scrub_store(2, vec![("aa", false, 4)], 1).await; // 有坏记录
         let dead = {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap().to_string()
         };
-        let master = Arc::new(FakeMaster::default().with_replica(101, &a).with_replica(102, &dead));
+        let master = Arc::new(
+            FakeMaster::default()
+                .with_replica(101, &a)
+                .with_replica(102, &dead),
+        );
         let router = app_with(master, AuthConfig::default());
 
         let v = body_json(
             &router,
-            Request::post("/api/partitions/3/scrub?deep=1").body(Body::empty()).unwrap(),
+            Request::post("/api/partitions/3/scrub?deep=1")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(v["deep"], true);
-        assert_eq!(v["verdict"]["inconclusive"], true, "有副本取不到素材 → 无法判定: {v}");
+        assert_eq!(
+            v["verdict"]["inconclusive"], true,
+            "有副本取不到素材 → 无法判定: {v}"
+        );
         assert_eq!(v["replicas"][1]["ok"], false, "{v}");
         assert!(
             v["replicas"][0]["verify"]["bad_records"].as_u64().unwrap() >= 1,
@@ -2629,11 +3028,16 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearer view")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(status(&router, write).await, StatusCode::FORBIDDEN, "viewer 不能触发 scrub");
+        assert_eq!(
+            status(&router, write).await,
+            StatusCode::FORBIDDEN,
+            "viewer 不能触发 scrub"
+        );
 
         let router = app("");
-        let req = Request::post("/api/partitions/999/scrub").body(Body::empty()).unwrap();
+        let req = Request::post("/api/partitions/999/scrub")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
     }
-
 }

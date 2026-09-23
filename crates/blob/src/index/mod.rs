@@ -261,7 +261,7 @@ mod tests {
     }
 
     fn put(seg: u64, off: u64) -> IndexValue {
-        IndexValue::put(LogOffset::new(seg, off), 100, 1)
+        IndexValue::put(LogOffset::new(seg, off), 100)
     }
 
     #[test]

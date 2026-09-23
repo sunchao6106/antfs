@@ -176,3 +176,44 @@
 
 - 每 Log 定容上界(容量/文件数,写满自动滚动新 partition)——设计锚点,暂缓。
 - 并发/共享模型(D4):`&mut self` 单写者 → 共享实例 + `RwLock`/并发结构(运行时 tokio vs 手写线程池仍为 Open Question)。
+
+## 步骤 19:存储模型简化 —— 对象不可变 + 删除不可逆(2026-09-23)
+
+- **语义**:对象**不可变**、删除**不可逆**。整体移除三个变更类操作 `undelete` / `update_ttl` / `hard_delete`;
+  随之删掉三个为"后写覆盖先写的定序"而存在的字段:`life_version`(生命版本)、`operation_time_ms`(op_time)、
+  `original_offset`(墓碑指向被删前 PUT 的位置)。错误 `NotDeleted` / `AlreadyUpdated` 不再存在;`Deleted` 保留。
+- **每个 key 至多两条记录**(PUT、墓碑)。`put` 命中已存在 key(存活或墓碑)→ `AlreadyExists`(blobId 永久占用);
+  `delete` 命中不存在 → `NotFound`;命中已墓碑 → **幂等成功 204**(见本条末尾「后续拍板」)。
+- **复制合并退化为墓碑恒胜**(单调、幂等、天然收敛):peer 墓碑覆盖本地 PUT;peer PUT 永不覆盖本地 PUT/墓碑;
+  本地墓碑 → `Skipped`;两边都存活 → `Skipped`。不再需要任何每对象定序字段,墓碑也不再需要数据体(省带宽)。
+- **磁盘格式三层同时精简**(实施时无已部署数据,**不做任何兼容层**;旧索引布局仍走"判 `Corrupt` → 从 log 重建"):
+  - **段头 v2**:物理 64 B(40 B 有效),`magic(0..4) / version=2(4..6) / reserved(6..8) / capacity(8..16) /
+    data_end(16..24) / created_ns(24..32) / key_prefix(32..36) / crc(36..40,覆盖 `[0,36)`)`;
+    `key_prefix` = blobId 高 32bit(该副本的 partitionId),**每段一份、整副本恒定**,create 写入、rollover 继承、
+    open 读回核对(不一致 → `Corrupt`)。
+  - **记录 v4**:`magic(2)|version(1)|flags(1)|key_suffix(4)|expiration_ms(8)|data_len(4)|data|crc(4)`,
+    固定开销 **38 B → 24 B**;**key 高 32bit 不在记录里,只在段头存一次**,记录只存 4B `key_suffix`,
+    读时 `key_prefix ‖ key_suffix` 拼回完整 blobId;写路径校验 key 的 partition 与前缀一致(不一致 → `BadArgument`)。
+  - **索引 v2**:value **59 B → 21 B**(`offset(8, (段号 u32 << 32) | 段内偏移 u32) | size(u32) | flags(1) |
+    expiration_ms(i64)`,entry = 8 B key + 21 B = **29 B**,索引 key **仍是完整 8 B blobId**)。
+  - **段容量硬上界 4 GiB**(`log_segment::MAX_CAPACITY` + `StoreConfig::validate` 的 `MAX_SEGMENT_SIZE_BYTES`):
+    4 GiB 是**格式不变量**而非调优旋钮 —— 段内偏移要放进索引 u32 偏移半区,且"单条记录 ≤ 段 − 64 < `u32::MAX`"
+    使记录的 u32 `data_len` 结构性无法回绕。
+- **配置/监控**:删 `store_server.hard_delete_interval_secs`、`store_server_hard_deleted_total`、
+  `store_hard_delete_total` / `store_hard_delete_duration_seconds`;本地 worker 从三条 loop 减到**两条**(flush + compaction)。
+- **契约面**:数据面删 `POST .../undelete` 与 `POST .../ttl`;frontend 删两条路由与 `x-ambry-blob-undeleted` /
+  `x-ambry-blob-ttl-updated` / `x-ambry-blob-life-version` 三个响应头(`CORS_EXPOSED_HEADERS` 现 8 项);
+  router 删 `undelete` / `update_ttl`,新增 **`put_with_ttl` / `put_file_with_ttl`**(`put`/`put_file` 为 `NO_EXPIRATION` 包装)。
+- **TTL 单次多数派写**:frontend 的 `x-ambry-ttl-ms` 从"先 `put` 再 `update_ttl`(两次多数派写)"改为
+  **写入时一次带 TTL**(解析成绝对 `expiration_ms` → `PUT ?expiration_ms=`)—— TTL 与数据体一样写完即定,之后无处可改。
+- **隐私口径降级**(记录在案):从"对象级擦除"降为"段级、惰性、最终由块复用覆盖";若将来需要真正擦除,
+  落法是"compaction 时把死记录置零再落盘",不需要每对象元数据。
+- **admin 连带**:`crates/admin` 读 store 元数据 JSON / `KeyState` 里的 `life_version` 等字段删除,假 store 夹具同步。
+- **后续拍板:`DELETE` 幂等化(2026-09-23,同日)** —— 墓碑 key 重复删由 blob 引擎直接回成功(不写第二条墓碑),
+  store→router→frontend 全链路 **204**;从未存在的 key 仍 404(经多数派聚合为 503,既有口径)。
+  见 `openspec/changes/simplify-delete-model/` 与 `docs/design/frontend.md` §2。
+- **文档同步**:`docs/design/{store.md,cluster.md,router.md,frontend.md,replication.md}`;
+  受影响的 change 档案(`store-local-worker` / `store-server` / `store-server-mutations` / `store-server-replication` /
+  `store-request-control` / `blob-io-end-to-end` / `balance-and-scrub`)加"后续变更"注记;
+  `openspec/changes/simplify-delete-model/` 从提案回填为已实施(逐项偏差见其 `tasks.md`「与原提案的偏差」)。
+- 本条目之前的各"步骤"描述的是当时真实的实现,不改写。

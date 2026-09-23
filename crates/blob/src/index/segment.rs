@@ -16,8 +16,9 @@ use crate::index::value::{IndexValue, VALUE_SIZE};
 use crate::types::{StoreKey, KEY_SIZE};
 
 const IDX_MAGIC: u32 = 0x414D_4258; // "AMBX"
-const IDX_VERSION: u16 = 1;
+const IDX_VERSION: u16 = 2;
 const IDX_HEADER_SIZE: usize = 32;
+/// 每条目 = 8B key(blobId) + 21B 值(见 [`crate::index::value`])。
 const ENTRY_SIZE: usize = KEY_SIZE + VALUE_SIZE;
 
 /// 从磁盘读回的原始段条目(活跃段层级整段载入内存用)。
@@ -241,4 +242,59 @@ fn atomic_write(path: &Path, buf: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::LogOffset;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::path::PathBuf::from(format!("/var/tmp/ambry_idxseg_{tag}_{ns}.idx"))
+    }
+
+    /// 磁盘布局的手指印:条目 = 8B blobId + 21B 值 = 29B。
+    #[test]
+    fn entry_size_is_key_plus_value() {
+        assert_eq!(KEY_SIZE, 8);
+        assert_eq!(VALUE_SIZE, 21);
+        assert_eq!(ENTRY_SIZE, 29, "条目 = 8B blobId + 21B 值");
+    }
+
+    #[test]
+    fn segment_file_roundtrips_and_rejects_layout_mismatch() {
+        let path = tmp("rt");
+        let entries = vec![
+            (
+                StoreKey::from_parts(3, 1),
+                IndexValue::put(LogOffset::new(0, 0), 100),
+            ),
+            (
+                StoreKey::from_parts(3, 2),
+                IndexValue::put(LogOffset::new(1, 4096), 200),
+            ),
+        ];
+        write_segment_file(&path, &entries).unwrap();
+        assert_eq!(read_segment_file(&path).unwrap().entries, entries);
+
+        // 头里的 `key_size/value_size` 是**布局指纹**:旧格式(如 59B 值)必须被判 Corrupt,
+        // 由 `open` 回退到"从 log 重建",而不是按新布局误读旧字节。
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[10..12].copy_from_slice(&59u16.to_le_bytes());
+        let hc = crc32fast::hash(&bytes[0..20]);
+        bytes[20..24].copy_from_slice(&hc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(
+                read_segment_file(&path),
+                Err(Error::Corrupt(ref m)) if m.contains("layout mismatch")
+            ),
+            "旧布局(59B 值)必须被判 Corrupt"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

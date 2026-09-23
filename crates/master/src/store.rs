@@ -52,8 +52,8 @@ fn to_err<E: std::error::Error + 'static>(e: E) -> AnyError {
 
 // openraft 的便捷构造器在 `StorageIOError` 上;`StorageError` 经 `#[from]` 承接。下列 helper 直接产出
 // `StorageError<NodeId>`,消掉每处 `.into()`。参数取 `impl Into<AnyError>`,兼容 `to_err()` 与 `de()`。
-use openraft::StorageIOError;
 use openraft::storage::SnapshotSignature;
+use openraft::StorageIOError;
 
 fn read_logs(src: impl Into<AnyError>) -> StorageError<NodeId> {
     StorageIOError::read_logs(src).into()
@@ -70,10 +70,16 @@ fn write_vote(src: impl Into<AnyError>) -> StorageError<NodeId> {
 fn write_state_machine(src: impl Into<AnyError>) -> StorageError<NodeId> {
     StorageIOError::write_state_machine(src).into()
 }
-fn read_snapshot(sig: Option<SnapshotSignature<NodeId>>, src: impl Into<AnyError>) -> StorageError<NodeId> {
+fn read_snapshot(
+    sig: Option<SnapshotSignature<NodeId>>,
+    src: impl Into<AnyError>,
+) -> StorageError<NodeId> {
     StorageIOError::read_snapshot(sig, src).into()
 }
-fn write_snapshot(sig: Option<SnapshotSignature<NodeId>>, src: impl Into<AnyError>) -> StorageError<NodeId> {
+fn write_snapshot(
+    sig: Option<SnapshotSignature<NodeId>>,
+    src: impl Into<AnyError>,
+) -> StorageError<NodeId> {
     StorageIOError::write_snapshot(sig, src).into()
 }
 
@@ -135,9 +141,7 @@ pub fn open(
             None => StateMachineData::default(),
         }
     };
-    metrics
-        .registered_nodes
-        .set(data.state.nodes.len() as i64);
+    metrics.registered_nodes.set(data.state.nodes.len() as i64);
 
     let sm = RedbStateMachine {
         db: db.clone(),
@@ -158,9 +162,14 @@ impl RedbStateMachine {
     #[allow(clippy::result_large_err)]
     fn persist_data(&self, data: &StateMachineData) -> Result<(), StorageError<NodeId>> {
         let bytes = ser(data).map_err(write_state_machine)?;
-        let w = self.db.begin_write().map_err(|e| write_state_machine(to_err(e)))?;
+        let w = self
+            .db
+            .begin_write()
+            .map_err(|e| write_state_machine(to_err(e)))?;
         {
-            let mut t = w.open_table(SM).map_err(|e| write_state_machine(to_err(e)))?;
+            let mut t = w
+                .open_table(SM)
+                .map_err(|e| write_state_machine(to_err(e)))?;
             t.insert(SM_DATA, bytes.as_slice())
                 .map_err(|e| write_state_machine(to_err(e)))?;
         }
@@ -352,7 +361,10 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             last_membership: self.data.last_membership.clone(),
             snapshot_id,
         };
-        let stored = StoredSnapshot { meta: meta.clone(), data: data_bytes.clone() };
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data: data_bytes.clone(),
+        };
         let stored_bytes = ser(&stored).map_err(|e| write_snapshot(None, e))?;
         let w = self
             .db
@@ -366,7 +378,10 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
                 .map_err(|e| write_snapshot(None, to_err(e)))?;
         }
         w.commit().map_err(|e| write_snapshot(None, to_err(e)))?;
-        Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(data_bytes)) })
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(data_bytes)),
+        })
     }
 }
 
@@ -375,8 +390,13 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, openraft::BasicNode>), StorageError<NodeId>>
-    {
+    ) -> Result<
+        (
+            Option<LogId<NodeId>>,
+            StoredMembership<NodeId, openraft::BasicNode>,
+        ),
+        StorageError<NodeId>,
+    > {
         let d = self.data.read().expect("state machine lock poisoned");
         Ok((d.last_applied, d.last_membership.clone()))
     }
@@ -399,14 +419,15 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                         r
                     }
                     EntryPayload::Membership(ref mem) => {
-                        d.last_membership =
-                            StoredMembership::new(Some(entry.log_id), mem.clone());
+                        d.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                         MasterResponse::Empty
                     }
                 };
                 responses.push(resp);
             }
-            self.metrics.registered_nodes.set(d.state.nodes.len() as i64);
+            self.metrics
+                .registered_nodes
+                .set(d.state.nodes.len() as i64);
             d.clone()
         };
         // apply 与 last_applied 在同一 redb 事务提交 = 持久化边界(§design 2)。
@@ -415,7 +436,11 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        let data = self.data.read().expect("state machine lock poisoned").clone();
+        let data = self
+            .data
+            .read()
+            .expect("state machine lock poisoned")
+            .clone();
         RedbSnapshotBuilder {
             db: self.db.clone(),
             snapshot_seq: self.snapshot_seq.clone(),
@@ -435,15 +460,20 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let data: StateMachineData = de(&bytes)
-            .map_err(|e| read_snapshot(Some(meta.signature()), e))?;
+        let data: StateMachineData =
+            de(&bytes).map_err(|e| read_snapshot(Some(meta.signature()), e))?;
         {
             let mut d = self.data.write().expect("state machine lock poisoned");
             *d = data.clone();
-            self.metrics.registered_nodes.set(d.state.nodes.len() as i64);
+            self.metrics
+                .registered_nodes
+                .set(d.state.nodes.len() as i64);
         }
         self.persist_data(&data)?;
-        let stored = StoredSnapshot { meta: meta.clone(), data: bytes };
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data: bytes,
+        };
         let stored_bytes = ser(&stored).map_err(|e| write_snapshot(Some(meta.signature()), e))?;
         let w = self
             .db
@@ -464,12 +494,19 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        let r = self.db.begin_read().map_err(|e| read_snapshot(None, to_err(e)))?;
-        let t = r.open_table(SM).map_err(|e| read_snapshot(None, to_err(e)))?;
-        match t.get(SM_SNAPSHOT).map_err(|e| read_snapshot(None, to_err(e)))? {
+        let r = self
+            .db
+            .begin_read()
+            .map_err(|e| read_snapshot(None, to_err(e)))?;
+        let t = r
+            .open_table(SM)
+            .map_err(|e| read_snapshot(None, to_err(e)))?;
+        match t
+            .get(SM_SNAPSHOT)
+            .map_err(|e| read_snapshot(None, to_err(e)))?
+        {
             Some(g) => {
-                let stored: StoredSnapshot =
-                    de(g.value()).map_err(|e| read_snapshot(None, e))?;
+                let stored: StoredSnapshot = de(g.value()).map_err(|e| read_snapshot(None, e))?;
                 Ok(Some(Snapshot {
                     meta: stored.meta,
                     snapshot: Box::new(Cursor::new(stored.data)),

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use antfs_master::pb::master_client::MasterClient;
 use antfs_master::pb::CreatePartitionsRequest;
 use antfs_master::{MasterConfig, MasterNode};
-use openraft::BasicNode;
 use antfs_store::{StoreServer, StoreServerConfig};
+use openraft::BasicNode;
 
 const SECRET: &str = "local-dev-secret";
 const OPERATOR_TOKEN: &str = "operator";
@@ -225,7 +225,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Box::leak(Box::new(server));
         store_addrs.push(http_addr);
     }
-    tracing::info!(count = store_ids.len(), "store nodes started, waiting for cluster registration");
+    tracing::info!(
+        count = store_ids.len(),
+        "store nodes started, waiting for cluster registration"
+    );
 
     // 等三节点全部注册(经心跳上报盘余量,选盘才有候选)。
     let sm = master.sm_data.clone();
@@ -269,7 +272,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if ready {
         tracing::info!(replicas = got, expected, "all replicas created");
     } else {
-        tracing::warn!(replicas = got, expected, "replicas not fully created within timeout");
+        tracing::warn!(
+            replicas = got,
+            expected,
+            "replicas not fully created within timeout"
+        );
     }
 
     // ---- admin web ----
@@ -284,7 +291,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         registry: areg,
         grafana_url: String::new(),
         // 审计落 `--dir/admin-audit.jsonl`(每次跑 devcluster 追加;`AuditLog::open` 会打印路径)。
-        audit: Arc::new(antfs_admin::audit::AuditLog::open(args.dir.join("admin-audit.jsonl"))),
+        audit: Arc::new(antfs_admin::audit::AuditLog::open(
+            args.dir.join("admin-audit.jsonl"),
+        )),
         scrub_runs: std::sync::Arc::new(antfs_admin::scrub::ScrubRuns::default()),
     };
     let aauth = antfs_admin::server::AuthConfig {
@@ -308,13 +317,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 装配见 `start_frontend`:与 admin 一样在进程内起一个 axum 服务,把 REST 请求翻译成 SDK 调用。
     let frontend_addr = start_frontend(&args, &grpc_addr).await;
 
-    print_summary(&args, &grpc_addr, &store_ids, &store_addrs, &admin_addr, frontend_addr.as_deref(), &created);
+    print_summary(
+        &args,
+        &grpc_addr,
+        &store_ids,
+        &store_addrs,
+        &admin_addr,
+        frontend_addr.as_deref(),
+        &created,
+    );
 
     // ---- 可选:起完就压一轮(--run-bench)----
     if let Some(mode) = args.run_bench.as_deref() {
         println!("--------------------------------------------------------");
-        println!("  --run-bench {mode}:在**本进程内**跑一轮压测(客户端与被测服务共享同一份 CPU/盘 IO,");
-        println!("  数字只作冒烟参考;正式压测请另起进程跑 antfs-bench-router / antfs-bench-frontend)");
+        println!(
+            "  --run-bench {mode}:在**本进程内**跑一轮压测(客户端与被测服务共享同一份 CPU/盘 IO,"
+        );
+        println!(
+            "  数字只作冒烟参考;正式压测请另起进程跑 antfs-bench-router / antfs-bench-frontend)"
+        );
         let result = match mode {
             "router" => {
                 antfs_bench_router::run(antfs_bench_router::Cfg {
@@ -432,7 +453,11 @@ fn print_summary(
         println!("  frontend REST : http://{fa}");
     }
     for (i, addr) in store_addrs.iter().enumerate() {
-        println!("  store node {}  : http://{addr}  (node_id={})", i + 1, store_ids[i]);
+        println!(
+            "  store node {}  : http://{addr}  (node_id={})",
+            i + 1,
+            store_ids[i]
+        );
     }
     println!(
         "  partitions    : {} 个 (RF={}) {partitions:?}",
@@ -446,20 +471,28 @@ fn print_summary(
     println!("    # 单对象冒烟:--ops 1 --size 1048576");
     if let Some(fa) = frontend_addr {
         println!("  REST 路径(经 frontend;任何 HTTP 客户端都能用)");
-        println!("    # 注意:`curl -T` 发的是 PUT,上传要用 POST(见 docs/design/frontend.md 的契约表)");
+        println!(
+            "    # 注意:`curl -T` 发的是 PUT,上传要用 POST(见 docs/design/frontend.md 的契约表)"
+        );
         println!("    curl -X POST --data-binary @/tmp/a.bin http://{fa}/blobs -i   # 201 + Location: /blobs/<blobId>");
         println!("    curl http://{fa}/blobs/<blobId> -o /tmp/b.bin && cmp /tmp/a.bin /tmp/b.bin");
         println!("    curl -I http://{fa}/blobs/<blobId>             # 元数据头(不读数据体)");
         println!("    curl -X DELETE http://{fa}/blobs/<blobId> -i   # 204");
-        println!("    curl -X POST \"http://{fa}/blobs/<blobId>/ttl?expiration_ms=1780000000000\" -i   # 204");
+        println!("    curl -X POST --data-binary @/tmp/a.bin -H 'x-ambry-ttl-ms: 1780000000000' http://{fa}/blobs -i   # 201;TTL 只能在写入时定");
         println!("    cargo run -p antfs-bench-frontend --release -- --frontend http://{fa} \\");
         println!("      --ops 20000 --concurrency 32 --size 4096 --read-ratio 20");
     }
     if let Some(pid) = partitions.first() {
         let key = "0f".repeat(8); // key 为 8 字节 → 16 hex
         println!("  裸数据面示例(绕过 router 只打单个 store;W/R 由 client 负责,**别当生产用法**)");
-        println!("    curl -X PUT --data-binary hello http://{}/partitions/{pid}/blobs/{key}", store_addrs[0]);
-        println!("    curl http://{}/partitions/{pid}/blobs/{key}", store_addrs[0]);
+        println!(
+            "    curl -X PUT --data-binary hello http://{}/partitions/{pid}/blobs/{key}",
+            store_addrs[0]
+        );
+        println!(
+            "    curl http://{}/partitions/{pid}/blobs/{key}",
+            store_addrs[0]
+        );
     }
     println!("  引擎层压测(独立跑,不压本集群):");
     println!("    cargo run -p antfs-bench-blob --release -- --ops 100000 --value-size 4096");

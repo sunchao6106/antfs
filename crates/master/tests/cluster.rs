@@ -67,7 +67,10 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     }
 
     // 在 node1 上初始化 3 成员集群。
-    nodes[0].initialize(raft_addrs.clone()).await.expect("initialize");
+    nodes[0]
+        .initialize(raft_addrs.clone())
+        .await
+        .expect("initialize");
 
     // 等待选出 leader(条件变量等待,非 sleep)。
     for n in &nodes {
@@ -78,8 +81,16 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
             .expect("leader elected within timeout");
     }
 
-    let leader_id = nodes[0].raft.metrics().borrow().current_leader.expect("has leader");
-    let leader = nodes.iter().find(|n| n.config.node_id == leader_id).expect("leader node");
+    let leader_id = nodes[0]
+        .raft
+        .metrics()
+        .borrow()
+        .current_leader
+        .expect("has leader");
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .expect("leader node");
 
     // 数据节点(id=100)经 leader 自注册,走 Raft 提案。
     let info = NodeInfo {
@@ -88,7 +99,9 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
         addr: "127.0.0.1:9000".into(),
         disks: BTreeMap::from([(
             "d0".to_string(),
-            antfs_master::types::DiskSpec { capacity_bytes: 16_000_000_000_000 },
+            antfs_master::types::DiskSpec {
+                capacity_bytes: 16_000_000_000_000,
+            },
         )]),
         registered_at_ms: 1,
     };
@@ -123,7 +136,10 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
         .await
         .expect("list_nodes")
         .into_inner();
-    assert!(list.nodes.iter().any(|e| e.node_id == 100), "ListNodes must include node 100");
+    assert!(
+        list.nodes.iter().any(|e| e.node_id == 100),
+        "ListNodes must include node 100"
+    );
 
     let state = client
         .get_cluster_state(ClusterStateRequest { version: 1 })
@@ -170,13 +186,18 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
             addr: format!("127.0.0.1:90{id}"),
             disks: BTreeMap::from([(
                 "d0".to_string(),
-                antfs_master::types::DiskSpec { capacity_bytes: 1_000_000_000_000 },
+                antfs_master::types::DiskSpec {
+                    capacity_bytes: 1_000_000_000_000,
+                },
             )]),
             registered_at_ms: 1,
         };
         leader
             .raft
-            .client_write(MasterCommand::RegisterNode { node_id: id, info: dinfo })
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: dinfo,
+            })
             .await
             .expect("register data node");
     }
@@ -192,7 +213,7 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
                 disk_id: "d0".into(),
                 capacity_bytes: 1_000_000_000_000,
                 free_bytes: 900_000_000_000,
-            health: String::new(),
+                health: String::new(),
             }],
             full_report: true,
             replicas: vec![],
@@ -204,7 +225,10 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
         .expect("heartbeat stream")
         .into_inner();
     for _ in 0..3 {
-        hb.message().await.expect("directive").expect("beat processed");
+        hb.message()
+            .await
+            .expect("directive")
+            .expect("beat processed");
     }
 
     // 建 1 个 RF=3 分区,断言副本跨 3 个不同节点。
@@ -218,12 +242,19 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
         .await
         .expect("create_partitions")
         .into_inner();
-    assert!(created.ok, "create_partitions must succeed: {}", created.error);
+    assert!(
+        created.ok,
+        "create_partitions must succeed: {}",
+        created.error
+    );
     assert_eq!(created.partition_ids.len(), 1);
     let pid = created.partition_ids[0];
 
     let locs = client
-        .lookup_partition(antfs_master::pb::LookupRequest { version: 1, partition_id: pid })
+        .lookup_partition(antfs_master::pb::LookupRequest {
+            version: 1,
+            partition_id: pid,
+        })
         .await
         .expect("lookup_partition")
         .into_inner();
@@ -231,14 +262,22 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     assert_eq!(locs.replicas.len(), 3);
     let mut nodes_used: Vec<u64> = locs.replicas.iter().map(|r| r.node_id).collect();
     nodes_used.sort();
-    assert_eq!(nodes_used, vec![101, 102, 103], "replicas must span the 3 data nodes");
+    assert_eq!(
+        nodes_used,
+        vec![101, 102, 103],
+        "replicas must span the 3 data nodes"
+    );
 
     let assigned = client
         .assign_partition(antfs_master::pb::AssignRequest { version: 1 })
         .await
         .expect("assign_partition")
         .into_inner();
-    assert!(assigned.ok, "assign must return a writable partition: {}", assigned.error);
+    assert!(
+        assigned.ok,
+        "assign must return a writable partition: {}",
+        assigned.error
+    );
     assert_eq!(assigned.partition_id, pid);
     assert_eq!(assigned.replicas.len(), 3);
 }
@@ -264,7 +303,9 @@ async fn get_metrics_exports_prometheus_text() {
         .await
         .expect("leader elected within timeout");
 
-    let mut client = MasterClient::connect(format!("http://{grpc_addr}")).await.expect("connect");
+    let mut client = MasterClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("connect");
     let resp = client
         .get_metrics(antfs_master::pb::MetricsRequest { version: 1 })
         .await
@@ -283,7 +324,9 @@ async fn get_metrics_exports_prometheus_text() {
     // 文本必须能被 Prometheus 文本解析器解析(common/metric parse)。
     let samples = antfs_metric::parse(&resp.text);
     assert!(
-        samples.iter().any(|s| s.name == "master_is_leader" && s.value == 1.0),
+        samples
+            .iter()
+            .any(|s| s.name == "master_is_leader" && s.value == 1.0),
         "leader must export master_is_leader 1"
     );
 }

@@ -1,6 +1,10 @@
 # store-server-mutations
 
-数据节点变更类端点(delete / undelete / updateTtl),承 store 引擎语义。
+数据节点变更类端点(delete),承 store 引擎语义。
+
+> **后续变更(2026-09-23,`simplify-delete-model`)**:对象不可变 + **删除不可逆** ⇒ 原先的「复活对象」与「更新 TTL」两个
+> Requirement 已被**删除**(数据面只剩 `DELETE`;TTL 只能在写入时经 `PUT ?expiration_ms=` 给定);`Error::NotDeleted` /
+> `AlreadyUpdated` 亦不存在,变更类 409 只剩「重复 DELETE 命中墓碑」。保留为当时的设计记录。
 
 ## ADDED Requirements
 
@@ -17,24 +21,6 @@ store server SHALL 提供 `DELETE /partitions/{pid}/blobs/{key}` 对已存在对
 
 - **WHEN** 对一个已删除的 key 再次 `DELETE`
 - **THEN** SHALL 返回 409
-
-### Requirement: 复活对象(undelete)
-
-store server SHALL 提供 `POST /partitions/{pid}/blobs/{key}/undelete` 复活已删除对象;成功返回 200;对未删除对象返回 409;key 不存在返回 404。
-
-#### Scenario: 删除后复活可读
-
-- **WHEN** 对一个已删除的 key `undelete`,随后 `GET`
-- **THEN** `undelete` SHALL 返回 200,`GET` SHALL 返回 200
-
-### Requirement: 更新 TTL
-
-store server SHALL 提供 `POST /partitions/{pid}/blobs/{key}/ttl?expiration_ms=<i64>` 更新对象过期时间;成功返回 204;已更新过返回 409;已删除返回 409;key 不存在返回 404。
-
-#### Scenario: 更新 TTL 成功
-
-- **WHEN** 对一个已写入且未改 TTL 的 key 发 `ttl` 更新
-- **THEN** SHALL 返回 204
 
 ### Requirement: 同步引擎 offload 与自关拒绝
 

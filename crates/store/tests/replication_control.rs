@@ -25,10 +25,9 @@ fn store_config() -> antfs_blob::StoreConfig {
     }
 }
 
+/// 数据面 key:分区 0 + 低 32bit = `n`(副本由 `create_with` 建库,key 前缀 0)。
 fn key(n: u8) -> StoreKey {
-    let mut b = [0u8; 8];
-    b[0] = n;
-    StoreKey::from_slice(&b).unwrap()
+    StoreKey::from_parts(0, n as u32)
 }
 
 /// 起一个**独立**节点(不接 master),建 pid=0 副本,真端口上跑 axum;返回 (base_url, server)。
@@ -71,7 +70,11 @@ async fn set_paused(router: &axum::Router, paused: bool) -> serde_json::Value {
 async fn get_paused(router: &axum::Router) -> serde_json::Value {
     let resp = router
         .clone()
-        .oneshot(Request::get("/admin/replication-control").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/admin/replication-control")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -98,7 +101,8 @@ async fn spawn_replicating(
         replication_interval_secs: 1,
         ..Default::default()
     };
-    let srv = StoreServer::start_with(cfg, store_config(), &registry).expect("start replicating node");
+    let srv =
+        StoreServer::start_with(cfg, store_config(), &registry).expect("start replicating node");
     (srv, registry)
 }
 
@@ -146,7 +150,9 @@ async fn paused_pull_keeps_new_replica_bootstrapping() {
     let beats_paused = fake.beat_count();
     // 时钟用**心跳 beat**(1s/次,与复制周期同为 1s):等 4 拍 ≫ 3 个复制周期。
     assert!(
-        wait_until(Duration::from_secs(20), || fake.beat_count() >= beats_paused + 4).await,
+        wait_until(Duration::from_secs(20), || fake.beat_count()
+            >= beats_paused + 4)
+        .await,
         "暂停期间心跳必须照常"
     );
     assert_eq!(
@@ -154,12 +160,18 @@ async fn paused_pull_keeps_new_replica_bootstrapping() {
         "BOOTSTRAP",
         "暂停拉复制时副本必须停在 BOOTSTRAP(否则 master 会据此删源)"
     );
-    assert!(store_b.get(&key(1)).is_err(), "暂停期间不得拉到源的数据(负例有证明力)");
+    assert!(
+        store_b.get(&key(1)).is_err(),
+        "暂停期间不得拉到源的数据(负例有证明力)"
+    );
     assert_eq!(rounds(&registry_b), rounds_paused, "暂停期间不得再跑复制轮");
     // 心跳上报的实然态(指标口径):一个副本仍未追平。
     assert!(
         wait_until(Duration::from_secs(10), || {
-            text_value(&metrics_text(&registry_b), "store_server_replicas_bootstrapping") == 1
+            text_value(
+                &metrics_text(&registry_b),
+                "store_server_replicas_bootstrapping",
+            ) == 1
         })
         .await,
         "暂停期间的「同步中」副本数必须为 1:\n{}",
@@ -173,10 +185,17 @@ async fn paused_pull_keeps_new_replica_bootstrapping() {
         "恢复拉复制并追平后必须转 ACTIVE;beats={}",
         fake.beat_count()
     );
-    assert_eq!(store_b.get(&key(1)).unwrap(), b"alpha", "转 ACTIVE 时数据必须已经真的在本地");
+    assert_eq!(
+        store_b.get(&key(1)).unwrap(),
+        b"alpha",
+        "转 ACTIVE 时数据必须已经真的在本地"
+    );
     assert!(
         wait_until(Duration::from_secs(10), || {
-            text_value(&metrics_text(&registry_b), "store_server_replicas_bootstrapping") == 0
+            text_value(
+                &metrics_text(&registry_b),
+                "store_server_replicas_bootstrapping",
+            ) == 0
         })
         .await,
         "追平后「同步中」计数必须归 0"
@@ -190,7 +209,10 @@ fn metrics_text(registry: &antfs_metric::Registry) -> String {
 
 /// `store_server_replication_rounds_total` 的当前值(读文本解析;测试断言用)。
 fn rounds(registry: &antfs_metric::Registry) -> u64 {
-    text_value(&metrics_text(registry), "store_server_replication_rounds_total")
+    text_value(
+        &metrics_text(registry),
+        "store_server_replication_rounds_total",
+    )
 }
 
 fn text_value(text: &str, name: &str) -> u64 {
@@ -233,7 +255,7 @@ async fn paused_pull_replication_stops_converging_then_resumes() {
     assert!(
         wait_until(Duration::from_secs(20), || store_b.get(&key(1)).is_ok()
             && rounds(&registry_b) > 0)
-            .await,
+        .await,
         "B 必须先能通过后台复制收敛(否则本用例没有证明力)"
     );
 
@@ -251,7 +273,9 @@ async fn paused_pull_replication_stops_converging_then_resumes() {
 
     // 时钟用**心跳 beat**(1s/次,与复制周期同为 1s):等 4 拍 ≫ 3 个复制周期。
     assert!(
-        wait_until(Duration::from_secs(20), || fake.beat_count() >= beats_paused + 4).await,
+        wait_until(Duration::from_secs(20), || fake.beat_count()
+            >= beats_paused + 4)
+        .await,
         "暂停期间心跳必须照常(它不受复制开关影响)"
     );
     assert!(
@@ -265,29 +289,48 @@ async fn paused_pull_replication_stops_converging_then_resumes() {
     let resp = router_b
         .clone()
         .oneshot(
-            Request::get(format!("/partitions/0/blobs/{}?replication=1", hex::encode(key(1).as_bytes())))
-                .body(Body::empty())
-                .unwrap(),
+            Request::get(format!(
+                "/partitions/0/blobs/{}?replication=1",
+                hex::encode(key(1).as_bytes())
+            ))
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "暂停期间复制读端点必须照常服务");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "暂停期间复制读端点必须照常服务"
+    );
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"alpha");
     let resp = router_b
         .clone()
         .oneshot(
-            Request::get("/partitions/0/replica-metadata?max_bytes=1024").body(Body::empty()).unwrap(),
+            Request::get("/partitions/0/replica-metadata?max_bytes=1024")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "暂停期间元数据端点必须照常服务");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "暂停期间元数据端点必须照常服务"
+    );
 
     // 复制开关与请求静默正交:暂停不影响数据面 put/get。
-    let put = Request::put(format!("/partitions/0/blobs/{}", hex::encode(key(3).as_bytes())))
-        .body(Body::from(b"local write".to_vec()))
-        .unwrap();
-    assert_eq!(router_b.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+    let put = Request::put(format!(
+        "/partitions/0/blobs/{}",
+        hex::encode(key(3).as_bytes())
+    ))
+    .body(Body::from(b"local write".to_vec()))
+    .unwrap();
+    assert_eq!(
+        router_b.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::CREATED
+    );
     let got = store_b.get(&key(3)).unwrap();
     assert_eq!(got.as_slice(), b"local write");
 
@@ -303,7 +346,7 @@ async fn paused_pull_replication_stops_converging_then_resumes() {
     assert!(
         wait_until(Duration::from_secs(20), || store_b.get(&key(2)).is_ok()
             && rounds(&registry_b) > rounds_paused)
-            .await,
+        .await,
         "恢复后必须继续收敛(拉到暂停期间的新对象)且复制轮继续计数"
     );
     assert!(

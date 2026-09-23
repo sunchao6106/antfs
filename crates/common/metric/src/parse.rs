@@ -27,7 +27,11 @@ fn parse_line(line: &str) -> Option<Sample> {
             if close < open {
                 return None;
             }
-            (&line[..open], parse_labels(&line[open + 1..close])?, &line[close + 1..])
+            (
+                &line[..open],
+                parse_labels(&line[open + 1..close])?,
+                &line[close + 1..],
+            )
         }
         None => {
             let ws = line.find(char::is_whitespace)?;
@@ -38,7 +42,11 @@ fn parse_line(line: &str) -> Option<Sample> {
         return None;
     }
     let value: f64 = rest.split_whitespace().next()?.parse().ok()?;
-    Some(Sample { name: name.to_string(), labels, value })
+    Some(Sample {
+        name: name.to_string(),
+        labels,
+        value,
+    })
 }
 
 /// 解析 `lk="lv",lk2="lv2"`:label 值可含除 `"` 外任意字符(含 `,`/`=`),故逐段扫描而非 split。
@@ -75,13 +83,23 @@ mod tests {
     #[test]
     fn parses_plain_sample() {
         let s = parse("master_is_leader 1");
-        assert_eq!(s, vec![Sample { name: "master_is_leader".into(), labels: vec![], value: 1.0 }]);
+        assert_eq!(
+            s,
+            vec![Sample {
+                name: "master_is_leader".into(),
+                labels: vec![],
+                value: 1.0
+            }]
+        );
     }
 
     #[test]
     fn parses_float_and_int_values() {
         let s = parse("a 2\nb 2.5\nc -3");
-        assert_eq!(s.iter().map(|x| x.value).collect::<Vec<_>>(), vec![2.0, 2.5, -3.0]);
+        assert_eq!(
+            s.iter().map(|x| x.value).collect::<Vec<_>>(),
+            vec![2.0, 2.5, -3.0]
+        );
     }
 
     #[test]
@@ -91,7 +109,10 @@ mod tests {
         assert_eq!(s[0].name, "store_get_total");
         assert_eq!(
             labels(&s[0]),
-            &[("partition".to_string(), "7".to_string()), ("replica".to_string(), "r1".to_string())]
+            &[
+                ("partition".to_string(), "7".to_string()),
+                ("replica".to_string(), "r1".to_string())
+            ]
         );
         assert_eq!(s[0].value, 42.0);
     }
@@ -102,7 +123,10 @@ mod tests {
         let s = parse(text);
         let names: Vec<&str> = s.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names, vec!["x", "y", "z"]);
-        assert!(labels(&s[1]).is_empty(), "empty label set must parse to no labels");
+        assert!(
+            labels(&s[1]).is_empty(),
+            "empty label set must parse to no labels"
+        );
     }
 
     #[test]

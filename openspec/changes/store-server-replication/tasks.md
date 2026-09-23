@@ -1,12 +1,15 @@
 # tasks — store-server-replication (S3a)
 
+> **后续变更(2026-09-23,`simplify-delete-model`)**:下文的生命周期版本 / 操作时间判定与"复活对象保留"测试已随"对象不可变 + 删除不可逆"作废;`apply_replicated` 现按**墓碑恒胜**合并。
+> 本清单保留为实现当时的记录。
+
 ## 1. 变更文档
 - [x] 1.1 proposal / design / spec delta 写就,`openspec validate store-server-replication --strict` 通过。
 
 ## 2. store 引擎:忠实 apply
 - [x] 2.1 `blob.rs`:`ReplicatedRecord` + `ApplyOutcome` 公有类型;`lib.rs` 导出。
-- [x] 2.2 `BlobStore::apply_replicated`(newest-wins + lifeVersion 判定;原样写 flags/lv/exp/op_time;inline seg_bytes/valid_stats;`is_available` 门控 + `track`;只增不删幂等)。
-- [x] 2.3 单测(§3.3 持久性):缺失存活复制、重复 apply Skipped、高 lifeVersion undelete 保留、墓碑传播、Unavailable 门控。
+- [x] 2.2 `BlobStore::apply_replicated`(墓碑恒胜判定;inline seg_bytes/valid_stats;`is_available` 门控 + `track`;只增不删幂等)。
+- [x] 2.3 单测(§3.3 持久性):缺失存活复制、重复 apply Skipped、墓碑传播、Unavailable 门控。
 
 ## 3. store-server 数据面端点
 - [x] 3.1 `server.rs`:`GET /partitions/{pid}/replica-metadata?token&max_bytes` → JSON FindInfo(token 用 base64/整数编码;404 无 replica)。

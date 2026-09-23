@@ -17,9 +17,9 @@ pub use blob::{
 };
 pub use config::StoreConfig;
 pub use error::{Error, Result};
-pub use index::{IndexValue, PersistentIndex};
 /// "不过期"哨兵(`i64::MAX` 语义见 value 模块):`put_from_reader` / HTTP 层的 `expiration_ms` 缺省值。
 pub use index::value::NO_EXPIRATION;
+pub use index::{IndexValue, PersistentIndex};
 pub use log::Log;
 pub use log_segment::LogSegment;
 pub use metrics::{StoreMetricHandles, StoreMetrics};

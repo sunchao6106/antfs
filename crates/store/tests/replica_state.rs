@@ -27,10 +27,9 @@ fn store_config() -> antfs_blob::StoreConfig {
     }
 }
 
+/// 数据面 key:分区 0 + 低 32bit = `n`(副本由 `create_with` 建库,key 前缀 0)。
 fn key(n: u8) -> StoreKey {
-    let mut b = [0u8; 8];
-    b[0] = n;
-    StoreKey::from_slice(&b).unwrap()
+    StoreKey::from_parts(0, n as u32)
 }
 
 fn config(dir: &std::path::Path, node_id: u64) -> StoreServerConfig {
@@ -73,7 +72,12 @@ fn state_of(srv: &StoreServer, pid: u32) -> String {
 }
 
 /// 在阻塞线程里跑一轮 `sync_round`(与后台复制器**同一入口**,故追平判定口径一致)。
-async fn sync(srv: &StoreServer, base: String, prior: Option<FindToken>, bootstrap: bool) -> SyncOutcome {
+async fn sync(
+    srv: &StoreServer,
+    base: String,
+    prior: Option<FindToken>,
+    bootstrap: bool,
+) -> SyncOutcome {
     let replicas = srv.replicas();
     tokio::task::spawn_blocking(move || {
         let peer = HttpPeer::new(base, 0, Duration::from_secs(10)).unwrap();
@@ -104,7 +108,9 @@ async fn single_replica_partition_reaches_active_without_peers() {
     srv_b.serve().await.expect("serve b");
 
     assert!(
-        wait_until(Duration::from_secs(20), || state_of(&srv_b, 0) == STATE_ACTIVE).await,
+        wait_until(Duration::from_secs(20), || state_of(&srv_b, 0)
+            == STATE_ACTIVE)
+        .await,
         "没有其他副本可供同步 = 没有数据要同步 → 必须在有限轮内转 ACTIVE"
     );
 }
@@ -133,8 +139,16 @@ async fn empty_partition_replica_reaches_active() {
     srv_b.replicas().ensure_replica(1).unwrap();
 
     // 建之初必须如实报 BOOTSTRAP(修的就是"一出生就自称 ACTIVE")。
-    assert_eq!(state_of(&srv_b, 0), STATE_BOOTSTRAP, "新建空副本不得自称 ACTIVE");
-    assert_eq!(state_of(&srv_b, 1), STATE_BOOTSTRAP, "新建空副本不得自称 ACTIVE");
+    assert_eq!(
+        state_of(&srv_b, 0),
+        STATE_BOOTSTRAP,
+        "新建空副本不得自称 ACTIVE"
+    );
+    assert_eq!(
+        state_of(&srv_b, 1),
+        STATE_BOOTSTRAP,
+        "新建空副本不得自称 ACTIVE"
+    );
     srv_b.serve().await.expect("serve b");
 
     assert!(
@@ -172,7 +186,13 @@ fn gauge_of(registry: &antfs_metric::Registry, name: &str) -> i64 {
 /// 取 Prometheus 文本里某指标的值(gauge 内联标签的形态与本文件用到的指标一致)。
 fn text_value(text: &str, name: &str) -> i64 {
     text.lines()
-        .find_map(|l| l.strip_prefix(name)?.split_whitespace().next()?.parse::<i64>().ok())
+        .find_map(|l| {
+            l.strip_prefix(name)?
+                .split_whitespace()
+                .next()?
+                .parse::<i64>()
+                .ok()
+        })
         .unwrap_or(-1)
 }
 
@@ -183,11 +203,16 @@ async fn replica_with_peer_data_stays_bootstrapping_until_caught_up() {
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (base_a, srv_a) = spawn_serving(dir_a.path(), &[0]).await;
     let registry_b = antfs_metric::Registry::new();
-    let srv_b = StoreServer::start_with(config(dir_b.path(), 2), store_config(), &registry_b).expect("start b");
+    let srv_b = StoreServer::start_with(config(dir_b.path(), 2), store_config(), &registry_b)
+        .expect("start b");
     srv_b.replicas().ensure_replica(0).unwrap();
     let store_b = srv_b.replicas().get(0).unwrap().store;
 
-    assert_eq!(state_of(&srv_b, 0), STATE_BOOTSTRAP, "新建副本起点必须是 BOOTSTRAP");
+    assert_eq!(
+        state_of(&srv_b, 0),
+        STATE_BOOTSTRAP,
+        "新建副本起点必须是 BOOTSTRAP"
+    );
 
     // 对端写入数据(本地一条都还没有)。
     let store_a = srv_a.replicas().get(0).unwrap().store;
@@ -200,7 +225,10 @@ async fn replica_with_peer_data_stays_bootstrapping_until_caught_up() {
         STATE_BOOTSTRAP,
         "对端有数据且本地没拉到时不得报 ACTIVE(否则 master 会据此删源)"
     );
-    assert!(store_b.get(&key(1)).is_err(), "此时本地确实还没有数据(负例有证明力)");
+    assert!(
+        store_b.get(&key(1)).is_err(),
+        "此时本地确实还没有数据(负例有证明力)"
+    );
 
     // 一轮拉复制(与后台复制器同一入口)→ 追平 → 转 ACTIVE。
     let out = sync(&srv_b, base_a.clone(), None, false).await;
@@ -211,7 +239,11 @@ async fn replica_with_peer_data_stays_bootstrapping_until_caught_up() {
     // 再拉一轮(幂等):状态不抖回去。
     let again = sync(&srv_b, base_a, Some(out.token), false).await;
     assert_eq!(again.stats.applied, 0, "已追平 → 无新增 apply");
-    assert_eq!(state_of(&srv_b, 0), STATE_ACTIVE, "ACTIVE 是单向的,不得回退");
+    assert_eq!(
+        state_of(&srv_b, 0),
+        STATE_ACTIVE,
+        "ACTIVE 是单向的,不得回退"
+    );
 }
 
 /// 场景 2(物理 bootstrap):`bootstrap_from_peer` 只拷封存段,**拷完不算追平** —— 副本仍是
@@ -247,7 +279,11 @@ async fn physical_bootstrap_alone_stays_bootstrapping() {
     .await
     .unwrap()
     .unwrap();
-    assert!(boot.segments >= 2, "应物理拷贝了封存段, got {}", boot.segments);
+    assert!(
+        boot.segments >= 2,
+        "应物理拷贝了封存段, got {}",
+        boot.segments
+    );
     assert_eq!(
         state_of(&srv_b, 0),
         STATE_BOOTSTRAP,
@@ -256,11 +292,22 @@ async fn physical_bootstrap_alone_stays_bootstrapping() {
 
     // 逻辑补齐(活跃尾)→ 追平 → ACTIVE。
     let out = sync(&srv_b, base_a, None, false).await;
-    assert_eq!(state_of(&srv_b, 0), STATE_ACTIVE, "bootstrap + 增量拉补齐后必须转 ACTIVE");
-    assert!(out.stats.applied <= 6, "不会重复 apply 已被封存段覆盖的记录");
+    assert_eq!(
+        state_of(&srv_b, 0),
+        STATE_ACTIVE,
+        "bootstrap + 增量拉补齐后必须转 ACTIVE"
+    );
+    assert!(
+        out.stats.applied <= 6,
+        "不会重复 apply 已被封存段覆盖的记录"
+    );
     let store_b = srv_b.replicas().get(0).unwrap().store;
     for n in 0..6u8 {
-        assert_eq!(store_b.get(&key(n)).unwrap(), big, "bootstrap 后 key {n} 可读");
+        assert_eq!(
+            store_b.get(&key(n)).unwrap(),
+            big,
+            "bootstrap 后 key {n} 可读"
+        );
     }
 }
 
@@ -303,7 +350,11 @@ async fn reopened_replica_starts_bootstrapping_then_active() {
         "重开的副本数据可能是旧的 → 先报 BOOTSTRAP(不得沿用旧进程的 ACTIVE)"
     );
     let store_b2 = srv2.replicas().get(0).unwrap().store;
-    assert_eq!(store_b2.get(&key(1)).unwrap(), b"alpha", "重开后数据必须还在");
+    assert_eq!(
+        store_b2.get(&key(1)).unwrap(),
+        b"alpha",
+        "重开后数据必须还在"
+    );
 
     // 一轮拉复制确认(对端没有新数据,幂等)→ 追平 → ACTIVE。
     let out = sync(&srv2, base_a, None, false).await;

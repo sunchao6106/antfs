@@ -29,7 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if cfg.initial_members == vec![cfg.node_id] {
         let members = BTreeMap::from([(cfg.node_id, BasicNode::new(cfg.raft_addr.clone()))]);
         match master.initialize(members).await {
-            Ok(()) => tracing::info!(node_id = cfg.node_id, "bootstrapped single-node master cluster"),
+            Ok(()) => tracing::info!(
+                node_id = cfg.node_id,
+                "bootstrapped single-node master cluster"
+            ),
             Err(e) => tracing::info!(error = %e, "initialize skipped (already initialized?)"),
         }
         let _ = master

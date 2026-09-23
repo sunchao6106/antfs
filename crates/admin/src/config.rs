@@ -87,14 +87,23 @@ impl Default for AdminConfig {
 impl Validate for AdminConfig {
     fn validate(&self) -> Result<()> {
         if self.master_addr.is_empty() {
-            return Err(antfs_config::ConfigError::invalid("admin.master_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid(
+                "admin.master_addr",
+                "must not be empty",
+            ));
         }
         if self.listen_addr.is_empty() {
-            return Err(antfs_config::ConfigError::invalid("admin.listen_addr", "must not be empty"));
+            return Err(antfs_config::ConfigError::invalid(
+                "admin.listen_addr",
+                "must not be empty",
+            ));
         }
         for (i, u) in self.users.iter().enumerate() {
             if u.token.is_empty() {
-                return Err(ConfigError::invalid(format!("admin.users[{i}].token"), "must not be empty"));
+                return Err(ConfigError::invalid(
+                    format!("admin.users[{i}].token"),
+                    "must not be empty",
+                ));
             }
             one_of(&format!("admin.users[{i}].role"), u.role.as_str(), &ROLES)?;
         }
@@ -107,7 +116,11 @@ mod tests {
     use super::*;
 
     fn user(name: &str, role: &str) -> AdminUser {
-        AdminUser { name: name.into(), token: format!("tok-{name}"), role: role.into() }
+        AdminUser {
+            name: name.into(),
+            token: format!("tok-{name}"),
+            role: role.into(),
+        }
     }
 
     #[test]
@@ -120,16 +133,26 @@ mod tests {
 
     #[test]
     fn users_accept_operator_and_viewer_only() {
-        let ok = AdminConfig { users: vec![user("a", "operator"), user("b", "viewer")], ..Default::default() };
+        let ok = AdminConfig {
+            users: vec![user("a", "operator"), user("b", "viewer")],
+            ..Default::default()
+        };
         assert!(ok.validate().is_ok(), "{ok:?}");
 
-        let bad_role = AdminConfig { users: vec![user("a", "Operator")], ..Default::default() };
+        let bad_role = AdminConfig {
+            users: vec![user("a", "Operator")],
+            ..Default::default()
+        };
         let err = bad_role.validate().unwrap_err().to_string();
         assert!(err.contains("admin.users[0].role"), "{err}");
         assert!(err.contains("operator, viewer"), "{err}");
 
         let empty_token = AdminConfig {
-            users: vec![AdminUser { name: "a".into(), token: String::new(), role: "viewer".into() }],
+            users: vec![AdminUser {
+                name: "a".into(),
+                token: String::new(),
+                role: "viewer".into(),
+            }],
             ..Default::default()
         };
         let err = empty_token.validate().unwrap_err().to_string();

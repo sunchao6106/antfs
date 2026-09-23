@@ -15,7 +15,7 @@
    curl ──HTTP──▶ frontend ──GetBlobIds + PUT ×N──▶ master / store ×N
 ```
 
-`Router` 负责:向 master 取 **blobId 号段**、按 blobId 定位副本、**W 多数派写**、**R=1 读**、变更类操作(删/复活/TTL)。
+`Router` 负责:向 master 取 **blobId 号段**、按 blobId 定位副本、**W 多数派写**、**R=1 读**、变更类操作(删除)与**写入时定 TTL**。
 它**不做**协议翻译(frontend 的事)、不做 ACL/配额(网关层远景)、不碰数据字节的存储语义(store 的事)。
 本 crate **不提供任何二进制**——压测见 `benchmark/router`,REST 入口见 `crates/frontend`。
 
@@ -35,7 +35,7 @@ put(key, bytes): 解析 key 的高 32 位得 partitionId
   副本数取**放置全量**(不是"活着的副本数"):RF=3 掉一个节点仍写得进,掉两个就写不进(正确 —— 少数派不接受写)。
 - **提前返回 = 取消剩余请求**:第 3 份靠异步拉复制收敛(`cluster.md §10`),这是 W 语义的应有之义,也是延迟的来源。
 - **失败即报错,不偷偷换 partition 重写**:换分区重写会掩盖问题且可能与已部分写入的副本产生分叉;重试由调用方决定。
-- 变更类(`delete`/`undelete`/`update_ttl`)同样走多数派扇出;`undelete` 额外返回首个成功副本上的 life version。
+- 变更类(`delete`)同样走多数派扇出。**TTL 只能在写入时给**:`put_with_ttl(key, data, expiration_ms)` / `put_file_with_ttl(path, expiration_ms)` 把绝对过期时刻(`expiration_ms`)随写一并扇出(单次多数派写);`put` / `put_file` 是 `NO_EXPIRATION`(常量由 `antfs_router` 再导出)的包装,等价于"永不过期"。写入之后**没有任何改 TTL 的接口**。
 
 ## 3. 读路径(R = 1)
 
@@ -59,7 +59,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `id_exhausted` | 该 partition 的 u32 objectId 空间耗尽 | **封存该分区**(绝不复用号) |
 | `http` | 数据面连不上/超时 | 副本不可达;换副本或等它恢复 |
 | `status` | 副本返回非预期状态码 | 见 detail |
-| `already_exists` | 副本返回 409 | **新号段不可能已存在** → 号被复用,属严重问题,必须查 |
+| `already_exists` | 副本返回 409 | 新号段却被判已存在 → **号被复用**(blobId 永久占用),属严重问题,必须查(重复 `DELETE` 已幂等回 204,不再产生 409) |
 | `store_full` | 副本返回 507 | 该分区写满 → 加分区(别当 500 忽略) |
 | `no_replica` | 副本返回 404「no replica for partition」 | 路由到了不持有该分区的节点 |
 | `silenced` | 副本返回 503 + `Retry-After` | 运维**请求静默**止血,不是故障 |
@@ -102,7 +102,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_put_replica_errors_total` | counter | `kind` | 次 | **单个副本**写失败分类(kind 同错误表) | 无 |
 | `router_get_total` | counter | `outcome` | 次 | 读请求数 | `RouterMetrics.getBlobOperationRate` |
 | `router_get_bytes_total` | counter | — | 字节 | 成功读出的字节数 | 无 |
-| `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`undelete`/`ttl`/`stat` 操作数 | `RouterMetrics.*OperationRate` |
+| `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`stat` 操作数 | `RouterMetrics.*OperationRate` |
 
 ## 7. 与 Ambry 的差异 / 已知取舍 / 待办
 
@@ -111,7 +111,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
    代价:写路径多一次 master RPC(经号段摊薄至 ≈0)+ 号可枚举(D6 已知取舍);
    收益:id 连续可数、partition 由 master 按容量兼顾均衡挑选(D10)、无"随机撞陈旧分区"问题。
 2. **partition 由 master 选**(D10):客户端不再本地挑可写分区。
-3. `stat`/`delete`/`undelete` 直接对数据面端点,无 account/container 维度(D7:blobId 64 位塞不下)。
+3. `stat`/`delete` 直接对数据面端点,无 account/container 维度(D7:blobId 64 位塞不下)。
 
 **已知取舍**:
 - 号段内已发放但未使用的号 = **空洞**(router 崩溃、换段时丢弃);master 侧 `master_id_alloc_holes_total` 可观测。
@@ -126,7 +126,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
   调用方在前面挂一层转发。**这是既有写 RPC 的共性问题,不只本 SDK。**
 - [ ] 号段**后台预取**(D2 的双 buffer):现在按需取段,号段边界有 RPC 尖峰。
 - [ ] 读路由缓存 TTL / 失败后强制刷新。
-- [ ] `put*` 增加 `expiration_ms` 参数(让 frontend 的 `x-ambry-ttl-ms` 变成原子写)。
+- [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,frontend 的 `x-ambry-ttl-ms` 已是单次原子写)。
 - [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
 
 ## 8. 配套工具(不在本 crate 内)

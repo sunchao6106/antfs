@@ -14,6 +14,10 @@
 而且 `cluster.md` 现在的架构决策是「**router SDK 取代 frontend**(无独立 frontend 集群)」—— 本 change 依用户指示
 **修正该决策**:frontend 保留并落地(`frontend` 角色不是被否决,而是排期),与 router SDK 并存。
 
+> **后续变更(2026-09-23,`simplify-delete-model`)**:下文 router 的"变更类(删/复活/TTL)"与 frontend 的
+> 「复活」「改 TTL」两条路由已删除;`x-ambry-ttl-ms`
+> 改为经 `Router::put_with_ttl` **写入时一次带上**。下文保留为当时的记录。
+
 ## What Changes
 
 - **master 新增 `GetBlobIds` RPC**(写路径入口):leader-only + 准入密钥,返回
@@ -25,10 +29,10 @@
   `partition_capacity_bytes − used_bytes`,取自心跳软状态 `used_bytes_by_partition`);候选优先取"至少一个副本节点存活"的,
   全不活则退回全部 RW(避免 master 刚重启、软状态未重建时出现"完全不可写"的假故障)。
 - **新 crate `crates/common/router`(router SDK + CLI)**:号段缓存、**W = 实际副本数/2+1(多数派,实算,不做配置项)**、
-  **R=1 首个成功**,变更类(删/复活/TTL)同样多数派;`put_file`/`get_file` 流式;CLI `antfs-bench-router`
+  **R=1 首个成功**,变更类(删)同样多数派;`put_file`/`get_file` 流式;CLI `antfs-bench-router`
   提供 `put/get/head/delete/alloc/bench`。
 - **新 crate `crates/frontend`(HTTP REST 对象接口层)**:`POST|GET|HEAD|DELETE /blobs[/{blobId}]`、
-  `POST /blobs/{blobId}/undelete`、`POST /blobs/{blobId}/ttl?expiration_ms=`、`POST /stitch`(分片拼装,无状态)、
+  `POST /stitch`(分片拼装,无状态)、
   `GET /metrics`;内嵌同一个 `Router`,**不重复实现 W/R**。
 - **store 侧配套**:
   - `PUT ...?expiration_ms=`(建对象时即带 TTL,分片孤儿回收需要);

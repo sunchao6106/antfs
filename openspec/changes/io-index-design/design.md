@@ -106,7 +106,7 @@ while (phase != DONE) switch (phase):
   - 后台 periodic persist 活跃索引段(先 fsync tmp **再 rename**,补现有 std::fs::write+rename 缺 fsync 的缺陷)。
   - 记录**索引持久化水位**(已落盘的 log 区间);启动**加载索引 + 从水位回放 log 尾部**,只补增量。
 - 仅当索引损坏/缺失时**全量 `open_rebuild_index`**(扫 log 重建)。索引比数据宽松(可重建),数据 fsync 是持久化边界。
-- **TTL 契约缺口**:当前 log 记录不带 expiration/op_time,rebuild 会丢 TTL;本 change 标记:后续实现须**把 expiration 落进 log 记录**,否则「从 log 重建」不完整。
+- **TTL 已随记录持久化**(记录 v4 带 `expiration`):「从 log 重建」可完整恢复 TTL,不再有该缺口。
 
 ### D7:文件组织与命名(对齐 Ambry)
 - 每对象属于一个 partition(BlobId 编码 partition id);节点按 replica/store 承载,每 store 一份 Log + Index(定容,写满滚新 partition)。

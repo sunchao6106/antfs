@@ -91,7 +91,9 @@ pub fn spawn_prober(disks: Vec<Disk>, interval: Duration, timeout: Duration, out
             tick.tick().await;
             for d in &disks {
                 let h = probe_disk(d.dir.clone(), timeout).await;
-                out.write().expect("health map poisoned").insert(d.id.clone(), h);
+                out.write()
+                    .expect("health map poisoned")
+                    .insert(d.id.clone(), h);
             }
         }
     });

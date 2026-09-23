@@ -2,13 +2,17 @@
 
 S1/S2/mutations 让数据节点能 `PUT`/`GET`/变更 blob 并接入集群,但**副本间还不会同步**:router SDK 的 W=2 异步 quorum 写(§10)靠拉复制把第 3 副本补齐;失联/ERROR 后 master 补的新副本(M3 再复制,target=BOOTSTRAP)也要靠拉复制追平。没有 S3,多副本只是"各写各的",冗余不收敛,§3.1 持久性红线落不了地。
 
-`store` 引擎已具备拉复制所需的全部读侧原语:`find_entries_since`(Ambry `findEntriesSince`)、`find_missing_keys`、`get_with_options`、`FindToken`/`MessageInfo`。**唯一缺口是写侧**:没有"把 peer 的一条记录按其原样(flags/lifeVersion/expiration/op_time)写进本地"的忠实 apply——现有 `put/delete/undelete/update_ttl` 都是**发起者语义**(`op_time=now`、lifeVersion 本地推导),不能用来复制(否则 bootstrap 一个已 undelete/高 lifeVersion 的 blob,本地会退回 lifeVersion 0,与 peer 永久发散)。
+`store` 引擎已具备拉复制所需的全部读侧原语:`find_entries_since`(Ambry `findEntriesSince`)、`find_missing_keys`、`get_with_options`、`FindToken`/`MessageInfo`。**唯一缺口是写侧**:没有"把 peer 的一条记录按其原样(flags/expiration)写进本地"的忠实 apply——现有 `put/delete` 都是**发起者语义**,不能用来复制。
+
+> **后续变更(2026-09-23,`simplify-delete-model`)**:本 change 落地时 `apply_replicated` 按 **newest-wins + 生命周期版本** 裁决
+> 并保留 peer 的定序字段。对象改为**不可变 + 删除不可逆**后已退化为**墓碑恒胜**,上述定序字段
+> 与「复活」/「改 TTL」操作均已不存在。下文保留为当时的记录。
 
 ## What Changes
 
 - **store 引擎**新增忠实复制-apply 原语(持久化写路径,守 §3.3):
-  - `ReplicatedRecord`(key + flags + expiration + op_time + life_version + 可选 data)与 `ApplyOutcome{Applied,Skipped}`。
-  - `BlobStore::apply_replicated(rec) -> Result<ApplyOutcome>`:按 **newest-wins + lifeVersion** 与本地赢家比较;需应用时把 peer 记录**逐字节原样**追加(保留其 flags/lifeVersion/expiration/op_time),更新索引/`seg_bytes`/`valid_stats`;已 ≥ peer 状态则 `Skipped`(幂等)。经 `is_available` 门控 + IO-error `track`(承 Phase 1)。
+  - `ReplicatedRecord`(key + flags + expiration + 可选 data)与 `ApplyOutcome{Applied,Skipped}`。
+  - `BlobStore::apply_replicated(rec) -> Result<ApplyOutcome>`:按 **墓碑恒胜**与本地赢家比较;需应用时把 peer 记录追加(保留其 flags/expiration),更新索引/`seg_bytes`/`valid_stats`;已 ≥ peer 状态则 `Skipped`(幂等)。经 `is_available` 门控 + IO-error `track`(承 Phase 1)。
 - **store-server 数据面(HTTP,承本 change Q2=HTTP)**:
   - `GET /partitions/{pid}/replica-metadata?token=<b64>&max_bytes=<u64>` → JSON `{entries:[MessageInfo],token,bytes_read}`(Ambry `ReplicaMetadataRequest`,step-1)。
   - blob 读加 `?replication=1`,对已删除/过期记录也返回数据体(供忠实 apply,step-2)。
@@ -27,7 +31,7 @@ S1/S2/mutations 让数据节点能 `PUT`/`GET`/变更 blob 并接入集群,但**
 ## Impact
 
 - **crate**:`store`(`blob.rs` 新增 apply_replicated + 类型;`lib.rs` 导出);`store-server`(`replication.rs` 新增;`server.rs` 加 2 端点;`config.rs`/`metrics.rs` 扩展;`serve()` 起复制器;`Cargo.toml` 加 `reqwest`)。
-- **保留契约**:blob 不整缓(数据体流式/按需拉);同步引擎经 `spawn_blocking`;blob id 永久占用;newest-wins + lifeVersion(store 已实现)。守 §3.1 先补冗余(拉复制**只增不删**本地数据,幂等可重试)。
+- **保留契约**:blob 不整缓(数据体流式/按需拉);同步引擎经 `spawn_blocking`;blob id 永久占用;墓碑恒胜合并(store 已实现)。守 §3.1 先补冗余(拉复制**只增不删**本地数据,幂等可重试)。
 
 ## Non-goals
 

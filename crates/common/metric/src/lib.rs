@@ -56,7 +56,12 @@ pub fn gauge(registry: &Registry, name: &str, help: &str) -> Result<IntGauge> {
 }
 
 /// 自定义桶的直方图(分布统计)。对齐 Dropwizard `Histogram`。
-pub fn histogram(registry: &Registry, name: &str, help: &str, buckets: Vec<f64>) -> Result<Histogram> {
+pub fn histogram(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    buckets: Vec<f64>,
+) -> Result<Histogram> {
     let h = Histogram::with_opts(HistogramOpts::new(name, help).buckets(buckets))?;
     registry.register(Box::new(h.clone()))?;
     Ok(h)
@@ -84,7 +89,12 @@ pub fn counter_vec(
 }
 
 /// 带 label 的 gauge。
-pub fn gauge_vec(registry: &Registry, name: &str, help: &str, labels: &[&str]) -> Result<IntGaugeVec> {
+pub fn gauge_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<IntGaugeVec> {
     let v = IntGaugeVec::new(Opts::new(name, help), labels)?;
     registry.register(Box::new(v.clone()))?;
     Ok(v)

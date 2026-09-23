@@ -19,10 +19,9 @@ fn small_store_config() -> antfs_blob::StoreConfig {
     }
 }
 
+/// 数据面 key:分区 0 + 低 32bit = `n`(副本由 `create_with` 建库,key 前缀 0)。
 fn key(n: u8) -> StoreKey {
-    let mut b = [0u8; 8];
-    b[0] = n;
-    StoreKey::from_slice(&b).unwrap()
+    StoreKey::from_parts(0, n as u32)
 }
 
 /// 起一个 store-server,建 pid=0 的 replica,在真端口上跑 axum;返回 (addr, 该 server)。
@@ -92,10 +91,12 @@ async fn pull_replication_converges_over_http() {
     .await
     .unwrap()
     .unwrap();
-    assert!(matches!(store_b.get(&key(1)), Err(antfs_blob::Error::Deleted)), "delete 传播");
+    assert!(
+        matches!(store_b.get(&key(1)), Err(antfs_blob::Error::Deleted)),
+        "delete 传播"
+    );
     assert_eq!(store_b.get(&key(2)).unwrap(), b"beta", "未删的仍在");
 }
-
 
 /// 在阻塞线程里跑一轮 `sync_round`(与后台复制器**同一入口**,故滞后估算与追平判定口径一致)。
 async fn pull(srv: &StoreServer, base: String, prior: Option<FindToken>) -> ReplicateStats {
@@ -149,7 +150,11 @@ async fn heartbeat_reports_used_bytes_and_lag_converges_to_zero() {
     let tok = pull_token(&srv_b, base_a.clone(), None).await;
     let store_b = srv_b.replicas().get(0).unwrap().store;
     let beat = beat_of(&srv_b, 0);
-    assert_eq!(beat.used_bytes, store_b.valid_data_size(), "used_bytes 必须取引擎的实际占用");
+    assert_eq!(
+        beat.used_bytes,
+        store_b.valid_data_size(),
+        "used_bytes 必须取引擎的实际占用"
+    );
     assert!(
         beat.used_bytes >= 2 * 8192,
         "写入字节必须反映在心跳里, got {}",
@@ -196,7 +201,10 @@ async fn replication_converges_while_source_data_ops_are_silenced() {
     let base = base_a.clone();
     let blocked = tokio::task::spawn_blocking(move || {
         reqwest::blocking::Client::new()
-            .put(format!("{base}/partitions/0/blobs/{}", hex::encode(key(4).as_bytes())))
+            .put(format!(
+                "{base}/partitions/0/blobs/{}",
+                hex::encode(key(4).as_bytes())
+            ))
             .body(vec![4u8; 16])
             .send()
             .expect("request")
@@ -262,9 +270,17 @@ async fn hybrid_bootstrap_physical_then_logical() {
     .unwrap()
     .unwrap();
 
-    assert!(out.bootstrap.segments >= 2, "应物理拷贝了封存段, got {}", out.bootstrap.segments);
+    assert!(
+        out.bootstrap.segments >= 2,
+        "应物理拷贝了封存段, got {}",
+        out.bootstrap.segments
+    );
     let store_b = b.1.replicas().get(0).unwrap().store;
     for n in 0..6u8 {
-        assert_eq!(store_b.get(&key(n)).unwrap(), big, "bootstrap 后 key {n} 可读");
+        assert_eq!(
+            store_b.get(&key(n)).unwrap(),
+            big,
+            "bootstrap 后 key {n} 可读"
+        );
     }
 }

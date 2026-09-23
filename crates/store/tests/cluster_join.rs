@@ -6,21 +6,25 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
 use antfs_master::config::MasterConfig;
 use antfs_master::pb::master_client::MasterClient;
 use antfs_master::pb::{CreatePartitionsRequest, ListPartitionsRequest};
 use antfs_master::MasterNode;
-use openraft::BasicNode;
 use antfs_store::{StoreServer, StoreServerConfig};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use openraft::BasicNode;
 use tower::ServiceExt;
 
 const SECRET: &str = "s2-secret";
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn small_store_config() -> antfs_blob::StoreConfig {
@@ -74,10 +78,15 @@ async fn store_server_joins_master_and_serves_directed_replica() {
         balance_move_timeout_secs: 300,
     };
     let mreg = antfs_metric::Registry::new();
-    let master = MasterNode::start(mcfg.clone(), &mreg).await.expect("master start");
+    let master = MasterNode::start(mcfg.clone(), &mreg)
+        .await
+        .expect("master start");
     master.serve().expect("master serve");
     master
-        .initialize(BTreeMap::from([(1u64, BasicNode::new(mcfg.raft_addr.clone()))]))
+        .initialize(BTreeMap::from([(
+            1u64,
+            BasicNode::new(mcfg.raft_addr.clone()),
+        )]))
         .await
         .expect("initialize");
     master
@@ -110,12 +119,20 @@ async fn store_server_joins_master_and_serves_directed_replica() {
     // 注册后 master 应见到节点 101。
     let sm = master.sm_data.clone();
     assert!(
-        wait_until(Duration::from_secs(15), || sm.read().unwrap().state.nodes.contains_key(&101)).await,
+        wait_until(Duration::from_secs(15), || sm
+            .read()
+            .unwrap()
+            .state
+            .nodes
+            .contains_key(&101))
+        .await,
         "master must see registered store-server node 101"
     );
 
     // master 建 1 个 RF=1 分区(放到 101;需心跳已上报该盘余量)。重试到选盘成功。
-    let mut mc = MasterClient::connect(format!("http://{}", mcfg.grpc_addr)).await.expect("mc");
+    let mut mc = MasterClient::connect(format!("http://{}", mcfg.grpc_addr))
+        .await
+        .expect("mc");
     let mut pid = None;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
@@ -146,17 +163,27 @@ async fn store_server_joins_master_and_serves_directed_replica() {
 
     // 经数据面 HTTP put/get(oneshot 命中同一 ReplicaManager)。
     let router = ss.router();
-    let key = "0f".repeat(8);
+    // key:16 hex = 高 32bit 分区 0 + 低 32bit objectId(副本以默认前缀 0 建库)。
+    let key = "000000000000000f";
     let data = b"s2 end-to-end blob".to_vec();
     let put = Request::put(format!("/partitions/{pid}/blobs/{key}"))
         .body(Body::from(data.clone()))
         .unwrap();
-    assert_eq!(router.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
-    let get = Request::get(format!("/partitions/{pid}/blobs/{key}")).body(Body::empty()).unwrap();
+    assert_eq!(
+        router.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    let get = Request::get(format!("/partitions/{pid}/blobs/{key}"))
+        .body(Body::empty())
+        .unwrap();
     let resp = router.clone().oneshot(get).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(body.as_ref(), data.as_slice(), "GET on directed replica returns written bytes");
+    assert_eq!(
+        body.as_ref(),
+        data.as_slice(),
+        "GET on directed replica returns written bytes"
+    );
 
     // ListPartitions(admin dashboard 用)应列出该分区,含副本 placement 与(心跳上报的)实然态。
     // `state: ""` = 不过滤(proto 新增的按状态过滤字段)。

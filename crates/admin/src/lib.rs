@@ -8,8 +8,8 @@ pub mod config;
 pub mod error;
 pub mod master_api;
 pub mod metrics;
-pub mod server;
 pub mod scrub;
+pub mod server;
 pub mod store_client;
 
 pub use audit::AuditLog;

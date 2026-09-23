@@ -4,7 +4,8 @@ Ambry 的 `RequestControl`(`AmbryServerRequests` 的 `RequestControlAdminRequest
 
 ## What Changes
 
-- 新模块 `crates/store/src/request_control.rs`:`DataOp`(put/get/delete/undelete/ttl_update)、`RequestControl`(节点级 + 分区级禁用 + 可选 deadline,惰性过期)、`classify(method, path, query) -> Option<DataOp>`。
+- 新模块 `crates/store/src/request_control.rs`:`DataOp`(put/get/delete)、`RequestControl`(节点级 + 分区级禁用 + 可选 deadline,惰性过期)、`classify(method, path, query) -> Option<DataOp>`。
+  > **后续变更(2026-09-23,`simplify-delete-model`)**:原先的「复活」/「改 TTL」两个 `DataOp` 已随对应端点移除,枚举由 5 项收窄为 3 项(`put`/`get`/`delete`)。
 - `gate` 中间件挂在**数据面路由之后**(在 body extractor 之前短路,禁 put 时不缓冲 body);命中 → `503 SERVICE_UNAVAILABLE` + 原因文本,有 TTL 时带 `Retry-After`;不进 `errors_total`,不计 `request_duration`/`in_flight`。
 - 端点:`POST /admin/request-control`(body `{op, partition_id?, enable, ttl_secs?}`,未知 op 400、无本地副本 404)、`GET /admin/request-control`(查当前禁用集);admin 侧转发 `POST|GET /api/stores/{node_id}/request-control`。
 - 新指标 `store_server_rejected_requests_total{op,reason}`;新配置 `store_server.request_control_default_ttl_secs`(默认 1800,0 = 不设默认时长)。

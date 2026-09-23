@@ -22,11 +22,11 @@ pub struct StoreMetrics {
     already_exists: IntCounterVec,
     compaction_reclaimed_bytes: IntCounterVec,
     compaction_duration: HistogramVec,
-    hard_delete_total: IntCounterVec,
-    hard_delete_duration: HistogramVec,
     used_capacity_bytes: IntGaugeVec,
     invalid_data_bytes: IntGaugeVec,
     segment_count: IntGaugeVec,
+    open_bad_records: IntCounterVec,
+    open_abandoned_segments: IntCounterVec,
 }
 
 impl StoreMetrics {
@@ -56,18 +56,6 @@ impl StoreMetrics {
                 "single compaction run duration",
                 &["store"],
             )?,
-            hard_delete_total: counter_vec(
-                registry,
-                "store_hard_delete_total",
-                "objects scrubbed by hard delete",
-                &["store"],
-            )?,
-            hard_delete_duration: latency_seconds_vec(
-                registry,
-                "store_hard_delete_duration_seconds",
-                "hard delete run duration",
-                &["store"],
-            )?,
             used_capacity_bytes: gauge_vec(
                 registry,
                 "store_log_used_capacity_bytes",
@@ -86,6 +74,18 @@ impl StoreMetrics {
                 "number of log segments",
                 &["store"],
             )?,
+            open_bad_records: counter_vec(
+                registry,
+                "store_open_bad_records_total",
+                "records skipped while opening (undecodable / CRC mismatch); bytes left untouched on disk",
+                &["store"],
+            )?,
+            open_abandoned_segments: counter_vec(
+                registry,
+                "store_open_abandoned_segments_total",
+                "segments whose remainder was abandoned during index rebuild (not resyncable)",
+                &["store"],
+            )?,
         })
     }
 
@@ -99,11 +99,11 @@ impl StoreMetrics {
                 .compaction_reclaimed_bytes
                 .with_label_values(&[store_id]),
             compaction_duration: self.compaction_duration.with_label_values(&[store_id]),
-            hard_delete_total: self.hard_delete_total.with_label_values(&[store_id]),
-            hard_delete_duration: self.hard_delete_duration.with_label_values(&[store_id]),
             used_capacity_bytes: self.used_capacity_bytes.with_label_values(&[store_id]),
             invalid_data_bytes: self.invalid_data_bytes.with_label_values(&[store_id]),
             segment_count: self.segment_count.with_label_values(&[store_id]),
+            open_bad_records: self.open_bad_records.with_label_values(&[store_id]),
+            open_abandoned_segments: self.open_abandoned_segments.with_label_values(&[store_id]),
         }
     }
 }
@@ -116,11 +116,11 @@ pub struct StoreMetricHandles {
     pub(crate) already_exists: IntCounter,
     pub(crate) compaction_reclaimed_bytes: IntCounter,
     pub(crate) compaction_duration: Histogram,
-    pub(crate) hard_delete_total: IntCounter,
-    pub(crate) hard_delete_duration: Histogram,
     pub(crate) used_capacity_bytes: IntGauge,
     pub(crate) invalid_data_bytes: IntGauge,
     pub(crate) segment_count: IntGauge,
+    pub(crate) open_bad_records: IntCounter,
+    pub(crate) open_abandoned_segments: IntCounter,
 }
 
 impl StoreMetricHandles {

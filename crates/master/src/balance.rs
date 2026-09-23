@@ -111,7 +111,9 @@ pub fn plan_balance(inputs: &BalanceInputs) -> Vec<BalanceMoveRecord> {
             continue;
         }
         for (disk_id, spec) in &info.disks {
-            let Some(u) = usage.get(&(*node_id, disk_id.clone())) else { continue };
+            let Some(u) = usage.get(&(*node_id, disk_id.clone())) else {
+                continue;
+            };
             stats.insert(
                 (*node_id, disk_id.clone()),
                 DiskStat {
@@ -144,7 +146,15 @@ pub fn plan_balance(inputs: &BalanceInputs) -> Vec<BalanceMoveRecord> {
 
     let disk_free: BTreeMap<(NodeId, DiskId), DiskFree> = usage
         .iter()
-        .map(|(k, u)| (k.clone(), DiskFree { free_bytes: u.free_bytes, health: u.health.clone() }))
+        .map(|(k, u)| {
+            (
+                k.clone(),
+                DiskFree {
+                    free_bytes: u.free_bytes,
+                    health: u.health.clone(),
+                },
+            )
+        })
         .collect();
 
     let mut out: Vec<BalanceMoveRecord> = Vec::new();
@@ -205,17 +215,27 @@ pub fn plan_balance(inputs: &BalanceInputs) -> Vec<BalanceMoveRecord> {
                     .filter(|d| !part.replicas.iter().any(|r| r.node_id == d.node_id))
                     .map(|d| (d.replicas, d.ratio(), d.node_id))
                     .collect();
-                target_nodes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+                target_nodes.sort_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then_with(|| a.1.total_cmp(&b.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                });
                 target_nodes.dedup_by_key(|t| t.2);
 
                 let mut accepted: Option<(NodeId, DiskId)> = None;
                 for (_, _, tnode) in target_nodes {
-                    let Some(info) = nodes.get(&tnode) else { continue };
+                    let Some(info) = nodes.get(&tnode) else {
+                        continue;
+                    };
                     // 落地判定复用 select_disks(盘 HEALTHY / free ≥ 上界 / 未将满),候选限定该节点。
                     let candidates = BTreeMap::from([(tnode, info.clone())]);
-                    let Ok(mut reps) =
-                        select_disks(&candidates, &disk_free, 1, partition_capacity_bytes, near_full_ratio)
-                    else {
+                    let Ok(mut reps) = select_disks(
+                        &candidates,
+                        &disk_free,
+                        1,
+                        partition_capacity_bytes,
+                        near_full_ratio,
+                    ) else {
                         continue;
                     };
                     let chosen = reps.remove(0);
@@ -295,14 +315,16 @@ pub fn move_phase(
         return (MovePhase::Failed, err.clone());
     }
     let part = partitions.get(&mv.partition_id);
-    let from_holds =
-        part.is_some_and(|p| p.replicas.iter().any(|r| r.node_id == mv.from_node_id));
+    let from_holds = part.is_some_and(|p| p.replicas.iter().any(|r| r.node_id == mv.from_node_id));
     let to_holds = part.is_some_and(|p| p.replicas.iter().any(|r| r.node_id == mv.to_node_id));
     if !from_holds {
         if to_holds {
             (MovePhase::Done, String::new())
         } else {
-            (MovePhase::Failed, "source replica gone before target landed".to_string())
+            (
+                MovePhase::Failed,
+                "source replica gone before target landed".to_string(),
+            )
         }
     } else if to_holds || moving.contains(&(mv.partition_id, mv.from_node_id)) {
         (MovePhase::InFlight, String::new())
@@ -389,19 +411,32 @@ mod tests {
                 dc: "dc1".into(),
                 rack: rack.into(),
                 addr: format!("127.0.0.1:{id}"),
-                disks: BTreeMap::from([("d0".to_string(), DiskSpec { capacity_bytes: CAP })]),
+                disks: BTreeMap::from([(
+                    "d0".to_string(),
+                    DiskSpec {
+                        capacity_bytes: CAP,
+                    },
+                )]),
                 registered_at_ms: 0,
             },
         )
     }
 
-    fn usage_for(nodes: &BTreeMap<NodeId, NodeInfo>, free: u64, health: &str) -> BTreeMap<(NodeId, DiskId), DiskUsage> {
+    fn usage_for(
+        nodes: &BTreeMap<NodeId, NodeInfo>,
+        free: u64,
+        health: &str,
+    ) -> BTreeMap<(NodeId, DiskId), DiskUsage> {
         nodes
             .keys()
             .map(|id| {
                 (
                     (*id, "d0".to_string()),
-                    DiskUsage { capacity_bytes: CAP, free_bytes: free, health: health.to_string() },
+                    DiskUsage {
+                        capacity_bytes: CAP,
+                        free_bytes: free,
+                        health: health.to_string(),
+                    },
                 )
             })
             .collect()
@@ -435,9 +470,13 @@ mod tests {
     impl Fx {
         /// 4 节点(1..4),3 个 RF=3 分区全落 1/2/3 → 4 为空,明显倾斜。
         fn skewed() -> Self {
-            let nodes = BTreeMap::from([node(1, "rA"), node(2, "rB"), node(3, "rC"), node(4, "rD")]);
-            let partitions =
-                BTreeMap::from([(0, part(3, &[1, 2, 3])), (1, part(3, &[1, 2, 3])), (2, part(3, &[1, 2, 3]))]);
+            let nodes =
+                BTreeMap::from([node(1, "rA"), node(2, "rB"), node(3, "rC"), node(4, "rD")]);
+            let partitions = BTreeMap::from([
+                (0, part(3, &[1, 2, 3])),
+                (1, part(3, &[1, 2, 3])),
+                (2, part(3, &[1, 2, 3])),
+            ]);
             let usage = usage_for(&nodes, 900_000_000_000, "");
             let mut used = BTreeMap::new();
             used.insert(0, 10_000);
@@ -481,7 +520,10 @@ mod tests {
             (2, part(3, &[3, 4, 1])),
             (3, part(3, &[4, 1, 2])),
         ]);
-        assert!(plan_balance(&fx.inputs(100)).is_empty(), "uniform cluster must yield no moves");
+        assert!(
+            plan_balance(&fx.inputs(100)).is_empty(),
+            "uniform cluster must yield no moves"
+        );
     }
 
     #[test]
@@ -493,14 +535,24 @@ mod tests {
         assert_eq!(moves.len(), 2, "got {moves:?}");
         // 源盘上按占用从大到小:pid2(30000)先于 pid1(20000)先于 pid0(10000)。
         assert_eq!(
-            (moves[0].partition_id, moves[0].from_node_id, moves[0].to_node_id),
+            (
+                moves[0].partition_id,
+                moves[0].from_node_id,
+                moves[0].to_node_id
+            ),
             (2, 1, 4)
         );
         assert_eq!(
-            (moves[1].partition_id, moves[1].from_node_id, moves[1].to_node_id),
+            (
+                moves[1].partition_id,
+                moves[1].from_node_id,
+                moves[1].to_node_id
+            ),
             (1, 2, 4)
         );
-        assert!(moves.iter().all(|m| m.from_disk_id == "d0" && m.to_disk_id == "d0"));
+        assert!(moves
+            .iter()
+            .all(|m| m.from_disk_id == "d0" && m.to_disk_id == "d0"));
     }
 
     #[test]
@@ -509,7 +561,11 @@ mod tests {
         let moves = plan_balance(&fx.inputs(1));
         assert_eq!(moves.len(), 1, "max_moves must truncate the plan");
         let pids: HashSet<_> = moves.iter().map(|m| m.partition_id).collect();
-        assert_eq!(pids.len(), moves.len(), "same partition must not repeat in one plan");
+        assert_eq!(
+            pids.len(),
+            moves.len(),
+            "same partition must not repeat in one plan"
+        );
     }
 
     #[test]
@@ -526,7 +582,11 @@ mod tests {
         let mut fx = Fx::skewed();
         fx.usage.insert(
             (4, "d0".to_string()),
-            DiskUsage { capacity_bytes: CAP, free_bytes: 900_000_000_000, health: "WRITE_TIMEOUT".into() },
+            DiskUsage {
+                capacity_bytes: CAP,
+                free_bytes: 900_000_000_000,
+                health: "WRITE_TIMEOUT".into(),
+            },
         );
         assert!(plan_balance(&fx.inputs(100)).is_empty());
     }
@@ -540,7 +600,9 @@ mod tests {
         fx.decom.clear();
         fx.decom.insert(1);
         let moves = plan_balance(&fx.inputs(100));
-        assert!(moves.iter().all(|m| m.from_node_id != 1 && m.to_node_id != 1));
+        assert!(moves
+            .iter()
+            .all(|m| m.from_node_id != 1 && m.to_node_id != 1));
     }
 
     #[test]
@@ -548,7 +610,10 @@ mod tests {
         let mut fx = Fx::skewed();
         fx.moving.insert((2, 1));
         let moves = plan_balance(&fx.inputs(100));
-        assert!(moves.iter().all(|m| m.partition_id != 2), "in-flight partition must be skipped");
+        assert!(
+            moves.iter().all(|m| m.partition_id != 2),
+            "in-flight partition must be skipped"
+        );
     }
 
     #[test]
@@ -574,19 +639,34 @@ mod tests {
         let parts = BTreeMap::from([(7, part(3, &[1, 2, 3]))]);
         assert_eq!(move_phase(&plan, &mv, &parts, &moving).0, MovePhase::Failed);
 
-        let clean = BalancePlanRecord { failed: vec![], ..plan.clone() };
+        let clean = BalancePlanRecord {
+            failed: vec![],
+            ..plan.clone()
+        };
         // 源在、目标不在 → pending。
-        assert_eq!(move_phase(&clean, &mv, &parts, &moving).0, MovePhase::Pending);
+        assert_eq!(
+            move_phase(&clean, &mv, &parts, &moving).0,
+            MovePhase::Pending
+        );
         // 目标已补上 → in_flight(等摘源)。
         let parts = BTreeMap::from([(7, part(3, &[1, 2, 3, 4]))]);
-        assert_eq!(move_phase(&clean, &mv, &parts, &moving).0, MovePhase::InFlight);
+        assert_eq!(
+            move_phase(&clean, &mv, &parts, &moving).0,
+            MovePhase::InFlight
+        );
         // 目标未补上但已记 moving → in_flight(防御性口径)。
         let parts = BTreeMap::from([(7, part(3, &[1, 2, 3]))]);
         let moving = BTreeSet::from([(7u32, 1u64)]);
-        assert_eq!(move_phase(&clean, &mv, &parts, &moving).0, MovePhase::InFlight);
+        assert_eq!(
+            move_phase(&clean, &mv, &parts, &moving).0,
+            MovePhase::InFlight
+        );
         // 源已摘、目标在 → done。
         let parts = BTreeMap::from([(7, part(3, &[2, 3, 4]))]);
-        assert_eq!(move_phase(&clean, &mv, &parts, &BTreeSet::new()).0, MovePhase::Done);
+        assert_eq!(
+            move_phase(&clean, &mv, &parts, &BTreeSet::new()).0,
+            MovePhase::Done
+        );
         // 源已摘、目标也不在 → failed(异常)。
         let parts = BTreeMap::from([(7, part(3, &[2, 3, 5]))]);
         let (phase, err) = move_phase(&clean, &mv, &parts, &BTreeSet::new());

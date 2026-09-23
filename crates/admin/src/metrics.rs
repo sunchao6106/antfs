@@ -18,11 +18,31 @@ pub struct AdminMetrics {
 impl AdminMetrics {
     pub fn new(registry: &Registry) -> Result<Self> {
         Ok(AdminMetrics {
-            api_requests: counter(registry, "admin_api_requests_total", "admin API requests served")?,
-            ops: counter(registry, "admin_ops_total", "admin ops (create-partitions/decommission)")?,
-            master_rpc_errors: counter(registry, "admin_master_rpc_errors_total", "failed master gRPC calls")?,
-            store_scrape_errors: counter(registry, "admin_store_scrape_errors_total", "failed scrapes of store /metrics endpoints")?,
-            scrub_runs: counter(registry, "admin_scrub_runs_total", "scrub runs triggered via admin")?,
+            api_requests: counter(
+                registry,
+                "admin_api_requests_total",
+                "admin API requests served",
+            )?,
+            ops: counter(
+                registry,
+                "admin_ops_total",
+                "admin ops (create-partitions/decommission)",
+            )?,
+            master_rpc_errors: counter(
+                registry,
+                "admin_master_rpc_errors_total",
+                "failed master gRPC calls",
+            )?,
+            store_scrape_errors: counter(
+                registry,
+                "admin_store_scrape_errors_total",
+                "failed scrapes of store /metrics endpoints",
+            )?,
+            scrub_runs: counter(
+                registry,
+                "admin_scrub_runs_total",
+                "scrub runs triggered via admin",
+            )?,
             scrub_divergences: counter(
                 registry,
                 "admin_scrub_divergences_total",

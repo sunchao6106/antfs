@@ -139,6 +139,7 @@ dependencies = [
  "proptest",
  "serde",
  "thiserror",
+ "tracing",
  "xorf",
 ]
 

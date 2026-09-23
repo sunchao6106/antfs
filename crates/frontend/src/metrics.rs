@@ -19,10 +19,6 @@ pub const OP_DOWNLOAD: &str = "download";
 pub const OP_HEAD: &str = "head";
 /// `DELETE /blobs/{blobId}`。
 pub const OP_DELETE: &str = "delete";
-/// `POST /blobs/{blobId}/undelete`。
-pub const OP_UNDELETE: &str = "undelete";
-/// `POST /blobs/{blobId}/ttl`。
-pub const OP_TTL: &str = "ttl";
 /// `POST /stitch`。
 pub const OP_STITCH: &str = "stitch";
 
@@ -42,7 +38,7 @@ pub struct FrontendMetrics {
     pub download_bytes: IntCounter,
     /// 删除请求数(`DELETE /blobs/{blobId}`),label `outcome`。
     pub delete_total: IntCounterVec,
-    /// 其余变更请求数,label `op`(head/undelete/ttl/stitch)+ `outcome`。
+    /// 其余变更请求数,label `op`(head/stitch)+ `outcome`。
     pub mutation_total: IntCounterVec,
     /// 请求延迟(秒),label `op`;覆盖含边界校验早退在内的所有出口。
     pub request_duration: HistogramVec,
@@ -86,7 +82,7 @@ impl FrontendMetrics {
             mutation_total: counter_vec(
                 registry,
                 "frontend_mutation_total",
-                "head/undelete/ttl/stitch requests by op and outcome",
+                "head/stitch requests by op and outcome",
                 &["op", "outcome"],
             )?,
             request_duration: latency_seconds_vec(

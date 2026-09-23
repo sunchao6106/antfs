@@ -74,7 +74,10 @@ impl ReplicaHandle {
     ///   成功不得把它抹掉;
     /// - **单向**:追平是持久事实,不因后续某一轮暂时拉不到 peer 而回退(避免状态抖动/误报)。
     pub fn mark_active(&self) -> bool {
-        let mut state = self.current_state.write().expect("current_state lock poisoned");
+        let mut state = self
+            .current_state
+            .write()
+            .expect("current_state lock poisoned");
         if *state == STATE_ACTIVE || *state == STATE_ERROR {
             return false;
         }
@@ -127,31 +130,44 @@ impl ReplicaManager {
     /// **重开**(`dir.exists()` → `open_with`)也走保守路径 —— 盘上数据可能是旧的,先报 `BOOTSTRAP`,
     /// 等一轮拉复制确认追平再转 `ACTIVE`(重启期间短时报"同步中"是诚实状态,不是故障)。
     pub fn ensure_replica(&self, pid: PartitionId) -> Result<ReplicaHandle> {
-        if let Some(h) = self.replicas.read().expect("replicas lock poisoned").get(&pid) {
+        if let Some(h) = self
+            .replicas
+            .read()
+            .expect("replicas lock poisoned")
+            .get(&pid)
+        {
             return Ok(h.clone());
         }
         let mut guard = self.replicas.write().expect("replicas lock poisoned");
         if let Some(h) = guard.get(&pid) {
             return Ok(h.clone());
         }
-        let disk = self.disks.pick(self.partition_capacity).ok_or(Error::NoDiskSpace)?;
+        let disk = self
+            .disks
+            .pick(self.partition_capacity)
+            .ok_or(Error::NoDiskSpace)?;
         let dir = disk.dir.join(format!("partition_{pid}"));
         let store_id = format!("p{pid}");
+        // `*_partition(..)` 必须带上 `pid`:它同时是段头的 key 前缀与写入校验的准绳 ——
+        // 用默认前缀 0 建库,则该分区上**任何真实 blobId 的写都会被拒**(前缀不符 → 400),
+        // 读也永远 miss。打开时顺带校验盘上副本的分区正是这个 pid。
         let store = if dir.exists() {
-            BlobStore::open_with(
+            BlobStore::open_with_partition(
                 &dir,
                 self.partition_capacity,
                 &self.store_config,
                 &self.store_metrics,
                 &store_id,
+                pid,
             )?
         } else {
-            BlobStore::create_with(
+            BlobStore::create_with_partition(
                 &dir,
                 self.partition_capacity,
                 &self.store_config,
                 &self.store_metrics,
                 &store_id,
+                pid,
             )?
         };
         let handle = Self::make_handle(disk.id.clone(), store);
@@ -161,7 +177,11 @@ impl ReplicaManager {
 
     /// 取某分区的本地 replica(数据面路由用);未建则 `None`。
     pub fn get(&self, pid: PartitionId) -> Option<ReplicaHandle> {
-        self.replicas.read().expect("replicas lock poisoned").get(&pid).cloned()
+        self.replicas
+            .read()
+            .expect("replicas lock poisoned")
+            .get(&pid)
+            .cloned()
     }
 
     /// 用 `BlobStore` 建句柄并接被动 IO-error hook(置 ERROR)。
@@ -206,7 +226,10 @@ impl ReplicaManager {
     ) -> Result<ReplicaHandle> {
         use std::io::Write;
         self.remove_replica(pid);
-        let disk = self.disks.pick(self.partition_capacity).ok_or(Error::NoDiskSpace)?;
+        let disk = self
+            .disks
+            .pick(self.partition_capacity)
+            .ok_or(Error::NoDiskSpace)?;
         let dir = disk.dir.join(format!("partition_{pid}"));
         let _ = std::fs::remove_dir_all(&dir);
         let log_dir = dir.join("log");
@@ -221,22 +244,30 @@ impl ReplicaManager {
             std::fs::rename(&tmp_path, &final_path)?;
         }
         let store_id = format!("p{pid}");
-        let store = antfs_blob::BlobStore::open_rebuild_index_with(
+        // 拷来的段头自述其分区 —— 必须等于本次 bootstrap 的 pid(拷错分区的段当场拒掉)。
+        let store = antfs_blob::BlobStore::open_rebuild_index_with_partition(
             &dir,
             self.partition_capacity,
             &self.store_config,
             &self.store_metrics,
             &store_id,
+            pid,
         )?;
         let handle = Self::make_handle(disk.id.clone(), store);
-        self.replicas.write().expect("replicas lock poisoned").insert(pid, handle.clone());
+        self.replicas
+            .write()
+            .expect("replicas lock poisoned")
+            .insert(pid, handle.clone());
         Ok(handle)
     }
 
     /// 摘除某分区本地 replica 的**内存句柄**(OFFLINE):盘上数据保留 —— 副本可能再回来。
     /// 要连盘上数据一起删,用 [`drop_replica`](Self::drop_replica)。
     pub fn remove_replica(&self, pid: PartitionId) {
-        self.replicas.write().expect("replicas lock poisoned").remove(&pid);
+        self.replicas
+            .write()
+            .expect("replicas lock poisoned")
+            .remove(&pid);
     }
 
     /// **删除**某分区本地 replica 的盘上数据(整目录 `partition_{pid}`),并摘除内存句柄。
@@ -257,7 +288,11 @@ impl ReplicaManager {
     /// **阻塞**(含删目录的同步 IO 与有界等待):调用方须在阻塞池([`tokio::task::spawn_blocking`])
     /// 里跑,别在 reactor 线程上直调。
     pub fn drop_replica(&self, pid: PartitionId) -> Result<bool> {
-        let removed = self.replicas.write().expect("replicas lock poisoned").remove(&pid);
+        let removed = self
+            .replicas
+            .write()
+            .expect("replicas lock poisoned")
+            .remove(&pid);
         let disk_id = removed.as_ref().map(|h| h.disk_id.clone());
         // 句柄在这里 drop:释放 BlobStore(及其 fd/mmap)后,库里才没有对外声明在服务的副本。
         if let Some(h) = &removed {
@@ -314,7 +349,11 @@ impl ReplicaManager {
             .expect("replicas lock poisoned")
             .iter()
             .map(|(pid, h)| {
-                let st = h.current_state.read().expect("current_state lock poisoned").clone();
+                let st = h
+                    .current_state
+                    .read()
+                    .expect("current_state lock poisoned")
+                    .clone();
                 ReplicaState {
                     partition_id: *pid,
                     disk_id: h.disk_id.clone(),
@@ -371,7 +410,11 @@ mod tests {
     fn manager(dir: &std::path::Path) -> ReplicaManager {
         let dm = DiskManager::mount(&[dir.to_string_lossy().into_owned()]).unwrap();
         let registry = antfs_metric::Registry::new();
-        let sc = StoreConfig { segment_size_bytes: 1 << 20, index_max_inmem_elements: 1000, io_error_count_to_trigger_shutdown: 0 };
+        let sc = StoreConfig {
+            segment_size_bytes: 1 << 20,
+            index_max_inmem_elements: 1000,
+            io_error_count_to_trigger_shutdown: 0,
+        };
         let sm = StoreMetrics::new(&registry).unwrap();
         ReplicaManager::new(dm, sc, sm, 4 << 20)
     }
@@ -383,7 +426,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rm = manager(tmp.path());
         let h = rm.ensure_replica(3).unwrap();
-        assert_eq!(*h.current_state.read().unwrap(), STATE_BOOTSTRAP, "新建副本不得自称 ACTIVE");
+        assert_eq!(
+            *h.current_state.read().unwrap(),
+            STATE_BOOTSTRAP,
+            "新建副本不得自称 ACTIVE"
+        );
         assert!(h.mark_active(), "首次追平必须真的转正");
         assert_eq!(*h.current_state.read().unwrap(), STATE_ACTIVE);
         assert!(!h.mark_active(), "重复置位幂等(返回是否真的变了)");
@@ -395,18 +442,61 @@ mod tests {
         assert_eq!(*h.current_state.read().unwrap(), STATE_ERROR);
     }
 
+    /// 副本的 key 前缀必须等于它的 pid,且**重开后依旧** —— 记录只存 blobId 低 32bit,
+    /// 前缀错了则该分区上任何真实 blobId 都写不进去(实测过的 wiring bug:曾用默认前缀 0 建库)。
+    #[test]
+    fn replica_accepts_keys_of_its_own_partition_after_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned()]).unwrap();
+        let registry = antfs_metric::Registry::new();
+        let sc = StoreConfig {
+            segment_size_bytes: 1 << 20,
+            index_max_inmem_elements: 1000,
+            io_error_count_to_trigger_shutdown: 0,
+        };
+        let sm = StoreMetrics::new(&registry).unwrap();
+        let rm = ReplicaManager::new(dm, sc, sm, 4 << 20);
+
+        let mine = antfs_blob::StoreKey::from_parts(9, 1);
+        let foreign = antfs_blob::StoreKey::from_parts(0, 1);
+        let h = rm.ensure_replica(9).unwrap();
+        assert_eq!(h.store.key_prefix(), 9, "建库必须声明本分区前缀");
+        h.store.put(mine, b"mine").unwrap();
+        assert_eq!(h.store.get(&mine).unwrap().as_slice(), b"mine");
+        assert!(
+            h.store.put(foreign, b"foreign").is_err(),
+            "别的 partition 的 key 必须被拒"
+        );
+        h.store.flush().unwrap();
+
+        // 重开:前缀从段头读回,且仍拒绝外来 key(否则重启后就写不进去了)。
+        rm.remove_replica(9);
+        let h2 = rm.ensure_replica(9).unwrap();
+        assert_eq!(h2.store.key_prefix(), 9, "前缀必须从段头读回");
+        assert_eq!(h2.store.get(&mine).unwrap().as_slice(), b"mine");
+        assert!(h2.store.put(foreign, b"foreign").is_err());
+    }
+
     #[test]
     fn ensure_replica_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned()]).unwrap();
         let registry = antfs_metric::Registry::new();
-        let sc = StoreConfig { segment_size_bytes: 1 << 20, index_max_inmem_elements: 1000, io_error_count_to_trigger_shutdown: 0 };
+        let sc = StoreConfig {
+            segment_size_bytes: 1 << 20,
+            index_max_inmem_elements: 1000,
+            io_error_count_to_trigger_shutdown: 0,
+        };
         let sm = StoreMetrics::new(&registry).unwrap();
         let rm = ReplicaManager::new(dm, sc, sm, 4 << 20);
 
         let a = rm.ensure_replica(7).unwrap();
         let b = rm.ensure_replica(7).unwrap();
-        assert_eq!(rm.count(), 1, "same partition must not create a second replica");
+        assert_eq!(
+            rm.count(),
+            1,
+            "same partition must not create a second replica"
+        );
         assert_eq!(a.disk_id, b.disk_id);
         assert!(rm.get(7).is_some());
         assert!(rm.get(8).is_none());
@@ -418,7 +508,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rm = manager(tmp.path());
         let h = rm.ensure_replica(5).unwrap();
-        h.store.put(antfs_blob::StoreKey::new([5; 8]), b"to be dropped").unwrap();
+        h.store
+            .put(antfs_blob::StoreKey::from_parts(5, 5), b"to be dropped")
+            .unwrap();
         h.store.flush().unwrap();
         let dir = tmp.path().join("partition_5");
         assert!(dir.is_dir(), "建副本必须落盘出目录");
@@ -429,7 +521,10 @@ mod tests {
         assert_eq!(rm.count(), 0);
         assert!(rm.replica_states().is_empty(), "心跳不再上报该副本");
 
-        assert!(!rm.drop_replica(5).unwrap(), "重复调用幂等:本地没有 → false,且不报错");
+        assert!(
+            !rm.drop_replica(5).unwrap(),
+            "重复调用幂等:本地没有 → false,且不报错"
+        );
     }
 
     /// OFFLINE 只摘句柄不删盘;其后到达的 DROPPED 必须仍能删掉残留目录(不留孤儿副本)。

@@ -21,7 +21,7 @@ pub mod config;
 pub mod error;
 pub mod metrics;
 
-pub use antfs_blob::StoreKey;
+pub use antfs_blob::{StoreKey, NO_EXPIRATION};
 pub use config::RouterConfig;
 pub use error::{Error, Result};
 pub use metrics::RouterMetrics;
@@ -60,10 +60,7 @@ pub struct BlobStat {
     pub size: u64,
     pub expiration_ms: i64,
     pub deleted: bool,
-    pub undeleted: bool,
-    pub ttl_updated: bool,
     pub expired: bool,
-    pub life_version: u16,
 }
 
 /// 一池已从 master 取回、尚未发完的 blobId 号段。
@@ -205,10 +202,16 @@ impl Router {
             return Err(map_master_error(&resp.error, resp.partition_id));
         }
         if resp.count == 0 {
-            return Err(Error::Rejected("master returned an empty id segment".into()));
+            return Err(Error::Rejected(
+                "master returned an empty id segment".into(),
+            ));
         }
-        let start = u32::try_from(resp.start_object_id)
-            .map_err(|_| Error::Rejected(format!("start_object_id {} overflows u32", resp.start_object_id)))?;
+        let start = u32::try_from(resp.start_object_id).map_err(|_| {
+            Error::Rejected(format!(
+                "start_object_id {} overflows u32",
+                resp.start_object_id
+            ))
+        })?;
         let pid = resp.partition_id;
         self.metrics.id_segments.inc();
         self.metrics.id_segment_ids.inc_by(resp.count as u64);
@@ -217,7 +220,11 @@ impl Router {
             .expect("topology lock poisoned")
             .insert(pid, sorted_replicas(resp.replicas));
         Ok((
-            Segment { pid, next: start + 1, end: start.saturating_add(resp.count) },
+            Segment {
+                pid,
+                next: start + 1,
+                end: start.saturating_add(resp.count),
+            },
             StoreKey::from_parts(pid, start),
         ))
     }
@@ -228,7 +235,12 @@ impl Router {
     ///
     /// 排序保证 `up` 的副本在前 —— 读路径(R=1)按顺序试,先试活着的。
     async fn replicas_for(&self, pid: PartitionId) -> Result<Vec<ReplicaLoc>> {
-        if let Some(rs) = self.topology.read().expect("topology lock poisoned").get(&pid) {
+        if let Some(rs) = self
+            .topology
+            .read()
+            .expect("topology lock poisoned")
+            .get(&pid)
+        {
             if !rs.is_empty() {
                 return Ok(rs.clone());
             }
@@ -237,7 +249,10 @@ impl Router {
             .master
             .lock()
             .await
-            .lookup_partition(LookupRequest { version: PROTO_VERSION, partition_id: pid })
+            .lookup_partition(LookupRequest {
+                version: PROTO_VERSION,
+                partition_id: pid,
+            })
             .await;
         let resp = match resp {
             Ok(r) => r.into_inner(),
@@ -259,10 +274,22 @@ impl Router {
 
     // ── 写 ─────────────────────────────────────────────────────────────────────────────────
 
-    /// 写一个 blob:向该 partition 的**全部副本并行 PUT**,收满**多数派** ack 即返回。
+    /// 写一个 blob(不过期):向该 partition 的**全部副本并行 PUT**,收满**多数派** ack 即返回。
     ///
     /// 收满即返回意味着发往其余副本的请求被取消 —— 第 3 份由拉复制补齐(`cluster.md §10`)。
     pub async fn put(&self, key: StoreKey, data: Bytes) -> Result<PutReport> {
+        self.put_with_ttl(key, data, NO_EXPIRATION).await
+    }
+
+    /// 写一个 blob 并在**写入时定下过期时刻**(`expiration_ms`,`NO_EXPIRATION` = 不过期)。
+    ///
+    /// 对象不可变,TTL 只有这一次机会确定 —— 没有事后"改期"的路径(要不同 TTL 就换一个 blobId)。
+    pub async fn put_with_ttl(
+        &self,
+        key: StoreKey,
+        data: Bytes,
+        expiration_ms: i64,
+    ) -> Result<PutReport> {
         let pid = key.partition_id();
         let replicas = self.replicas_for(pid).await?;
         let total = replicas.len();
@@ -272,7 +299,7 @@ impl Router {
             let addr = r.addr.clone();
             let data = data.clone();
             futs.push(async move {
-                let res = self.put_body(pid, &key, data, &addr).await;
+                let res = self.put_body(pid, &key, data, expiration_ms, &addr).await;
                 (addr, res)
             });
         }
@@ -284,11 +311,18 @@ impl Router {
             .with_label_values(&[outcome])
             .observe(started.elapsed().as_secs_f64());
         for (_, e) in &f.failures {
-            self.metrics.put_replica_errors.with_label_values(&[e.kind()]).inc();
+            self.metrics
+                .put_replica_errors
+                .with_label_values(&[e.kind()])
+                .inc();
         }
         if f.reached() {
             self.metrics.put_bytes.inc_by(data.len() as u64);
-            Ok(PutReport { acks: f.ok.len(), total: f.total, required: f.required })
+            Ok(PutReport {
+                acks: f.ok.len(),
+                total: f.total,
+                required: f.required,
+            })
         } else {
             Err(Error::Quorum {
                 acks: f.ok.len(),
@@ -302,6 +336,15 @@ impl Router {
     /// 上传本地文件:分配 blobId → 并行 PUT 全部副本,**每个副本各自从文件流式读**
     /// (`reqwest::Body::from(File)` 自带 `Content-Length`),内存不随文件大小涨。
     pub async fn put_file(&self, path: impl AsRef<Path>) -> Result<(StoreKey, PutReport)> {
+        self.put_file_with_ttl(path, NO_EXPIRATION).await
+    }
+
+    /// [`put_file`](Self::put_file) + 写入时定 TTL,语义同 [`put_with_ttl`](Self::put_with_ttl)。
+    pub async fn put_file_with_ttl(
+        &self,
+        path: impl AsRef<Path>,
+        expiration_ms: i64,
+    ) -> Result<(StoreKey, PutReport)> {
         let path = path.as_ref().to_path_buf();
         let len = tokio::fs::metadata(&path).await?.len();
         let key = self.allocate_one().await?;
@@ -314,7 +357,9 @@ impl Router {
             let addr = r.addr.clone();
             let path = path.clone();
             futs.push(async move {
-                let res = self.put_file_to(pid, &key, &path, &addr).await;
+                let res = self
+                    .put_file_to(pid, &key, &path, expiration_ms, &addr)
+                    .await;
                 (addr, res)
             });
         }
@@ -326,11 +371,21 @@ impl Router {
             .with_label_values(&[outcome])
             .observe(started.elapsed().as_secs_f64());
         for (_, e) in &f.failures {
-            self.metrics.put_replica_errors.with_label_values(&[e.kind()]).inc();
+            self.metrics
+                .put_replica_errors
+                .with_label_values(&[e.kind()])
+                .inc();
         }
         if f.reached() {
             self.metrics.put_bytes.inc_by(len);
-            Ok((key, PutReport { acks: f.ok.len(), total: f.total, required: f.required }))
+            Ok((
+                key,
+                PutReport {
+                    acks: f.ok.len(),
+                    total: f.total,
+                    required: f.required,
+                },
+            ))
         } else {
             Err(Error::Quorum {
                 acks: f.ok.len(),
@@ -346,15 +401,19 @@ impl Router {
         pid: PartitionId,
         key: &StoreKey,
         data: Bytes,
+        expiration_ms: i64,
         addr: &str,
     ) -> Result<()> {
         let resp = self
             .http
-            .put(blob_url(addr, pid, key))
+            .put(put_url(addr, pid, key, expiration_ms))
             .body(data)
             .send()
             .await
-            .map_err(|source| Error::Http { addr: addr.to_string(), source })?;
+            .map_err(|source| Error::Http {
+                addr: addr.to_string(),
+                source,
+            })?;
         classify_put(addr, pid, resp).await
     }
 
@@ -363,16 +422,20 @@ impl Router {
         pid: PartitionId,
         key: &StoreKey,
         path: &Path,
+        expiration_ms: i64,
         addr: &str,
     ) -> Result<()> {
         let file = tokio::fs::File::open(path).await?;
         let resp = self
             .http
-            .put(blob_url(addr, pid, key))
+            .put(put_url(addr, pid, key, expiration_ms))
             .body(reqwest::Body::from(file))
             .send()
             .await
-            .map_err(|source| Error::Http { addr: addr.to_string(), source })?;
+            .map_err(|source| Error::Http {
+                addr: addr.to_string(),
+                source,
+            })?;
         classify_put(addr, pid, resp).await
     }
 
@@ -406,7 +469,10 @@ impl Router {
         } else {
             last.unwrap_or(Error::NotFound { pid })
         };
-        self.metrics.get_total.with_label_values(&[err.kind()]).inc();
+        self.metrics
+            .get_total
+            .with_label_values(&[err.kind()])
+            .inc();
         Err(err)
     }
 
@@ -419,9 +485,7 @@ impl Router {
         for r in &replicas {
             let addr = r.addr.clone();
             match self.get_stream(pid, key, &addr).await {
-                Ok(resp) => {
-                    return drain_to_file(resp, &addr, path.as_ref(), &self.metrics).await
-                }
+                Ok(resp) => return drain_to_file(resp, &addr, path.as_ref(), &self.metrics).await,
                 Err(e @ Error::NotFound { .. }) => {
                     missing += 1;
                     last = Some(e);
@@ -434,7 +498,10 @@ impl Router {
         } else {
             last.unwrap_or(Error::NotFound { pid })
         };
-        self.metrics.get_total.with_label_values(&[err.kind()]).inc();
+        self.metrics
+            .get_total
+            .with_label_values(&[err.kind()])
+            .inc();
         Err(err)
     }
 
@@ -449,7 +516,10 @@ impl Router {
             .get(blob_url(addr, pid, key))
             .send()
             .await
-            .map_err(|source| Error::Http { addr: addr.to_string(), source })?;
+            .map_err(|source| Error::Http {
+                addr: addr.to_string(),
+                source,
+            })?;
         match resp.status().as_u16() {
             200 => Ok(resp),
             _ => Err(classify_err_status(addr, pid, resp).await),
@@ -458,9 +528,10 @@ impl Router {
 
     async fn get_from(&self, pid: PartitionId, key: &StoreKey, addr: &str) -> Result<Bytes> {
         let resp = self.get_stream(pid, key, addr).await?;
-        resp.bytes()
-            .await
-            .map_err(|source| Error::Http { addr: addr.to_string(), source })
+        resp.bytes().await.map_err(|source| Error::Http {
+            addr: addr.to_string(),
+            source,
+        })
     }
 
     /// 读元数据(`HEAD` 语义:不读数据体):第一个成功即返回(R=1)。
@@ -473,7 +544,10 @@ impl Router {
             let addr = r.addr.clone();
             match self.stat_from(pid, key, &addr).await {
                 Ok(m) => {
-                    self.metrics.mutation_total.with_label_values(&["stat", "ok"]).inc();
+                    self.metrics
+                        .mutation_total
+                        .with_label_values(&["stat", "ok"])
+                        .inc();
                     return Ok(m);
                 }
                 Err(e @ Error::NotFound { .. }) => {
@@ -488,30 +562,39 @@ impl Router {
         } else {
             last.unwrap_or(Error::NotFound { pid })
         };
-        self.metrics.mutation_total.with_label_values(&["stat", err.kind()]).inc();
+        self.metrics
+            .mutation_total
+            .with_label_values(&["stat", err.kind()])
+            .inc();
         Err(err)
     }
 
     async fn stat_from(&self, pid: PartitionId, key: &StoreKey, addr: &str) -> Result<BlobStat> {
-        let url = format!("http://{addr}/partitions/{pid}/blobs/{}/metadata", hex_key(key));
+        let url = format!(
+            "http://{addr}/partitions/{pid}/blobs/{}/metadata",
+            hex_key(key)
+        );
         let resp = self
             .http
             .get(url)
             .send()
             .await
-            .map_err(|source| Error::Http { addr: addr.to_string(), source })?;
+            .map_err(|source| Error::Http {
+                addr: addr.to_string(),
+                source,
+            })?;
         if resp.status().as_u16() == 200 {
-            return resp
-                .json::<BlobStat>()
-                .await
-                .map_err(|source| Error::Http { addr: addr.to_string(), source });
+            return resp.json::<BlobStat>().await.map_err(|source| Error::Http {
+                addr: addr.to_string(),
+                source,
+            });
         }
         Err(classify_err_status(addr, pid, resp).await)
     }
 
-    // ── 变更(delete / undelete / ttl)──────────────────────────────────────────────────────
+    // ── 变更(delete)──────────────────────────────────────────────────────────────────────
 
-    /// 删除(写墓碑):多数派 ack。
+    /// 删除(写墓碑):多数派 ack。墓碑 key 重复删幂等成功(204);未存在的 key 报 `NotFound`。
     pub async fn delete(&self, key: &StoreKey) -> Result<PutReport> {
         let pid = key.partition_id();
         let replicas = self.replicas_for(pid).await?;
@@ -520,69 +603,18 @@ impl Router {
         for r in &replicas {
             let addr = r.addr.clone();
             futs.push(async move {
-                let res = self.mutate_one(pid, key, &addr, "delete", None).await;
+                let res = self.mutate_one(pid, key, &addr).await;
                 (addr, res)
             });
         }
         let f = collect_majority(futs, total).await;
         self.record_mutation("delete", &f);
         if f.reached() {
-            Ok(PutReport { acks: f.ok.len(), total: f.total, required: f.required })
-        } else {
-            Err(Error::Quorum {
+            Ok(PutReport {
                 acks: f.ok.len(),
-                required: f.required,
                 total: f.total,
-                detail: f.detail(),
-            })
-        }
-    }
-
-    /// 复活已删除对象:多数派 ack,返回首个成功副本上的新生命版本。
-    pub async fn undelete(&self, key: &StoreKey) -> Result<(PutReport, u16)> {
-        let pid = key.partition_id();
-        let replicas = self.replicas_for(pid).await?;
-        let total = replicas.len();
-        let futs = FuturesUnordered::new();
-        for r in &replicas {
-            let addr = r.addr.clone();
-            futs.push(async move {
-                let res = self.mutate_one(pid, key, &addr, "undelete", None).await;
-                (addr, res)
-            });
-        }
-        let f = collect_majority(futs, total).await;
-        self.record_mutation("undelete", &f);
-        if f.reached() {
-            let life = f.ok.first().and_then(|v| *v).unwrap_or(0);
-            Ok((PutReport { acks: f.ok.len(), total: f.total, required: f.required }, life))
-        } else {
-            Err(Error::Quorum {
-                acks: f.ok.len(),
                 required: f.required,
-                total: f.total,
-                detail: f.detail(),
             })
-        }
-    }
-
-    /// 更新过期时间:多数派 ack。
-    pub async fn update_ttl(&self, key: &StoreKey, expiration_ms: i64) -> Result<PutReport> {
-        let pid = key.partition_id();
-        let replicas = self.replicas_for(pid).await?;
-        let total = replicas.len();
-        let futs = FuturesUnordered::new();
-        for r in &replicas {
-            let addr = r.addr.clone();
-            futs.push(async move {
-                let res = self.mutate_one(pid, key, &addr, "ttl", Some(expiration_ms)).await;
-                (addr, res)
-            });
-        }
-        let f = collect_majority(futs, total).await;
-        self.record_mutation("ttl", &f);
-        if f.reached() {
-            Ok(PutReport { acks: f.ok.len(), total: f.total, required: f.required })
         } else {
             Err(Error::Quorum {
                 acks: f.ok.len(),
@@ -595,46 +627,36 @@ impl Router {
 
     fn record_mutation(&self, op: &'static str, f: &Fanout<Option<u16>>) {
         let outcome = if f.reached() { "ok" } else { "quorum" };
-        self.metrics.mutation_total.with_label_values(&[op, outcome]).inc();
+        self.metrics
+            .mutation_total
+            .with_label_values(&[op, outcome])
+            .inc();
         for (_, e) in &f.failures {
-            self.metrics.put_replica_errors.with_label_values(&[e.kind()]).inc();
+            self.metrics
+                .put_replica_errors
+                .with_label_values(&[e.kind()])
+                .inc();
         }
     }
 
-    /// 单副本变更请求。`expiration_ms` 仅 `ttl` 用。
+    /// 单副本删除请求(写墓碑)。
     async fn mutate_one(
         &self,
         pid: PartitionId,
         key: &StoreKey,
         addr: &str,
-        op: &'static str,
-        expiration_ms: Option<i64>,
     ) -> Result<Option<u16>> {
-        let url = match op {
-            "delete" => blob_url(addr, pid, key),
-            "undelete" => format!("http://{addr}/partitions/{pid}/blobs/{}/undelete", hex_key(key)),
-            "ttl" => format!(
-                "http://{addr}/partitions/{pid}/blobs/{}/ttl?expiration_ms={}",
-                hex_key(key),
-                expiration_ms.unwrap_or(-1)
-            ),
-            other => return Err(Error::Rejected(format!("unknown mutation {other}"))),
-        };
-        let req = match op {
-            "delete" => self.http.delete(url),
-            _ => self.http.post(url),
-        };
-        let resp = req
+        let resp = self
+            .http
+            .delete(blob_url(addr, pid, key))
             .send()
             .await
-            .map_err(|source| Error::Http { addr: addr.to_string(), source })?;
-        let status = resp.status().as_u16();
-        match status {
+            .map_err(|source| Error::Http {
+                addr: addr.to_string(),
+                source,
+            })?;
+        match resp.status().as_u16() {
             204 => Ok(None),
-            200 => {
-                let text = resp.text().await.unwrap_or_default();
-                Ok(Some(text.trim().parse::<u16>().unwrap_or(0)))
-            }
             _ => Err(classify_err_status(addr, pid, resp).await),
         }
     }
@@ -659,7 +681,12 @@ async fn collect_majority<T>(
             break;
         }
     }
-    Fanout { ok, failures, total, required }
+    Fanout {
+        ok,
+        failures,
+        total,
+        required,
+    }
 }
 
 /// 副本位置排序:`up` 的在前(读路径按序试,先试活着的),同组保持 master 给的顺序。
@@ -676,6 +703,16 @@ fn blob_url(addr: &str, pid: PartitionId, key: &StoreKey) -> String {
     format!("http://{addr}/partitions/{pid}/blobs/{}", hex_key(key))
 }
 
+/// PUT 的 URL:`expiration_ms` 非 [`NO_EXPIRATION`] 时带上写入时定下的 TTL(数据面 `PUT ?expiration_ms=`)。
+fn put_url(addr: &str, pid: PartitionId, key: &StoreKey, expiration_ms: i64) -> String {
+    let base = blob_url(addr, pid, key);
+    if expiration_ms == NO_EXPIRATION {
+        base
+    } else {
+        format!("{base}?expiration_ms={expiration_ms}")
+    }
+}
+
 /// 非 2xx 的状态码 → 归一错误(写/读/变更共用同一套语义)。
 ///
 /// 消费掉响应体(状态码 + 文案一起判定),故调用方在 2xx 分支之外才能调用它。
@@ -685,14 +722,26 @@ async fn classify_err_status(addr: &str, pid: PartitionId, resp: reqwest::Respon
     let body = resp.text().await.unwrap_or_default();
     match status {
         // store 对"无此副本"与"对象不存在"都回 404;按响应体区分(文案是 store 的稳定契约)。
-        404 if body.contains("no replica for partition") => {
-            Error::NoReplica { addr: addr.to_string(), pid }
-        }
+        404 if body.contains("no replica for partition") => Error::NoReplica {
+            addr: addr.to_string(),
+            pid,
+        },
         404 => Error::NotFound { pid },
-        409 => Error::AlreadyExists { addr: addr.to_string() },
-        507 => Error::StoreFull { addr: addr.to_string() },
-        503 => Error::Silenced { addr: addr.to_string(), retry_after_secs: retry },
-        s => Error::ReplicaStatus { addr: addr.to_string(), status: s, detail: body },
+        409 => Error::AlreadyExists {
+            addr: addr.to_string(),
+        },
+        507 => Error::StoreFull {
+            addr: addr.to_string(),
+        },
+        503 => Error::Silenced {
+            addr: addr.to_string(),
+            retry_after_secs: retry,
+        },
+        s => Error::ReplicaStatus {
+            addr: addr.to_string(),
+            status: s,
+            detail: body,
+        },
     }
 }
 
@@ -724,7 +773,10 @@ async fn drain_to_file(
     let mut stream = resp.bytes_stream();
     let mut n = 0u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| Error::Http { addr: addr.to_string(), source })?;
+        let chunk = chunk.map_err(|source| Error::Http {
+            addr: addr.to_string(),
+            source,
+        })?;
         n += chunk.len() as u64;
         file.write_all(&chunk).await?;
     }

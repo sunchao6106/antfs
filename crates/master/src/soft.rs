@@ -53,7 +53,13 @@ impl SoftState {
     /// 记录一次心跳:刷新 `last_beat` 与各盘实时状态(余量 + 健康)。
     pub fn record_beat(&self, node_id: NodeId, disks: HashMap<DiskId, DiskUsage>) {
         let mut g = self.inner.write().expect("soft state lock poisoned");
-        g.nodes.insert(node_id, Liveness { last_beat: Instant::now(), disks });
+        g.nodes.insert(
+            node_id,
+            Liveness {
+                last_beat: Instant::now(),
+                disks,
+            },
+        );
     }
 
     /// 节点是否在 `timeout` 内有心跳(据此在 `ListNodes` 标 up/down)。
@@ -68,7 +74,10 @@ impl SoftState {
     /// 某节点各盘的实时状态快照(余量 + 健康;`ListNodes` 回填用)。
     pub fn disks_of(&self, node_id: NodeId) -> HashMap<DiskId, DiskUsage> {
         let g = self.inner.read().expect("soft state lock poisoned");
-        g.nodes.get(&node_id).map(|l| l.disks.clone()).unwrap_or_default()
+        g.nodes
+            .get(&node_id)
+            .map(|l| l.disks.clone())
+            .unwrap_or_default()
     }
 
     /// 全集群 `(node, disk) -> 实时盘状态`(余量 + 健康)快照,喂给选盘(§7.3)与盘将满判定。
@@ -162,14 +171,20 @@ impl SoftState {
     /// 所有副本上报 `lag_bytes` 的最大值(无上报 = 0)。
     pub fn max_replica_lag_bytes(&self) -> u64 {
         let g = self.inner.read().expect("soft state lock poisoned");
-        g.replicas.values().map(|st| st.lag_bytes).max().unwrap_or(0)
+        g.replicas
+            .values()
+            .map(|st| st.lag_bytes)
+            .max()
+            .unwrap_or(0)
     }
 
     /// 各分区上报的 `used_bytes` 最大值(`partition -> bytes`;无任何上报的分区不在表中)。
     ///
     /// **口径**:一个分区的多个副本各报各自占用(同一份数据,量级相同),取其**最大值**代表该分区
     /// 的实际占用,避免按副本数(RF 倍)重复计数放大用量。
-    pub fn used_bytes_by_partition(&self) -> std::collections::BTreeMap<crate::types::PartitionId, u64> {
+    pub fn used_bytes_by_partition(
+        &self,
+    ) -> std::collections::BTreeMap<crate::types::PartitionId, u64> {
         let g = self.inner.read().expect("soft state lock poisoned");
         let mut out = std::collections::BTreeMap::new();
         for ((pid, _), st) in &g.replicas {

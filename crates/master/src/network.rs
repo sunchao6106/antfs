@@ -5,13 +5,13 @@
 //! `append_entries` / `vote` / `install_snapshot` 三个方法;`full_snapshot` 用默认分片实现走
 //! `install_snapshot`。
 
+use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::error::{NetworkError, RPCError, RemoteError, Unreachable};
-use openraft::network::{RaftNetwork, RaftNetworkFactory, RPCOption};
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::BasicNode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -31,7 +31,11 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetworkFactory {
     type Network = GrpcNetwork;
 
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
-        GrpcNetwork { target, addr: node.addr.clone(), client: None }
+        GrpcNetwork {
+            target,
+            addr: node.addr.clone(),
+            client: None,
+        }
     }
 }
 
@@ -65,7 +69,10 @@ fn dec<T: DeserializeOwned>(b: &[u8]) -> Result<T, NetworkError> {
 }
 
 fn msg(payload: Vec<u8>) -> RaftMessage {
-    RaftMessage { version: PROTO_VERSION, payload }
+    RaftMessage {
+        version: PROTO_VERSION,
+        payload,
+    }
 }
 
 impl RaftNetwork<TypeConfig> for GrpcNetwork {
@@ -115,8 +122,10 @@ impl RaftNetwork<TypeConfig> for GrpcNetwork {
             .install_snapshot(msg(payload))
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let inner: Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>> =
-            dec(&resp.into_inner().payload)?;
+        let inner: Result<
+            InstallSnapshotResponse<NodeId>,
+            RaftError<NodeId, InstallSnapshotError>,
+        > = dec(&resp.into_inner().payload)?;
         inner.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
 }
