@@ -16,6 +16,9 @@ target/
 # devcluster 本地集群数据(可重生)
 /.localcluster/
 
+# release 打包产物(dist/ 在仓库根;crates/admin/ui/dist 需入库,故只忽略根目录)
+/dist/
+
 # admin SPA 依赖 / 构建中间产物(dist/index.html 需入库供 include_str! 内嵌)
 crates/admin/ui/node_modules/
 crates/admin/ui/*.tsbuildinfo

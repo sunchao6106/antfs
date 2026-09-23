@@ -9,6 +9,7 @@
 <p align="center">
   <a href="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="https://github.com/sunchao6106/ambry-rs/pkgs/container/antfs"><img alt="Container image" src="https://img.shields.io/badge/ghcr.io-antfs-2496ED?logo=docker&logoColor=white"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange?logo=rust">
   <a href="docs/design/README.md"><img alt="Docs" src="https://img.shields.io/badge/docs-design%20docs-green"></a>
   <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
@@ -94,6 +95,61 @@ Run a full local cluster — 1 Raft master + 3 store nodes + admin web, all in-p
 ```bash
 cargo run -p antfs-devcluster
 ```
+
+### Prebuilt binaries
+
+Every `v*` tag produces tarballs for Linux (x86_64 / aarch64) and macOS (arm64 / x86_64) on the [Releases page](https://github.com/sunchao6106/ambry-rs/releases). Each tarball contains `antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-admin` and `antfs-devcluster`:
+
+```bash
+target=x86_64-unknown-linux-gnu    # or aarch64-unknown-linux-gnu / aarch64-apple-darwin / x86_64-apple-darwin
+base=https://github.com/sunchao6106/ambry-rs/releases/latest/download
+curl -LO "$base/antfs-$target.tar.gz" && curl -LO "$base/SHA256SUMS"
+sha256sum "antfs-$target.tar.gz"   # macOS: shasum -a 256 — compare with the matching line in SHA256SUMS
+tar xzf "antfs-$target.tar.gz" && cd "antfs-$target" && ./antfs-devcluster
+```
+
+### Run with Docker
+
+A container image is published to the GitHub Container Registry on every push to `main` (tag `latest`) and on `v*` tags (semver tags):
+
+```bash
+docker run --rm -it \
+  -p 7300:7300 -p 7400:7400 \
+  -v antfs-data:/data \
+  ghcr.io/sunchao6106/antfs:latest
+```
+
+It starts the same one-command dev cluster (1 Raft master + 3 store nodes + admin web + REST frontend). The startup log prints every endpoint and the admin tokens; from the host you get:
+
+- admin web console — <http://127.0.0.1:7300>
+- REST API — <http://127.0.0.1:7400/blobs>, Prometheus metrics at `/metrics`
+
+Prefer Compose:
+
+```bash
+docker compose up -d
+```
+
+The image runs as a non-root user (UID 10001), so if you bind-mount a host directory instead of the named volume, make the directory writable first:
+
+```bash
+mkdir -p data && sudo chown -R 10001:10001 data
+docker run --rm -p 7300:7300 -p 7400:7400 -v "$PWD/data:/data" ghcr.io/sunchao6106/antfs:latest
+```
+
+The image also ships the individual components (`antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-admin`), so you can run one of them instead of the whole cluster:
+
+```bash
+docker run --rm --entrypoint antfs-master -p 7101:7101 ghcr.io/sunchao6106/antfs:latest
+```
+
+Or bake a benchmark run into the container startup:
+
+```bash
+docker run --rm ghcr.io/sunchao6106/antfs:latest --run-bench router --bench-ops 50000
+```
+
+To build the image locally: `docker build -t antfs:dev .`
 
 ### Optional: Linux-fidelity runs (colima VM)
 

@@ -9,6 +9,7 @@
 <p align="center">
   <a href="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="https://github.com/sunchao6106/ambry-rs/pkgs/container/antfs"><img alt="容器镜像" src="https://img.shields.io/badge/ghcr.io-antfs-2496ED?logo=docker&logoColor=white"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange?logo=rust">
   <a href="docs/design/README.md"><img alt="Docs" src="https://img.shields.io/badge/docs-design%20docs-green"></a>
   <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
@@ -96,6 +97,61 @@ cargo run -p antfs-smoke        # 存储引擎冒烟测试
 ```bash
 cargo run -p antfs-devcluster
 ```
+
+### 预编译二进制
+
+打 `v*` tag 会在 [Releases 页面](https://github.com/sunchao6106/ambry-rs/releases)产出 Linux(x86_64 / aarch64)与 macOS(arm64 / x86_64)四个平台的包,每个包里含 `antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-admin`、`antfs-devcluster`:
+
+```bash
+target=x86_64-unknown-linux-gnu    # 或 aarch64-unknown-linux-gnu / aarch64-apple-darwin / x86_64-apple-darwin
+base=https://github.com/sunchao6106/ambry-rs/releases/latest/download
+curl -LO "$base/antfs-$target.tar.gz" && curl -LO "$base/SHA256SUMS"
+sha256sum "antfs-$target.tar.gz"   # macOS 用 shasum -a 256,与 SHA256SUMS 对应行比对
+tar xzf "antfs-$target.tar.gz" && cd "antfs-$target" && ./antfs-devcluster
+```
+
+### 用 Docker 跑
+
+容器镜像发布在 GitHub Container Registry:每次推 `main` 更新 `latest`,打 `v*` tag 出语义化版本 tag。
+
+```bash
+docker run --rm -it \
+  -p 7300:7300 -p 7400:7400 \
+  -v antfs-data:/data \
+  ghcr.io/sunchao6106/antfs:latest
+```
+
+起的还是那条「一键本地集群」(1 个 Raft master + 3 个 store + admin web + REST frontend)。启动日志会打印各端点与 admin token,宿主机上可直接访问:
+
+- admin web 控制台 —— <http://127.0.0.1:7300>
+- REST 接口 —— <http://127.0.0.1:7400/blobs>,Prometheus 指标在 `/metrics`
+
+也可以用 Compose:
+
+```bash
+docker compose up -d
+```
+
+镜像以非 root 用户(UID 10001)运行,所以若改用挂载宿主机目录而不是命名卷,先把目录属主调好:
+
+```bash
+mkdir -p data && sudo chown -R 10001:10001 data
+docker run --rm -p 7300:7300 -p 7400:7400 -v "$PWD/data:/data" ghcr.io/sunchao6106/antfs:latest
+```
+
+镜像里同时带了各独立组件(`antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-admin`),可以只起其中一个:
+
+```bash
+docker run --rm --entrypoint antfs-master -p 7101:7101 ghcr.io/sunchao6106/antfs:latest
+```
+
+想在容器启动时顺手压一轮:
+
+```bash
+docker run --rm ghcr.io/sunchao6106/antfs:latest --run-bench router --bench-ops 50000
+```
+
+本地构建镜像:`docker build -t antfs:dev .`
 
 ### 可选:Linux 目标保真(colima VM)
 

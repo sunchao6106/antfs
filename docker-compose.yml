@@ -1,0 +1,13 @@
+services:
+  antfs:
+    image: ghcr.io/sunchao6106/antfs:latest
+    container_name: antfs
+    ports:
+      - "7300:7300"   # admin web console
+      - "7400:7400"   # REST API (/blobs, /metrics)
+    volumes:
+      - antfs-data:/data
+    restart: unless-stopped
+
+volumes:
+  antfs-data:

@@ -39,6 +39,9 @@ struct Args {
     /// store 是否开启主动盘探测(`disk_health_enabled`,默认 false;开启后心跳会带 HEALTHY/... 健康值)。
     disk_health: bool,
     frontend_port: u16,
+    /// 对外服务的监听 host(`--host`,默认回环)。容器里传 `0.0.0.0` 才能被 `-p` 发布的端口访问。
+    /// 只影响**监听**地址:集群内部互连地址恒为 `127.0.0.1`(master/store/admin/frontend 同进程)。
+    host: String,
     /// `--run-bench router|frontend`:起完集群(等就绪)后在**同一进程**内跑一轮压测并退出。
     /// 客户端与被测服务共享同一份 CPU/盘 IO,数字只作冒烟参考 —— 正式压测请另起进程跑 bench 二进制。
     run_bench: Option<String>,
@@ -62,6 +65,7 @@ impl Default for Args {
             disk_near_full_ratio: 0.95,
             disk_health: false,
             frontend_port: 7400,
+            host: "127.0.0.1".to_string(),
             run_bench: None,
             bench_ops: 20_000,
             bench_concurrency: 32,
@@ -90,6 +94,7 @@ fn parse_args() -> Args {
             }
             "--disk-health" => a.disk_health = true,
             "--frontend-port" => a.frontend_port = val().parse().expect("port"),
+            "--host" => a.host = val(),
             "--run-bench" => {
                 let mode = val();
                 if mode != "router" && mode != "frontend" {
@@ -133,6 +138,8 @@ fn print_help() {
          --disk-near-full-ratio F  master 盘将满阈值 (default 0.95;调小可在本地复现「分区转 RO」)\n\
          --disk-health          开启 store 主动盘探测(心跳带健康值,用于验证健康回填与避让)\n\
          --frontend-port P      frontend REST 端口 (default 7400)\n\
+         --host ADDR            对外服务(master gRPC / admin / frontend)的监听 host\n\
+                                (default 127.0.0.1;容器里传 0.0.0.0 才能被 -p 发布的端口访问)\n\
          --run-bench MODE       起完集群(等就绪)后跑一轮压测并退出:MODE = router | frontend\n\
                                 (同进程压测,数字只作冒烟参考;正式压测请跑 antfs-bench-* 二进制)\n\
          --bench-ops N          压测写操作数 (default 20000;仅 --run-bench 时用)\n\
@@ -157,14 +164,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = parse_args();
     std::fs::create_dir_all(&args.dir)?;
 
+    // `grpc_addr` = 集群内部互连地址(恒回环);`*_bind` = 实际监听地址(`--host`,容器里 0.0.0.0)。
     let grpc_addr = format!("127.0.0.1:{}", args.master_grpc_port);
+    let grpc_bind = format!("{}:{}", args.host, args.master_grpc_port);
     let raft_addr = format!("127.0.0.1:{}", args.master_raft_port);
 
     // ---- master(单节点自举,开可写分区所需的健康副本 quorum 由 3 store 提供)----
     let mcfg = MasterConfig {
         node_id: 1,
         raft_addr: raft_addr.clone(),
-        grpc_addr: grpc_addr.clone(),
+        grpc_addr: grpc_bind.clone(),
         data_dir: args.dir.join("master").to_string_lossy().into_owned(),
         initial_members: vec![1],
         cluster_secret: SECRET.to_string(),
@@ -303,7 +312,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let arouter = antfs_admin::server::build_router(astate, aauth);
     let admin_addr = format!("127.0.0.1:{}", args.admin_port);
-    let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
+    let admin_bind = format!("{}:{}", args.host, args.admin_port);
+    let listener = tokio::net::TcpListener::bind(&admin_bind).await?;
     tokio::spawn(async move {
         // 带 connect info 以记录审计的 remote_addr。
         let _ = axum::serve(
@@ -388,7 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// 失败只记 warn 并返回 `None` —— devcluster 的主职责是 master+store 起得来,REST 入口缺了不影响直连模式联调。
 async fn start_frontend(args: &Args, grpc_addr: &str) -> Option<String> {
     let cfg = antfs_frontend::config::FrontendConfig {
-        listen_addr: format!("127.0.0.1:{}", args.frontend_port),
+        listen_addr: format!("{}:{}", args.host, args.frontend_port),
         // dev 环境放宽(默认 2 MiB);与 store 侧同因、同值。
         max_body_bytes: 16 << 20,
         cors_allowed_origins: Vec::new(),

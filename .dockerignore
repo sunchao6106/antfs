@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.run
+.localcluster
+target
+**/node_modules
+docs
+openspec
+*.md
+vm-cargo.sh

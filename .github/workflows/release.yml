@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 tag(如 v0.1.0):按它构建二进制并发布"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            protoc: apt
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            protoc: apt
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+            protoc: brew
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+            protoc: brew
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # crates/master/build.rs 用 tonic-prost-build,构建期需要 protoc。
+      - name: Install protoc
+        run: |
+          if [[ "${{ matrix.protoc }}" == "apt" ]]; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          else
+            brew install protobuf
+          fi
+
+      # 交叉编译 Linux aarch64:zig 当 linker,免自建交叉工具链(与 RustFS 同路数)。
+      - name: Set up Zig
+        if: matrix.cross
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo_args=(--release --locked --target "${{ matrix.target }}"
+            -p antfs-master -p antfs-store -p antfs-frontend -p antfs-admin -p antfs-devcluster)
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cargo zigbuild "${cargo_args[@]}"
+          else
+            cargo build "${cargo_args[@]}"
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          scripts/release/package_binaries.sh "${tag#v}" "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Merge and verify checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sort -k2 SHA256SUMS > SHA256SUMS.sorted && mv SHA256SUMS.sorted SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      # 再补一份去掉版本号的固定名:`releases/latest/download/antfs-<target>.tar.gz` 可直接用。
+      - name: Add version-less aliases
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          cd dist
+          for file in antfs-*.tar.gz; do
+            alias=${file/antfs-$version-/antfs-}
+            [[ $alias == "$file" ]] && continue
+            cp "$file" "$alias"
+            sha256sum "$alias" >> SHA256SUMS
+          done
+          ls -l
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          scripts/release/create_or_update_release.sh "$tag" dist/*.tar.gz dist/SHA256SUMS
