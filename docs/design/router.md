@@ -22,13 +22,27 @@
 ## 2. 写路径(W = 实际副本数 / 2 + 1)
 
 ```
-allocate_one(): 号段内有号 → 本地 offset++(零 RPC)
-                号段耗尽  → GetBlobIds 向 master 取一段(master 侧先 Raft 抬水位再发,见 blobid-master-assign)
+allocate_one(): 本地号段里**按分区轮转**取 → offset++(零 RPC)
+                所有分区的号段都取完 → 补段:ListPartitions 拿当前可写(RW)分区列表
+                                      → 对每个分区各 GetBlobIds 一小批(id_segment_size 个)
+                                        (master 侧先 Raft 抬水位再发,见 blobid-master-assign)
 put(key, bytes): 解析 key 的高 32 位得 partitionId
                 → 取该 partition 的**全部**副本位置(发号响应带回,或 LookupPartition)
                 → 并行 HTTP PUT 到所有副本
                 → 收满 W = 副本数/2+1 个 ack 即返回成功(其余请求被取消,由拉复制补齐)
 ```
+
+- **发号按分区轮转(打散写 IOPS)**:稳态下 router **每个可写分区各持一段**号,取号在它们之间轮转 —— 相邻写落在不同
+  分区(进而是不同副本、不同盘),而不是把一段号连续耗尽在一个分区上。分区集合仍由 **master** 给(router 不自造 id):
+  补段用 `ListPartitions(state=RW)` 取权威可写列表 + 显式点名 `partition_id` 的 `GetBlobIds`(master 复核该分区确实
+  可写、有副本)。单个分区取号失败(期间转 RO/封存)只跳过它;router **不做**容量/副本自选 —— 代价是负载由 D10 的
+  "按剩余容量加权随机"变成"可写分区上的**均匀轮转**",理由与取舍见 `openspec/changes/router-partition-round-robin`。
+- **补段的代价**:一次补段 = 1 次 `ListPartitions` + 「分区数」次 `GetBlobIds`,整轮在号段锁里单飞(并发调用各补一轮会放大
+  RPC 并可能重号)。故 `id_segment_size` 是**每个分区**的号段大小,稳态持有「可写分区数 × N」个号。
+- **可写分区列表由后台任务保鲜**:`connect` 起一个后台任务,按 `partition_refresh_secs` 周期拉一次列表 —— 已不可写的
+  分区**丢掉号段**(余号成空洞,无害,D3)、新出现的可写分区**补一段**;号段耗尽的写路径自己也会同步一次(故周期配
+  `0` 也能跑,只是缓存跟不上分区增减)。任务持号段池的 `Weak`,最后一个 `Router` 析构后自行退出;重建轮转顺序时
+  **保持轮转相位**,空刷新不会让同一分区连出两个号。
 
 - **W 是实算的,不是配置项**:RF=3 → 2(等于 Ambry `routerPutSuccessTarget=2`)、RF=2 → 2、RF=1 → 1、RF=5 → 3。
   低于多数派的写会破坏"已确认 ⇒ 多数副本有"的前提,故**不提供配置开关**(避免有人调低它静默削弱持久性)。
@@ -77,10 +91,12 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router.master_addr` | String | `127.0.0.1:7101` | 非空 | master 控制面 gRPC 地址。**须指向 leader**(见 §7 待办) | Ambry 从 clustermap 拿地址,不配 |
 | `router.cluster_secret` | String | `""` | — | 集群准入密钥(与 master 一致);空 = 关校验(仅本地测试) | 无(Ambry 用 account/container 鉴权) |
 | `router.request_timeout_secs` | u64 | `10` | ≥1 | 单请求超时(同时用于 master gRPC 与数据面 HTTP) | `router.routerRequestTimeoutMs`(默认 20s) |
-| `router.id_segment_size` | u32 | `1024` | ≥1 | **一次向 master 申请的 blobId 个数**(号段 N):越大越省 RPC、router 崩溃留下的空洞越大(空洞无害,D3) | 无(Ambry 的 id 是本地随机生成,无发号) |
+| `router.id_segment_size` | u32 | `1024` | ≥1 | **每个可写分区**一次向 master 申请的 blobId 个数(号段 N)。稳态持有「可写分区数 × N」个号:越大越省 RPC、router 崩溃留下的空洞越大(空洞无害,D3) | 无(Ambry 的 id 是本地随机生成,无发号) |
+| `router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新**可写分区列表**的周期(秒):已不可写分区的号段被丢掉、新出现的可写分区补一段 | 无 |
 
-> **请求哪个 partition**:`GetBlobIds` 的 `partition_id` 是 proto3 `optional` —— **缺省 = 由 master 按剩余容量加权挑**
-> (router 走的就是这条);显式点名则要求该分区 RW 且**至少有一个副本**,否则 `ok=false`。
+> **请求哪个 partition**:补段时先 `ListPartitions(state=RW)` 拿可写分区列表,再对**每个**分区显式点名
+> `partition_id` 申请一小批(master 复核该分区 RW 且**至少有一个副本**,否则 `ok=false` 只跳过该分区)。
+> `partition_id` 缺省 = 由 master 按剩余容量加权挑一个 —— **分区分派始终由 master 定**,router 不自选(D10)。
 > (早期版本用"`0` 表示自动",导致第 0 号分区无法被点名,已改。)
 
 > **没有 W/R 配置项**(见 §2)、**没有重试次数配置项**(失败即返回,重试由调用方决定)。
@@ -103,6 +119,8 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_get_total` | counter | `outcome` | 次 | 读请求数 | `RouterMetrics.getBlobOperationRate` |
 | `router_get_bytes_total` | counter | — | 字节 | 成功读出的字节数 | 无 |
 | `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`stat` 操作数 | `RouterMetrics.*OperationRate` |
+| `router_partition_refresh_total` | counter | `outcome` | 次 | 后台刷新可写分区列表的次数(失败为 `error`) | 无 |
+| `router_writable_partitions` | gauge | — | 个 | 本地**持有号段的分区数**(后台刷新后刷新;0 = 当前无可写分区) | 无 |
 
 ## 7. 与 Ambry 的差异 / 已知取舍 / 待办
 

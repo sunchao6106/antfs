@@ -228,6 +228,7 @@ impl Fixture {
                 cluster_secret: SECRET.to_string(),
                 request_timeout_secs: 10,
                 id_segment_size: 4,
+                partition_refresh_secs: 30,
             },
         };
         cfg.validate().expect("frontend config");

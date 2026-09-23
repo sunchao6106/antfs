@@ -138,7 +138,8 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend.router.master_addr` | String | `127.0.0.1:7101` | 非空 | 内嵌 SDK 的 master 地址(见 [`router.md` §5](./router.md)) | 无 |
 | `frontend.router.cluster_secret` | String | `""` | — | 集群准入密钥 | 无 |
 | `frontend.router.request_timeout_secs` | u64 | `10` | ≥1 | 单请求超时 | `router.routerRequestTimeoutMs` |
-| `frontend.router.id_segment_size` | u32 | `1024` | ≥1 | 一次申请的 blobId 个数 | 无 |
+| `frontend.router.id_segment_size` | u32 | `1024` | ≥1 | **每个可写分区**一次申请的 blobId 个数(见 [`router.md` §2/§5](./router.md)) | 无 |
+| `frontend.router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新可写分区列表的周期(秒;见 [`router.md` §2](./router.md)) | 无 |
 
 > **`[frontend.router]` 是内嵌 router 的配置子表**:W/R、号段大小等只有**一处真源**,frontend 不重复定义
 > (W 甚至不可配,见 `router.md §2`)。

@@ -5,10 +5,18 @@
 //! `benchmark/router` 也用它,故 W/R 逻辑只有一份实现。本 crate **不提供二进制**。
 //!
 //! ```text
-//! GetBlobIds(gRPC) ─▶ master  回 (可写 partitionId, objectId 号段 [start,start+N), 副本位置)
+//! ListPartitions/GetBlobIds(gRPC) ─▶ master  回 (可写 partitionId 列表;每分区一段 objectId [start,start+N) + 副本位置)
 //! PUT ×N (HTTP)    ─▶ store   收 W 个 ack 即返回(其余副本靠拉复制补齐)
 //! GET   (HTTP)     ─▶ store   第一个成功即返回(R=1)
 //! ```
+//!
+//! **发号 = 多分区轮转**:补段时先拉 master 的当前可写(RW)分区列表,对**每个**分区各申请一小批号
+//! (显式点名 `partition_id`),之后写请求在这些分区之间轮转取号 —— 相邻写落在不同分区、不同盘上,
+//! 写 IOPS 摊开,而不是把一段号连续耗尽在一个分区上。**分区分派仍由 master 定**,router 不自选(D10)。
+//!
+//! **可写分区列表由后台任务保鲜**:`connect` 起一个后台任务,按 `partition_refresh_secs` 周期向 master 拉一次
+//! 可写分区列表,把已不可写分区的号段丢掉、给新出现的可写分区补一段(号段耗尽的写路径自己也会同步一次;
+//! 周期配 0 = 不起后台任务)。任务持号段池的 `Weak` 引用,最后一个 `Router` 析构后自行退出。
 //!
 //! **两条正确性约束(不做成可配)**:
 //! - 写:W = 该分区**实际副本数 / 2 + 1**(多数派)。RF=3 → 2(对齐 Ambry `routerPutSuccessTarget`)、
@@ -26,9 +34,9 @@ pub use config::RouterConfig;
 pub use error::{Error, Result};
 pub use metrics::RouterMetrics;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -38,7 +46,9 @@ use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
 
 use antfs_master::pb::master_client::MasterClient;
-use antfs_master::pb::{GetBlobIdsRequest, LookupRequest, ReplicaLoc};
+use antfs_master::pb::{
+    GetBlobIdsRequest, GetBlobIdsResponse, ListPartitionsRequest, LookupRequest, ReplicaLoc,
+};
 use antfs_master::PartitionId;
 
 const PROTO_VERSION: u32 = 1;
@@ -63,16 +73,54 @@ pub struct BlobStat {
     pub expired: bool,
 }
 
-/// 一池已从 master 取回、尚未发完的 blobId 号段。
+/// 一个分区上已从 master 取回、尚未发完的 blobId 号段。
 struct Segment {
     pid: PartitionId,
+    /// 下一个待发号(含);`next >= end` 即已取完。
     next: u32,
     end: u32,
 }
 
+/// 号段池:**每个可写分区各持一段**,取号时在它们之间轮转。
 #[derive(Default)]
 struct IdCache {
-    segments: Vec<Segment>,
+    /// 未发完的段(`pid → 段`);取完即移除。
+    segments: HashMap<PartitionId, Segment>,
+    /// 轮转顺序(补段时刷新的可写分区列表,pid 升序)。
+    order: Vec<PartitionId>,
+    /// 轮转游标:`order` 里下一个待取的分区位置。
+    cursor: usize,
+}
+
+impl IdCache {
+    /// 轮转取一个号:游标所指分区的段没取完就用它,取完就丢掉并转到下一个分区。
+    ///
+    /// 走完一轮都没号 → `None`(调用方去补段)。**顺序轮转**保证相邻写落在不同分区
+    /// (进而是不同副本、不同盘),写 IOPS 摊开而不是把一段号连续耗尽在一个分区上。
+    fn take_rr(&mut self) -> Option<StoreKey> {
+        for _ in 0..self.order.len() {
+            if self.cursor >= self.order.len() {
+                self.cursor = 0;
+            }
+            let pid = self.order[self.cursor];
+            self.cursor += 1;
+            let Some(seg) = self.segments.get_mut(&pid) else {
+                continue;
+            };
+            if seg.next >= seg.end {
+                self.segments.remove(&pid);
+                continue;
+            }
+            let key = StoreKey::from_parts(pid, seg.next);
+            seg.next += 1;
+            let exhausted = seg.next >= seg.end;
+            if exhausted {
+                self.segments.remove(&pid);
+            }
+            return Some(key);
+        }
+        None
+    }
 }
 
 /// antfs router(客户端 SDK)。可 `Arc` 共享给多任务并发使用。
@@ -82,9 +130,11 @@ pub struct Router {
     master: Mutex<MasterClient<Channel>>,
     http: reqwest::Client,
     /// 号段池。**锁跨取段的 `await` 持有**:号段边界单飞,避免并发调用各取一段。
-    ids: Mutex<IdCache>,
+    ///
+    /// `Arc` 是为了让后台刷新任务持 `Weak` 引用 —— 最后一个 `Router` 析构后任务自己退出,不留常驻任务。
+    ids: Arc<Mutex<IdCache>>,
     /// `partitionId → 副本位置` 读路由缓存(读路径用;写路径优先用发号响应带回的副本)。
-    topology: RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>,
+    topology: Arc<RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>>,
     metrics: Arc<RouterMetrics>,
 }
 
@@ -121,7 +171,7 @@ impl<T> Fanout<T> {
 }
 
 impl Router {
-    /// 连 master(懒连接:首个 RPC 才真正建连)并注册指标。
+    /// 连 master(懒连接:首个 RPC 才真正建连)、注册指标,并起**后台刷新任务**(见 [`spawn_refresher`])。
     pub async fn connect(cfg: RouterConfig, registry: &antfs_metric::Registry) -> Result<Self> {
         antfs_config::Validate::validate(&cfg)?;
         let channel = Endpoint::from_shared(format!("http://{}", cfg.master_addr))
@@ -133,12 +183,21 @@ impl Router {
             .build()
             .map_err(Error::HttpClient)?;
         let metrics = Arc::new(RouterMetrics::new(registry)?);
+        let ids = Arc::new(Mutex::new(IdCache::default()));
+        let topology = Arc::new(RwLock::new(HashMap::new()));
+        spawn_refresher(
+            &cfg,
+            channel.clone(),
+            Arc::downgrade(&ids),
+            Arc::clone(&topology),
+            Arc::clone(&metrics),
+        );
         Ok(Router {
             cfg,
             master: Mutex::new(MasterClient::new(channel)),
             http,
-            ids: Mutex::new(IdCache::default()),
-            topology: RwLock::new(HashMap::new()),
+            ids,
+            topology,
             metrics,
         })
     }
@@ -155,78 +214,30 @@ impl Router {
 
     // ── 发号 ────────────────────────────────────────────────────────────────────────────────
 
-    /// 申请一个 blobId:号段内直接取(零 RPC),号段耗尽时向 master 取下一段。
+    /// 申请一个 blobId:本地号段里轮转取(零 RPC);所有分区的号段都取完才对齐一次可写分区列表。
     pub async fn allocate_one(&self) -> Result<StoreKey> {
         let mut cache = self.ids.lock().await;
-        if let Some(seg) = cache.segments.iter_mut().find(|s| s.next < s.end) {
-            let key = StoreKey::from_parts(seg.pid, seg.next);
-            seg.next += 1;
+        if let Some(key) = cache.take_rr() {
             return Ok(key);
         }
-        let (seg, first) = self.fetch_segment().await?;
-        cache.segments.retain(|s| s.next < s.end);
-        cache.segments.push(seg);
-        Ok(first)
+        sync_segments(
+            &mut cache,
+            &self.master,
+            &self.cfg,
+            &self.metrics,
+            &self.topology,
+        )
+        .await?;
+        cache.take_rr().ok_or(Error::NoWritablePartition)
     }
 
-    /// 申请 `count` 个 blobId(顺序取,可能跨多个号段/分区)。
+    /// 申请 `count` 个 blobId(按分区轮转取,可能跨多个分区)。
     pub async fn allocate_batch(&self, count: u32) -> Result<Vec<StoreKey>> {
         let mut out = Vec::with_capacity(count as usize);
         while (out.len() as u32) < count {
             out.push(self.allocate_one().await?);
         }
         Ok(out)
-    }
-
-    /// 向 master 取一段 blobId(两层批处理的第一层;水位抬升由 master 侧完成)。
-    ///
-    /// 返回 `(段, 首个 blobId)`。顺带把响应里的副本位置写进读路由缓存。
-    async fn fetch_segment(&self) -> Result<(Segment, StoreKey)> {
-        let want = self.cfg.id_segment_size;
-        let req = GetBlobIdsRequest {
-            version: PROTO_VERSION,
-            cluster_secret: self.cfg.cluster_secret.clone(),
-            count: want,
-            // 不指定 partition = 由 master 按剩余容量加权挑一个可写分区(blobid-master-assign D10)
-            partition_id: None,
-        };
-        let resp = self
-            .master
-            .lock()
-            .await
-            .get_blob_ids(req)
-            .await
-            .map_err(Error::Master)?
-            .into_inner();
-        if !resp.ok {
-            return Err(map_master_error(&resp.error, resp.partition_id));
-        }
-        if resp.count == 0 {
-            return Err(Error::Rejected(
-                "master returned an empty id segment".into(),
-            ));
-        }
-        let start = u32::try_from(resp.start_object_id).map_err(|_| {
-            Error::Rejected(format!(
-                "start_object_id {} overflows u32",
-                resp.start_object_id
-            ))
-        })?;
-        let pid = resp.partition_id;
-        self.metrics.id_segments.inc();
-        self.metrics.id_segment_ids.inc_by(resp.count as u64);
-        self.topology
-            .write()
-            .expect("topology lock poisoned")
-            .insert(pid, sorted_replicas(resp.replicas));
-        Ok((
-            Segment {
-                pid,
-                next: start + 1,
-                end: start.saturating_add(resp.count),
-            },
-            StoreKey::from_parts(pid, start),
-        ))
     }
 
     // ── 读路由 ──────────────────────────────────────────────────────────────────────────────
@@ -662,6 +673,171 @@ impl Router {
     }
 }
 
+// ── 号段 ↔ 可写分区列表对齐(热路径补段 + 后台刷新任务共用)────────────────────────────────────
+
+/// 起**后台刷新任务**:按 `cfg.partition_refresh_secs` 周期向 master 拉可写分区列表并调账本地号段
+/// (已不可写的分区丢掉号段,新出现的可写分区补一段)。`partition_refresh_secs = 0` 不起任务。
+///
+/// 任务持号段池的 `Weak`:最后一个 `Router` 析构后引用计数归零,任务下一拍自己退出。
+/// 刷新失败只计 `router_partition_refresh_total{outcome="error"}` —— 后台刷新是**增强**(让缓存跟上
+/// 分区增减),不是正确性依赖:号段耗尽的写路径自己会 [`sync_segments`] 一次。
+fn spawn_refresher(
+    cfg: &RouterConfig,
+    channel: Channel,
+    ids: Weak<Mutex<IdCache>>,
+    topology: Arc<RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>>,
+    metrics: Arc<RouterMetrics>,
+) {
+    if cfg.partition_refresh_secs == 0 {
+        return;
+    }
+    let period = Duration::from_secs(cfg.partition_refresh_secs);
+    let cfg = cfg.clone();
+    tokio::spawn(async move {
+        // 自带的控制面 client(与写路径各自独立,不争同一把锁)。
+        let master = Mutex::new(MasterClient::new(channel));
+        loop {
+            let Some(cache) = ids.upgrade() else {
+                return;
+            };
+            let res = {
+                let mut cache = cache.lock().await;
+                sync_segments(&mut cache, &master, &cfg, &metrics, &topology).await
+            };
+            let outcome = if res.is_ok() { "ok" } else { "error" };
+            metrics
+                .partition_refresh_total
+                .with_label_values(&[outcome])
+                .inc();
+            tokio::time::sleep(period).await;
+        }
+    });
+}
+
+/// 一次「可写分区列表 ↔ 本地号段」对齐:
+/// 拉列表 → **丢掉**已不在列表里的分区的号段(余号成空洞,无害,D3)→ 给缺号段的分区**各申请一小批**
+/// (显式点名 `partition_id`,每批 `id_segment_size` 个)→ 按 pid 升序重建轮转顺序。
+///
+/// - 分区集合与合法性由 master 给:router 只从权威 RW 列表里取分区、**不自造 id**、不缓存容量判断,
+///   且每个分区在发号时被 master 复核(RW + 至少一个副本)。代价:负载由 D10 的"按剩余容量加权随机"
+///   变为"可写分区上的**均匀轮转**"(取舍见 `openspec/changes/router-partition-round-robin`)。
+/// - 单个分区取号失败(期间被改成 RO/封存、号耗尽、已下线)只跳过它,**不影响其余分区**。
+/// - 取段并发(`master` client 克隆后各自调用);整轮在号段锁里跑 —— 热路径借它单飞,后台任务借它
+///   与取号互斥。缓存补齐后仍一个号段都没有才算失败。
+async fn sync_segments(
+    cache: &mut IdCache,
+    master: &Mutex<MasterClient<Channel>>,
+    cfg: &RouterConfig,
+    metrics: &RouterMetrics,
+    topology: &RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>,
+) -> Result<()> {
+    let order = list_writable(master).await?;
+    // 重建轮转顺序时**保持相位**:记下"下一个本该轮到谁",在新顺序里找回它的位置。
+    // 否则一次什么都没补的空刷新(后台任务常走到这条)会把游标打回起点,让同一分区连出两个号。
+    let anchor = if cache.order.is_empty() {
+        None
+    } else {
+        Some(cache.order[cache.cursor % cache.order.len()])
+    };
+    let writable: HashSet<PartitionId> = order.iter().copied().collect();
+    cache.segments.retain(|pid, _| writable.contains(pid));
+    let want: Vec<PartitionId> = order
+        .iter()
+        .copied()
+        .filter(|pid| !cache.segments.contains_key(pid))
+        .collect();
+    cache.order = order;
+    cache.cursor = anchor
+        .and_then(|pid| cache.order.iter().position(|p| *p == pid))
+        .unwrap_or(0);
+
+    let mut pending = FuturesUnordered::new();
+    for pid in want {
+        let mut client = master.lock().await.clone();
+        let req = GetBlobIdsRequest {
+            version: PROTO_VERSION,
+            cluster_secret: cfg.cluster_secret.clone(),
+            count: cfg.id_segment_size,
+            partition_id: Some(pid),
+        };
+        pending.push(async move { client.get_blob_ids(req).await });
+    }
+
+    let mut last_err: Option<Error> = None;
+    while let Some(resp) = pending.next().await {
+        match resp {
+            Ok(resp) => match segment_from_response(resp.into_inner(), metrics, topology) {
+                Ok(seg) => {
+                    cache.segments.insert(seg.pid, seg);
+                }
+                Err(e) => last_err = Some(e),
+            },
+            Err(status) => last_err = Some(Error::Master(status)),
+        }
+    }
+    metrics.writable_partitions.set(cache.segments.len() as i64);
+    if cache.segments.is_empty() {
+        return Err(last_err.unwrap_or(Error::NoWritablePartition));
+    }
+    Ok(())
+}
+
+/// master 当前可写(RW)分区列表(pid 升序)。跳过没有副本的分区 —— 挑了它只会拿到一个必然写不进去的号段。
+async fn list_writable(master: &Mutex<MasterClient<Channel>>) -> Result<Vec<PartitionId>> {
+    let resp = master
+        .lock()
+        .await
+        .list_partitions(ListPartitionsRequest {
+            version: PROTO_VERSION,
+            offset: 0,
+            limit: 0, // 0 = 不限,一次取全
+            state: "RW".to_string(),
+        })
+        .await
+        .map_err(Error::Master)?
+        .into_inner();
+    Ok(resp
+        .partitions
+        .into_iter()
+        .filter(|p| !p.replicas.is_empty())
+        .map(|p| p.partition_id)
+        .collect())
+}
+
+/// 发号响应 → 一段号段(两层批处理的第一层;水位抬升由 master 侧完成)。顺带把响应里的副本位置写进读路由缓存。
+fn segment_from_response(
+    resp: GetBlobIdsResponse,
+    metrics: &RouterMetrics,
+    topology: &RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>,
+) -> Result<Segment> {
+    if !resp.ok {
+        return Err(map_master_error(&resp.error, resp.partition_id));
+    }
+    if resp.count == 0 {
+        return Err(Error::Rejected(
+            "master returned an empty id segment".into(),
+        ));
+    }
+    let start = u32::try_from(resp.start_object_id).map_err(|_| {
+        Error::Rejected(format!(
+            "start_object_id {} overflows u32",
+            resp.start_object_id
+        ))
+    })?;
+    let pid = resp.partition_id;
+    metrics.id_segments.inc();
+    metrics.id_segment_ids.inc_by(resp.count as u64);
+    topology
+        .write()
+        .expect("topology lock poisoned")
+        .insert(pid, sorted_replicas(resp.replicas));
+    Ok(Segment {
+        pid,
+        next: start,
+        end: start.saturating_add(resp.count),
+    })
+}
+
 /// 多数派扇形收集:并行结果里收满 `total / 2 + 1` 个成功即返回(其余未完成的不再等)。
 ///
 /// 提前返回意味着"凑不够了"(剩余未完成的即使全成功也不够),避免无谓等待。
@@ -799,5 +975,75 @@ fn map_master_error(error: &str, pid: PartitionId) -> Error {
         Error::IdExhausted(pid)
     } else {
         Error::Rejected(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 段 [start, start+count) —— 与发号响应同构(`next` 含、`end` 不含)。
+    fn seg(pid: PartitionId, start: u32, count: u32) -> Segment {
+        Segment {
+            pid,
+            next: start,
+            end: start + count,
+        }
+    }
+
+    /// 缓存里装上各分区的一段号,轮转顺序 = `pids`。
+    fn cache_with(pids: &[PartitionId], count: u32) -> IdCache {
+        let mut c = IdCache {
+            order: pids.to_vec(),
+            ..Default::default()
+        };
+        for (i, pid) in pids.iter().enumerate() {
+            c.segments
+                .insert(*pid, seg(*pid, 100 * (i as u32 + 1), count));
+        }
+        c
+    }
+
+    /// 核心行为:取号在持有号段的分区之间**交替**,而不是把一个分区的一段连续耗尽。
+    #[test]
+    fn take_rr_rotates_across_partitions() {
+        let mut c = cache_with(&[1, 2, 3], 2);
+        let pids: Vec<PartitionId> = (0..6)
+            .map(|_| c.take_rr().expect("有号可取").partition_id())
+            .collect();
+        assert_eq!(pids, vec![1, 2, 3, 1, 2, 3], "必须按分区轮转");
+        assert!(c.take_rr().is_none(), "号取完 → 交给调用方补段");
+        assert!(c.segments.is_empty(), "取完的段必须被丢掉");
+    }
+
+    /// 一段只有一个号(count=1)也必须发得出去 —— `next` 含 / `end` 不含 的边界。
+    #[test]
+    fn take_rr_handles_single_id_segment() {
+        let mut c = cache_with(&[7], 1);
+        let key = c.take_rr().expect("单号段仍可发一个号");
+        assert_eq!((key.partition_id(), key.object_id()), (7, 100));
+        assert!(c.take_rr().is_none());
+    }
+
+    /// 某分区的段取完后跳过它,其余分区继续轮转;空缓存返回 None。
+    #[test]
+    fn take_rr_skips_exhausted_and_empty_cache_returns_none() {
+        assert!(IdCache::default().take_rr().is_none());
+        let mut c = cache_with(&[1, 2], 1);
+        let pids: Vec<PartitionId> = (0..2)
+            .map(|_| c.take_rr().expect("有号可取").partition_id())
+            .collect();
+        assert_eq!(pids, vec![1, 2]);
+        assert!(c.take_rr().is_none());
+    }
+
+    /// 分区不在了(转 RO/封存后从 `order` 里消失)不 panic、不卡死:游标越过 `order` 长度要回绕。
+    #[test]
+    fn take_rr_wraps_cursor_when_order_shrinks() {
+        let mut c = cache_with(&[1, 2], 4);
+        assert_eq!(c.take_rr().expect("号").partition_id(), 1);
+        c.order = vec![2]; // 分区 1 转 RO:从轮转顺序里摘掉
+        assert_eq!(c.take_rr().expect("号").partition_id(), 2);
+        assert_eq!(c.take_rr().expect("号").partition_id(), 2);
     }
 }

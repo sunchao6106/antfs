@@ -22,9 +22,14 @@ pub struct RouterConfig {
     pub cluster_secret: String,
     /// 单次数据面 HTTP 请求超时(秒)。
     pub request_timeout_secs: u64,
-    /// 一次向 master 申请的 blobId 个数(号段大小 N)。越大越省 RPC、client 崩溃留下的空洞越大
+    /// **每个可写分区**一次向 master 申请的 blobId 个数(号段大小 N)。router 稳态下同时持有
+    /// 「可写分区数 × N」个号:越大越省 RPC、router 崩溃留下的空洞越大
     /// (空洞无害,见 `blobid-master-assign` D3/D9)。
     pub id_segment_size: u32,
+    /// 后台刷新**可写分区列表**的周期(秒)。router 起一个后台任务,按此周期向 master 拉一次可写(RW)分区列表:
+    /// 已不可写的分区,其本地号段被丢掉;新出现的可写分区,补一段加进缓存。
+    /// **0 = 关闭**刷新(退回"只在号段耗尽时拉一次列表")。
+    pub partition_refresh_secs: u64,
 }
 
 impl Default for RouterConfig {
@@ -34,6 +39,7 @@ impl Default for RouterConfig {
             cluster_secret: String::new(),
             request_timeout_secs: 10,
             id_segment_size: 1024,
+            partition_refresh_secs: 30,
         }
     }
 }

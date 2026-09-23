@@ -66,6 +66,7 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
             cluster_secret: cfg.cluster_secret.clone(),
             request_timeout_secs: cfg.request_timeout_secs,
             id_segment_size: cfg.id_segment_size,
+            partition_refresh_secs: 30,
         },
         &registry,
     )

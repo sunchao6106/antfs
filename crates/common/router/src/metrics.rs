@@ -3,7 +3,8 @@
 //! DI 见 [`docs/design/common.md` §2.2];清单见 [`docs/design/router.md`];改名字即改文档(CLAUDE.md §7)。
 
 use antfs_metric::{
-    counter, counter_vec, histogram_vec, IntCounter, IntCounterVec, Registry, Result,
+    counter, counter_vec, gauge, histogram_vec, IntCounter, IntCounterVec, IntGauge, Registry,
+    Result,
 };
 
 /// router 指标集,构造时注册进传入的 `Registry`。
@@ -27,6 +28,10 @@ pub struct RouterMetrics {
     pub get_bytes: IntCounter,
     /// 其它数据面操作数,label `op`(delete/stat)+ `outcome`。
     pub mutation_total: IntCounterVec,
+    /// 后台刷新可写分区列表的次数,label `outcome`(ok / error)。
+    pub partition_refresh_total: IntCounterVec,
+    /// 本地持有号段的**分区数**(= 当前可写分区数;gauge)。
+    pub writable_partitions: IntGauge,
 }
 
 impl RouterMetrics {
@@ -82,6 +87,17 @@ impl RouterMetrics {
                 "router_mutation_total",
                 "delete/stat requests by op and outcome",
                 &["op", "outcome"],
+            )?,
+            partition_refresh_total: counter_vec(
+                registry,
+                "router_partition_refresh_total",
+                "writable-partition list refreshes by outcome",
+                &["outcome"],
+            )?,
+            writable_partitions: gauge(
+                registry,
+                "router_writable_partitions",
+                "partitions currently holding a cached id segment",
             )?,
         })
     }

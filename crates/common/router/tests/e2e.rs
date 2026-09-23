@@ -5,8 +5,9 @@
 //!   2. **W = 实际副本数 / 2 + 1**:RF=3 掉一个副本仍能写成功(acks=2);RF=1 只要求 1 个 ack
 //!      (证明门槛是"实算多数派",不是写死 2);
 //!   3. **R = 1**:第一个副本不可达时自动换副本读成功;
-//!   4. 号段:一次申请多个 id,互不重复、都落在 master 发的 partition 上;
-//!   5. 元数据/删除/复活;不存在的对象报 `NotFound`(而不是笼统的传输错误)。
+//!   4. 号段:一次申请多个 id,互不重复、都落在 master 发的 partition 上,**且在可写分区之间轮转**;
+//!   5. 元数据/删除/复活;不存在的对象报 `NotFound`(而不是笼统的传输错误);
+//!   6. 后台刷新任务:可写分区增减(转 RO / 新建)后本地号段池跟着调账。
 //!
 //! 测试夹具刻意**不依赖心跳周期**:节点注册与分区建立直接经 master 的 Raft 提交,副本在 store 上
 //! 经 admin 端点同步创建 —— 全部同步等待,不用 `sleep`(CLAUDE.md §5.6)。
@@ -14,7 +15,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use antfs_master::types::{DiskSpec, MasterCommand, MasterResponse, NodeInfo, ReplicaPlacement};
+use antfs_master::types::{
+    DiskSpec, MasterCommand, MasterResponse, NodeInfo, PartitionState, ReplicaPlacement,
+};
 use antfs_master::{MasterConfig, MasterNode};
 use antfs_router::{Error, Router, RouterConfig, StoreKey};
 use antfs_store::{StoreServer, StoreServerConfig};
@@ -156,6 +159,8 @@ fn client_cfg(master_addr: &str) -> RouterConfig {
         cluster_secret: SECRET.to_string(),
         request_timeout_secs: 10,
         id_segment_size: 4,
+        // 1s:让后台刷新在测试里可观测(生产默认 30s)。
+        partition_refresh_secs: 1,
     }
 }
 
@@ -304,7 +309,7 @@ async fn allocated_ids_are_unique_and_partitioned() {
     let (_sa, addr_a) = start_store(&dir_a, 101).await;
     register_node(&node, 101, &addr_a).await;
 
-    // 两个分区(master 按剩余容量加权挑,两次申请应能覆盖到)。
+    // 两个可写分区:router 补段时给**每个**分区各申请一段,取号在两者之间轮转。
     let p0 = create_partition(&node, vec![placement(101)]).await;
     let p1 = create_partition(&node, vec![placement(101)]).await;
     ensure_replica(&addr_a, p0).await;
@@ -315,9 +320,16 @@ async fn allocated_ids_are_unique_and_partitioned() {
         .await
         .expect("connect");
 
-    // 号段 4:申请 10 个 → 跨 3 个号段。
+    // 号段 4:申请 10 个 → 每个分区各发完两轮,中途再补一次段。
     let ids = client.allocate_batch(10).await.expect("allocate_batch");
     assert_eq!(ids.len(), 10);
+    // 轮转发号:相邻写落在不同分区(进而是不同盘),而不是把一段号连续耗尽在一个分区上。
+    let pids: Vec<u32> = ids.iter().map(|k| k.partition_id()).collect();
+    assert_eq!(
+        pids,
+        vec![p0, p1, p0, p1, p0, p1, p0, p1, p0, p1],
+        "取号必须在可写分区之间轮转"
+    );
     let mut seen = std::collections::HashSet::new();
     for id in &ids {
         assert!(seen.insert(id.as_u64()), "blobId 不得重复: {id:?}");
@@ -430,4 +442,70 @@ async fn concurrent_allocations_are_unique_and_writable() {
     for (k, data) in written {
         assert_eq!(router.get(&k).await.expect("get"), data);
     }
+}
+
+/// 后台刷新任务(`partition_refresh_secs`):周期拉可写分区列表并调账本地号段 ——
+/// **分区转 RO 后其号段被丢掉**(不再往里写)、**新出现的可写分区被补上段**(开始参与轮转)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_refresh_tracks_writable_partitions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let dir_a = tmp.path().join("store-a");
+    let (_sa, addr_a) = start_store(&dir_a, 101).await;
+    register_node(&node, 101, &addr_a).await;
+
+    let p0 = create_partition(&node, vec![placement(101)]).await;
+    let p1 = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, p0).await;
+    ensure_replica(&addr_a, p1).await;
+
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect");
+    let held = || client.metrics().writable_partitions.get() as u64;
+
+    // 后台任务启动即拉一次列表 → 两个可写分区各持一段。
+    wait_for("两个可写分区各持一段", || held() == 2).await;
+
+    // p0 转 RO:刷新后它的号段必须被丢掉,后续取号不再落在它上面。
+    set_state(&node, p0, PartitionState::ReadOnly).await;
+    wait_for("RO 分区的号段被丢掉", || held() == 1).await;
+    for key in client.allocate_batch(4).await.expect("allocate_batch") {
+        assert_eq!(key.partition_id(), p1, "转 RO 的分区不得再被发号");
+    }
+
+    // 新分区出现:刷新后应被补上段并参与轮转。
+    let p2 = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, p2).await;
+    wait_for("新可写分区被补段", || held() == 2).await;
+    let ids = client.allocate_batch(8).await.expect("allocate_batch");
+    assert!(
+        ids.iter().any(|k| k.partition_id() == p2),
+        "新出现的可写分区应参与发号"
+    );
+    assert!(
+        ids.iter().all(|k| k.partition_id() != p0),
+        "转 RO 的分区不得再被发号"
+    );
+}
+
+/// 带超时的条件轮询(等后台任务,不靠固定 `sleep` 赌时长;CLAUDE.md §5.6)。
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "等待超时:{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 改分区可写态(直接走 Raft,与 master `SetPartitionState` gRPC 同一条命令)。
+async fn set_state(node: &MasterNode, pid: u32, state: PartitionState) {
+    node.raft
+        .client_write(MasterCommand::SetPartitionState {
+            partition_id: pid,
+            state,
+        })
+        .await
+        .expect("set partition state");
 }
