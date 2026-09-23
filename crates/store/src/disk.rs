@@ -15,6 +15,30 @@ pub struct Disk {
     pub free_bytes: u64,
 }
 
+impl Disk {
+    /// 暂存目录:流式 put 的落地中转文件(也是崩溃遗留 `.tmp` 的清理点)。
+    ///
+    /// 落在**数据盘**上而非系统临时目录 —— 大文件暂存不该吃掉 tmpfs 的内存。
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.dir.join("tmp")
+    }
+}
+
+/// 清掉暂存目录里遗留的 `*.tmp`(流式 put 中途崩溃/被杀留下的半成品)。
+///
+/// 安全性:这些文件**从未提交进 log**(提交发生在引擎 `Reserved::commit`),丢弃不影响任何已确认的写;
+/// log 里若有半截记录,由既有的 CRC 扫描恢复逻辑淘汰。目录不存在 = 无操作(没跑过流式 put 的部署)。
+fn clean_tmp_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".tmp") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// 用 `statfs`(libc `statvfs`,macOS/Linux 通用)探目录所在文件系统的总量/可用量。
 ///
 /// `total = f_blocks * f_frsize`,`free = f_bavail * f_frsize`(f_bavail 是非特权可用块)。
@@ -47,6 +71,8 @@ impl DiskManager {
             let dir = PathBuf::from(d);
             std::fs::create_dir_all(&dir)?;
             let (capacity_bytes, free_bytes) = statfs(&dir)?;
+            // 清掉上次崩溃/中断遗留的流式 put 暂存文件(未提交,见 clean_tmp_dir)。
+            clean_tmp_dir(&dir.join("tmp"));
             let id = dir
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())

@@ -15,6 +15,32 @@ struct Entry {
     segment: Arc<LogSegment>,
 }
 
+/// 已预留但尚未发布的连续写入区间(用于**长度已知的流式记录**)。
+///
+/// [`Log::reserve`] 产出:先在活跃段内占好 `total` 字节,调用方分块写入(可多次
+/// [`write`](Self::write)),最后 [`commit`](Self::commit) 一次性推进 `data_end` 使其对读者可见。
+/// 中途放弃(如上游读流出错)不发布任何内容:该区间仍是"未写"状态,后续追加覆盖即可,
+/// 读者与恢复扫描都看不到(恢复只认 header 里上一次 flush 的 `data_end`)。
+pub struct Reserved {
+    position: u64,
+    start: u64,
+    total: u64,
+    segment: Arc<LogSegment>,
+}
+
+impl Reserved {
+    /// 写预留区内相对 `off` 处的字节(可多次调用,分块写入)。
+    pub fn write(&self, off: u64, buf: &[u8]) -> Result<()> {
+        self.segment.write_reserved(self.start, off, buf)
+    }
+
+    /// 发布整段(一次性推进 `data_end`),返回该记录的全局 [`LogOffset`]。
+    pub fn commit(self) -> Result<LogOffset> {
+        self.segment.commit_reserved(self.start, self.total)?;
+        Ok(LogOffset::new(self.position, self.start))
+    }
+}
+
 /// 多段日志。并发读安全 + 单写者:写者由上层 `write_lock` 串行化,`entries` 用 `RwLock`
 /// 仅在滚动(push 新段)时取写锁、读/定位时取读锁(纳秒级,克隆 `Arc<LogSegment>` 后即释放)。
 /// 段内数据的读写可见性由 [`LogSegment`] 的 `AtomicU64` data_end 保证,故读者全程不阻塞写者的追加。
@@ -115,6 +141,36 @@ impl Log {
         };
         let offset = segment.append(record)?;
         Ok(LogOffset::new(position, offset))
+    }
+
+    /// 预留一段连续空间以**流式写入**一条长度已知的记录,返回 [`Reserved`]。
+    ///
+    /// 放不下/跨段的判定与 [`append`](Self::append) 完全一致(单条记录不得跨段;活跃段剩余不足则
+    /// 先 flush 旧段再滚动)。区别是**不立即发布** `data_end` —— 预留区间在 [`Reserved::commit`]
+    /// 之前对读者与 [`segment_spans`](Self::segment_spans) 扫描都不可见。写者由上层 `write_lock`
+    /// 串行,故预留期间不会有别的预留/追加插入。
+    pub fn reserve(&self, total: u64) -> Result<Reserved> {
+        let (position, segment) = self.active_segment();
+        let seg_data_cap = segment.data_capacity();
+        if total > seg_data_cap {
+            return Err(Error::BadArgument(format!(
+                "record size {total} exceeds segment data capacity {seg_data_cap}"
+            )));
+        }
+
+        let (position, segment) = if segment.remaining() < total {
+            self.roll_over()?;
+            self.active_segment()
+        } else {
+            (position, segment)
+        };
+        let start = segment.reserve(total)?;
+        Ok(Reserved {
+            position,
+            start,
+            total,
+            segment,
+        })
     }
 
     /// 读取 `at` 起 `len` 字节(不得跨段)。

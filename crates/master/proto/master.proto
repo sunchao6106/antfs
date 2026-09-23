@@ -13,12 +13,19 @@ service Master {
   rpc CreatePartitions(CreatePartitionsRequest) returns (CreatePartitionsResponse);
   rpc LookupPartition(LookupRequest) returns (PartitionLocations);
   rpc AssignPartition(AssignRequest) returns (AssignResponse);
+  rpc GetBlobIds(GetBlobIdsRequest) returns (GetBlobIdsResponse);
   rpc DecommissionNode(DecommissionRequest) returns (DecommissionResponse);
   rpc ListPartitions(ListPartitionsRequest) returns (ListPartitionsResponse);
   rpc SetPartitionState(SetPartitionStateRequest) returns (SetPartitionStateResponse);
+  rpc SetMaintenance(SetMaintenanceRequest) returns (SetMaintenanceResponse);
   rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
   rpc RepairPartition(RepairPartitionRequest) returns (RepairPartitionResponse);
   rpc MoveReplica(MoveReplicaRequest) returns (MoveReplicaResponse);
+  // 计划式均衡(eval → start → cancel → state):先评估出计划由运维确认,再按并发上限逐个执行。
+  rpc EvalBalance(EvalBalanceRequest) returns (EvalBalanceResponse);
+  rpc StartBalance(StartBalanceRequest) returns (StartBalanceResponse);
+  rpc CancelBalance(CancelBalanceRequest) returns (CancelBalanceResponse);
+  rpc GetBalanceState(BalanceStateRequest) returns (BalanceStateResponse);
 }
 
 // Raft 内部 RPC:master ↔ master(openraft 消息以序列化字节承载,避免逐字段镜像 openraft 内部类型)。
@@ -68,6 +75,7 @@ message ReplicaBeat {
   string disk_id = 2;
   string current_state = 3; // OFFLINE/BOOTSTRAP/ACTIVE/INACTIVE/ERROR ...
   uint64 lag_bytes = 4;
+  uint64 used_bytes = 5; // 该分区在本副本的实际占用字节(blob 活数据),供 master 汇总可写容量与均衡判据
 }
 
 // master → 节点:把某副本推向目标态(M3)。
@@ -114,6 +122,8 @@ message ClusterState {
   uint64 term = 4;
   uint64 registered_nodes = 5;
   uint32 next_partition_id = 6;
+  bool maintenance = 7;     // 维护模式:暂停自动动作(再复制/迁移/下线 evacuation),对标 Ceph noout/norecover
+  bool pause_autogrow = 8;  // 维护模式是否连带暂停自动扩容
 }
 
 // openraft 请求/响应经 JSON 序列化放进 payload,避免在 proto 里镜像 openraft 内部类型演进。
@@ -170,6 +180,30 @@ message AssignResponse {
   string error = 5;
 }
 
+// ── 发号(client/网关写路径的入口,见 blobid-master-assign D1–D4)────────────────────────────────
+// client 一次申请一段 objectId(默认 master.id_alloc_segment_size 个),leader 只发**已提交水位以内**的号:
+// 水位不足时先经 Raft 抬水位(`AllocateObjectId`,一次预留 B = N × raft_batch_multiple),再切成号段发出。
+// 崩溃/切主后新 leader 从已提交水位续发 → 永不复用;未发完的预留号成为**空洞**(无害)。
+message GetBlobIdsRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint32 count = 3;        // 申请的 blobId 个数;0 = 用 master 默认号段大小(id_alloc_segment_size)
+  // 指定 partition;**缺省(未设置)= 由 master 按剩余容量加权挑一个可写(RW)分区**。
+  // 用 `optional` 而非"0 表示自动":第 0 号分区是合法分区,不能被"自动"这个哨兵值占用。
+  optional uint32 partition_id = 4;
+}
+
+message GetBlobIdsResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;      // 非 leader 时回填,供 client 重定向
+  string error = 4;
+  uint32 partition_id = 5;     // 号段所属分区(blobId 高 32bit)
+  uint64 start_object_id = 6;  // 号段起点(blobId 低 32bit);u32 语义用 uint64 承载,避免 uint32 回绕歧义
+  uint32 count = 7;            // 本次实发个数
+  repeated ReplicaLoc replicas = 8; // 该分区的副本位置(client/网关据此刻直连写,收 W = 副本数/2+1 个 ack)
+}
+
 message DecommissionRequest {
   uint32 version = 1;
   string cluster_secret = 2;
@@ -189,6 +223,7 @@ message ListPartitionsRequest {
   uint32 version = 1;
   uint64 offset = 2; // 分页起始(按 partition_id 升序)
   uint32 limit = 3;  // 0 = 不限(返回全部)
+  string state = 4;  // 空 = 全部;否则按状态过滤(RW / RO / SEALED)
 }
 
 // 一个副本的实然态(软状态,心跳上报)。
@@ -196,6 +231,7 @@ message ReplicaCurrent {
   uint64 node_id = 1;
   string current_state = 2; // OFFLINE/BOOTSTRAP/ACTIVE/INACTIVE/ERROR ...
   uint64 lag_bytes = 3;
+  uint64 used_bytes = 4; // 该副本上报的分区实际占用字节
 }
 
 // 一个分区的全量视图(admin dashboard 用):hard placement + soft current。
@@ -274,3 +310,98 @@ message MoveReplicaResponse {
   string to_disk_id = 6;
 }
 
+// 维护模式开关(对标 Ceph `osd set noout/norecover`):暂停后 master 不再执行再复制/迁移/下线
+// evacuation 等自动动作,观测(心跳/指标/指令下发)继续;手动 ops(RepairPartition/MoveReplica)不受阻。
+message SetMaintenanceRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  bool paused = 3;
+  bool pause_autogrow = 4; // 是否连带暂停自动扩容(默认 false)
+}
+
+message SetMaintenanceResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;
+  string error = 4;
+}
+
+
+// ---- 计划式均衡(对标 Ceph balancer 的 eval → optimize → execute)----
+//
+// 计划由 leader 用软状态(每盘余量/每分区真实占用)算出并**写入 Raft**(apply 只存不算,保 apply 确定性),
+// 因此可跨 leader 切换存活;执行在 reconciler 内推进,受维护模式与并发上限约束,基元是既有 MoveReplica。
+
+message EvalBalanceRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint32 max_moves = 3; // 计划最多包含多少条搬迁;0 = 用 master 配置默认
+}
+
+message EvalBalanceResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3; // 非 leader 时回填
+  string error = 4;
+  BalancePlan plan = 5;   // 评估结果(status = PREVIEW;无搬迁需求时 moves 为空)
+}
+
+message StartBalanceRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint64 plan_id = 3; // 必须是当前 PREVIEW 计划的 id(防陈旧确认)
+}
+
+message StartBalanceResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;
+  string error = 4;
+}
+
+message CancelBalanceRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint64 plan_id = 3;
+}
+
+message CancelBalanceResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  string leader_addr = 3;
+  string error = 4;
+}
+
+message BalanceStateRequest { uint32 version = 1; }
+
+message BalanceStateResponse {
+  uint32 version = 1;
+  bool present = 2;      // 当前是否有计划
+  BalancePlan plan = 3;  // 计划 + 逐 move 进度(进度由 master 从状态派生,不额外存)
+}
+
+// 一次均衡计划。`status`:`PREVIEW`(待确认)/`RUNNING`/`CANCELLED`/`DONE`。
+message BalancePlan {
+  uint64 plan_id = 1;
+  string status = 2;
+  uint64 created_at_ms = 3;
+  uint32 max_in_flight = 4; // 执行期同时最多几个在途搬迁(配置快照)
+  repeated BalanceMove moves = 5;
+  uint32 total = 6;
+  uint32 pending = 7;
+  uint32 in_flight = 8;
+  uint32 done = 9;
+  uint32 failed = 10;
+}
+
+// 单条搬迁:把 partition_id 的副本从 from 节点迁到 to 节点。
+// `status`:`pending` / `in_flight` / `done` / `failed` / `infeasible`(目标不可用,跳过)。
+message BalanceMove {
+  uint32 partition_id = 1;
+  uint64 from_node_id = 2;
+  string from_disk_id = 3;
+  uint64 to_node_id = 4;
+  string to_disk_id = 5;
+  string status = 6;
+  string error = 7;
+}

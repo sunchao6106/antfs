@@ -1,6 +1,6 @@
 ## Why
 
-S1/S2/mutations 让数据节点能 `PUT`/`GET`/变更 blob 并接入集群,但**副本间还不会同步**:client SDK 的 W=2 异步 quorum 写(§10)靠拉复制把第 3 副本补齐;失联/ERROR 后 master 补的新副本(M3 再复制,target=BOOTSTRAP)也要靠拉复制追平。没有 S3,多副本只是"各写各的",冗余不收敛,§3.1 持久性红线落不了地。
+S1/S2/mutations 让数据节点能 `PUT`/`GET`/变更 blob 并接入集群,但**副本间还不会同步**:router SDK 的 W=2 异步 quorum 写(§10)靠拉复制把第 3 副本补齐;失联/ERROR 后 master 补的新副本(M3 再复制,target=BOOTSTRAP)也要靠拉复制追平。没有 S3,多副本只是"各写各的",冗余不收敛,§3.1 持久性红线落不了地。
 
 `store` 引擎已具备拉复制所需的全部读侧原语:`find_entries_since`(Ambry `findEntriesSince`)、`find_missing_keys`、`get_with_options`、`FindToken`/`MessageInfo`。**唯一缺口是写侧**:没有"把 peer 的一条记录按其原样(flags/lifeVersion/expiration/op_time)写进本地"的忠实 apply——现有 `put/delete/undelete/update_ttl` 都是**发起者语义**(`op_time=now`、lifeVersion 本地推导),不能用来复制(否则 bootstrap 一个已 undelete/高 lifeVersion 的 blob,本地会退回 lifeVersion 0,与 peer 永久发散)。
 
@@ -33,5 +33,5 @@ S1/S2/mutations 让数据节点能 `PUT`/`GET`/变更 blob 并接入集群,但**
 
 - **N3 物理段拷贝(sealed segment stream-copy)推迟到 S3b**(文档化的分期,非代码就地另选;见 design.md 决策 D-A)。本 change 只落**逻辑拉复制**(含 bootstrap 全量逻辑回放),已能正确收敛冗余;物理拷贝是 MTTR 优化,后续叠加。
 - 不改副本状态机转移的 master 侧决策(M3 已有);BOOTSTRAP→ACTIVE 的自动上报追平作为本 change 的 current_state 更新。
-- 不做 client SDK(用户指示暂不做);**EC 仍锁定(暂不解锁)**。
+- 不做 router SDK(用户指示暂不做);**EC 仍锁定(暂不解锁)**。
 - FindToken 的 sessionId/resetKey(compaction 失效重定位)仍按 store 现状推迟(见 store `find_entries_since` 注释)。

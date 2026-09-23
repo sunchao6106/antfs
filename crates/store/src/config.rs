@@ -48,6 +48,16 @@ pub struct StoreServerConfig {
     pub compaction_dead_ratio: f64,
     /// 本地 worker hard_delete 周期(秒):擦除已删除对象数据体(隐私)。
     pub hard_delete_interval_secs: u64,
+    /// 数据面单请求 body 上限(字节),经 axum `DefaultBodyLimit` 生效。
+    /// **默认 2 MiB = axum `DefaultBodyLimit` 的默认值**(CLAUDE.md §5.1 不擅自改默认):要观测/接收
+    /// 真正的大 blob 需显式调大;调小则超限请求在 extractor 前即被 413 拒掉。
+    pub max_body_bytes: u64,
+    /// 请求静默(`/admin/request-control`)未指定 `ttl_secs` 时的默认禁用时长(秒)。
+    /// **0 = 不设默认时长**(即未指定 `ttl_secs` 时永久禁用,须显式开回)。
+    pub request_control_default_ttl_secs: u64,
+    /// 本地完整性校验(`GET /partitions/{pid}/verify`)单次扫描的**读取字节上限**(默认 64 MiB):
+    /// 深扫会读全量数据体,限流以免打爆盘;到点返回部分结果并在响应里标 `truncated`。
+    pub scrub_max_batch_bytes: u64,
 }
 
 impl Default for StoreServerConfig {
@@ -72,6 +82,10 @@ impl Default for StoreServerConfig {
             compaction_interval_secs: 3600,
             compaction_dead_ratio: 0.5,
             hard_delete_interval_secs: 300,
+            // axum `DefaultBodyLimit` 的默认值(2 MiB);不擅自改默认,调大才收得下真正的大 blob。
+            max_body_bytes: 2 * 1024 * 1024,
+            request_control_default_ttl_secs: 1800,
+            scrub_max_batch_bytes: 64 << 20,
         }
     }
 }
@@ -97,6 +111,14 @@ impl Validate for StoreServerConfig {
         at_least("store_server.flush_interval_secs", self.flush_interval_secs, 1)?;
         at_least("store_server.compaction_interval_secs", self.compaction_interval_secs, 1)?;
         at_least("store_server.hard_delete_interval_secs", self.hard_delete_interval_secs, 1)?;
+        at_least("store_server.max_body_bytes", self.max_body_bytes, 1)?;
+        // 0 合法 = 不设默认时长(永久禁用),故下界为 0。
+        at_least(
+            "store_server.request_control_default_ttl_secs",
+            self.request_control_default_ttl_secs,
+            0,
+        )?;
+        at_least("store_server.scrub_max_batch_bytes", self.scrub_max_batch_bytes, 1)?;
         if !(self.compaction_dead_ratio > 0.0 && self.compaction_dead_ratio <= 1.0) {
             return Err(antfs_config::ConfigError::invalid(
                 "store_server.compaction_dead_ratio",

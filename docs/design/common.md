@@ -6,6 +6,10 @@
 |---|---|---|---|---|
 | `config` | `crates/common/config` | 类型化分层配置加载 + 语义校验 | `serde` + [`config`](https://docs.rs/config)(TOML) | `com.github.ambry.config`(`VerifiableProperties` + `*Config`) |
 | `metric` | `crates/common/metric` | 统计打点(注册表 + typed handle) | [`prometheus`](https://docs.rs/prometheus) | Dropwizard `MetricRegistry` + `*Metrics` |
+| `router` | `crates/common/router` | 客户端侧 **router**(通用组件):向 master 取 blobId 号段、按 blobId 定位副本、W 多数派写 / R=1 读、流式文件读写 | `tonic`(控制面)+ `reqwest`(数据面);纯库、无二进制 | `NonBlockingRouter`(封装进 SDK) |
+
+> `router` 的详细设计(写读路径、错误契约、配置/监控清单)**不只属于本文件**:见 [`router.md`](./router.md);
+> `frontend`(`crates/frontend`)与 `benchmark/router` 都依赖它,W/R 逻辑只有一份实现。
 
 原则:**照搬 Ambry 的形状(每模块一个 `*Config` / `*Metrics`,handle 存成字段),实现换成 Rust 生态最佳库**,不手搬
 `VerifiableProperties`(字符串 getter + 手写区间校验)与 Dropwizard(客户端 EWMA/reservoir)这些 Java 包袱。
@@ -58,6 +62,20 @@ let cfg: StoreConfig = Loader::new()
 
 环境变量:前缀分隔符固定 `_`,嵌套分隔符默认 `__`(可 `with_env_separator` 改),`try_parsing` 已开启使字符串正确转成
 数值/布尔并覆盖同名 TOML 值。
+
+**表名与 flat key(踩过的坑)**:设计文档写的是"字段名即 TOML key(在 `[admin]` / `[store_server]` / `[master]` /
+`[frontend]` 表下)",但 `load()` 只按**根级**字段反序列化 —— 表里的值会被 serde 默认**静默掩盖**(配置写了不生效,
+不报错)。凡配置写在表里(或环境变量用嵌套形式 `AMBRY_ADMIN__MASTER_ADDR`)的进程,都要用:
+
+```rust
+let cfg: AdminConfig = Loader::new()
+    .with_file("admin.toml", false)
+    .with_env_prefix("AMBRY")
+    .load_table("admin")?;            // 表存在 → 只取该表;不存在 → 回落 flat(兼容旧写法)
+```
+
+`load_table` 的语义:**表存在时只解析该表,表内字段写错直接报错**(不从表静默回落到 flat,否则又会变成"配了没生效");
+表不存在时回落顶层 flat。同一份配置里**不要混用**两种写法。frontend 用的是等价的 `FrontendToml` 包装结构(先例)。
 
 ### 1.3 配置项清单
 

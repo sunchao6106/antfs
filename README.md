@@ -20,9 +20,12 @@
 |---|---|---|
 | common | 公共库:`config`(`serde`+`config` 分层配置)、`metric`(`prometheus` 统计打点);对标 Ambry `config` 包 + Dropwizard `MetricRegistry` | 进行中 |
 | blob | 单机存储引擎:`Log` / `LogSegment` / `PersistentIndex` / `BlobStore`(put/get/delete/undelete/updateTtl/compaction/hard_delete/恢复 + 复制 apply);对标 Ambry `ambry-store` | 进行中 |
-| master | 集群大脑:内建 Raft(`openraft`)管放置/节点状态机/调谐/下线;对标 Helix+ZK 的替代 | 进行中 |
+| master | 集群大脑:内建 Raft(`openraft`)管放置/节点状态机/调谐/下线/**发号(blobId 号段)**;对标 Helix+ZK 的替代 | 进行中 |
 | store | 数据节点(store server):多副本编排 + HTTP 数据面 + 心跳/磁盘监控 + 拉复制;承载 `blob` 引擎 | 进行中 |
-| frontend / S3 网关 / admin web 等 | 其余 Ambry 模块 | 规划中 |
+| router | 客户端 SDK(通用组件,`crates/common/router`):向 master 取号段、W 多数派写、R=1 读、流式大文件;frontend 与压测共用;对标 Ambry `NonBlockingRouter` | 进行中 |
+| frontend | HTTP REST 对象接口层(`/blobs` 读写/删/TTL/分片拼装 + `/metrics`);内嵌同一个 router SDK;对标 Ambry `ambry-frontend` | 进行中 |
+| admin | admin web:运维操作 + 控制面 dashboard(拓扑/节点/盘/分区/指标) | 进行中 |
+| S3 网关 / 多租户 ACL、配额 | 网关层远景(与 frontend 同层) | 规划中 |
 
 > 命名:`blob` = 单机 blob 存储引擎(旧 `store`);`store` = 数据节点(旧 `store-server`)。
 

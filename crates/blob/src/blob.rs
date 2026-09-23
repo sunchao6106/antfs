@@ -48,11 +48,54 @@ mod rec {
 /// 记录去掉 data 后的固定开销(头 + 尾部 crc)。
 pub const RECORD_OVERHEAD: usize = rec::DATA + rec::CRC_LEN;
 
+/// 记录头字节数(不含 data 与尾部 crc)。
+const RECORD_HEADER: usize = rec::DATA;
+
+/// 流式写([`BlobStore::put_from_reader`])的分块大小:单次上传的内存占用 ≈ 这一块。
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 只写记录头(magic/version/flags/key/expiration/op_time/life_version/data_len)。
+///
+/// 流式写入需要**先落头再落数据体**(长度已知,先写在预留区首部),故与 [`encode_record`] 共用。
+fn encode_header_into(
+    buf: &mut [u8],
+    key: &StoreKey,
+    flags: u8,
+    expiration_ms: i64,
+    operation_time_ms: u64,
+    life_version: u16,
+    data_len: u32,
+) {
+    debug_assert!(buf.len() >= RECORD_HEADER);
+    buf[rec::MAGIC..rec::MAGIC + 2].copy_from_slice(&REC_MAGIC.to_le_bytes());
+    buf[rec::VERSION] = REC_VERSION;
+    buf[rec::FLAGS] = flags;
+    buf[rec::KEY..rec::KEY + KEY_SIZE].copy_from_slice(key.as_bytes());
+    buf[rec::EXPIRATION..rec::EXPIRATION + 8].copy_from_slice(&expiration_ms.to_le_bytes());
+    buf[rec::OP_TIME..rec::OP_TIME + 8].copy_from_slice(&operation_time_ms.to_le_bytes());
+    buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2].copy_from_slice(&life_version.to_le_bytes());
+    buf[rec::DATA_LEN..rec::DATA_LEN + 4].copy_from_slice(&data_len.to_le_bytes());
+}
+
+/// 记录内 `data_len` 是 u32:数据体超过 `u32::MAX` 的记录**不可写** —— 否则长度字段回绕,落盘后任何读取
+/// 都会因 `decode_record` 的尺寸校验失败而报 `Corrupt`(持久性红线:宁拒绝,不写坏)。
+///
+/// 段大小默认 4 GiB 时本检查**必然通过**(单条记录 ≤ 段 − 102 < `u32::MAX`),保留它是为"把段配大"
+/// (如 8 GiB)时兜底:`segment_size_bytes` 放大后仍能写进 log,但单条超过 4 GiB 的对象会被这里拒掉。
+fn record_data_len(len: u64) -> Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        Error::BadArgument(format!(
+            "data length {len} exceeds what a single record can encode ({}) — use chunked upload",
+            u32::MAX
+        ))
+    })
 }
 
 fn encode_record(
@@ -62,22 +105,24 @@ fn encode_record(
     operation_time_ms: u64,
     life_version: u16,
     data: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
+    let data_len = record_data_len(data.len() as u64)?;
     let total = RECORD_OVERHEAD + data.len();
     let mut buf = vec![0u8; total];
-    buf[rec::MAGIC..rec::MAGIC + 2].copy_from_slice(&REC_MAGIC.to_le_bytes());
-    buf[rec::VERSION] = REC_VERSION;
-    buf[rec::FLAGS] = flags;
-    buf[rec::KEY..rec::KEY + KEY_SIZE].copy_from_slice(key.as_bytes());
-    buf[rec::EXPIRATION..rec::EXPIRATION + 8].copy_from_slice(&expiration_ms.to_le_bytes());
-    buf[rec::OP_TIME..rec::OP_TIME + 8].copy_from_slice(&operation_time_ms.to_le_bytes());
-    buf[rec::LIFE_VERSION..rec::LIFE_VERSION + 2].copy_from_slice(&life_version.to_le_bytes());
-    buf[rec::DATA_LEN..rec::DATA_LEN + 4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    encode_header_into(
+        &mut buf[..RECORD_HEADER],
+        key,
+        flags,
+        expiration_ms,
+        operation_time_ms,
+        life_version,
+        data_len,
+    );
     buf[rec::DATA..rec::DATA + data.len()].copy_from_slice(data);
     let crc_at = rec::DATA + data.len();
     let crc = crc32fast::hash(&buf[..crc_at]);
     buf[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
-    buf
+    Ok(buf)
 }
 
 struct DecodedRecord {
@@ -217,6 +262,34 @@ pub struct CompactionStats {
     pub dead_bytes: u64,
     pub segments_before: usize,
     pub segments_after: usize,
+}
+
+/// 本地完整性校验结果(见 [`BlobStore::verify`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VerifyReport {
+    /// 成功解码且 CRC 校验通过的记录数。
+    pub records: u64,
+    /// 解码或 CRC 失败的记录数(每条计 1)。
+    pub bad_records: u64,
+    /// 第一条坏记录的 `(segment, offset)`;全好则 `None`。
+    pub first_bad_offset: Option<(u64, u64)>,
+    /// 活记录里"索引元数据与 log 记录不符"的条数(data_len/flags/life_version 任一不符)。
+    pub index_mismatch: u64,
+    /// 扫描未覆盖全部 log:`max_bytes` 到点,或遇到无法重同步的坏记录(段尾截断)时为 true。
+    pub truncated: bool,
+}
+
+/// 副本摘要(只走索引/mmap,**不读数据体**,开销与 key 数成正比)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndexStats {
+    /// 活记录数(不含墓碑)。
+    pub live_records: u64,
+    /// 墓碑(软删记录)数。
+    pub tombstones: u64,
+    /// 活记录的数据字节(不含记录头与 CRC,不含墓碑)。
+    pub live_bytes: u64,
+    /// 封存段数(不含活跃段)。
+    pub sealed_segments: usize,
 }
 
 /// blob 元数据(不读数据体):状态标志 + TTL + 生命版本 + 数据长度。
@@ -563,6 +636,95 @@ impl BlobStore {
         self.track(self.put_ttl_inner(key, data, expiration_ms))
     }
 
+    /// 流式写入一个对象:`src` 提供 `len` 字节数据体,边读边写,**内存占用恒为一个
+    /// [`STREAM_CHUNK_BYTES`] 块**(不随 `len` 增长)——用于大文件上传,避免「整个 blob 缓进内存」
+    /// (CLAUDE.md §5.3)。
+    ///
+    /// 长度须**已知**(记录内 `data_len` 为 u32,故 `len ≤ u32::MAX`):HTTP 层用 `Content-Length`,
+    /// 由调用方保证 `src` 恰好能提供 `len` 字节(不足则 `read_exact` 报 IO 错,该次写不发布)。
+    /// 语义与 [`put_ttl`](Self::put_ttl) 完全一致(AlreadyExists / StoreFull / 索引与统计更新);
+    /// 崩溃语义亦一致 —— 记录在 [`crate::log::Reserved::commit`] 前不对读者可见,恢复只认 header 里
+    /// 上一次 flush 的 `data_end`。
+    pub fn put_from_reader(
+        &self,
+        key: StoreKey,
+        len: u64,
+        src: &mut impl std::io::Read,
+        expiration_ms: i64,
+    ) -> Result<()> {
+        if !self.is_available() {
+            return Err(Error::Unavailable);
+        }
+        self.track(self.put_from_reader_inner(key, len, src, expiration_ms))
+    }
+
+    fn put_from_reader_inner(
+        &self,
+        key: StoreKey,
+        len: u64,
+        src: &mut impl std::io::Read,
+        expiration_ms: i64,
+    ) -> Result<()> {
+        let _t = self.metrics.op_timer("put");
+        let _w = self.write_lock.lock().expect("blob write_lock poisoned");
+        // 与整块写路径共用同一条长度策略(记录内 data_len 是 u32):超限直接拒,**绝不写回绕的记录**。
+        let data_len = record_data_len(len)?;
+        let inner = self.inner();
+        if inner.index.find(&key).is_some() {
+            self.metrics.already_exists.inc();
+            return Err(Error::AlreadyExists);
+        }
+        let op_time = now_ms();
+        let mut header = [0u8; RECORD_HEADER];
+        encode_header_into(&mut header, &key, 0, expiration_ms, op_time, 0, data_len);
+        let total = RECORD_OVERHEAD as u64 + len;
+        // 预留整段后分块写入:crc 边写边算,最后补写尾部 crc 再 commit 发布。
+        let reserved = inner.log.reserve(total).map_err(to_store_full)?;
+        reserved.write(0, &header)?;
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header);
+        let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+        let mut done = 0u64;
+        while done < len {
+            let want = std::cmp::min(STREAM_CHUNK_BYTES as u64, len - done) as usize;
+            src.read_exact(&mut buf[..want])?;
+            reserved.write(rec::DATA as u64 + done, &buf[..want])?;
+            hasher.update(&buf[..want]);
+            done += want as u64;
+        }
+        reserved.write(rec::DATA as u64 + len, &hasher.finalize().to_le_bytes())?;
+        let offset = reserved.commit()?;
+        self.publish_put(key, offset, total, op_time, expiration_ms)
+    }
+
+    /// 记录已落 log 后的统一发布:索引 + 每段存活字节 + 有效数据统计。
+    /// 整块写([`put_ttl`](Self::put_ttl))与流式写([`put_from_reader`](Self::put_from_reader))共用,
+    /// 保证两条写路径的索引/统计语义逐字一致。
+    fn publish_put(
+        &self,
+        key: StoreKey,
+        offset: LogOffset,
+        size: u64,
+        operation_time_ms: u64,
+        expiration_ms: i64,
+    ) -> Result<()> {
+        let inner = self.inner();
+        let mut value = IndexValue::put(offset, size, operation_time_ms);
+        value.expiration_ms = expiration_ms;
+        inner.index.add(key, value)?;
+        self.seg_bytes
+            .lock()
+            .expect("blob seg_bytes poisoned")
+            .entry(offset.segment)
+            .or_default()
+            .live += size;
+        self.valid_stats
+            .lock()
+            .expect("blob valid_stats poisoned")
+            .add(&value);
+        Ok(())
+    }
+
     fn put_ttl_inner(&self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
         let _t = self.metrics.op_timer("put");
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
@@ -572,22 +734,9 @@ impl BlobStore {
             return Err(Error::AlreadyExists);
         }
         let op_time = now_ms();
-        let record = encode_record(&key, 0, expiration_ms, op_time, 0, data);
+        let record = encode_record(&key, 0, expiration_ms, op_time, 0, data)?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
-        let mut value = IndexValue::put(offset, record.len() as u64, op_time);
-        value.expiration_ms = expiration_ms;
-        inner.index.add(key, value)?;
-        self.seg_bytes
-            .lock()
-            .expect("blob seg_bytes poisoned")
-            .entry(offset.segment)
-            .or_default()
-            .live += record.len() as u64;
-        self.valid_stats
-            .lock()
-            .expect("blob valid_stats poisoned")
-            .add(&value);
-        Ok(())
+        self.publish_put(key, offset, record.len() as u64, op_time, expiration_ms)
     }
 
     /// 读取一个对象。不存在/已删除/已过期分别返回对应错误。
@@ -823,7 +972,7 @@ impl BlobStore {
             rec.operation_time_ms,
             rec.life_version,
             &data,
-        );
+        )?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, rec.operation_time_ms);
         value.flags = rec.flags;
@@ -852,6 +1001,98 @@ impl BlobStore {
     /// 有效数据字节:索引赢家中**未删除**记录的 `size` 之和(墓碑不计)。**不区分过期**(过期但
     /// 未回收对象仍占盘,故计入),故 ≠ `stats` 的 live 字节(后者含墓碑)。走增量计数,`O(1)` 查询;
     /// 正确性由 `#[cfg(test)]` 全扫基准 `valid_data_size_by_scan` 差分对拍守护。
+    /// 本地完整性校验:逐记录读 log 并验 CRC,**遇到坏记录记下继续**(与生产读路径"坏即 Err"不同 ——
+    /// 这里的目标是"告诉运维坏在哪个段/偏移",而不是让整副本的复制/重建失败)。
+    ///
+    /// 口径:
+    /// - 坏记录后尝试从记录头读出 `data_len` 以重同步到下一条;头也读不出则本段止步并把 `truncated` 置真。
+    /// - `index_mismatch`:对**活记录**(索引当前赢家,即 `find(key).offset == 本记录 offset`)比对索引里的
+    ///   `size`/`flags`/`life_version` 与记录实际值,不一致即计 1。它只能发现"索引与 log 对不上"的这一类漂移,
+    ///   **发现不了**"索引里指向了 log 中并不存在的 offset"(那需要遍历索引反向核对,属后续增强)。
+    /// - `max_bytes` 是本次扫描的**读取字节上限**(到点返回部分结果 + `truncated=true`),供深扫限流用。
+    pub fn verify(&self, max_bytes: u64) -> Result<VerifyReport> {
+        let inner = self.inner();
+        let mut report = VerifyReport::default();
+        let mut read: u64 = 0;
+        'segments: for (position, data_end) in inner.log.segment_spans() {
+            let mut off = 0u64;
+            while off < data_end {
+                if read >= max_bytes {
+                    report.truncated = true;
+                    break 'segments;
+                }
+                let at = LogOffset::new(position, off);
+                match read_full_record(&inner.log, at) {
+                    Ok((raw, decoded)) => {
+                        read += raw.len() as u64;
+                        off += raw.len() as u64;
+                        report.records += 1;
+                        if let Some(v) = inner.index.find(&decoded.key) {
+                            if v.offset == at
+                                && (v.size != raw.len() as u64
+                                    || v.flags != decoded.flags
+                                    || v.life_version != decoded.life_version)
+                            {
+                                report.index_mismatch += 1;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        report.bad_records += 1;
+                        if report.first_bad_offset.is_none() {
+                            report.first_bad_offset = Some((position, off));
+                        }
+                        // 从记录头重同步:读得出 data_len 就跳过这条坏记录,否则本段止步(尾部截断)。
+                        match inner.log.read(at, RECORD_OVERHEAD) {
+                            Ok(head) => {
+                                let data_len = u32::from_le_bytes(
+                                    head[rec::DATA_LEN..rec::DATA_LEN + 4].try_into().unwrap(),
+                                ) as u64;
+                                let skip = RECORD_OVERHEAD as u64 + data_len;
+                                if skip == 0 || off + skip > data_end {
+                                    report.truncated = true;
+                                    break;
+                                }
+                                read += skip;
+                                off += skip;
+                            }
+                            Err(_) => {
+                                report.truncated = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// 本副本 log 末端 `(segment, data_end)`(含活跃段);空 log → `None`。
+    ///
+    /// 供 scrub 报告"各副本各自读到哪儿"用:两侧末端一致才说明**可比**(否则是采样时点不同,差异未必是真不一致)。
+    pub fn log_end(&self) -> Option<(u64, u64)> {
+        self.inner().log.segment_spans().last().copied()
+    }
+
+    /// 副本摘要(活记录数/墓碑数/活数据字节/封存段数);只走索引与 mmap,不读数据体。
+    pub fn index_stats(&self) -> IndexStats {
+        let inner = self.inner();
+        let mut stats = IndexStats {
+            sealed_segments: self.sealed_segments().len(),
+            ..Default::default()
+        };
+        inner.index.for_each(|_k, v| {
+            if v.is_deleted() {
+                stats.tombstones += 1;
+            } else {
+                stats.live_records += 1;
+                stats.live_bytes += v.size.saturating_sub(RECORD_OVERHEAD as u64);
+            }
+        });
+        stats
+    }
+
     pub fn valid_data_size(&self) -> u64 {
         self.valid_stats
             .lock()
@@ -991,7 +1232,7 @@ impl BlobStore {
             op_time,
             old.life_version,
             &[],
-        );
+        )?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_DELETED;
@@ -1050,7 +1291,7 @@ impl BlobStore {
             op_time,
             new_life,
             &put.data,
-        );
+        )?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = FLAG_UNDELETED;
@@ -1104,7 +1345,7 @@ impl BlobStore {
             op_time,
             cur.life_version,
             &rec.data,
-        );
+        )?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record.len() as u64, op_time);
         value.flags = flags;
@@ -2051,7 +2292,7 @@ mod tests {
     fn record_roundtrip_and_crc_guard() {
         let k = key(42);
         let data = b"payload".to_vec();
-        let mut buf = encode_record(&k, 0, 1_700_000_000_000, 1_699_000_000_000, 7, &data);
+        let mut buf = encode_record(&k, 0, 1_700_000_000_000, 1_699_000_000_000, 7, &data).unwrap();
         let d = decode_record(&buf).unwrap();
         assert_eq!(d.flags, 0);
         assert_eq!(d.key, k);
@@ -3380,5 +3621,36 @@ mod tests {
         copied.close().unwrap();
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
+    }
+}
+
+#[cfg(test)]
+mod record_len_tests {
+    use super::*;
+
+    /// 记录内 `data_len` 是 u32:恰好 `u32::MAX` 放行,再多一个字节必须**拒绝**
+    /// (静默回绕会写出长度自相矛盾的记录,之后任何读取都 `Corrupt` —— 持久性红线)。
+    ///
+    /// 这条测试刻意只测**长度策略本身**(不需要真分配 4 GiB):
+    /// 走 HTTP 的两条写路径(inline ≤1 MiB / 流式)都汇到 `record_data_len`。
+    #[test]
+    fn record_data_len_accepts_up_to_u32_max_and_rejects_more() {
+        assert_eq!(record_data_len(0).unwrap(), 0);
+        assert_eq!(record_data_len(u32::MAX as u64).unwrap(), u32::MAX);
+        let err = record_data_len(u32::MAX as u64 + 1).unwrap_err();
+        assert!(matches!(err, Error::BadArgument(_)), "got {err:?}");
+        assert!(err.to_string().contains("exceeds"), "报错要说清是长度超限: {err}");
+    }
+
+    /// 64 位平台才存在"超过 u32 的 `usize`";16/32 位平台该分支不可达,故不测。
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn bulk_put_path_rejects_oversized_slice_via_policy() {
+        // 整块写路径无法在不分配 4 GiB 的前提下构造真实入参,故这里断言它**调用的那条策略**。
+        // 结构性的保证在类型层:`encode_record` 现在返回 `Result<Vec<u8>>`、内部用 `record_data_len`
+        // 做 `u32::try_from`(截断所需的 `as u32` 已从代码里删除),而 6 个调用点都写了 `?` ——
+        // 任何人把它改回"静默截断"都会**编不过**,不依赖这条测试去发现。
+        assert!(record_data_len(u32::MAX as u64 + 1).is_err(), "策略必须拒");
+        assert_eq!(record_data_len((1 << 20) as u64).unwrap(), 1 << 20, "常规大小照常放行");
     }
 }

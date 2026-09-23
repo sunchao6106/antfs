@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg: StoreServerConfig = antfs_config::Loader::new()
         .with_file("store.toml", false)
         .with_env_prefix("AMBRY")
-        .load()
+        .load_table("store_server")
         .unwrap_or_default();
 
     let registry = antfs_metric::Registry::new();

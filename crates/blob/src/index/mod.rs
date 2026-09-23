@@ -200,6 +200,18 @@ impl PersistentIndex {
         Ok(())
     }
 
+    /// 遍历全部索引条目(活跃 SkipMap + 各封存段的升序条目),供只读统计/摘要用。
+    ///
+    /// 只走内存索引与 mmap 条目(**不读数据体**),故开销与 key 数成正比、与数据量无关。
+    pub fn for_each(&self, mut f: impl FnMut(&StoreKey, IndexValue)) {
+        for e in self.active.iter() {
+            f(e.key(), *e.value());
+        }
+        for seg in self.sealed.read().unwrap().iter() {
+            seg.for_each_entry(&mut f);
+        }
+    }
+
     pub fn sealed_segment_count(&self) -> usize {
         self.sealed.read().unwrap().len()
     }

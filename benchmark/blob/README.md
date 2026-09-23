@@ -4,6 +4,7 @@
 分 PUT / GET 两阶段测吞吐(ops/s、MB/s)与延迟分位(p50/p99/max)。std-only,无第三方依赖。
 
 > `benchmark/` 目录后续会新增 blob-server 层与 S3 frontend 的压测二进制;本 crate 只覆盖 store 层。
+> **集群/数据面端到端压测已落地**:`antfs-bench-router / antfs-bench-frontend`(见 [`crates/common/router`](../../crates/common/router) 与 [`docs/design/router.md` §8](../../docs/design/router.md))。
 
 ## 运行
 

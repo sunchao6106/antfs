@@ -194,6 +194,41 @@ impl LogSegment {
         Ok(start)
     }
 
+    /// 为一条长度已知的记录预留 `total` 字节连续空间,返回其起始 offset。
+    ///
+    /// **不推进 `data_end`** —— 预留期间该区间对读者与顺序扫描都不可见,须
+    /// [`commit_reserved`](Self::commit_reserved) 才可见。写者由上层 `write_lock` 串行,
+    /// 故 `data_end` 在预留期间不会被别的追加改动。
+    pub fn reserve(&self, total: u64) -> Result<u64> {
+        let start = self.data_end.load(Ordering::Acquire);
+        if start + total > self.data_capacity {
+            return Err(Error::SegmentFull);
+        }
+        Ok(start)
+    }
+
+    /// 写入预留区内相对 `off` 处的字节(可多次调用,分块流式写入)。
+    pub fn write_reserved(&self, start: u64, off: u64, buf: &[u8]) -> Result<()> {
+        self.file
+            .write_all_at(buf, HEADER_SIZE as u64 + start + off)?;
+        Ok(())
+    }
+
+    /// 发布预留区间:一次性把 `data_end` 推进到 `start + total`,该记录自此对读者可见。
+    pub fn commit_reserved(&self, start: u64, total: u64) -> Result<()> {
+        let end = start + total;
+        if end > self.data_capacity {
+            return Err(Error::SegmentFull);
+        }
+        debug_assert_eq!(
+            self.data_end.load(Ordering::Acquire),
+            start,
+            "reserved range must be committed before any other append"
+        );
+        self.data_end.store(end, Ordering::Release);
+        Ok(())
+    }
+
     /// 持久化:写入 header(data_end)→ `sync_all`(fsync)。成为持久化边界。
     pub fn flush(&self) -> Result<()> {
         self.write_header()?;

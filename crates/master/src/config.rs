@@ -44,6 +44,23 @@ pub struct MasterConfig {
     /// 成为 leader 后的调谐稳定期(秒):期内不做失败驱动的再复制,等 store 心跳重建软状态,
     /// 避免重启/切主时误判全体失联触发再复制风暴(0 = 关闭宽限,立即调谐)。
     pub reconcile_startup_grace_secs: u64,
+    /// 号段大小 N:client 单次向 master 申请的 objectId 个数,也是 client 一次缓存的号数
+    /// (`GetBlobIds` 的 `count=0` 时取此值)。号段越大越省 RPC、client 崩溃留下的空洞越大
+    /// (空洞无害,见 blobid-master-assign D3/D9)。
+    pub id_alloc_segment_size: u32,
+    /// 水位批次倍数:master 一次向 Raft 预留 `N × 该值` 个 objectId,再由 leader 切成 N 大小的号段发出。
+    /// 越大 Raft 提交越省、切主留下的空洞越大(默认 2,见 blobid-master-assign D9)。
+    pub id_alloc_raft_batch_multiple: u32,
+    /// 计划式均衡:执行期同时在途的搬迁数上限(写入计划快照,`StartBalance` 后按它节流)。
+    pub balance_max_in_flight: u32,
+    /// 计划式均衡:一份计划最多包含的搬迁条数(`EvalBalanceRequest.max_moves=0` 时取此值)。
+    pub balance_max_moves: u32,
+    /// 计划式均衡:倾斜阈值——每盘副本数/用量比超过均值 × 该值才认为该盘倾斜
+    /// (1.0 = 严格高于均值;另有"副本数差 ≥ 2 或用量比显著更好"的改善护栏防抖,见 balance.rs)。
+    pub balance_skew_threshold: f64,
+    /// 计划式均衡:单条在途搬迁的超时(秒);超时未摘源 → 判败(`FailBalanceMove`),释放并发预算,
+    /// 不再重试该条(重试同样的落点大概率再卡,留给运维重新 eval)。
+    pub balance_move_timeout_secs: u64,
 }
 
 impl Default for MasterConfig {
@@ -65,6 +82,13 @@ impl Default for MasterConfig {
             auto_grow_batch: 4,
             reconcile_interval_secs: 5,
             reconcile_startup_grace_secs: 15,
+            // blobid-master-assign D9 的默认值:号段 1024、水位批次倍数 2(即一次 Raft 预留 2048 个号)。
+            id_alloc_segment_size: 1024,
+            id_alloc_raft_batch_multiple: 2,
+            balance_max_in_flight: 1,
+            balance_max_moves: 100,
+            balance_skew_threshold: 1.0,
+            balance_move_timeout_secs: 300,
         }
     }
 }
@@ -83,6 +107,17 @@ impl Validate for MasterConfig {
         at_least("master.auto_grow_interval_secs", self.auto_grow_interval_secs, 1)?;
         at_least("master.auto_grow_batch", self.auto_grow_batch, 1)?;
         at_least("master.reconcile_interval_secs", self.reconcile_interval_secs, 1)?;
+        at_least("master.id_alloc_segment_size", self.id_alloc_segment_size, 1)?;
+        at_least("master.id_alloc_raft_batch_multiple", self.id_alloc_raft_batch_multiple, 1)?;
+        at_least("master.balance_max_in_flight", self.balance_max_in_flight, 1)?;
+        at_least("master.balance_max_moves", self.balance_max_moves, 1)?;
+        if self.balance_skew_threshold <= 0.0 {
+            return Err(antfs_config::ConfigError::invalid(
+                "master.balance_skew_threshold",
+                "must be > 0",
+            ));
+        }
+        at_least("master.balance_move_timeout_secs", self.balance_move_timeout_secs, 1)?;
         if self.raft_addr.is_empty() {
             return Err(antfs_config::ConfigError::invalid("master.raft_addr", "must not be empty"));
         }

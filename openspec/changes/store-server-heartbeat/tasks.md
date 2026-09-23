@@ -25,4 +25,8 @@
 - [x] 5.1 `docs/design/cluster.md` §9.1 更新 S2 状态 + 配置/监控清单。
 
 ## 后续(不在 S2)
-- [ ] S3 拉复制 + bootstrap;S4 本地 worker;放置据 DiskHealth 避让;`DROPPED` 删目录;**EC 仍锁定**。
+- [x] S3 拉复制 + bootstrap。已落地(`replication.rs` 的 `sync_from_peer` / `bootstrap_from_peer`)。
+- [x] S4 本地 worker。已落地(`worker.rs`)。
+- [ ] 放置据 `DiskHealth` 避让:`placement.rs::select_disks` 完全不看 `health`(grep 0 命中),盘健康上报目前只进软状态,不参与选盘。
+- [ ] `DROPPED` 删目录:`replica.rs::remove_replica` 只从内存 map 摘除,盘上数据不删(下线副本后数据永久留在盘上)。
+- [ ] **EC 仍锁定**。

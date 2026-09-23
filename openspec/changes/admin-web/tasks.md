@@ -31,4 +31,10 @@
 - [x] 6.2 `docs/design/cluster.md`:admin 章节 + 配置项 / 监控项清单(§7 必须项)。
 
 ## 后续(不在本 change)
-- [ ] 分页(海量分区);RBAC/多用户/审计持久化;更多 ops(compaction/复制开关/标 RO/EC——EC 仍锁定);admin `--dev` 代理 vite。
+- [x] 分页(海量分区)。已落地(每页 10/20/50/100 + 状态过滤/仅欠副本 + 前端分页)。
+- [x] RBAC(operator/viewer 双令牌)。已落地(详见 `openspec/changes/admin-enhancements/`)。
+- [x] 更多 ops:compaction(手动 compact)、标 RO/SEALED。已落地(`POST /api/partitions/{id}/compact` 与 `/state`)。
+- [ ] 复制开关:store 侧运行期暂停拉复制 —— 未做(现有的 `store_server.replication_enabled` 是启动期配置;`/admin/request-control` 只管入向请求)。
+- [ ] 多用户 / 审计持久化:当时定为 non-goal(双固定 token 即够),仍未做。
+- [ ] admin `--dev` 代理 vite:未做(本地联调目前靠独立 admin 进程或直接跑 devcluster)。
+- [ ] **EC 仍锁定**。

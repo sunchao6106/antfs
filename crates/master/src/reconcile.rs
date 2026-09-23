@@ -152,18 +152,26 @@ pub fn plan_evacuation(
     out
 }
 
-/// 对迁移中的副本(MoveReplica)算"后删":新副本已补上、存活且非迁出源的副本数 ≥ RF 时,
-/// 可移除迁出源 (pid, node)(add-before-remove,守 §3.1)。
+/// 对迁移中的副本(MoveReplica)算"后删":新副本已补上、存活且非迁出源的副本数 ≥ RF **且继任者
+/// 已 ACTIVE** 时,可移除迁出源 (pid, node)(add-before-remove,守 §3.1)。
 ///
 /// `moving`:`(pid, node)` = 该节点上该分区副本是待迁出源。迁出源自身即使存活也不计入健康数。
+/// `successor_active`:`(pid, 迁出源)` 中**继任者(= MoveReplica 的目标节点)已上报 ACTIVE** 的子集。
+///
+/// **闸门收紧**(§3.1"先补后删"要真的等到新副本可用):只数"存活副本 ≥ RF"不够——新副本刚补上就
+/// 可能还在 BOOTSTRAP(追平中),此时删源会退化成"只有 RF−1 份可用数据"。故额外要求继任者已 ACTIVE。
 pub fn plan_move(
     partitions: &BTreeMap<PartitionId, PartitionInfo>,
     moving: &BTreeSet<(PartitionId, NodeId)>,
     up_nodes: &HashSet<NodeId>,
+    successor_active: &HashSet<(PartitionId, NodeId)>,
 ) -> Vec<(PartitionId, NodeId)> {
     let mut out = Vec::new();
     for (pid, node) in moving {
         let Some(info) = partitions.get(pid) else { continue };
+        if !successor_active.contains(&(*pid, *node)) {
+            continue; // 继任者尚未 ACTIVE(追平中/未上报)→ 绝不删源
+        }
         let healthy = info
             .replicas
             .iter()
@@ -174,6 +182,50 @@ pub fn plan_move(
         }
     }
     out
+}
+
+/// 待删源副本(`pending_drop`)的继任者确认输入(A6;喂 [`drop_confirmed`])。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuccessorConfirm {
+    /// 迁移删除:`move_targets` 有记账,且继任者已上报 `ACTIVE`(= 追平完成)。
+    Active,
+    /// 迁移删除:有记账但继任者尚未 `ACTIVE` → 还不能删。
+    NotYetActive,
+    /// 无迁移记账(evacuation 的"后删")→ 走冗余判据。
+    Unrecorded,
+}
+
+/// (A6) 待删源副本是否已可下发 `DROPPED`:hard placement 已移除该副本 + 继任者确认。
+///
+/// 三条确认里的前两条在此判定(第三条"源仍持有"由调用方用软状态判):
+/// 1. **placement 已不含** `(pid, source)`——否则还没"移除",谈不上删;
+/// 2. **继任者确认**:
+///    - 有迁移记账([`SuccessorConfirm::Active`] / [`SuccessorConfirm::NotYetActive`]):**只看继任者是否
+///      已 ACTIVE**(= 新副本追平,转移成功)。其余副本是否临时失联**不拖延删除**——转移已由 hard
+///      placement 记账,源上的那份数据不再是唯一来源;
+///    - 无迁移记账([`SuccessorConfirm::Unrecorded`],evacuation 的"后删"):退化为**冗余判据**
+///      "其余副本(排除源)数量 ≥ RF 且无一上报 `ERROR`"。
+///
+/// **保守性**:任何一条拿不准就返回 false —— 宁可让源盘上多留一份数据(后续心跳会重试),绝不少删。
+pub fn drop_confirmed(
+    pid: PartitionId,
+    info: &PartitionInfo,
+    source: NodeId,
+    successor: SuccessorConfirm,
+    errored: &HashSet<(PartitionId, NodeId)>,
+) -> bool {
+    if info.replicas.iter().any(|r| r.node_id == source) {
+        return false;
+    }
+    let others: Vec<_> = info.replicas.iter().filter(|r| r.node_id != source).collect();
+    match successor {
+        SuccessorConfirm::Active => true,
+        SuccessorConfirm::NotYetActive => false,
+        SuccessorConfirm::Unrecorded => {
+            others.len() >= info.replication_factor as usize
+                && !others.iter().any(|r| errored.contains(&(pid, r.node_id)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,15 +343,17 @@ mod tests {
     }
 
     #[test]
-    fn move_removes_source_after_replacement_healthy() {
-        // RF=3,副本在 1/2/3 + 新补 4;moving={(0,3)}:非迁出源存活 = {1,2,4} = 3 ≥ RF → 移除 3。
+    fn move_removes_source_after_replacement_active() {
+        // RF=3,副本在 1/2/3 + 新补 4;moving={(0,3)}:非迁出源存活 = {1,2,4} = 3 ≥ RF,
+        // 且继任者 4 已 ACTIVE → 移除 3。
         let parts = BTreeMap::from([(
             0,
             part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]),
         )]);
         let moving = BTreeSet::from([(0u32, 3u64)]);
         let up = HashSet::from([1, 2, 3, 4]); // 迁出源 3 自己也 up,也要被移除
-        assert_eq!(plan_move(&parts, &moving, &up), vec![(0, 3)]);
+        let successor_active = HashSet::from([(0u32, 3u64)]);
+        assert_eq!(plan_move(&parts, &moving, &up, &successor_active), vec![(0, 3)]);
     }
 
     #[test]
@@ -311,13 +365,30 @@ mod tests {
         )]);
         let moving = BTreeSet::from([(0u32, 3u64)]);
         let up = HashSet::from([1, 2, 3]);
-        assert!(plan_move(&parts, &moving, &up).is_empty(), "replacement not up: must hold the source");
+        let successor_active = HashSet::from([(0u32, 3u64)]); // 即便"已 ACTIVE"也要节点存活 ≥ RF
+        assert!(plan_move(&parts, &moving, &up, &successor_active).is_empty(), "replacement not up: must hold the source");
+    }
+
+    #[test]
+    fn move_holds_source_until_successor_active() {
+        // 新副本 4 存活但仍在 BOOTSTRAP(未 ACTIVE):up 计数已够(3),闸门必须再拦住。
+        let parts = BTreeMap::from([(
+            0,
+            part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]),
+        )]);
+        let moving = BTreeSet::from([(0u32, 3u64)]);
+        let up = HashSet::from([1, 2, 3, 4]);
+        assert!(
+            plan_move(&parts, &moving, &up, &HashSet::new()).is_empty(),
+            "successor not ACTIVE yet: must hold the source (true add-before-remove)"
+        );
     }
 
     #[test]
     fn move_ignores_unknown_partition() {
         let moving = BTreeSet::from([(9u32, 1u64)]);
-        assert!(plan_move(&BTreeMap::new(), &moving, &HashSet::from([1])).is_empty());
+        let successor_active = HashSet::from([(9u32, 1u64)]);
+        assert!(plan_move(&BTreeMap::new(), &moving, &HashSet::from([1]), &successor_active).is_empty());
     }
 
     #[test]
@@ -331,6 +402,47 @@ mod tests {
 
     fn rh(up: bool, state: &str, decom: bool) -> ReplicaHealth {
         ReplicaHealth { up, current_state: state.to_string(), decommissioning: decom }
+    }
+
+    #[test]
+    fn drop_confirmed_requires_source_removed() {
+        // 源 3 仍在 placement(还没"移除")→ 任何确认都不得放行。
+        let p = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (3, "d0", "ACTIVE")]);
+        assert!(!drop_confirmed(0, &p, 3, SuccessorConfirm::Active, &HashSet::new()));
+    }
+
+    #[test]
+    fn drop_confirmed_for_move_only_looks_at_successor() {
+        // 源 3 已被移除;继任者 4 已 ACTIVE → 放行(其余副本是否失联不影响:不拖延删除)。
+        let p = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]);
+        assert!(drop_confirmed(0, &p, 3, SuccessorConfirm::Active, &HashSet::new()));
+        // 继任者尚未 ACTIVE → 继续等(哪怕冗余数已够)。
+        assert!(!drop_confirmed(0, &p, 3, SuccessorConfirm::NotYetActive, &HashSet::new()));
+    }
+
+    #[test]
+    fn drop_confirmed_without_move_bookkeeping_uses_redundancy() {
+        // evacuation 的"后删":无 move 记账 → 其余副本(排除源)≥ RF 且无 ERROR 才放行。
+        let enough = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE"), (4, "d0", "ACTIVE")]);
+        assert!(drop_confirmed(0, &enough, 3, SuccessorConfirm::Unrecorded, &HashSet::new()));
+        // 只有 2 份(< RF=3)→ 不放行。
+        let short = part(3, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE")]);
+        assert!(!drop_confirmed(0, &short, 3, SuccessorConfirm::Unrecorded, &HashSet::new()));
+        // 其余的有一份上报 ERROR → 不放行(那份数据不算数);ERROR 只在**别的分区**上 → 不影响。
+        assert!(!drop_confirmed(
+            0,
+            &enough,
+            3,
+            SuccessorConfirm::Unrecorded,
+            &HashSet::from([(0u32, 2u64)])
+        ));
+        assert!(drop_confirmed(
+            0,
+            &enough,
+            3,
+            SuccessorConfirm::Unrecorded,
+            &HashSet::from([(9u32, 2u64)])
+        ));
     }
 
     #[test]

@@ -25,5 +25,5 @@
 - [x] 6.2 `cargo test` 绿 + `cargo clippy` 无告警。
 
 ## 推迟(M4 后续,另立 change)
-- [ ] 容量再平衡(纯决策可先做,执行依赖 store server)。
-- [ ] D5 EC 转换钩子(依赖 store server + 封存段语义,§5)。
+- [ ] 容量再平衡:转由 `openspec/changes/balance-and-scrub/` 承接(计划式均衡)。
+- [ ] D5 EC 转换钩子 —— **EC 仍锁定**(依赖封存段语义,§5)。

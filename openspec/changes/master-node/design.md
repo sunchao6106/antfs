@@ -88,7 +88,7 @@ service RaftInternal { /* append_entries / vote / install_snapshot */ }
 ```
 
 - **准入校验(Q1 安全点)**:M1 用**共享集群密钥/token**(配置项 `master.cluster_secret`,注册与心跳校验)起步;不做完整 mTLS(留后续)。校验失败 → `Unauthenticated`,记 `warn`(预期拒绝不打 error)。
-- 只有 leader 能处理写(RegisterNode、AllocatePartitionId);follower 收到写请求返回 leader 地址供 client 重定向(client SDK 处理)。只读查询任意节点可答(可能读到略旧软状态,可接受)。
+- 只有 leader 能处理写(RegisterNode、AllocatePartitionId);follower 收到写请求返回 leader 地址供 client 重定向(router SDK 处理)。只读查询任意节点可答(可能读到略旧软状态,可接受)。
 
 ## 6. 验证策略(M1)
 

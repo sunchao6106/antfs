@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg: MasterConfig = antfs_config::Loader::new()
         .with_file("master.toml", false)
         .with_env_prefix("AMBRY")
-        .load()
+        .load_table("master")
         .unwrap_or_default();
     antfs_config::Validate::validate(&cfg)?;
 

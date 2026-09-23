@@ -9,7 +9,9 @@
 //! - 持久化(Q3):Raft log + 状态机快照落 `redb`。
 
 pub mod autogrow;
+pub mod balance;
 pub mod config;
+pub mod idalloc;
 pub mod metrics;
 pub mod network;
 pub mod placement;

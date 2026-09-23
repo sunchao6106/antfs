@@ -1,16 +1,93 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, fmtBytes, Node, Partition } from "../api";
+import {
+  api,
+  CompactionJob,
+  CompactJobsNodeResult,
+  fmtBytes,
+  Node,
+  Partition,
+  ScrubResult,
+} from "../api";
+import { partitionHealth } from "../health";
 import type { T } from "../App";
 
 const REFRESH_MS = 5000;
 const PAGE_SIZES = [10, 20, 50, 100];
+/** 后台 compact 的进度轮询间隔(store 台账是内存态,轮询足够)。 */
+const JOB_POLL_MS = 2000;
 
 type Msg = { kind: "ok" | "err"; text: string } | null;
 
-export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; isOperator: boolean }) {
+/** 一行 = 一个副本节点的后台 compact 进度。 */
+interface JobRow {
+  node_id: number;
+  /** 提交时拿到的 job_id(提交失败则没有)。 */
+  job_id?: number;
+  /** `running` / `done` / `failed`(提交即 running)。 */
+  state: "running" | "done" | "failed";
+  /** 该副本的 compact 结果(仅 done)。 */
+  result?: CompactionJob["result"];
+  /** 失败原因(提交失败 / 任务失败 / 节点不可达)。 */
+  error?: string;
+}
+
+/** 该副本已到终态(失败或完成)→ 不必再等它。 */
+function terminal(r: JobRow): boolean {
+  return r.state === "done" || r.state === "failed";
+}
+
+/** 进度行状态 → i18n 文案与 pill 配色。 */
+function jobState(t: T, state: JobRow["state"]): { text: string; cls: string } {
+  switch (state) {
+    case "done":
+      return { text: t("jobDone"), cls: "ok" };
+    case "failed":
+      return { text: t("jobFailed"), cls: "down" };
+    case "running":
+      return { text: t("jobRunning"), cls: "" };
+  }
+}
+
+/**
+ * 用最新一轮 `compact-jobs` 更新进度行:只认**该行提交时的 job_id**(台账里同名分区的旧任务不算);
+ * 节点本轮不可达(`ok:false`)且该行未到终态 → 记下原因,等下一轮。
+ */
+function mergeJobs(prev: JobRow[], results: CompactJobsNodeResult[]): JobRow[] {
+  return prev.map((row) => {
+    if (terminal(row)) return row;
+    const node = results.find((r) => r.node_id === row.node_id);
+    if (!node) return row;
+    if (!node.ok) return { ...row, error: node.error ?? "" };
+    const job = (node.jobs ?? []).find((j) => j.job_id === row.job_id);
+    if (!job) return row;
+    return {
+      ...row,
+      state: job.state,
+      result: job.result,
+      error: job.state === "failed" ? (job.error ?? "") : undefined,
+    };
+  });
+}
+
+export function PartitionsTab({
+  t,
+  nodes,
+  isOperator,
+  maintenance,
+  stateFilter,
+  onStateFilter,
+}: {
+  t: T;
+  nodes: Node[];
+  isOperator: boolean;
+  /** 维护中:自动收敛(再复制/迁移)已暂停,迁移徽标旁给出提示。 */
+  maintenance: boolean;
+  /** 状态筛选(受控,来自 App 的 hash query;刷新后仍生效)。 */
+  stateFilter: string;
+  onStateFilter: (s: string) => void;
+}) {
   const [pageSize, setPageSize] = useState(10);
   const [offset, setOffset] = useState(0);
-  const [stateFilter, setStateFilter] = useState("");
   const [underOnly, setUnderOnly] = useState(false);
   const [partitions, setPartitions] = useState<Partition[]>([]);
   const [total, setTotal] = useState(0);
@@ -20,30 +97,36 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
   const [moveFor, setMoveFor] = useState<number | null>(null);
   const [moveFrom, setMoveFrom] = useState<number | "">("");
   const [moveTo, setMoveTo] = useState<number | "">("");
-
-  const filtering = stateFilter !== "" || underOnly;
+  /** 正在跟进的「后台整理」分区(展开进度行的那个)与其逐副本进度。 */
+  const [asyncFor, setAsyncFor] = useState<number | null>(null);
+  // 一致性巡检(Wave3):逐分区展开面板 + 结果;deep 由 checkbox 控制。
+  const [scrubFor, setScrubFor] = useState<number | null>(null);
+  const [scrubDeep, setScrubDeep] = useState(false);
+  const [scrubBusy, setScrubBusy] = useState(false);
+  const [scrubResult, setScrubResult] = useState<ScrubResult | null>(null);
+  const [asyncRows, setAsyncRows] = useState<JobRow[]>([]);
+  /** 某个副本的 job 已到终态(或提交即失败)→ 整轮结束,停止轮询。 */
+  const asyncDone = asyncRows.length > 0 && asyncRows.every(terminal);
 
   const refresh = useCallback(async () => {
     try {
-      const p = filtering ? await api.partitions(0, 0) : await api.partitions(offset, pageSize);
-      let items = p.items;
-      let tot = p.total;
-      if (filtering) {
-        items = items.filter(
-          (x) =>
-            (stateFilter === "" || x.state === stateFilter) &&
-            (!underOnly || !!x.under_replicated_reason),
-        );
-        tot = items.length;
-        items = items.slice(offset, offset + pageSize);
+      if (underOnly) {
+        // 欠副本无服务端筛选参数:取全量(仍按 state 过滤)后本地筛 + 本地分页。
+        const p = await api.partitions(0, 0, stateFilter);
+        const items = p.items.filter((x) => !!x.under_replicated_reason);
+        setPartitions(items.slice(offset, offset + pageSize));
+        setTotal(items.length);
+      } else {
+        // state 过滤由 master 做(过滤先于分页),total 即过滤后的总数。
+        const p = await api.partitions(offset, pageSize, stateFilter);
+        setPartitions(p.items);
+        setTotal(p.total);
       }
-      setPartitions(items);
-      setTotal(tot);
       setErr("");
     } catch (e) {
       setErr(String(e));
     }
-  }, [filtering, stateFilter, underOnly, offset, pageSize]);
+  }, [stateFilter, underOnly, offset, pageSize]);
 
   useEffect(() => {
     refresh();
@@ -90,8 +173,74 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
     }
   };
 
-  const openMove = (p: Partition) => {
-    if (moveFor === p.partition_id) {
+  /** 手动 compact:所有副本节点并发触发,逐节点结果拼进消息条(ok 节点报回收字节,失败报原因)。 */
+  const compact = async (id: number) => {
+    try {
+      const r = await api.compactPartition(id);
+      if (r.error) {
+        setMsg({ kind: "err", text: t("compactErr", { err: r.error }) });
+        return;
+      }
+      if (r.results.length === 0) {
+        setMsg({ kind: "err", text: t("compactNoReplicas") });
+        return;
+      }
+      const parts = r.results.map((x) =>
+        x.ok
+          ? t("compactNodeOk", { node: x.node_id, bytes: fmtBytes(x.dead_bytes ?? 0) })
+          : t("compactNodeFail", { node: x.node_id, err: x.error ?? "" }),
+      );
+      setMsg({ kind: r.results.every((x) => x.ok) ? "ok" : "err", text: parts.join("; ") });
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    }
+  };
+
+  /**
+   * 后台整理:各副本节点提交任务并立即回 `job_id`,然后在行下方展开逐副本进度
+   * (轮询 `compact-jobs` 直到全部终态,或用户收起)。
+   */
+  const compactAsync = async (id: number) => {
+    try {
+      const r = await api.compactPartitionAsync(id);
+      const rows: JobRow[] = r.results.map((x) =>
+        x.ok && x.job_id != null
+          ? { node_id: x.node_id, job_id: x.job_id, state: "running" }
+          : { node_id: x.node_id, state: "failed", error: x.error ?? r.error },
+      );
+      setAsyncRows(rows);
+      setAsyncFor(rows.length > 0 ? id : null);
+      if (r.error) setMsg({ kind: "err", text: t("compactErr", { err: r.error }) });
+      else if (rows.length === 0) setMsg({ kind: "err", text: t("compactNoReplicas") });
+      else setMsg(null);
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    }
+  };
+
+  /** 收起进度行 = 不再跟进(轮询 effect 依赖 `asyncFor` 自动停)。 */
+  const collapseAsync = () => {
+    setAsyncFor(null);
+    setAsyncRows([]);
+  };
+
+  // 轮询直到全部终态(或收起);失败只提示,下一轮继续。
+  useEffect(() => {
+    if (asyncFor == null || asyncDone) return;
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const r = await api.compactJobs(asyncFor);
+          setAsyncRows((prev) => mergeJobs(prev, r.results));
+        } catch (e) {
+          setMsg({ kind: "err", text: t("compactJobsPollErr", { err: String(e) }) });
+        }
+      })();
+    }, JOB_POLL_MS);
+    return () => clearInterval(timer);
+  }, [asyncFor, asyncDone, t]);
+
+  const openMove = (p: Partition) => {    if (moveFor === p.partition_id) {
       setMoveFor(null);
       return;
     }
@@ -118,15 +267,22 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
 
   const pageNo = Math.floor(offset / pageSize) + 1;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
-  const aliveNodes = useMemo(() => nodes.filter((n) => n.up), [nodes]);
+  const runScrub = useCallback(async (id: number, deep: boolean) => {
+    setScrubFor(id);
+    setScrubBusy(true);
+    try {
+      const r = await api.scrubPartition(id, deep);
+      setScrubResult(r);
+      setMsg(null);
+    } catch (e) {
+      setScrubResult(null);
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setScrubBusy(false);
+    }
+  }, []);
 
-  const health = (p: Partition): { cls: string; text: string } => {
-    const frac = `${p.healthy_replicas}/${p.replication_factor}`;
-    if (!p.under_replicated_reason) return { cls: "ok", text: `${frac} ${t("healthy")}` };
-    const reason = t(`reason_${p.under_replicated_reason}`);
-    if (!p.healable) return { cls: "down", text: `${frac} · ${t("stuck")} · ${reason}` };
-    return { cls: "warn", text: `${frac} · ${t("recovering")} · ${reason}` };
-  };
+  const aliveNodes = useMemo(() => nodes.filter((n) => n.up), [nodes]);
 
   const allPageSelected = partitions.length > 0 && partitions.every((p) => selected.has(p.partition_id));
   const toggleAll = () => {
@@ -156,7 +312,7 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
           <select
             value={stateFilter}
             onChange={(e) => {
-              setStateFilter(e.target.value);
+              onStateFilter(e.target.value);
               setOffset(0);
             }}
           >
@@ -225,7 +381,7 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
         </thead>
         <tbody>
           {partitions.map((p) => {
-            const h = health(p);
+            const h = partitionHealth(t, p);
             const rows = [
               <tr key={p.partition_id}>
                 {isOperator && (
@@ -243,6 +399,9 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
                   <span className={`pill ${h.cls}`}>{h.text}</span>
                   {p.moving_out_nodes.length > 0 && (
                     <span className="pill warn small">{t("moving")}</span>
+                  )}
+                  {maintenance && p.moving_out_nodes.length > 0 && (
+                    <span className="pill info small">{t("autoConvergePaused")}</span>
                   )}
                 </td>
                 <td>{p.replication_factor}</td>
@@ -273,10 +432,149 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
                     <button className="btn tiny" onClick={() => setState(p.partition_id, "SEALED")}>{t("markSealed")}</button>
                     <button className="btn tiny" onClick={() => repair(p.partition_id)}>{t("repair")}</button>
                     <button className="btn tiny" onClick={() => openMove(p)}>{t("move")}</button>
+                    <button className="btn tiny" onClick={() => compact(p.partition_id)}>{t("compact")}</button>
+                    <button className="btn tiny" onClick={() => compactAsync(p.partition_id)}>{t("compactAsync")}</button>
+                    <button
+                      className="btn tiny"
+                      onClick={() =>
+                        scrubFor === p.partition_id
+                          ? (setScrubFor(null), setScrubResult(null))
+                          : runScrub(p.partition_id, scrubDeep)
+                      }
+                    >
+                      {t("scrub")}
+                    </button>
                   </td>
                 )}
               </tr>,
             ];
+            if (isOperator && asyncFor === p.partition_id) {
+              rows.push(
+                <tr key={`${p.partition_id}-jobs`} className="detail">
+                  <td colSpan={colSpan}>
+                    <div className="panel">
+                      <div className="panel-head">
+                        <span className="card-label">
+                          {t("compactJobsTitle", { id: p.partition_id })}
+                        </span>
+                        <div className="spacer" />
+                        <button className="btn ghost tiny" onClick={collapseAsync}>
+                          {t("collapseBtn")}
+                        </button>
+                      </div>
+                      {asyncRows.map((r) => {
+                        const s = jobState(t, r.state);
+                        return (
+                          <div key={r.node_id} className="kv-row">
+                            <span className="k">
+                              {t("node")} {r.node_id}
+                            </span>
+                            <span className="v">
+                              <span className={`pill small ${s.cls}`}>{s.text}</span>
+                              {r.result && ` ${t("compactReclaimed", { bytes: fmtBytes(r.result.dead_bytes) })}`}
+                              {r.state === "failed" && ` ${r.error}`}
+                              {!terminal(r) && r.error && ` (${r.error})`}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </td>
+                </tr>,
+              );
+            }
+            if (scrubFor === p.partition_id) {
+              rows.push(
+                <tr key={`${p.partition_id}-scrub`} className="detail">
+                  <td colSpan={colSpan}>
+                    <div className="panel">
+                      <div className="panel-head">
+                        <span className="card-label">{t("scrubTitle", { id: p.partition_id })}</span>
+                        <div className="spacer" />
+                        <label className="inline-check">
+                          <input
+                            type="checkbox"
+                            checked={scrubDeep}
+                            onChange={(e) => setScrubDeep(e.target.checked)}
+                          />
+                          {t("scrubDeep")}
+                        </label>
+                        <button
+                          className="btn tiny"
+                          disabled={scrubBusy}
+                          onClick={() => runScrub(p.partition_id, scrubDeep)}
+                        >
+                          {scrubBusy ? t("scrubRunning") : t("scrubRerun")}
+                        </button>
+                        <button
+                          className="btn ghost tiny"
+                          onClick={() => {
+                            setScrubFor(null);
+                            setScrubResult(null);
+                          }}
+                        >
+                          {t("collapseBtn")}
+                        </button>
+                      </div>
+                      {scrubBusy && !scrubResult && <p className="empty">{t("scrubRunning")}</p>}
+                      {scrubResult && (
+                        <>
+                          <div className="kv-row">
+                            <span className="k">{t("scrubVerdict")}</span>
+                            <span className="v">
+                              <span className={`pill small ${scrubVerdict(t, scrubResult).cls}`}>
+                                {scrubVerdict(t, scrubResult).text}
+                              </span>
+                              {` · ${t("scrubCheckedAt")} ${new Date(scrubResult.checked_at_ms).toLocaleTimeString()}`}
+                              {scrubResult.deep && ` · ${t("scrubDeepTag")}`}
+                            </span>
+                          </div>
+                          {scrubResult.replicas.map((r) => (
+                            <div key={r.node_id} className="kv-row">
+                              <span className="k">{t("node")} {r.node_id}</span>
+                              <span className="v">
+                                {r.ok && r.report ? (
+                                  <>
+                                    {`records=${r.report.live_records} bytes=${fmtBytes(r.report.live_bytes)} tombstones=${r.report.tombstones} segs=${r.report.sealed_segments}`}
+                                    {r.key_count != null && ` keys=${r.key_count}`}
+                                    {r.partial && <span className="pill small warn">{t("scrubPartial")}</span>}
+                                    {r.verify &&
+                                      ` · ${t("scrubVerify")} bad=${r.verify.bad_records} idx=${r.verify.index_mismatch}${r.verify.truncated ? " (truncated)" : ""}`}
+                                  </>
+                                ) : (
+                                  <span className="pill small down">{r.error || t("scrubUnavailable")}</span>
+                                )}
+                              </span>
+                            </div>
+                          ))}
+                          <div className="kv-row">
+                            <span className="k">{t("scrubDivergences")}</span>
+                            <span className="v">
+                              {scrubResult.verdict.divergences.length === 0 ? (
+                                t("scrubNoDivergences")
+                              ) : (
+                                <ul className="scrub-divs">
+                                  {scrubResult.verdict.divergences.map((d, i) => (
+                                    <li key={i}>
+                                      {d.kind === "summary" && `${d.field}: ${d.detail}`}
+                                      {d.kind === "verify" && `n${d.node_id}: ${d.detail}`}
+                                      {d.kind === "key" &&
+                                        `${t("scrubKeyDiff")} ${d.key_hex.slice(0, 12)}… ${d.nodes
+                                          .map((n) => `n${n.node_id}=${n.state}`)
+                                          .join(" ")}`}
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </span>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </td>
+                </tr>,
+              );
+            }
             if (isOperator && moveFor === p.partition_id) {
               rows.push(
                 <tr key={`${p.partition_id}-move`} className="detail">
@@ -338,4 +636,14 @@ export function PartitionsTab({ t, nodes, isOperator }: { t: T; nodes: Node[]; i
       </div>
     </section>
   );
+}
+
+/** scrub 结论 → 徽标文案(走 i18n)与配色(不一致红 / 无法判定或部分比对黄 / 一致绿)。 */
+export function scrubVerdict(t: T, r: ScrubResult): { text: string; cls: string } {
+  if (r.verdict.inconclusive) return { text: t("scrubVerdictInconclusive"), cls: "warn" };
+  if (!r.verdict.consistent && r.verdict.divergences.length > 0) {
+    return { text: t("scrubVerdictInconsistent"), cls: "down" };
+  }
+  if (r.verdict.partial) return { text: t("scrubVerdictPartial"), cls: "warn" };
+  return { text: t("scrubVerdictConsistent"), cls: "ok" };
 }

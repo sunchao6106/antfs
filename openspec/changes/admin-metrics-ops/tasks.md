@@ -9,4 +9,4 @@
 - [x] 前端:tab 化重构 + 节点聚合/展开 + 分区筛选/批量/repair/move + uPlot 指标页 + 运维页(强制下线面板、分区查找)+ i18n + 构建
 - [x] devcluster:admin registry 接线;真集群 curl 端到端(store/admin /metrics、/api/metrics、partition detail、repair/move)
 - [x] 文档:cluster.md(新 RPC、§9.1 store /metrics、§11 admin 聚合与监控项)、store.md(/metrics 说明)
-- [ ] 浏览器端到端验证 UI(tabs/图表/大数量布局)
+- [x] 浏览器端到端验证 UI(tabs/节点展开/分区筛选与批量/指标图表/运维面板):已用真集群 100 分区逐 tab 截图核验

@@ -1,6 +1,6 @@
 ## Why
 
-S1/S2 让数据节点能 `PUT`/`GET` blob 并接入集群,但**变更类操作**(delete / undelete / updateTtl)还没有 HTTP 端点。`store` 引擎早已实现这三个语义(且 Phase 1 已给它们套上被动 IO-error 追踪),只差数据面暴露。补齐后 client SDK / gateway 才能对对象做删除/复活/改 TTL。
+S1/S2 让数据节点能 `PUT`/`GET` blob 并接入集群,但**变更类操作**(delete / undelete / updateTtl)还没有 HTTP 端点。`store` 引擎早已实现这三个语义(且 Phase 1 已给它们套上被动 IO-error 追踪),只差数据面暴露。补齐后 router SDK / gateway 才能对对象做删除/复活/改 TTL。
 
 ## What Changes
 
@@ -26,6 +26,6 @@ S1/S2 让数据节点能 `PUT`/`GET` blob 并接入集群,但**变更类操作**
 
 ## Non-goals
 
-- 不做 client SDK(用户指示暂不做)。
+- 不做 router SDK(用户指示暂不做)。
 - 不做拉复制传播这些变更(S3);S1/S2 单副本本地语义已够测试。
 - **EC 暂不解锁**。

@@ -4,6 +4,7 @@
 //! `openspec/changes/store-server/`。**S1**:骨架 + 数据面(HTTP put/get)+ `statfs` 容量。
 //! 不接 master、不复制、**不含 EC**(暂不解锁)。
 
+pub mod compaction_jobs;
 pub mod config;
 pub mod disk;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod heartbeat;
 pub mod metrics;
 pub mod replica;
 pub mod replication;
+pub mod request_control;
 pub mod server;
 pub mod worker;
 
@@ -21,4 +23,5 @@ pub type PartitionId = u32;
 pub use config::StoreServerConfig;
 pub use error::{Error, Result};
 pub use metrics::StoreServerMetrics;
+pub use request_control::{DataOp, RequestControl};
 pub use server::StoreServer;

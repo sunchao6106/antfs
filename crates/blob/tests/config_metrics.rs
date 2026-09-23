@@ -103,3 +103,28 @@ fn two_stores_share_registry_distinguished_by_label() {
     assert!(text.contains("store_request_duration_seconds_count{op=\"put\",store=\"p1\"} 2"));
     assert!(text.contains("store_request_duration_seconds_count{op=\"put\",store=\"p2\"} 1"));
 }
+
+/// 默认段大小的**结构性不变量**:段 ≤ 4 GiB 时,单条记录 ≤ `段 − 64(段头) − 38(记录头尾) < u32::MAX`,
+/// 故"`data_len` 只有 u32 → 长度回绕写出坏记录"在默认配置下**不可能发生**
+/// (`record_data_len` 的显式校验是第二道保险,供把段配大时兜底)。
+///
+/// 同时这是一道"别静默改默认值"的闸门(CLAUDE.md §5.1:改默认需显式指示):
+/// 若要把默认段调大过 4 GiB,必须同时确认上面那条不变量已不再被依赖 —— 那时改这条断言并说明理由。
+#[test]
+fn default_segment_size_keeps_single_record_under_u32() {
+    const SEG_HEADER: u64 = 64; // `log_segment.rs::HEADER_SIZE`
+    const RECORD_OVERHEAD: u64 = 38; // `blob.rs::RECORD_OVERHEAD`(KEY_SIZE = 8)
+    // 硬编码 4 GiB,而不用 `StoreConfig::default()` —— 这样"默认被改"必然让本测试变红。
+    let seg = 4 * 1024 * 1024 * 1024u64;
+    assert_eq!(
+        StoreConfig::default().segment_size_bytes,
+        seg,
+        "默认段大小变更须知会(CLAUDE.md §5.1),并复核本条不变量"
+    );
+    let max_record = seg - SEG_HEADER;
+    let max_data = max_record - RECORD_OVERHEAD;
+    assert!(
+        max_data < u32::MAX as u64,
+        "默认段下单条数据体必须 < u32::MAX,实际上限 {max_data}"
+    );
+}

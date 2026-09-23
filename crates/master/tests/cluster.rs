@@ -37,6 +37,12 @@ fn node_config(id: u64, dir: &std::path::Path, raft_port: u16, grpc_port: u16) -
         auto_grow_batch: 4,
         reconcile_interval_secs: 5,
         reconcile_startup_grace_secs: 0,
+        id_alloc_segment_size: 1024,
+        id_alloc_raft_batch_multiple: 2,
+        balance_max_in_flight: 1,
+        balance_max_moves: 100,
+        balance_skew_threshold: 1.0,
+        balance_move_timeout_secs: 300,
     }
 }
 

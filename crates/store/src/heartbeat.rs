@@ -75,28 +75,34 @@ async fn run(
     let mut inbound = client.heartbeat(ReceiverStream::new(rx)).await?.into_inner();
 
     {
-        let (config, disks, replicas, health) =
-            (config.clone(), disks.clone(), replicas.clone(), health.clone());
+        let (config, disks, replicas, health, metrics) =
+            (config.clone(), disks.clone(), replicas.clone(), health.clone(), metrics.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(config.heartbeat_interval_secs));
             loop {
                 tick.tick().await;
                 let mut dm = disks.clone();
                 dm.refresh();
+                let states = replicas.replica_states();
+                // 每拍顺带刷新副本相关 gauge(实然态会随拉复制转正而变,见 `replication::sync_round`)。
+                metrics.set_replica_gauges(&states);
                 let beat = NodeBeat {
                     version: 1,
                     cluster_secret: config.cluster_secret.clone(),
                     node_id: config.node_id,
                     disks: disk_beats(&dm, &health),
                     full_report: true,
-                    replicas: replicas
-                        .replica_states()
+                    replicas: states
                         .into_iter()
-                        .map(|(pid, disk_id, current_state)| ReplicaBeat {
-                            partition_id: pid,
-                            disk_id,
-                            current_state,
-                            lag_bytes: 0,
+                        .map(|s| ReplicaBeat {
+                            partition_id: s.partition_id,
+                            disk_id: s.disk_id,
+                            current_state: s.current_state,
+                            // 滞后字节为**估算**(口径与误差见 `replication::lag_bytes`):
+                            // 每轮复制开始时 peer 游标与本地已 apply 游标之差,按段容量线性化。
+                            lag_bytes: s.lag_bytes,
+                            // 实际占用 = blob 活数据(墓碑不计),供 master 汇总可写容量与均衡判据。
+                            used_bytes: s.used_bytes,
                         })
                         .collect(),
                 };
@@ -117,10 +123,31 @@ async fn run(
                     // ensure_replica 同步阻塞(建 BlobStore),offload 到阻塞池。
                     let _ = tokio::task::spawn_blocking(move || r.ensure_replica(pid)).await;
                 }
-                "OFFLINE" | "DROPPED" => replicas.remove_replica(t.partition_id),
+                // OFFLINE = 临时摘除(只摘内存句柄,盘上数据保留 —— 副本可能再回来),
+                // **不删数据**:删盘只在 DROPPED 时做(见下)。
+                "OFFLINE" => replicas.remove_replica(t.partition_id),
+                // DROPPED = 该副本已从集群 placement 正式移除且继任者已 ACTIVE(master 确认后才下发),
+                // 可以删盘上数据。`remove_dir_all` 是同步阻塞 IO,offload 到阻塞池,别卡心跳 loop。
+                "DROPPED" => {
+                    let r = replicas.clone();
+                    let pid = t.partition_id;
+                    match tokio::task::spawn_blocking(move || r.drop_replica(pid)).await {
+                        // 真的删了才计数;`false` = 本地本来就没有(重复指令/重放)→ 幂等忽略。
+                        Ok(Ok(true)) => metrics.replicas_dropped.inc(),
+                        Ok(Ok(false)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(partition = pid, error = %e, "drop local replica failed")
+                        }
+                        Err(_) => tracing::warn!(partition = pid, "drop local replica join error"),
+                    }
+                }
                 _ => {}
             }
         }
+        // 副本数与实然态可能经本路径(心跳指令)而非 `POST /admin/partitions/{pid}` 变化,每轮刷新一次,
+        // 否则 `store_server_replicas` 会恒为 0(既有缺口)。实然态照旧上报(只是值更真实:
+        // 新建/重开/重装出来的副本先报 `BOOTSTRAP`,拉复制追平后由复制器转 `ACTIVE`)。
+        metrics.set_replica_gauges(&replicas.replica_states());
     }
     Ok(())
 }

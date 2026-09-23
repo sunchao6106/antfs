@@ -28,8 +28,9 @@
 - [x] 7.1 `docs/design/cluster.md` §9 标注 S1 已实现 + 配置/监控清单(新 `docs/design/store-server.md` 或并入)。
 
 ## 后续(不在 S1)
-- [ ] S2 HeartbeatClient + RegisterNode + ReplicaLifecycle(接 master transitions)。
-- [ ] S3 ReplicationPuller + bootstrap(N3)。
-- [ ] S4 LocalWorker(flush/compaction/hard_delete)。
-- [ ] 真流式 put(消除内存聚合);变更类端点(delete/undelete/ttl)。
+- [x] S2 HeartbeatClient + RegisterNode + ReplicaLifecycle(接 master transitions)。已落地 `crates/store/src/heartbeat.rs`。
+- [x] S3 ReplicationPuller + bootstrap(N3)。已落地 `crates/store/src/replication.rs`。
+- [x] S4 LocalWorker(flush/compaction/hard_delete)。已落地 `crates/store/src/worker.rs`。
+- [x] 变更类端点(delete/undelete/ttl)。已落地(详见 `openspec/changes/store-server-mutations/`)。
+- [x] 真流式 put(消除内存聚合)。已落地:`BlobStore::put_from_reader`(`crates/blob/src/blob.rs`:605)+ store 侧 `INLINE_BODY_MAX` 以内内联、超过走流式(`crates/store/src/server.rs` put handler)。
 - [ ] **EC 仍锁定**(暂不解锁)。

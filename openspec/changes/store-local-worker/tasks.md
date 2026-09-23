@@ -20,4 +20,6 @@
 - [x] 5.1 `docs/design/cluster.md` §9.1:S4 本地 worker 状态 + 配置项 / 监控项清单补项。
 
 ## 后续(不在本 change)
-- [ ] 每盘专用线程池 / IO 调度(N4);P1 集群级 scheduler(再复制/再平衡/EC);**EC 仍锁定**。
+- [ ] 每盘专用线程池 / IO 调度(N4):目前 store 的同步 IO 一律 `spawn_blocking` 到共享阻塞池,无 per-disk 隔离。
+- [ ] P1 集群级 scheduler(再复制/再平衡/EC):master 现在只有零散的 reconciler tick,没有 scheduler 角色;均衡部分见 `balance-and-scrub`。
+- [ ] **EC 仍锁定**。

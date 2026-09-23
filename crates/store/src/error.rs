@@ -19,6 +19,9 @@ pub enum Error {
     /// 无满足容量上界的可用盘。
     #[error("no disk with enough free space")]
     NoDiskSpace,
+    /// 本节点没有该分区的副本(数据面路由不到)。
+    #[error("no local replica for partition")]
+    NoReplica,
     /// 拉复制传输/解析错误。
     #[error("replication: {0}")]
     Replication(String),

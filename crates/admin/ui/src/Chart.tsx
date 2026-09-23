@@ -4,8 +4,22 @@ import "uplot/dist/uPlot.min.css";
 
 const HEIGHT = 220;
 
+/** 图表配色(series 按序取色)。 */
+export const PALETTE = [
+  "#2f81f7",
+  "#2ea043",
+  "#d29922",
+  "#f85149",
+  "#a371f7",
+  "#39c5cf",
+  "#f778ba",
+  "#e3b341",
+];
+
 export interface ChartProps {
   title: string;
+  /** 标题右侧的补充读数(如"最近 1 分钟 xx/min"),可省。 */
+  subtitle?: string;
   /** y 序列名(与 data[1..] 对应)。 */
   labels: string[];
   colors: string[];
@@ -15,7 +29,7 @@ export interface ChartProps {
 }
 
 /** uPlot 薄封装:实例随组件创建/销毁,数据更新走 setData,宽度随容器自适应。 */
-export function Chart({ title, labels, colors, data, fmt }: ChartProps) {
+export function Chart({ title, subtitle, labels, colors, data, fmt }: ChartProps) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
   const dataRef = useRef(data);
@@ -33,13 +47,28 @@ export function Chart({ title, labels, colors, data, fmt }: ChartProps) {
       width: Math.max(el.clientWidth, 320),
       height: HEIGHT,
       legend: { show: true },
-      scales: { x: { time: true } },
+      scales: {
+        x: {
+          time: true,
+          // 首屏只有 1~2 个样本时 x 跨度可能不足 1 秒:uPlot 会切到亚秒格式(标签又长又难读),
+          // 单点时区间还会退化成 [t, t] 撑出无意义的刻度。这里统一给一个最小 1 分钟窗口,
+          // 最新点贴右缘;数据跨度超过 1 分钟后按真实数据走。
+          range: (_u, min, max) => {
+            if (min == null || max == null) return [0, 1];
+            const MIN_SPAN_SECS = 60;
+            if (max - min >= MIN_SPAN_SECS) return [min, max];
+            return [max - MIN_SPAN_SECS, max];
+          },
+        },
+      },
       axes: [
         { stroke: "#8b949e", grid: { stroke: "#2d333b" }, ticks: { stroke: "#2d333b" } },
         {
           stroke: "#8b949e",
           grid: { stroke: "#2d333b" },
           ticks: { stroke: "#2d333b" },
+          // 自定义 `values` 后 uPlot 不再按默认标签预留宽度,必须给足,否则长标签(如 "768.0 MiB")被裁到只剩 ".7 MiB"。
+          size: 96,
           values: (_u, splits) =>
             splits.map((v) => (v == null ? "" : fmtRef.current ? fmtRef.current(v) : String(v))),
         },
@@ -75,5 +104,11 @@ export function Chart({ title, labels, colors, data, fmt }: ChartProps) {
     plotRef.current?.setData(data);
   }, [data, seriesKey]);
 
-  return <div className="chart-card" ref={wrapRef} />;
+  return (
+    <div className="chart-card">
+      {subtitle && <div className="chart-sub">{subtitle}</div>}
+      {/* uPlot 自己往宿主里 append DOM,故宿主只交给它,不放 React 子节点。 */}
+      <div ref={wrapRef} />
+    </div>
+  );
 }

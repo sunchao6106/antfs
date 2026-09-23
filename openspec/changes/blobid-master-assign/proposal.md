@@ -25,7 +25,9 @@ blobId 的 objectId 部分怎么生成,是绕不开的架构决策,牵动 [D4 �
 
 ## Impact
 
-- **代码(发号)**:master 侧新增 per-partition 水位状态 + Raft 提交 + AllocId RPC;client SDK 新增号段缓存/预取(对齐 SDFS `IDRangeAllocator`/`IDPoolWatcher`)。未实现,本 change 固化决策。
+- **代码(发号)**:master 侧新增 per-partition 水位状态 + Raft 提交 + AllocId RPC;router SDK 新增号段缓存/预取(对齐 SDFS `IDRangeAllocator`/`IDPoolWatcher`)。未实现,本 change 固化决策。
+  → **已落地**(`openspec/changes/blob-io-end-to-end/`):RPC 为 `GetBlobIds`,`crates/master/src/idalloc.rs` 落号段池与水位抬升,
+     `crates/common/router` 落号段缓存(按需取段;后台预取仍待办),配置 key 扁平化为 `master.id_alloc_segment_size` / `master.id_alloc_raft_batch_multiple`。
 - **代码(blobId 32B→8B,待协调)**:`crates/blob/src/types.rs` `KEY_SIZE=32→8`(或 `StoreKey` 改 `u64`)+ 注释;波及 `crates/blob/src/{index/segment.rs,blob.rs}`(排序段/Fuse 布局按 8B key)、`crates/store/src/server.rs` 与 `crates/store-server`(去掉"key must be 32 bytes / 64 hex"校验、改 16 hex)、`crates/store/tests/data_plane.rs` 等测试夹具。**⚠ 当前另有 agent 在改 `crates/store`,代码改动待协调后再做,本 change 仅固化决策 + 记录范围。**
 - **文档(已改)**:[cluster.md §8 blobId 结构 + §7.6 Q7 + 线 22/445](../../../docs/design/cluster.md)、[store.md §5 StoreKey](../../../docs/design/store.md) 已更新为 64bit/8B、32/32、无 version、master 号段发号。
 - **持久性红线**:新增"Raft 日志存储 fsync 为持久边界"的崩溃一致性测试要求([CLAUDE.md §6](../../../CLAUDE.md))。

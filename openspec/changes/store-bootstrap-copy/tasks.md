@@ -26,4 +26,6 @@
 - [x] 6.1 `docs/design/cluster.md` §9.1/§10:S3b 落地(物理拷贝 + 逻辑尾)+ 配置/监控清单补项。
 
 ## 后续(不在本 change)
-- [ ] disk-aware 每盘并发限流(N4);增量段 diff/断点续传;**EC 仍锁定**。
+- [ ] disk-aware 每盘并发限流(N4):复制/bootstrap/worker 共用同一个阻塞池,无 per-disk 上限。
+- [ ] 增量段 diff / 断点续传:bootstrap 目前是整段拷贝(有 `bootstrap_segments/bytes` 指标),无增量与续传。
+- [ ] **EC 仍锁定**。

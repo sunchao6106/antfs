@@ -99,6 +99,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "antfs-bench-common"
+version = "0.0.0"
+
+[[package]]
+name = "antfs-bench-frontend"
+version = "0.0.0"
+dependencies = [
+ "antfs-bench-common",
+ "bytes",
+ "futures",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
+name = "antfs-bench-router"
+version = "0.0.0"
+dependencies = [
+ "antfs-bench-common",
+ "antfs-config",
+ "antfs-metric",
+ "antfs-router",
+ "bytes",
+ "futures",
+ "tokio",
+]
+
+[[package]]
 name = "antfs-blob"
 version = "0.0.0"
 dependencies = [
@@ -128,14 +156,44 @@ name = "antfs-devcluster"
 version = "0.0.0"
 dependencies = [
  "antfs-admin",
+ "antfs-bench-frontend",
+ "antfs-bench-router",
  "antfs-blob",
  "antfs-config",
+ "antfs-frontend",
  "antfs-master",
  "antfs-metric",
+ "antfs-router",
  "antfs-store",
  "axum",
  "openraft",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "antfs-frontend"
+version = "0.0.0"
+dependencies = [
+ "antfs-blob",
+ "antfs-config",
+ "antfs-master",
+ "antfs-metric",
+ "antfs-router",
+ "antfs-store",
+ "axum",
+ "bytes",
+ "futures",
+ "hex",
+ "openraft",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -169,6 +227,27 @@ name = "antfs-metric"
 version = "0.0.0"
 dependencies = [
  "prometheus",
+]
+
+[[package]]
+name = "antfs-router"
+version = "0.0.0"
+dependencies = [
+ "antfs-blob",
+ "antfs-config",
+ "antfs-master",
+ "antfs-metric",
+ "antfs-store",
+ "bytes",
+ "futures",
+ "hex",
+ "openraft",
+ "reqwest",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1640,12 +1719,14 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -2424,6 +2505,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

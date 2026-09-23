@@ -66,6 +66,12 @@ async fn store_server_joins_master_and_serves_directed_replica() {
         auto_grow_batch: 4,
         reconcile_interval_secs: 60, // 慢,避免干扰
         reconcile_startup_grace_secs: 0,
+        id_alloc_segment_size: 1024,
+        id_alloc_raft_batch_multiple: 2,
+        balance_max_in_flight: 1,
+        balance_max_moves: 100,
+        balance_skew_threshold: 1.0,
+        balance_move_timeout_secs: 300,
     };
     let mreg = antfs_metric::Registry::new();
     let master = MasterNode::start(mcfg.clone(), &mreg).await.expect("master start");
@@ -153,8 +159,14 @@ async fn store_server_joins_master_and_serves_directed_replica() {
     assert_eq!(body.as_ref(), data.as_slice(), "GET on directed replica returns written bytes");
 
     // ListPartitions(admin dashboard 用)应列出该分区,含副本 placement 与(心跳上报的)实然态。
+    // `state: ""` = 不过滤(proto 新增的按状态过滤字段)。
     let listed = mc
-        .list_partitions(ListPartitionsRequest { version: 1, offset: 0, limit: 0 })
+        .list_partitions(ListPartitionsRequest {
+            version: 1,
+            offset: 0,
+            limit: 0,
+            state: String::new(),
+        })
         .await
         .expect("list_partitions")
         .into_inner();

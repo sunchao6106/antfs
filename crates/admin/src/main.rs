@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use antfs_admin::audit::AuditLog;
 use antfs_admin::config::AdminConfig;
 use antfs_admin::master_api::GrpcMasterApi;
 use antfs_admin::metrics::AdminMetrics;
@@ -15,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg: AdminConfig = antfs_config::Loader::new()
         .with_file("admin.toml", false)
         .with_env_prefix("AMBRY")
-        .load()
+        .load_table("admin")
         .unwrap_or_default();
     cfg.validate()?;
 
@@ -23,8 +24,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metrics = Arc::new(AdminMetrics::new(&registry)?);
     let master = Arc::new(GrpcMasterApi::connect(&cfg.master_addr, cfg.cluster_secret.clone()).await?);
 
-    let state = AppState { master, metrics, registry, grafana_url: cfg.grafana_url.clone() };
+    let state = AppState {
+        master,
+        metrics,
+        registry,
+        grafana_url: cfg.grafana_url.clone(),
+        // 打不开也只 warn(审计降级),不阻断启动。
+        audit: Arc::new(AuditLog::open(&cfg.audit_path)),
+        scrub_runs: std::sync::Arc::new(antfs_admin::scrub::ScrubRuns::default()),
+    };
     let auth = AuthConfig {
+        users: cfg.users.clone(),
         operator_token: cfg.operator_token.clone(),
         viewer_token: cfg.viewer_token.clone(),
     };
@@ -32,6 +42,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;
     tracing::info!(addr = %cfg.listen_addr, master = %cfg.master_addr, "admin web listening");
-    axum::serve(listener, router).await?;
+    // 带 connect info 以记录审计的 remote_addr。
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

@@ -17,4 +17,6 @@
 - [x] 4.1 `docs/design/cluster.md` §9.1 数据面端点说明补变更类。
 
 ## 后续
-- [ ] 变更经拉复制传播(S3);client SDK(暂不做);**EC 仍锁定**。
+- [x] 变更经拉复制传播(S3)。已落地(`tests/replication.rs` 有 put/delete 收敛断言)。
+- [ ] router SDK(暂不做:仓库里还没有 frontend/SDK crate)。
+- [ ] **EC 仍锁定**。

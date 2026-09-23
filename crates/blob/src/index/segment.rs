@@ -63,6 +63,21 @@ impl SealedSegment {
         self.seq
     }
 
+    /// 按 key 升序遍历本段全部条目(供 scrub 摘要等只读统计;不读数据体,不分配整段内存)。
+    ///
+    /// 条目在 mmap 上是定长且已按 key 升序(写入时排序),故直接顺序扫描即可。
+    pub fn for_each_entry(&self, mut f: impl FnMut(&StoreKey, IndexValue)) {
+        let bytes = &self.map[IDX_HEADER_SIZE..];
+        let count = bytes.len() / ENTRY_SIZE;
+        for i in 0..count {
+            let off = i * ENTRY_SIZE;
+            let key = StoreKey::from_slice(&bytes[off..off + KEY_SIZE]).expect("key size fixed");
+            let value = IndexValue::from_bytes(&bytes[off + KEY_SIZE..off + ENTRY_SIZE])
+                .expect("value size fixed");
+            f(&key, value);
+        }
+    }
+
     pub fn find(&self, key: &StoreKey) -> Option<IndexValue> {
         if !self.filter.contains(&key.hash64()) {
             return None;

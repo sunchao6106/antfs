@@ -7,6 +7,7 @@
 //!        [--read-threads T] [--index-max N] [--segment-mib M] [--dir PATH]`
 //!
 //! 后续 `benchmark/` 下会新增数据节点(HTTP 数据面)与 S3 frontend 的压测二进制;本程序只覆盖 blob 引擎层。
+//! **集群/数据面端到端压测已落地**:`antfs-client bench`(见 `crates/client` 与 `docs/design/client.md §8`)。
 
 use std::path::PathBuf;
 use std::sync::Arc;

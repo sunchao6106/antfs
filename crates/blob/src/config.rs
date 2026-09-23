@@ -12,6 +12,10 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct StoreConfig {
     /// 单个 log 段大小(字节)。对齐 Ambry `store.segment.size.in.bytes`。
+    ///
+    /// **默认 4 GiB**:记录内 `data_len` 是 u32,段 ≤ 4 GiB 时单条记录必然 ≤ `段 − 102 < u32::MAX`,
+    /// "长度回绕写坏记录"这件事在**结构上**不可能发生(`record_data_len` 的显式校验是第二道保险,
+    /// 供把段配大时兜底)。同时容量粒度比 8 GiB 更细,`is_full()`(剩余 < 一个段)不会过早触发。
     pub segment_size_bytes: u64,
     /// 活跃索引常驻内存的最大条目数,达阈值即封存。对齐 Ambry `store.index.max.number.of.inmem.elements`。
     pub index_max_inmem_elements: usize,
@@ -23,7 +27,8 @@ pub struct StoreConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
-            segment_size_bytes: 8 * 1024 * 1024 * 1024,
+            // 4 GiB:使"单条记录 ≤ 段 − 102 < u32::MAX"成为结构性不变量(见字段注释)。
+            segment_size_bytes: 4 * 1024 * 1024 * 1024,
             index_max_inmem_elements: 10_000,
             io_error_count_to_trigger_shutdown: 0,
         }

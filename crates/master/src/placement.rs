@@ -13,6 +13,9 @@ use crate::types::{DiskId, NodeId, NodeInfo, ReplicaPlacement};
 /// M1/M2 副本统一目标态(Q4:不区分 leader/standby)。
 const ACTIVE: &str = "ACTIVE";
 
+/// 盘主动探测的健康值(store `DiskHealth::Healthy`)。
+const HEALTHY: &str = "HEALTHY";
+
 /// 选盘失败。
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PlacementError {
@@ -24,10 +27,12 @@ pub enum PlacementError {
     ZeroReplicationFactor,
 }
 
-/// 某块盘的实时余量快照(软状态,心跳上报)。
-#[derive(Clone, Copy, Debug)]
+/// 某块盘的实时快照(软状态,心跳上报)。
+#[derive(Clone, Debug)]
 pub struct DiskFree {
     pub free_bytes: u64,
+    /// 该盘主动探测的健康结果(空串 = **未启用主动探测**,视为可用;见 [`select_disks`])。
+    pub health: String,
 }
 
 /// 一块候选盘(展平后带定位与排序键)。
@@ -44,8 +49,12 @@ struct Candidate {
 /// - `partition_cap`:分区容量上界,盘可用容量须 ≥ 它。
 /// - `near_full_ratio`:盘用量超此比例视为将满,跳过(用量 = 1 - free/capacity)。
 ///
-/// 规则:候选 = 余量 ≥ 上界且未将满;按余量降序贪心,**每个副本落不同节点**、优先不同 rack;
+/// 规则:候选 = 余量 ≥ 上界、未将满、**健康**;按余量降序贪心,**每个副本落不同节点**、优先不同 rack;
 /// 不足则 `InsufficientDisks`(不降 rf)。确定性:同输入恒产同输出(按 (node,disk) 稳定定序)。
+///
+/// **盘健康避让**(S2):`health` 非空且 ≠ `HEALTHY` 的盘(主动探测报出坏盘/挂载不可达)不再放新副本。
+/// **空串 = 该盘未启用主动探测**(store 侧默认关)→ **视为可用**:否则未开探测的集群会被整体判为
+/// 不可放置。即:避让只对"明确探测为不健康"的盘生效,不把"没探测"当"不健康"。
 pub fn select_disks(
     nodes: &BTreeMap<NodeId, NodeInfo>,
     usage: &BTreeMap<(NodeId, DiskId), DiskFree>,
@@ -64,6 +73,9 @@ pub fn select_disks(
             let Some(free) = usage.get(&(*node_id, disk_id.clone())) else {
                 continue; // 未上报余量 → 不可用
             };
+            if !free.health.is_empty() && free.health != HEALTHY {
+                continue; // 探测为不健康 → 不放新副本(空串=未探测,视为可用)
+            }
             if free.free_bytes < partition_cap {
                 continue; // 容量不足
             }
@@ -161,6 +173,16 @@ mod tests {
 
     const CAP: u64 = 100;
 
+    /// 盘余量快照(health 空串 = 该盘未启用主动探测)。
+    fn free(free_bytes: u64) -> DiskFree {
+        DiskFree { free_bytes, health: String::new() }
+    }
+
+    /// 带健康上报的盘余量快照。
+    fn free_health(free_bytes: u64, health: &str) -> DiskFree {
+        DiskFree { free_bytes, health: health.to_string() }
+    }
+
     #[test]
     fn spreads_across_nodes_and_racks() {
         let nodes = BTreeMap::from([
@@ -169,9 +191,9 @@ mod tests {
             (3, node("rC", &[("d0", 1000)])),
         ]);
         let usage = BTreeMap::from([
-            ((1, "d0".to_string()), DiskFree { free_bytes: 1000 }),
-            ((2, "d0".to_string()), DiskFree { free_bytes: 1000 }),
-            ((3, "d0".to_string()), DiskFree { free_bytes: 1000 }),
+            ((1, "d0".to_string()), free(1000)),
+            ((2, "d0".to_string()), free(1000)),
+            ((3, "d0".to_string()), free(1000)),
         ]);
         let out = select_disks(&nodes, &usage, 3, CAP, 0.95).unwrap();
         assert_eq!(out.len(), 3);
@@ -189,8 +211,8 @@ mod tests {
         ]);
         // node2 盘用量 99% > 95% → 跳过 → 候选不足。
         let usage = BTreeMap::from([
-            ((1, "d0".to_string()), DiskFree { free_bytes: 900 }),
-            ((2, "d0".to_string()), DiskFree { free_bytes: 10 }),
+            ((1, "d0".to_string()), free(900)),
+            ((2, "d0".to_string()), free(10)),
         ]);
         let err = select_disks(&nodes, &usage, 2, CAP, 0.95).unwrap_err();
         assert!(matches!(err, PlacementError::InsufficientDisks { needed: 2, available: 1 }));
@@ -199,7 +221,7 @@ mod tests {
     #[test]
     fn rejects_disk_below_partition_cap() {
         let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
-        let usage = BTreeMap::from([((1, "d0".to_string()), DiskFree { free_bytes: 50 })]);
+        let usage = BTreeMap::from([((1, "d0".to_string()), free(50))]);
         let err = select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap_err();
         assert!(matches!(err, PlacementError::InsufficientDisks { .. }));
     }
@@ -212,24 +234,66 @@ mod tests {
         assert!(matches!(err, PlacementError::InsufficientDisks { needed: 1, available: 0 }));
     }
 
+    #[test]
+    fn unhealthy_disk_is_excluded() {
+        // node2 的盘主动探测报 WRITE_TIMEOUT(容量充裕、也未将满)→ 仍不得放新副本。
+        let nodes = BTreeMap::from([
+            (1, node("rA", &[("d0", 1000)])),
+            (2, node("rB", &[("d0", 1000)])),
+        ]);
+        let usage = BTreeMap::from([
+            ((1, "d0".to_string()), free(1000)),
+            ((2, "d0".to_string()), free_health(1000, "WRITE_TIMEOUT")),
+        ]);
+        // RF=2 只剩 1 块可用盘 → 不足(绝不放到坏盘上);RF=1 则只选健康的 node1。
+        let err = select_disks(&nodes, &usage, 2, CAP, 0.95).unwrap_err();
+        assert!(matches!(err, PlacementError::InsufficientDisks { needed: 2, available: 1 }));
+        let one = select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].node_id, 1, "unhealthy disk must not host a new replica");
+    }
+
+    #[test]
+    fn empty_health_means_probe_disabled_and_disk_stays_usable() {
+        // 未启用主动探测的集群:health 恒为空串 → 照常可选(否则会全盘不可用)。
+        let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
+        let usage = BTreeMap::from([((1, "d0".to_string()), free_health(1000, ""))]);
+        let out = select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap();
+        assert_eq!(out[0].node_id, 1, "empty health = probe disabled = usable");
+    }
+
+    #[test]
+    fn healthy_report_keeps_disk_usable() {
+        let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
+        let usage = BTreeMap::from([((1, "d0".to_string()), free_health(1000, "HEALTHY"))]);
+        assert_eq!(select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap().len(), 1);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(200))]
 
-        // 无论输入如何,选出的副本恒:数量=rf、跨不同节点、盘余量≥上界、未将满;且确定。
+        // 无论输入如何,选出的副本恒:数量=rf、跨不同节点、盘余量≥上界、未将满、非不健康;且确定。
         #[test]
         fn placement_invariants(
             n_nodes in 1usize..8,
             rf in 1u8..6,
             frees in prop::collection::vec(0u64..2000, 1..8),
+            unhealthy in prop::collection::hash_set(0usize..8, 0..3),
         ) {
             let mut nodes = BTreeMap::new();
             let mut usage = BTreeMap::new();
+            let mut bad: std::collections::HashSet<u64> = std::collections::HashSet::new();
             for i in 0..n_nodes {
                 let id = i as u64 + 1;
                 let cap = 1000u64;
                 nodes.insert(id, node(&format!("r{i}"), &[("d0", cap)]));
-                let free = frees[i % frees.len()].min(cap);
-                usage.insert((id, "d0".to_string()), DiskFree { free_bytes: free });
+                let free_b = frees[i % frees.len()].min(cap);
+                if unhealthy.contains(&i) {
+                    bad.insert(id);
+                    usage.insert((id, "d0".to_string()), free_health(free_b, "READ_ERROR"));
+                } else {
+                    usage.insert((id, "d0".to_string()), free(free_b));
+                }
             }
             let near_full = 0.95;
             let r1 = select_disks(&nodes, &usage, rf, CAP, near_full);
@@ -241,10 +305,11 @@ mod tests {
                 let mut seen = std::collections::HashSet::new();
                 for p in &placed {
                     prop_assert!(seen.insert(p.node_id), "distinct node per replica");
+                    prop_assert!(!bad.contains(&p.node_id), "never place on an unhealthy disk");
                     let cap = nodes[&p.node_id].disks[&p.disk_id].capacity_bytes;
-                    let free = usage[&(p.node_id, p.disk_id.clone())].free_bytes;
-                    prop_assert!(free >= CAP, "free >= partition cap");
-                    let used = 1.0 - (free as f64 / cap as f64);
+                    let free_b = usage[&(p.node_id, p.disk_id.clone())].free_bytes;
+                    prop_assert!(free_b >= CAP, "free >= partition cap");
+                    let used = 1.0 - (free_b as f64 / cap as f64);
                     prop_assert!(used <= near_full, "not near-full");
                 }
             }

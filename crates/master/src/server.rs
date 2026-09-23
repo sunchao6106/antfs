@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,27 +22,69 @@ use crate::network::GrpcNetworkFactory;
 use crate::pb::master_server::{Master, MasterServer};
 use crate::pb::raft_internal_server::{RaftInternal, RaftInternalServer};
 use crate::pb::{
-    AssignRequest, AssignResponse, ClusterState, ClusterStateRequest, CreatePartitionsRequest,
-    CreatePartitionsResponse, DecommissionRequest, DecommissionResponse, ListNodesRequest,
+    AssignRequest, AssignResponse, BalanceStateRequest, BalanceStateResponse, CancelBalanceRequest,
+    CancelBalanceResponse, ClusterState, ClusterStateRequest, CreatePartitionsRequest,
+    CreatePartitionsResponse, DecommissionRequest, DecommissionResponse, EvalBalanceRequest,
+    EvalBalanceResponse, GetBlobIdsRequest, GetBlobIdsResponse, ListNodesRequest,
     ListPartitionsRequest, ListPartitionsResponse, LookupRequest, MasterDirective, MetricsRequest,
     MetricsResponse, MoveReplicaRequest, MoveReplicaResponse, NodeBeat, NodeEntry, NodeList,
     PartitionEntry, PartitionLocations, RaftMessage, RegisterRequest, RegisterResponse,
     RepairPartitionRequest, RepairPartitionResponse, ReplicaCurrent, ReplicaLoc,
-    SetPartitionStateRequest, SetPartitionStateResponse,
+    SetMaintenanceRequest, SetMaintenanceResponse, SetPartitionStateRequest,
+    SetPartitionStateResponse, StartBalanceRequest, StartBalanceResponse,
 };
+use crate::idalloc::IdAllocator;
 use crate::placement::{select_disks, DiskFree, PlacementError};
-use crate::reconcile::{plan_evacuation, plan_move, plan_rereplication, plan_transitions, EvacAction};
+use crate::reconcile::{
+    drop_confirmed, plan_evacuation, plan_move, plan_rereplication, plan_transitions, EvacAction,
+    SuccessorConfirm,
+};
 use crate::soft::{DiskUsage, SoftState};
 use crate::store::{open, StateMachineData};
 use crate::types::{
-    DiskId, DiskSpec, MasterCommand, NodeId, NodeInfo, PartitionId, PartitionState,
-    ReplicaPlacement, TypeConfig,
+    BalancePlanRecord, BalanceStatus, DiskId, DiskSpec, MasterCommand, MasterState, NodeId,
+    NodeInfo, PartitionId, PartitionState, ReplicaPlacement, TypeConfig,
 };
 
 const PROTO_VERSION: u32 = 1;
 
+/// 删除源副本的指令目标态(A6):源节点收到即删本地副本(含目录)。
+///
+/// proto 不改(`Transition.target_state` 复用新取值);只在三条确认全满足后才下发,见
+/// [`MasterService::heartbeat`] 与 [`drop_confirmed`]。
+const DROPPED: &str = "DROPPED";
+
+/// 选盘输入:软状态(余量 + 盘健康)→ [`DiskFree`] 快照(re-replication / repair / move / 建分区共用)。
+///
+/// 盘健康由此进入放置决策:非空且 ≠ `HEALTHY` 的盘会被 `select_disks` 排除(见其文档)。
+fn placement_usage(soft: &SoftState) -> BTreeMap<(NodeId, DiskId), DiskFree> {
+    soft.usage_snapshot()
+        .into_iter()
+        .map(|(k, u)| (k, DiskFree { free_bytes: u.free_bytes, health: u.health }))
+        .collect()
+}
+
+/// 一块盘的已用比例(`free/capacity`;capacity=0 视为不可判 → `None`)。
+fn used_ratio(u: &DiskUsage) -> Option<f64> {
+    (u.capacity_bytes > 0).then(|| 1.0 - (u.free_bytes as f64 / u.capacity_bytes as f64))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// 轻量伪随机(u64,仅用于"按权重挑分区"这类散列用途,**非安全用途**)。
+///
+/// 不引入 `rand` 依赖:时间 + 自增序号经 splitmix/xorshift 混合 —— 同一毫秒内的连续调用也得到不同值
+/// (序号不同),避免高并发下所有请求都落到同一个分区。
+fn pseudo_random() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut x = now_ms() ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    x ^= x >> 29;
+    x
 }
 
 /// 装配好的 master 节点:持有 Raft 句柄、共享状态机内存态、软状态、指标、配置。
@@ -119,6 +162,7 @@ impl MasterNode {
             metrics: self.metrics.clone(),
             config: self.config.clone(),
             registry: self.registry.clone(),
+            id_alloc: IdAllocator::default(),
         });
 
         tokio::spawn(async move {
@@ -167,7 +211,7 @@ impl MasterNode {
                 if raft.metrics().borrow().current_leader != Some(config.node_id) {
                     continue; // 仅 leader 决策扩容
                 }
-                let (rw, total, rf) = {
+                let (rw, total, rf, maintenance, pause_autogrow) = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => continue,
@@ -178,8 +222,18 @@ impl MasterNode {
                         .values()
                         .filter(|p| p.state == PartitionState::ReadWrite)
                         .count() as u64;
-                    (rw, g.state.partitions.len() as u64, g.state.policy.default_replication_factor)
+                    (
+                        rw,
+                        g.state.partitions.len() as u64,
+                        g.state.policy.default_replication_factor,
+                        g.state.maintenance,
+                        g.state.pause_autogrow,
+                    )
                 };
+                // 维护模式仅在显式要求连带暂停扩容时停(默认 false = 维护不影响扩容)。
+                if maintenance && pause_autogrow {
+                    continue;
+                }
                 let n = crate::autogrow::plan_auto_grow(
                     rw,
                     total,
@@ -214,6 +268,13 @@ impl MasterNode {
             let mut leader_since: Option<Instant> = None;
             let mut last_unsatisfiable: std::collections::BTreeSet<PartitionId> =
                 std::collections::BTreeSet::new();
+            // 均衡执行器的 leader 本地簿记(不进 Raft):在途计时与终态计数都只需 leader 侧口径,
+            // 切主后由新 leader 重建(计时重新起算、已在终态的条目不重复计数)。
+            let mut balance_dispatched_at: HashMap<(u64, PartitionId, NodeId), Instant> =
+                HashMap::new();
+            let mut balance_counted: std::collections::HashSet<(u64, PartitionId, NodeId)> =
+                std::collections::HashSet::new();
+            let mut balance_plan_seen: Option<u64> = None;
             loop {
                 tick.tick().await;
                 if raft.metrics().borrow().current_leader != Some(config.node_id) {
@@ -227,7 +288,7 @@ impl MasterNode {
                     continue;
                 }
                 let up = soft.up_nodes(timeout);
-                let (partitions, all_nodes, decom, moving) = {
+                let (partitions, all_nodes, decom, moving, move_targets, pending_drop, maintenance, balance) = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => continue,
@@ -237,12 +298,92 @@ impl MasterNode {
                         g.state.nodes.clone(),
                         g.state.decommissioning.clone(),
                         g.state.moving.clone(),
+                        g.state.move_targets.clone(),
+                        g.state.pending_drop.clone(),
+                        g.state.maintenance,
+                        g.state.balance.clone(),
                     )
                 };
 
                 // 补副本目标:失联再复制(M3)∪ 下线 evacuation 的"先补"(M4)。动作相同,合并去重。
                 let evac = plan_evacuation(&partitions, &decom, &up);
                 let errored = soft.errored_replicas();
+                let usage = soft.usage_snapshot();
+
+                // 集群级观测 gauge(周期刷新,仅 leader;对齐 under_replicated_partitions 的更新时机)。
+                {
+                    let (mut n_rw, mut n_ro, mut n_sealed, mut n_majority_down) = (0i64, 0i64, 0i64, 0i64);
+                    for (pid, info) in &partitions {
+                        match info.state {
+                            PartitionState::ReadWrite => n_rw += 1,
+                            PartitionState::ReadOnly => n_ro += 1,
+                            PartitionState::Sealed => n_sealed += 1,
+                        }
+                        // Ambry isMajorityReplicasDown:健康副本(存活且未上报 ERROR)≤ RF/2。
+                        let healthy = info
+                            .replicas
+                            .iter()
+                            .filter(|r| up.contains(&r.node_id) && !errored.contains(&(*pid, r.node_id)))
+                            .count();
+                        if healthy * 2 <= info.replication_factor as usize {
+                            n_majority_down += 1;
+                        }
+                    }
+                    metrics.partitions_rw.set(n_rw);
+                    metrics.partitions_ro.set(n_ro);
+                    metrics.partitions_sealed.set(n_sealed);
+                    let writable_capacity = n_rw.saturating_mul(config.partition_capacity_bytes as i64);
+                    metrics.writable_capacity_bytes.set(writable_capacity);
+                    // 可写已用:每分区取各副本 used 最大值后求和(RF 副本不重复计,口径见 soft)。
+                    let used = soft
+                        .sum_used_bytes(
+                            partitions
+                                .iter()
+                                .filter(|(_, p)| p.state == PartitionState::ReadWrite)
+                                .map(|(pid, _)| *pid),
+                        ) as i64;
+                    metrics.writable_used_bytes.set(used);
+                    metrics.writable_free_bytes.set(writable_capacity.saturating_sub(used));
+                    metrics.nodes_up.set(up.len() as i64);
+                    let (capacity, free) = soft.capacity_totals();
+                    metrics.cluster_free_bytes.set(free as i64);
+                    metrics.cluster_used_bytes.set(capacity.saturating_sub(free) as i64);
+                    metrics.max_replica_lag_bytes.set(soft.max_replica_lag_bytes() as i64);
+                    metrics.majority_replicas_down_partitions.set(n_majority_down);
+                    metrics.maintenance.set(i64::from(maintenance));
+                    // A5:主动探测报出不健康的盘数(空串 = 未启用探测,不计)。
+                    let unhealthy = usage
+                        .values()
+                        .filter(|u| !u.health.is_empty() && u.health != "HEALTHY")
+                        .count();
+                    metrics.unhealthy_disks.set(unhealthy as i64);
+                    // A6:待删源副本对数(等源节点确认后下发 DROPPED)。
+                    metrics.pending_drops.set(pending_drop.len() as i64);
+                    // 每盘承载的副本数(hard placement 口径):已注册盘(含 0 副本)∪ placement 涉及的盘。
+                    let mut per_disk: BTreeMap<(NodeId, DiskId), i64> = BTreeMap::new();
+                    for (id, info) in &all_nodes {
+                        for disk_id in info.disks.keys() {
+                            per_disk.insert((*id, disk_id.clone()), 0);
+                        }
+                    }
+                    for info in partitions.values() {
+                        for r in &info.replicas {
+                            *per_disk.entry((r.node_id, r.disk_id.clone())).or_insert(0) += 1;
+                        }
+                    }
+                    for ((node_id, disk_id), n) in &per_disk {
+                        metrics
+                            .replicas_by_disk
+                            .with_label_values(&[&node_id.to_string(), disk_id])
+                            .set(*n);
+                    }
+                    let skew = match (per_disk.values().max(), per_disk.values().min()) {
+                        (Some(max), Some(min)) => max - min,
+                        _ => 0,
+                    };
+                    metrics.disk_skew.set(skew);
+                }
+
                 let mut add_targets: std::collections::BTreeSet<PartitionId> =
                     plan_rereplication(&partitions, &up, &errored).into_iter().collect();
                 for a in &evac {
@@ -251,6 +392,51 @@ impl MasterNode {
                     }
                 }
                 metrics.under_replicated_partitions.set(add_targets.len() as i64);
+
+                // A4 盘将满 → 自动转 RO(**只置不回**,止损)。位置:gauge 刷新**之后**(让本周期观测先
+                // 反映上一轮状态)、维护模式 skip **之前** —— 盘满会立刻挡住写入,这是止损而非"恢复动作",
+                // 维护期也应生效(维护窗口换盘正是要它先兜住)。只在当前为 RW 时写,故天然幂等:转 RO 后
+                // 下个周期不再命中,不会每 tick 空转 raft。空间释放后**不自动恢复 RW**(恢复靠运维
+                // `POST /api/partitions/{id}/state`,避免"抖动即回"把写流量又引回将满的盘)。
+                for (pid, info) in &partitions {
+                    if info.state != PartitionState::ReadWrite {
+                        continue;
+                    }
+                    // 任一副本所在盘用量超阈值即转(取第一个命中的,记日志用)。
+                    let Some((node_id, disk_id, ratio)) = info.replicas.iter().find_map(|r| {
+                        let u = usage.get(&(r.node_id, r.disk_id.clone()))?;
+                        let ratio = used_ratio(u)?;
+                        (ratio > config.disk_near_full_ratio)
+                            .then(|| (r.node_id, r.disk_id.clone(), ratio))
+                    }) else {
+                        continue;
+                    };
+                    if raft
+                        .client_write(MasterCommand::SetPartitionState {
+                            partition_id: *pid,
+                            state: PartitionState::ReadOnly,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        metrics.partitions_forced_ro.inc();
+                        tracing::warn!(
+                            partition = *pid,
+                            node = node_id,
+                            disk = %disk_id,
+                            used_ratio = ratio,
+                            threshold = config.disk_near_full_ratio,
+                            "磁盘将满:分区自动转只读(只置不回,恢复请走 SetPartitionState)"
+                        );
+                    }
+                }
+
+                // 维护模式(对标 Ceph noout/norecover):观测(上面的 gauge/欠副本数)照常刷新,但
+                // **不执行自动动作**——再复制 / 迁移后删 / 下线 evacuation 全部跳过;心跳里的
+                // plan_transitions 下发保持运行(否则 move 的新副本永不落地)。手动 ops 走 RPC,不受影响。
+                if maintenance {
+                    continue;
+                }
                 let mut unsatisfiable: std::collections::BTreeSet<PartitionId> =
                     std::collections::BTreeSet::new();
                 for pid in add_targets {
@@ -293,14 +479,235 @@ impl MasterNode {
                     }
                 }
 
-                // 副本迁移(MoveReplica)的"后删":新副本补上且健康副本(不含迁出源)≥ RF 才移除迁出源。
-                for (pid, node) in plan_move(&partitions, &moving, &up) {
+                // 副本迁移(MoveReplica)的"后删":新副本补上、继任者已 ACTIVE、且非迁出源的存活副本
+                // 数 ≥ RF,才移除迁出源(真正的"先补后删",见 `plan_move`)。
+                let active = soft.active_replicas();
+                let successor_active: std::collections::HashSet<(PartitionId, NodeId)> = moving
+                    .iter()
+                    .filter(|(pid, from)| {
+                        move_targets
+                            .get(pid)
+                            .and_then(|m| m.get(from))
+                            .is_some_and(|to| active.contains(&(*pid, *to)))
+                    })
+                    .copied()
+                    .collect();
+                for (pid, node) in plan_move(&partitions, &moving, &up, &successor_active) {
                     if raft
                         .client_write(MasterCommand::RemoveReplica { partition_id: pid, node_id: node })
                         .await
                         .is_ok()
                     {
                         metrics.replicas_moved.inc();
+                    }
+                }
+
+                // A6 记账清理:源节点**已不再上报**该 pid(= 盘上已删/已不再持有)→ 清 `pending_drop`
+                // 与 `move_targets`。判据:节点存活且软状态显示它不再持有(心跳是全量上报,缺项即"没有");
+                // **仍在上报时绝不清**,否则会丢掉对源的删除催促。与其它自动动作同在维护 skip 之后。
+                for (pid, node) in pending_drop {
+                    if !up.contains(&node) || soft.holds(pid, node) {
+                        continue;
+                    }
+                    if raft
+                        .client_write(MasterCommand::ConfirmDrop { partition_id: pid, node_id: node })
+                        .await
+                        .is_err()
+                    {
+                        break; // 提交失败(切主等):下个周期重来,不刷日志
+                    }
+                }
+
+                // ---- 计划式均衡执行器(§7.3;维护模式 skip 之后,与其它自动动作并列)----
+                // 计划是 hard state(可跨切主存活);这里只推进 status==RUNNING 的计划。
+                // Cancel/替换旧计划后:状态不匹配 → 本块不再碰它;在途 move 的 moving 记账仍由上面的
+                // `plan_move` 后删自然收敛(**不回滚**,注释见 `SetBalancePlan`)。
+                {
+                    // 计划切换(含被清)→ 重置 leader 本地簿记,旧计划的 move 绝不再推进。
+                    let cur_id = balance.as_ref().map(|p| p.plan_id);
+                    if cur_id != balance_plan_seen {
+                        balance_plan_seen = cur_id;
+                        balance_dispatched_at.clear();
+                        balance_counted.clear();
+                        // 预填终态条目:切主/换计划时已在终态的 move 不重复计数(老 leader 已计过)。
+                        if let Some(p) = &balance {
+                            for m in &p.moves {
+                                let (phase, _) =
+                                    crate::balance::move_phase(p, m, &partitions, &moving);
+                                if matches!(phase, crate::balance::MovePhase::Done | crate::balance::MovePhase::Failed) {
+                                    balance_counted.insert((p.plan_id, m.partition_id, m.from_node_id));
+                                }
+                            }
+                        }
+                    }
+                    // gauge:任何在册计划都刷新(无计划 = 0)。
+                    match &balance {
+                        Some(plan) => {
+                            let phases: Vec<crate::balance::MovePhase> = plan
+                                .moves
+                                .iter()
+                                .map(|m| crate::balance::move_phase(plan, m, &partitions, &moving).0)
+                                .collect();
+                            let count = |want: crate::balance::MovePhase| {
+                                phases.iter().filter(|p| **p == want).count()
+                            };
+                            let (n_pending, n_in_flight) =
+                                (count(crate::balance::MovePhase::Pending), count(crate::balance::MovePhase::InFlight));
+                            metrics.balance_pending.set(n_pending as i64);
+                            metrics.balance_in_flight.set(n_in_flight as i64);
+                            // 终态计数(每条只计一次;counter 口径见 metrics.rs)。
+                            for (m, phase) in plan.moves.iter().zip(&phases) {
+                                let key = (plan.plan_id, m.partition_id, m.from_node_id);
+                                if balance_counted.contains(&key) {
+                                    continue;
+                                }
+                                match phase {
+                                    crate::balance::MovePhase::Done => {
+                                        balance_counted.insert(key);
+                                        metrics.balance_moves.inc();
+                                    }
+                                    crate::balance::MovePhase::Failed => {
+                                        balance_counted.insert(key);
+                                        metrics.balance_failed.inc();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if plan.status != BalanceStatus::Running {
+                                continue; // PREVIEW 待确认 / DONE 已收官:不推进
+                            }
+                            // 全部 move 进入终态 → 收官 DONE(apply 幂等;下周期 status!=RUNNING 不再写)。
+                            if phases.iter().all(|p| {
+                                matches!(p, crate::balance::MovePhase::Done | crate::balance::MovePhase::Failed)
+                            }) {
+                                let _ = raft
+                                    .client_write(MasterCommand::SetBalanceStatus {
+                                        plan_id: plan.plan_id,
+                                        status: BalanceStatus::Done,
+                                    })
+                                    .await;
+                                continue;
+                            }
+                            // stuck 判据:在途超过 balance_move_timeout_secs 仍未摘源 → 判败释放预算,
+                            // 不再重试该条(同一落点重试大概率再卡;重搬由运维重新 eval 决策)。
+                            for (m, phase) in plan.moves.iter().zip(&phases) {
+                                let key = (plan.plan_id, m.partition_id, m.from_node_id);
+                                if *phase == crate::balance::MovePhase::InFlight {
+                                    let since = balance_dispatched_at.entry(key).or_insert_with(Instant::now);
+                                    if since.elapsed() >= Duration::from_secs(config.balance_move_timeout_secs)
+                                        && raft
+                                            .client_write(MasterCommand::FailBalanceMove {
+                                                plan_id: plan.plan_id,
+                                                partition_id: m.partition_id,
+                                                from_node_id: m.from_node_id,
+                                                error: format!(
+                                                    "in-flight move stuck for over {}s",
+                                                    config.balance_move_timeout_secs
+                                                ),
+                                            })
+                                            .await
+                                            .is_ok()
+                                    {
+                                        balance_dispatched_at.remove(&key);
+                                    }
+                                } else {
+                                    balance_dispatched_at.remove(&key); // 非在途:计时无意义
+                                }
+                            }
+                            // 并发预算 = max_in_flight − 在途数(在途口径:派生为 InFlight 的本计划 move)。
+                            let mut budget =
+                                (plan.max_in_flight as usize).saturating_sub(n_in_flight);
+                            if budget == 0 {
+                                continue;
+                            }
+                            for (m, phase) in plan.moves.iter().zip(&phases) {
+                                if budget == 0 {
+                                    break;
+                                }
+                                if *phase != crate::balance::MovePhase::Pending {
+                                    continue;
+                                }
+                                let Some(part) = partitions.get(&m.partition_id) else { continue };
+                                // 执行前再校验(计划是评估时快照,执行期集群可能已变):
+                                let fail_reason = if !part.replicas.iter().any(|r| r.node_id == m.from_node_id) {
+                                    Some("source no longer holds the replica".to_string())
+                                } else if !up.contains(&m.to_node_id) || decom.contains(&m.to_node_id) {
+                                    Some(format!("target node {} not up/decommissioning", m.to_node_id))
+                                } else {
+                                    None
+                                };
+                                // 幂等陷阱:目标已持有该副本 = 上次已投递受理(apply 只在目标不存在时
+                                // 才追加+记 moving)→ **不当失败重投**,等 plan_move 摘源即可。
+                                let target_holds =
+                                    part.replicas.iter().any(|r| r.node_id == m.to_node_id);
+                                if fail_reason.is_none() && !target_holds && !moving.contains(&(m.partition_id, m.from_node_id)) {
+                                    // 目标盘再校验/重选:评估时选的盘此刻可能已不可用(将满/坏盘)。
+                                    let picked = match all_nodes.get(&m.to_node_id) {
+                                        Some(info) => {
+                                            let candidates =
+                                                BTreeMap::from([(m.to_node_id, info.clone())]);
+                                            select_disks(
+                                                &candidates,
+                                                &placement_usage(&soft),
+                                                1,
+                                                config.partition_capacity_bytes,
+                                                config.disk_near_full_ratio,
+                                            )
+                                            .ok()
+                                            .map(|mut reps| reps.remove(0))
+                                        }
+                                        None => None,
+                                    };
+                                    match picked {
+                                        Some(replica) => {
+                                            if raft
+                                                .client_write(MasterCommand::MoveReplica {
+                                                    partition_id: m.partition_id,
+                                                    from_node_id: m.from_node_id,
+                                                    replica,
+                                                })
+                                                .await
+                                                .is_ok()
+                                            {
+                                                balance_dispatched_at.insert(
+                                                    (plan.plan_id, m.partition_id, m.from_node_id),
+                                                    Instant::now(),
+                                                );
+                                                budget -= 1;
+                                            }
+                                        }
+                                        None => {
+                                            let _ = raft
+                                                .client_write(MasterCommand::FailBalanceMove {
+                                                    plan_id: plan.plan_id,
+                                                    partition_id: m.partition_id,
+                                                    from_node_id: m.from_node_id,
+                                                    error: format!(
+                                                        "target node {} has no eligible disk at execution time",
+                                                        m.to_node_id
+                                                    ),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                } else if let Some(reason) = fail_reason {
+                                    // 落点已失效(目标 down/下线/源已不在)→ 判败,不再重试。
+                                    let _ = raft
+                                        .client_write(MasterCommand::FailBalanceMove {
+                                            plan_id: plan.plan_id,
+                                            partition_id: m.partition_id,
+                                            from_node_id: m.from_node_id,
+                                            error: reason,
+                                        })
+                                        .await;
+                                }
+                                // target_holds / moving 已含该 (pid,from):已受理,不占预算投递,等摘源。
+                            }
+                        }
+                        None => {
+                            metrics.balance_pending.set(0);
+                            metrics.balance_in_flight.set(0);
+                        }
                     }
                 }
             }
@@ -321,19 +728,63 @@ fn pick_replica_disk(
         .filter(|(id, _)| !exclude.contains(id) && up.contains(id))
         .map(|(id, info)| (*id, info.clone()))
         .collect();
-    let usage = soft
-        .free_snapshot()
-        .into_iter()
-        .map(|(k, free_bytes)| (k, DiskFree { free_bytes }))
-        .collect();
     let mut reps = select_disks(
         &candidates,
-        &usage,
+        &placement_usage(soft),
         1,
         config.partition_capacity_bytes,
         config.disk_near_full_ratio,
     )?;
     Ok(reps.remove(0))
+}
+
+/// (A6) 算出该节点本轮该下发的 `DROPPED` 指令:遍历 `pending_drop`,**三条确认全满足**才发。
+///
+/// 1. hard placement 已不含该 `(pid, node)`(reconciler 的 `RemoveReplica` 已提交);
+/// 2. 继任者确认([`drop_confirmed`]):有 move 记账时要求其目标节点已上报 `ACTIVE`(= 追平,转移成功);
+///    无记账(evacuation 的"后删")退化为"其余副本数 ≥ RF 且无 ERROR";
+/// 3. 源节点存活(正在心跳)**且仍上报该 pid** —— 否则无需删(记账清理由 reconciler 的 `ConfirmDrop` 负责)。
+///
+/// **安全不变量**:全仓只有 reconciler 写 `RemoveReplica`,没有运维 RPC 能直接移除副本,故
+/// "placement 已移除 + 继任者已 ACTIVE + 源仍持有"三条齐了才删 = 安全下界(最坏也只是源上多留一份数据)。
+/// 每轮心跳重发直到 store 不再上报该 pid(幂等)。
+fn plan_drops(
+    soft: &SoftState,
+    state: &MasterState,
+    node_id: NodeId,
+    reported: &BTreeMap<PartitionId, String>,
+) -> Vec<crate::pb::Transition> {
+    let mine: Vec<(PartitionId, NodeId)> = state
+        .pending_drop
+        .iter()
+        .copied()
+        .filter(|(pid, node)| *node == node_id && reported.contains_key(pid))
+        .collect();
+    if mine.is_empty() {
+        return Vec::new(); // 常态:该节点没有待删项 → 不碰软状态
+    }
+    let active = soft.active_replicas();
+    let errored = soft.errored_replicas();
+    let mut out = Vec::new();
+    for (pid, node) in mine {
+        let Some(info) = state.partitions.get(&pid) else { continue };
+        let successor = match state.move_target_of(pid, node) {
+            Some(target) if active.contains(&(pid, target)) => SuccessorConfirm::Active,
+            Some(_) => SuccessorConfirm::NotYetActive,
+            None => SuccessorConfirm::Unrecorded,
+        };
+        if !drop_confirmed(pid, info, node, successor, &errored) {
+            continue;
+        }
+        // disk_id 从软状态取该副本所在盘;拿不到落点就不发(宁可留一份数据,不猜是哪块盘)。
+        let Some(st) = soft.replica_state(pid, node) else { continue };
+        out.push(crate::pb::Transition {
+            partition_id: pid,
+            disk_id: st.disk_id,
+            target_state: DROPPED.to_string(),
+        });
+    }
+    out
 }
 
 /// 在一个健康、非排除的节点上给分区补一个副本(re-replication / evacuation / repair 共用)。
@@ -383,13 +834,14 @@ fn has_spare_disk(
         .filter(|(id, _)| !exclude.contains(id) && up.contains(id))
         .map(|(id, info)| (*id, info.clone()))
         .collect();
-    let usage = soft
-        .free_snapshot()
-        .into_iter()
-        .map(|(k, free_bytes)| (k, DiskFree { free_bytes }))
-        .collect();
-    select_disks(&candidates, &usage, 1, config.partition_capacity_bytes, config.disk_near_full_ratio)
-        .is_ok()
+    select_disks(
+        &candidates,
+        &placement_usage(soft),
+        1,
+        config.partition_capacity_bytes,
+        config.disk_near_full_ratio,
+    )
+    .is_ok()
 }
 
 fn enc<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, Status> {
@@ -442,6 +894,8 @@ struct MasterService {
     metrics: MasterMetrics,
     config: MasterConfig,
     registry: antfs_metric::Registry,
+    /// objectId 号段发号器(leader 内存池 + Raft 水位;见 [`crate::idalloc`])。
+    id_alloc: IdAllocator,
 }
 
 impl MasterService {
@@ -462,6 +916,80 @@ impl MasterService {
         let addrs: BTreeMap<u64, String> =
             m.membership_config.nodes().map(|(id, n)| (*id, n.addr.clone())).collect();
         addrs.get(&leader).cloned()
+    }
+
+    /// 发号失败响应:统一 `ok=false` + 失败计数 + 回填 leader 地址(写路径,非 leader 时 client 据此重定向)。
+    fn blob_ids_fail(&self, error: impl Into<String>) -> GetBlobIdsResponse {
+        self.metrics.blob_ids_failures.inc();
+        GetBlobIdsResponse {
+            version: PROTO_VERSION,
+            ok: false,
+            leader_addr: self.leader_addr().unwrap_or_default(),
+            error: error.into(),
+            partition_id: 0,
+            start_object_id: 0,
+            count: 0,
+            replicas: Vec::new(),
+        }
+    }
+
+    /// 按**剩余容量加权**随机挑一个可写(RW)分区(blobid-master-assign D10:写路由由 master 选,
+    /// 换来全局容量感知均衡 + 不撞陈旧的满/RO 分区 + 薄 client)。
+    ///
+    /// - 权重 = `partition_capacity_bytes − used_bytes[pid]`,下界 1(留一丝机会,不让"上报为满"的分区
+    ///   被永久饿死)。`used_bytes` 取自心跳软状态,缺上报按 0 计(即视为"还没写过")。
+    /// - 候选**优先**取「至少一个副本所在节点存活」的分区;若一个都没有(典型是 master 刚重启、
+    ///   软状态还没被心跳重建),退回全部 RW 分区 —— 否则会出现"心跳空窗期完全不可写"的假故障。
+    /// - 随机只在 leader 侧发生(不进 `apply`,守状态机确定性铁律)。
+    fn pick_writable_partition(
+        &self,
+        g: &StateMachineData,
+        used: &BTreeMap<PartitionId, u64>,
+        timeout: Duration,
+    ) -> Option<PartitionId> {
+        let cap = self.config.partition_capacity_bytes;
+        let weight =
+            |pid: PartitionId| cap.saturating_sub(used.get(&pid).copied().unwrap_or(0)).max(1);
+
+        let mut cands: Vec<PartitionId> = g
+            .state
+            .partitions
+            .iter()
+            .filter(|(_, p)| p.state == PartitionState::ReadWrite)
+            // 没有副本的分区写不进去(避让:迁移/下线过程中可能出现瞬时 0 副本),
+            // 挑了它只会让 client 拿到一个必然失败的号段。
+            .filter(|(_, p)| !p.replicas.is_empty())
+            .map(|(pid, _)| *pid)
+            .collect();
+        if cands.is_empty() {
+            return None;
+        }
+        let live: Vec<PartitionId> = cands
+            .iter()
+            .copied()
+            .filter(|pid| {
+                g.state.partitions[pid]
+                    .replicas
+                    .iter()
+                    .any(|r| self.soft.is_up(r.node_id, timeout))
+            })
+            .collect();
+        if !live.is_empty() {
+            cands = live;
+        }
+        // 稳定顺序:权重相同时结果可复现,便于测试与排障(随机只体现在落点上)。
+        cands.sort_unstable();
+
+        let total: u64 = cands.iter().map(|pid| weight(*pid)).sum();
+        let mut point = pseudo_random() % total;
+        for pid in &cands {
+            let w = weight(*pid);
+            if point < w {
+                return Some(*pid);
+            }
+            point -= w;
+        }
+        cands.last().copied()
     }
 }
 
@@ -539,7 +1067,11 @@ impl Master for MasterService {
                 let disks: HashMap<String, DiskUsage> = beat
                     .disks
                     .into_iter()
-                    .map(|d| (d.disk_id, DiskUsage { capacity_bytes: d.capacity_bytes, free_bytes: d.free_bytes }))
+                    .map(|d| (d.disk_id, DiskUsage {
+                        capacity_bytes: d.capacity_bytes,
+                        free_bytes: d.free_bytes,
+                        health: d.health,
+                    }))
                     .collect();
                 soft.record_beat(beat.node_id, disks);
 
@@ -549,25 +1081,38 @@ impl Master for MasterService {
                 soft.record_replicas(
                     beat.node_id,
                     beat.replicas.into_iter().map(|r| {
-                        (r.partition_id, crate::soft::ReplicaState { current_state: r.current_state, lag_bytes: r.lag_bytes })
+                        (r.partition_id, crate::soft::ReplicaState {
+                            disk_id: r.disk_id,
+                            current_state: r.current_state,
+                            lag_bytes: r.lag_bytes,
+                            used_bytes: r.used_bytes,
+                        })
                     }),
+                    beat.full_report,
                 );
                 let transitions: Vec<crate::pb::Transition> = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => break,
                     };
-                    plan_transitions(beat.node_id, &g.state.partitions, &reported)
-                        .into_iter()
-                        .map(|t| crate::pb::Transition {
-                            partition_id: t.partition_id,
-                            disk_id: t.disk_id,
-                            target_state: t.target_state,
-                        })
-                        .collect()
+                    let mut out: Vec<crate::pb::Transition> =
+                        plan_transitions(beat.node_id, &g.state.partitions, &reported)
+                            .into_iter()
+                            .map(|t| crate::pb::Transition {
+                                partition_id: t.partition_id,
+                                disk_id: t.disk_id,
+                                target_state: t.target_state,
+                            })
+                            .collect();
+                    out.extend(plan_drops(&soft, &g.state, beat.node_id, &reported));
+                    out
                 };
                 if !transitions.is_empty() {
                     metrics.transitions_issued.inc_by(transitions.len() as u64);
+                }
+                let dropped = transitions.iter().filter(|t| t.target_state == DROPPED).count();
+                if dropped > 0 {
+                    metrics.dropped_directives.inc_by(dropped as u64);
                 }
                 if tx
                     .send(Ok(MasterDirective { version: PROTO_VERSION, transitions, tasks: vec![] }))
@@ -601,7 +1146,8 @@ impl Master for MasterService {
                         disk_id: disk_id.clone(),
                         capacity_bytes: spec.capacity_bytes,
                         free_bytes: usage.get(disk_id).map(|u| u.free_bytes).unwrap_or(0),
-                        health: String::new(),
+                        // 主动探测结果回填(空 = 尚未探测/未启用):admin 节点页据此显示健康徽标。
+                        health: usage.get(disk_id).map(|u| u.health.clone()).unwrap_or_default(),
                     })
                     .collect();
                 NodeEntry {
@@ -630,6 +1176,8 @@ impl Master for MasterService {
             term: m.current_term,
             registered_nodes: g.state.nodes.len() as u64,
             next_partition_id: g.state.next_partition_id,
+            maintenance: g.state.maintenance,
+            pause_autogrow: g.state.pause_autogrow,
         }))
     }
 
@@ -694,6 +1242,7 @@ impl Master for MasterService {
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<PartitionLocations>, Status> {
+        self.metrics.lookup_requests.inc();
         let pid = request.into_inner().partition_id;
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
@@ -726,9 +1275,23 @@ impl Master for MasterService {
         request: Request<ListPartitionsRequest>,
     ) -> Result<Response<ListPartitionsResponse>, Status> {
         let req = request.into_inner();
+        // 状态过滤(空 = 全部)。边界校验:非法状态串直接拒(admin 传错时不静默当"全部")。
+        let want = match req.state.as_str() {
+            "" => None,
+            "RW" => Some(PartitionState::ReadWrite),
+            "RO" => Some(PartitionState::ReadOnly),
+            "SEALED" => Some(PartitionState::Sealed),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "invalid state {other} (want RW/RO/SEALED)"
+                )))
+            }
+        };
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
-        let total = g.state.partitions.len() as u64;
+        let keep = |p: &crate::types::PartitionInfo| want.is_none_or(|s| p.state == s);
+        // 过滤先于分页:`total` 是过滤后的总数,offset/limit 作用在过滤后的集合上。
+        let total = g.state.partitions.values().filter(|p| keep(p)).count() as u64;
         let up_set = self.soft.up_nodes(timeout);
         // BTreeMap 按 partition_id 升序,offset/limit 稳定切片(limit=0 表示不限)。
         let take = if req.limit == 0 { usize::MAX } else { req.limit as usize };
@@ -736,6 +1299,7 @@ impl Master for MasterService {
             .state
             .partitions
             .iter()
+            .filter(|(_, part)| keep(part))
             .skip(req.offset as usize)
             .take(take)
             .map(|(pid, part)| {
@@ -758,6 +1322,7 @@ impl Master for MasterService {
                             node_id: r.node_id,
                             current_state: st.current_state,
                             lag_bytes: st.lag_bytes,
+                            used_bytes: st.used_bytes,
                         })
                     })
                     .collect();
@@ -857,12 +1422,69 @@ impl Master for MasterService {
         }
     }
 
+    async fn set_maintenance(
+        &self,
+        request: Request<SetMaintenanceRequest>,
+    ) -> Result<Response<SetMaintenanceResponse>, Status> {
+        let req = request.into_inner();
+        self.check_secret(&req.cluster_secret)?;
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return Ok(Response::new(SetMaintenanceResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                leader_addr: self.leader_addr().unwrap_or_default(),
+                error: "not leader".to_string(),
+            }));
+        }
+        // 时间戳在 leader 侧取,作为提案数据进 Raft(apply 不取 now,确定性铁律见 types.rs 头)。
+        let set_at_ms = now_ms();
+        match self
+            .raft
+            .client_write(MasterCommand::SetMaintenance {
+                paused: req.paused,
+                pause_autogrow: req.pause_autogrow,
+                set_at_ms,
+            })
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    paused = req.paused,
+                    pause_autogrow = req.pause_autogrow,
+                    set_at_ms,
+                    "maintenance mode updated"
+                );
+                // ok=true ⟺ 已提交的 `ClusterState.maintenance` == req.paused(apply 为纯赋值)。
+                Ok(Response::new(SetMaintenanceResponse {
+                    version: PROTO_VERSION,
+                    ok: true,
+                    leader_addr: String::new(),
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(SetMaintenanceResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                leader_addr: self.leader_addr().unwrap_or_default(),
+                error: format!("{e}"),
+            })),
+        }
+    }
+
     async fn assign_partition(
         &self,
         _request: Request<AssignRequest>,
     ) -> Result<Response<AssignResponse>, Status> {
+        self.metrics.assign_requests.inc();
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
-        let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+        let g = match self.sm_data.read() {
+            Ok(g) => g,
+            Err(_) => {
+                self.metrics.assign_failures.inc();
+                return Err(Status::internal("sm lock poisoned"));
+            }
+        };
         let writable = g
             .state
             .partitions
@@ -894,13 +1516,117 @@ impl Master for MasterService {
                     error: String::new(),
                 }))
             }
-            None => Ok(Response::new(AssignResponse {
-                version: PROTO_VERSION,
-                ok: false,
-                partition_id: 0,
-                replicas: vec![],
-                error: "no writable partition".to_string(),
-            })),
+            None => {
+                self.metrics.assign_failures.inc();
+                Ok(Response::new(AssignResponse {
+                    version: PROTO_VERSION,
+                    ok: false,
+                    partition_id: 0,
+                    replicas: vec![],
+                    error: "no writable partition".to_string(),
+                }))
+            }
+        }
+    }
+
+    /// 发号:client/网关写路径的入口(blobid-master-assign)。
+    ///
+    /// leader-only + 需准入密钥(写路径,要经 Raft 抬水位)。返回**可写分区 + objectId 号段 + 副本位置**,
+    /// client 据此拼 `blobId = partitionId << 32 | objectId` 并直连副本写。
+    async fn get_blob_ids(
+        &self,
+        request: Request<GetBlobIdsRequest>,
+    ) -> Result<Response<GetBlobIdsResponse>, Status> {
+        let req = request.into_inner();
+        self.metrics.blob_ids_requests.inc();
+        self.check_secret(&req.cluster_secret)?;
+
+        // count = 0 → 用 master 默认号段大小(薄 client:默认值由服务端定)。
+        let count = if req.count == 0 { self.config.id_alloc_segment_size } else { req.count };
+        if count == 0 {
+            return Ok(Response::new(self.blob_ids_fail("id_alloc_segment_size must be > 0")));
+        }
+
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return Ok(Response::new(self.blob_ids_fail("not leader")));
+        }
+
+        // 选分区 + 取副本位置。**读锁必须在 await 前释放**(std guard 非 Send,跨 await 会让
+        // 该 handler 的 future 不再是 Send),故这里用一个显式作用域把它圈住。
+        let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+        let (pid, replicas) = {
+            let g = match self.sm_data.read() {
+                Ok(g) => g,
+                Err(_) => return Err(Status::internal("sm lock poisoned")),
+            };
+            let pid = match req.partition_id {
+                Some(p) => match g.state.partitions.get(&p) {
+                    Some(part) if part.state != PartitionState::ReadWrite => {
+                        let state = pstate(part.state).to_string();
+                        return Ok(Response::new(
+                            self.blob_ids_fail(format!("partition {p} is not writable (state {state})")),
+                        ));
+                    }
+                    // 显式点名一个没有副本的分区:号段发得出来也写不进去,直接拒(与自动挑选同一判据)。
+                    Some(part) if part.replicas.is_empty() => {
+                        return Ok(Response::new(
+                            self.blob_ids_fail(format!("partition {p} has no replica")),
+                        ))
+                    }
+                    Some(_) => p,
+                    None => {
+                        return Ok(Response::new(
+                            self.blob_ids_fail(format!("unknown partition {p}")),
+                        ))
+                    }
+                },
+                None => match self.pick_writable_partition(&g, &self.soft.used_bytes_by_partition(), timeout) {
+                    Some(p) => p,
+                    None => return Ok(Response::new(self.blob_ids_fail("no writable partition"))),
+                },
+            };
+            let replicas = g
+                .state
+                .partitions
+                .get(&pid)
+                .map(|p| {
+                    p.replicas
+                        .iter()
+                        .map(|r| ReplicaLoc {
+                            node_id: r.node_id,
+                            addr: g
+                                .state
+                                .nodes
+                                .get(&r.node_id)
+                                .map(|n| n.addr.clone())
+                                .unwrap_or_default(),
+                            disk_id: r.disk_id.clone(),
+                            target_state: r.target_state.clone(),
+                            up: self.soft.is_up(r.node_id, timeout),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (pid, replicas)
+        };
+
+        // 发号:池内直接取;不够则先经 Raft 抬水位(失败 → ok=false,err 说明原因)。
+        match self.id_alloc.allocate(&self.raft, pid, count, &self.config, &self.metrics).await {
+            Ok((start, n)) => {
+                self.metrics.blob_ids_allocated.inc_by(n as u64);
+                Ok(Response::new(GetBlobIdsResponse {
+                    version: PROTO_VERSION,
+                    ok: true,
+                    leader_addr: String::new(),
+                    error: String::new(),
+                    partition_id: pid,
+                    start_object_id: start as u64,
+                    count: n,
+                    replicas,
+                }))
+            }
+            Err(e) => Ok(Response::new(self.blob_ids_fail(e.to_string()))),
         }
     }
 
@@ -1121,15 +1847,9 @@ impl Master for MasterService {
             };
             // 选盘限定在该节点。
             let candidates = BTreeMap::from([(req.to_node_id, info.clone())]);
-            let usage = self
-                .soft
-                .free_snapshot()
-                .into_iter()
-                .map(|(k, free_bytes)| (k, DiskFree { free_bytes }))
-                .collect();
             match select_disks(
                 &candidates,
-                &usage,
+                &placement_usage(&self.soft),
                 1,
                 self.config.partition_capacity_bytes,
                 self.config.disk_near_full_ratio,
@@ -1165,6 +1885,184 @@ impl Master for MasterService {
             Err(e) => fail(format!("{e}")),
         }
     }
+
+    /// EvalBalance:leader 侧算计划(读软状态,非确定)→ `SetBalancePlan` 落 Raft(status PREVIEW)。
+    /// 新评估**整体替换**旧计划(无论其状态);无搬迁需求也返回 ok=true + 空 moves。
+    async fn eval_balance(
+        &self,
+        request: Request<EvalBalanceRequest>,
+    ) -> Result<Response<EvalBalanceResponse>, Status> {
+        let req = request.into_inner();
+        self.check_secret(&req.cluster_secret)?;
+        let fail = |svc: &MasterService, error: String| {
+            Ok(Response::new(EvalBalanceResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                leader_addr: svc.leader_addr().unwrap_or_default(),
+                error,
+                plan: None,
+            }))
+        };
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return fail(self, "not leader".to_string());
+        }
+
+        let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+        let up = self.soft.up_nodes(timeout);
+        let usage = self.soft.usage_snapshot();
+        let used = self.soft.used_bytes_by_partition();
+        let (nodes, partitions, moving, decom, prev_plan_id) = {
+            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            (
+                g.state.nodes.clone(),
+                g.state.partitions.clone(),
+                g.state.moving.clone(),
+                g.state.decommissioning.clone(),
+                g.state.balance.as_ref().map(|p| p.plan_id).unwrap_or(0),
+            )
+        };
+        let max_moves = if req.max_moves == 0 { self.config.balance_max_moves } else { req.max_moves };
+        let moves = crate::balance::plan_balance(&crate::balance::BalanceInputs {
+            partitions: &partitions,
+            nodes: &nodes,
+            usage: &usage,
+            used_bytes: &used,
+            moving: &moving,
+            decommissioning: &decom,
+            up: &up,
+            max_moves,
+            skew_threshold: self.config.balance_skew_threshold,
+            partition_capacity_bytes: self.config.partition_capacity_bytes,
+            near_full_ratio: self.config.disk_near_full_ratio,
+        });
+        let record = BalancePlanRecord {
+            // plan_id 单调:旧计划 id + 1(读自已提交状态,切主后不回头;时间戳同理由提案带入)。
+            plan_id: prev_plan_id + 1,
+            status: BalanceStatus::Preview,
+            created_at_ms: now_ms(),
+            max_in_flight: self.config.balance_max_in_flight,
+            moves,
+            failed: Vec::new(),
+        };
+        match self
+            .raft
+            .client_write(MasterCommand::SetBalancePlan { plan: Some(record.clone()) })
+            .await
+        {
+            Ok(_) => {
+                // 新计划全部 move 处于 pending(派生口径),直接构造视图返回。
+                let plan = crate::balance::plan_view(&record, &partitions, &moving);
+                tracing::info!(
+                    plan_id = record.plan_id,
+                    moves = plan.total,
+                    "balance plan evaluated (PREVIEW)"
+                );
+                Ok(Response::new(EvalBalanceResponse {
+                    version: PROTO_VERSION,
+                    ok: true,
+                    leader_addr: String::new(),
+                    error: String::new(),
+                    plan: Some(plan),
+                }))
+            }
+            Err(e) => fail(self, format!("{e}")),
+        }
+    }
+
+    /// StartBalance:确认当前 PREVIEW 计划 → RUNNING(reconciler 执行器随后按并发上限推进)。
+    async fn start_balance(
+        &self,
+        request: Request<StartBalanceRequest>,
+    ) -> Result<Response<StartBalanceResponse>, Status> {
+        let req = request.into_inner();
+        self.check_secret(&req.cluster_secret)?;
+        let resp = |ok: bool, leader_addr: String, error: String| {
+            Ok(Response::new(StartBalanceResponse { version: PROTO_VERSION, ok, leader_addr, error }))
+        };
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return resp(false, self.leader_addr().unwrap_or_default(), "not leader".to_string());
+        }
+        {
+            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            let cur = g.state.balance.as_ref();
+            // 必须是当前计划且处于 PREVIEW:plan_id 不匹配 = 陈旧确认(计划已被替换/取消)。
+            match cur {
+                Some(p) if p.plan_id == req.plan_id && p.status == BalanceStatus::Preview => {}
+                Some(p) if p.plan_id == req.plan_id => {
+                    return resp(
+                        false,
+                        String::new(),
+                        format!("plan {} is not preview (status {:?})", req.plan_id, p.status),
+                    );
+                }
+                _ => return resp(false, String::new(), format!("plan {} not found", req.plan_id)),
+            }
+        }
+        match self
+            .raft
+            .client_write(MasterCommand::SetBalanceStatus {
+                plan_id: req.plan_id,
+                status: BalanceStatus::Running,
+            })
+            .await
+        {
+            Ok(_) => resp(true, String::new(), String::new()),
+            Err(e) => resp(false, self.leader_addr().unwrap_or_default(), format!("{e}")),
+        }
+    }
+
+    /// CancelBalance:清掉当前计划(`SetBalancePlan{None}`)。**不回滚**已受理的 move:
+    /// 在途迁移的 `moving` 记账仍在,由 reconciler 既有的"后删 + DROPPED + 记账清理"自然收敛
+    /// (等价于一次手动 MoveReplica 走到完,守 §3.1 先补后删)。
+    async fn cancel_balance(
+        &self,
+        request: Request<CancelBalanceRequest>,
+    ) -> Result<Response<CancelBalanceResponse>, Status> {
+        let req = request.into_inner();
+        self.check_secret(&req.cluster_secret)?;
+        let resp = |ok: bool, leader_addr: String, error: String| {
+            Ok(Response::new(CancelBalanceResponse { version: PROTO_VERSION, ok, leader_addr, error }))
+        };
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return resp(false, self.leader_addr().unwrap_or_default(), "not leader".to_string());
+        }
+        {
+            let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+            match g.state.balance.as_ref() {
+                Some(p) if p.plan_id == req.plan_id => {}
+                _ => return resp(false, String::new(), format!("plan {} not found", req.plan_id)),
+            }
+        }
+        match self.raft.client_write(MasterCommand::SetBalancePlan { plan: None }).await {
+            Ok(_) => {
+                tracing::info!(plan_id = req.plan_id, "balance plan cancelled (in-flight moves converge naturally)");
+                resp(true, String::new(), String::new())
+            }
+            Err(e) => resp(false, self.leader_addr().unwrap_or_default(), format!("{e}")),
+        }
+    }
+
+    /// GetBalanceState:任何节点可答(只读);返回计划 + 逐 move 的派生进度。
+    async fn get_balance_state(
+        &self,
+        _request: Request<BalanceStateRequest>,
+    ) -> Result<Response<BalanceStateResponse>, Status> {
+        let g = self.sm_data.read().map_err(|_| Status::internal("sm lock poisoned"))?;
+        match g.state.balance.as_ref() {
+            Some(plan) => {
+                let view = crate::balance::plan_view(plan, &g.state.partitions, &g.state.moving);
+                Ok(Response::new(BalanceStateResponse { version: PROTO_VERSION, present: true, plan: Some(view) }))
+            }
+            None => Ok(Response::new(BalanceStateResponse {
+                version: PROTO_VERSION,
+                present: false,
+                plan: None,
+            })),
+        }
+    }
 }
 
 fn pstate(s: PartitionState) -> &'static str {
@@ -1189,14 +2087,9 @@ async fn place_one_partition(
         let g = sm_data.read().map_err(|_| "sm lock poisoned".to_string())?;
         g.state.nodes.clone()
     };
-    let usage = soft
-        .free_snapshot()
-        .into_iter()
-        .map(|(k, free_bytes)| (k, DiskFree { free_bytes }))
-        .collect();
     let replicas = select_disks(
         &nodes,
-        &usage,
+        &placement_usage(soft),
         rf,
         config.partition_capacity_bytes,
         config.disk_near_full_ratio,

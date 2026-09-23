@@ -30,4 +30,8 @@
 - [x] 7.1 `docs/design/cluster.md` §9.1 补 S3a 状态 + §10 复制传输标注(HTTP 决策,S3a/S3b 分期);配置项 / 监控项清单补新增项。
 
 ## 后续(S3b,不在本 change)
-- [ ] 封存段物理流式拷贝(整段 + 段头)+ 接收侧 rebuild_index + disk-aware 每盘并发(N4);FindToken sessionId/resetKey;client SDK(暂不做);**EC 仍锁定**。
+- [x] 封存段物理拷贝(整段 + 段头)+ 接收侧装载重建:`bootstrap_from_peer`(`replication.rs`:263)拉整段 → `install_bootstrap` 重建。注:整段在内存(非流式)。
+- [ ] disk-aware 每盘并发限流(N4):复制/bootstrap/worker 共用同一个阻塞池,无 per-disk 上限。
+- [ ] FindToken 的 sessionId / resetKey:token 只有 `(segment, offset)`,无会话语义。
+- [ ] router SDK(暂不做)。
+- [ ] **EC 仍锁定**。

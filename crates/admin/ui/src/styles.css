@@ -126,9 +126,73 @@ td.wrap { max-width: 380px; white-space: normal; }
 
 /* 图表卡片网格 */
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); gap: 12px; margin-top: 16px; }
+/* 指标页采集状态条:最后更新 / 样本数 / 各 store 抓取状态 / 手动刷新。 */
+.metrics-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 16px; padding: 8px 12px; color: var(--muted); font-size: 12px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+}
+.metrics-bar .spacer { flex: 1; }
 .chart-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px; overflow: hidden; }
 .chart-card .u-legend { color: var(--muted); font-size: 11px; }
 .chart-card .u-legend .u-marker { width: 10px; height: 4px; }
 .chart-card .u-select { background: rgba(47,129,247,0.1); }
 
 .kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+
+/* 概览:健康横幅(仅异常时着色,正常时低调) */
+.health-banner { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--panel); margin-bottom: 16px; }
+.health-banner.ok { color: var(--muted); }
+.health-banner.warn { background: rgba(210,153,34,0.12); border-color: var(--warn); color: var(--warn); }
+.health-banner.danger { background: rgba(248,81,73,0.12); border-color: var(--err); color: var(--err); }
+
+/* 大卡(概览 4 张定义性指标) */
+.bigcards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.bigcard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+.bigcard.warn { border-color: var(--warn); }
+.bigcard.danger { border-color: var(--err); }
+.bigvalue { font-size: 30px; font-weight: 600; line-height: 1.2; margin-top: 6px; }
+.bigmeta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+/* 两列区(趋势图 + 概况表 / Top-N 列表) */
+.grid-2 { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 12px; margin-top: 16px; align-items: start; }
+.grid-2 > section { min-width: 0; }
+@media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+.chart-sub { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+
+/* 紧凑键值表(集群概况) */
+.kv { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 6px 14px; }
+.kv-row { display: flex; align-items: baseline; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.kv-row:last-child { border-bottom: none; }
+.kv-row .k { color: var(--muted); }
+.kv-row .v { margin-left: auto; text-align: right; }
+
+/* Top-N 列表(磁盘水位榜 / 可写分区速览) */
+.topn { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 4px 14px; }
+.topn-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.topn-row:last-child { border-bottom: none; }
+.topn-row.clickable { cursor: pointer; }
+.topn-row.clickable:hover { background: rgba(47,129,247,0.06); }
+.topn-name { min-width: 180px; }
+.topn-num { margin-left: auto; text-align: right; white-space: nowrap; }
+.topn .prog { flex: 1; min-width: 80px; margin-top: 0; }
+
+/* 面板(维护模式 / 限流等) */
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.panel-head { display: flex; align-items: center; gap: 10px; }
+.panel-head h3 { margin: 0; }
+/* 运维页的 .op-box 把 label 排成竖列(输入框在标题下),但复选框行要横排。 */
+.op-box label.check { flex-direction: row; align-items: center; }
+.panel .check { margin: 10px 0; }
+.panel .btn { margin-top: 4px; }
+.panel-msgs { display: flex; flex-direction: column; gap: 8px; }
+.grid-2 > .panel { margin-top: 0; }
+.panel + .panel { margin-top: 12px; }
+
+/* 维护模式 / 提示徽标 */
+.pill.maint { background: rgba(210,153,34,0.18); color: var(--warn); border-color: var(--warn); font-weight: 600; }
+.pill.info { background: rgba(47,129,247,0.12); color: var(--accent); border-color: var(--accent); }
+
+/* 均衡页:迁移明细表过长时内部滚动(sticky 表头沿用全局规则) */
+.table-scroll { max-height: 460px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; }
+.table-scroll table { border: none; border-radius: 0; }

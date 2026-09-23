@@ -106,3 +106,50 @@ fn range_helpers_accept_valid_values() {
     assert_eq!(at_least("k", 5, 1).unwrap(), 5);
     assert_eq!(one_of("k", "a", &["a", "b"]).unwrap(), "a");
 }
+
+// ---- `load_table`:文档约定的 `[表]` 写法,同时兼容顶层 flat(见 Loader::load_table)----
+
+#[test]
+fn load_table_reads_documented_table_form() {
+    // 设计文档写的是"字段名即 TOML key(在 `[store_server]` 表下)"——这种写法必须真的生效。
+    let cfg: StoreConfig = Loader::new()
+        .with_inline_toml("[store_server]\ndata_flush_interval_seconds = 7\n")
+        .load_table("store_server")
+        .expect("table form must load");
+    assert_eq!(cfg.data_flush_interval_seconds, 7);
+    assert_eq!(cfg.compaction_policy, "hybrid", "未列出的字段回落默认");
+}
+
+#[test]
+fn load_table_falls_back_to_flat_when_table_absent() {
+    // 表不存在时回落 flat:兼容既有 flat 配置文件。
+    let cfg: StoreConfig = Loader::new()
+        .with_inline_toml("data_flush_interval_seconds = 9\n")
+        .load_table("store_server")
+        .expect("flat form must still load");
+    assert_eq!(cfg.data_flush_interval_seconds, 9);
+}
+
+#[test]
+fn load_table_env_forms() {
+    // 两个 env 场景放同一个用例里顺序执行:环境变量是进程级全局,拆成两个 #[test] 会并行竞态。
+    let key = "AMBRY_STORE_SERVER__DATA_FLUSH_INTERVAL_SECONDS";
+
+    // ① 只有嵌套 env(表写法对应的环境变量形式)→ 生效。
+    std::env::set_var(key, "11");
+    let cfg: StoreConfig = Loader::new()
+        .with_env_prefix("AMBRY")
+        .load_table("store_server")
+        .expect("nested env must load");
+    assert_eq!(cfg.data_flush_interval_seconds, 11);
+
+    // ② 表里有值 5,env 覆盖为 42 → env 优先(来源优先级:文件 < 环境变量)。
+    std::env::set_var(key, "42");
+    let cfg: StoreConfig = Loader::new()
+        .with_inline_toml("[store_server]\ndata_flush_interval_seconds = 5\n")
+        .with_env_prefix("AMBRY")
+        .load_table("store_server")
+        .expect("env must override table");
+    std::env::remove_var(key);
+    assert_eq!(cfg.data_flush_interval_seconds, 42);
+}

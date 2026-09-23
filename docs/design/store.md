@@ -206,7 +206,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [x] 每 Log 定容上界(store 层):`total_capacity`(per-replica 构造参数,对齐 Ambry `capacityInBytes`)+ 写满归一为 `Error::StoreFull` + 容量自省(`total_capacity`/`available_capacity`/`is_full`)。**「写满自动滚动新 partition」是集群/路由层职责,不在 store**
-- [x] 压测:`benchmark/blob`(`antfs-bench-blob` 二进制)—— 多线程共享 `Arc<BlobStore>` 压 PUT/GET,报吞吐(ops/s、MB/s)+ 延迟分位(p50/p99/max);`benchmark/` 下后续加 blob-server / S3 frontend 压测
+- [x] 压测:`benchmark/blob`(`antfs-bench-blob` 二进制)—— 多线程共享 `Arc<BlobStore>` 压 PUT/GET,报吞吐(ops/s、MB/s)+ 延迟分位(p50/p99/max);**集群/数据面端到端压测见 `antfs-bench-router / antfs-bench-frontend`**(`crates/common/router`,直连或经 frontend,见 [`router.md` §8](./router.md))
 - [ ] **封存段 EC 冷层**(热副本→冷 EC,封存段级;转换/读/修复在服务层)——见 [`cluster.md` §5 (D5)](./cluster.md);store 侧需支持封存段的 EC 读路径(有整副本直读,否则读 k 分片重构)
 - [ ] (已废弃)monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销
 
@@ -228,7 +228,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.io_error_count_to_trigger_shutdown` | u32 | 0(=禁用) | 任意(0 禁用,≥1 阈值) | **已接入**:连续 IO 错误达此值则 store 自关(被动磁盘检测)+ 触发回调;0=禁用,对齐 Ambry 默认 `MAX_VALUE` | `store.io.error.count.to.trigger.shutdown` |
 | `store.max_journal_entries_to_return` | u32 | 5000 | 1–10000 | journal 单次返回上限 | `store.max.number.of.entries.to.return.from.journal` |
 | `store.index_persisted_entry_min_bytes` | u32 | 115 | ≥1 | 索引条目持久化最小字节(注:Rust `IndexValue` 定长 59B,值需按实际布局重定) | `store.index.persisted.entry.min.bytes` |
-| `store.segment_size_bytes` | u64 | **待定** | ≥1 | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;antfs 需按"每 Log 定容上界"设计锚点定具体值) | `store.segment.size.in.bytes` |
+| `store.segment_size_bytes` | u64 | **4 GiB** | ≥1 | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;antfs 取段级定容,**默认 4 GiB 使"单条记录 ≤ 段 − 102 < `u32::MAX`"成为结构性不变量** —— 记录内 `data_len` 是 u32;把段配到 >4 GiB 时单条超过 4 GiB 的对象会被 `record_data_len` 拒掉而非写出回绕记录) | `store.segment.size.in.bytes` |
 | `store.index_mem_state` | enum | `mmap_without_force_load` | 枚举 | 索引内存策略 | `store.index.mem.state` |
 
 ### 10.2 `[store.compaction]`
@@ -360,3 +360,307 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store_stats_scan_duration_seconds` | histogram | `store`,`kind`(on_demand/bucketing) | 秒 | 扫描耗时 | `StatsOnDemandScanTotalTimeMs`/`StatsBucketingScanTotalTimeMs` |
 | `store_stats_scan_error_total` | counter | `store`,`kind`(scanner/queue) | 次 | 扫描/队列错误 | `BlobStoreStatsIndexScannerErrorCount`/`…QueueProcessorErrorCount` |
 | `store_stats_forward_scan_entries` | histogram | `store` | 个 | 前向扫描条目数 | `StatsForwardScanEntryCount` |
+
+## 12. 数据节点(store-server)批 1 增量
+
+> 本节只记本批次(数据节点侧)新增/变更的**语义**与**配置/监控项**。`StoreServerConfig` 与
+> `StoreServerMetrics` 的**完整**清单仍以 [`cluster.md` §9](./cluster.md) 为准(本节不重复、避免两处漂移)。
+> 代码位置:`crates/store/`(心跳见 `heartbeat.rs`、复制滞后见 `replication.rs`、数据面见 `server.rs`、
+> 静默见 `request_control.rs`、compaction 台账见 `compaction_jobs.rs`)。
+
+### 12.1 心跳上报:分区实际占用 + 复制滞后估算
+
+`ReplicaBeat`(proto tag 4/5)两个字段由数据节点填充:
+
+| 字段 | 取值 | 口径 |
+|---|---|---|
+| `used_bytes` | `BlobStore::valid_data_size()` | 该分区在本副本的**实际占用**:索引赢家中未删除记录的字节(含记录头/crc);**墓碑不计**(故 ≠ `stats()` 的含墓碑 live)。**不区分过期**——过期但未回收的对象仍占盘,故计入 |
+| `lag_bytes` | **估算**(见下) | 拉复制滞后字节;0 = 已追平或尚无基线 |
+
+**`lag_bytes` 估算口径**(对齐"从 peer 拉的游标 − 本地已 apply 的游标"):
+
+- 每轮拉复制记录 `peer_token`(本轮 peer 返回的 `FindToken`)与本地已 apply 的游标(上轮 peer 游标),
+  取 `(peer.segment − applied.segment) * segment_size_bytes + (peer.offset − applied.offset)`;
+  **仅 peer 在前时为正**,追平/本地在前/游标未知(`Uninitialized`)一律记 0。
+- 段容量取 store 引擎配置 `store.segment_size_bytes`(`ReplicaManager::segment_size_bytes()`)。
+- 该值只写进一个**诊断用原子量**(`ReplicaHandle::lag`),复制/apply 语义完全不变 → 无一致性风险。
+
+**已知误差**(故只作倾向性观测:master 判据/看板;不参与任何一致性决策):
+
+1. 两游标都在**peer 的 log 坐标系**里且 offset 是记录字节(含记录头/crc),比对象负载略大;
+2. 段容量按配置线性化,真实段数据容量还要扣 header,且只在本地/peer **段大小相同**时成立(同配置部署
+   下成立);
+3. 游标语义是"最后一条已审视记录的**起点**",故差值**不含新游标处那条记录本身** → 最多偏小一条记录:
+   前后记录大小相近(稳态流)时基本准确,大小悬殊时该误差不可忽略(只落后一条大记录时,报出的可能是
+   上一条小记录的长度);
+4. 采样点是**滞后采样**(每轮一次,反映"上一轮以来积压了多少"),轮内已追平的部分要到下一轮才归 0。
+
+### 12.2 blob 请求延迟:按对象大小分桶(对齐 Ambry)
+
+`store_server_blob_request_duration_seconds{op,size}` 只在**成功**路径 observe(对齐 Ambry 只在 `NoError`
+计数;参数校验早退、404/409/500 等错误路径**不**计入),put 用**请求 body 长度**、get 用**返回数据长度**分桶:
+
+| 桶 | 边界(上界开区间) |
+|---|---|
+| `small` | `len < 50 KiB`(`SMALL_BLOB_MAX_BYTES = 50 * 1024`) |
+| `medium` | `50 KiB ≤ len < 1 MiB`(`MEDIUM_BLOB_MAX_BYTES = 1024 * 1024`) |
+| `large` | `len ≥ 1 MiB` |
+
+边界值本身落到更大的桶(50 KiB 算 `medium`,1 MiB 算 `large`);常量与分桶函数在
+`crates/store/src/metrics.rs`,边界有单测守护。与全量 `store_server_request_duration_seconds{op}` 的关系:
+后者覆盖所有 op/所有出口(含早退),前者只覆盖 put/get 的成功出口并多一个 size 维度。
+
+### 12.3 RequestControl(节点级请求静默,对标 Ambry `RequestControl`)
+
+运维可在**节点级**或**分区级**临时静默 5 类数据面操作(`put`/`get`/`delete`/`undelete`/`ttl_update`),
+命中即 `503 SERVICE_UNAVAILABLE` + 说明文本(有 TTL 时带 `Retry-After`,秒数向上取整),**在 extractor
+之前短路**(被禁的 put 连 body 都不缓冲)。被拒请求只计 `store_server_rejected_requests_total{op,reason}`,
+**不进** `errors_total`、**不计** `request_duration`/`in_flight`(那三个记的是真正进到引擎的请求)。
+
+端点(必须在豁免白名单内,否则禁用后无法远程恢复):
+
+- `POST /admin/request-control`:body `{op, partition_id?, enable, ttl_secs?}`;未知 `op` → 400;
+  指定 `partition_id` 但本地无该副本 → 404;返回操作后的当前禁用集。
+- `GET /admin/request-control`:当前禁用集 `[{op, partition_id, remaining_secs}]`(已过期条目剔除)。
+
+语义:`enable = false` 且不带 `partition_id` 时解除该 op 的**全部**静默(节点级 + 各分区,便于"一键恢复
+全开");带 `partition_id` 时只解该分区。`ttl_secs` 缺省用配置默认;**`ttl_secs = 0` = 0 秒有效期(立即到期,
+配合惰性判定等于不禁)**。过期判定是**惰性**的:判定/列举时比较 deadline,过期即视为启用并顺手摘除条目,
+**不**新起后台清理任务;数据面判定走**读锁快路径**(禁用是少见状态,常规请求不与静默写争锁),仅在需摘除
+过期条目时才升级到写锁。
+
+**豁免清单**(绝不静默;实现见 `request_control::classify`,单测逐条覆盖 `router()` 的全部路由):
+
+| 豁免 | 理由 |
+|---|---|
+| `GET /partitions/{pid}/blobs/{key}?replication=1` | 与普通 GET **同 method + 同 path**,只能按 query 区分;它是拉复制 step-2 取数据体的通道,挡掉 ⇒ 副本永久不收敛/掉数据 |
+| `GET /partitions/{pid}/replica-metadata` | 拉复制 step-1(元数据游标),挡掉 ⇒ 复制停摆 |
+| `GET /partitions/{pid}/segments`、`GET /partitions/{pid}/segments/{position}` | 拉复制 bootstrap 的物理段拷贝,挡掉 ⇒ 空副本无法 bootstrap |
+| `GET /metrics` | 运维抓取入口 |
+| 任何 `/admin/**`(**含 `/admin/request-control` 自身**) | 否则做出一个"无法远程恢复"的节点 |
+| 其余未知路径/方法 | 默认豁免(失败方向刻意选"宁可禁不掉,不可禁出数据问题") |
+
+**与 Ambry 的三条刻意偏离**:
+
+1. **豁免拉复制/运维端点**:Ambry 的 `RequestControl` 按 `RequestType` 整类禁;这里额外保证 `?replication=1`、
+   `replica-metadata`、`segments*`、`/metrics`、`/admin/**` 永不被禁(持久性红线:禁用不得导致副本停更)。
+2. **不持久化**:状态只在内存,进程重启即恢复全开——静默是**临时**止血手段,刻意不做成持久配置(避免
+   "残留的静默"在重启/扩容后成为难查的隐性故障)。
+3. **带默认 TTL 的惰性过期**:`request_control_default_ttl_secs`(默认 1800s)保证"忘了开回来"也能自愈;
+   Ambry 无 TTL 概念,需人工解除。过期在判定时惰性生效,无后台任务。
+
+### 12.4 配置项清单(本批新增)
+
+> 完整清单见 [`cluster.md` §9](./cluster.md)。默认值/范围与代码 `impl Default` + `Validate` 逐项对齐(CLAUDE.md §7)。
+
+| key(TOML 路径) | 类型 | 默认 | 范围/校验 | 含义/影响 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限,**两条路径都按它校验**:① 非流式抽取器(以及 PUT 的 chunked 回落路径)经 `DefaultBodyLimit`/`to_bytes` 上限;**② 流式 PUT(带 `Content-Length`)在收 body 前先比 `Content-Length`,超限直接 413(不读 body)**。**默认与 axum `DefaultBodyLimit` 默认值一致**(§5.1 不擅自改默认),要收真正的大 blob 必须显式调大 | — |
+| `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0(0 = 不设默认时长) | `/admin/request-control` 未指定 `ttl_secs` 时的默认禁用时长(秒);**0 = 永久禁用**(须显式开回) | 偏离 Ambry(其 RequestControl 无 TTL),见 12.3 |
+
+### 12.5 监控项清单(本批新增)
+
+> 完整清单见 [`cluster.md` §9](./cluster.md)。命名/label 与注册处(`metrics.rs`)逐项对齐(CLAUDE.md §7)。
+
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_server_blob_request_duration_seconds` | histogram | `op`(put/get),`size`(small/medium/large) | 秒 | **成功** blob 请求延迟,按对象大小分桶(边界 50 KiB / 1 MiB);错误/早退不计数 | `ServerMetrics` 的 small/medium/large blob 分桶计时器 |
+| `store_server_rejected_requests_total` | counter | `op`,`reason`(目前仅 `disabled`) | 次 | 被 RequestControl 静默拒掉的请求数(在进引擎之前) | Ambry `RequestControl` 的静默拒绝计数 |
+| `store_server_replicas_dropped_total` | counter | — | 次 | 收到 `DROPPED` 指令后**实际删除**本地副本数据的次数(见 §12.6);重复指令被幂等忽略,**不**计数 | — |
+| `store_server_replication_paused` | gauge | — | 0/1 | 运维是否暂停本节点主动拉复制(1 = 暂停);见 §12.7 | — |
+| `store_server_compaction_jobs_total` | counter | `state`(running/done/failed) | 次 | 异步手动 compaction 任务的提交/完成/失败计数(每个任务在 running 与 done/failed 各计一次);见 §12.8 | — |
+
+> 心跳的 `used_bytes` / `lag_bytes` 是**控制面 proto 字段**(`ReplicaBeat`),不是本节点 Prometheus 指标,
+> 故不进上表;口径见 §12.1。
+>
+> 下三节(A6 副本删除 / A7 复制开关 / A3 异步 compaction)只新增上表那 3 个监控项,
+> **不新增任何配置项**(复制开关与 compaction 台账都是端点驱动的运行期状态,刻意不进配置)。
+>
+> 后续批次新增的副本实然态监控项见 §12.9(`store_server_replicas_bootstrapping`);同样不进配置。
+
+### 12.6 副本删除:`DROPPED` 指令的语义(幂等、只在 master 确认后)
+
+master 下发 `Transition{partition_id, disk_id, target_state: "DROPPED"}` 的语义是
+**「该副本已从集群 placement 正式移除,且继任者已 ACTIVE」**——这是"可以删本地数据"的**唯一触发条件**;
+master 侧何时产生该指令由 master 决定(见 [`cluster.md`](./cluster.md) 与 `openspec/changes/master-reconcile/`),
+**proto 不变**。三条指令的本地动作:
+
+| 指令 `target_state` | 本地动作 | 盘上数据 |
+|---|---|---|
+| `ACTIVE` / `BOOTSTRAP` | `ensure_replica`(建/开副本) | 创建(实然态初值一律 `BOOTSTRAP`,追平后由复制器转 `ACTIVE`,见 §12.9) |
+| `OFFLINE` | `remove_replica`:只摘内存句柄 | **保留**(副本可能再回来) |
+| `DROPPED` | `drop_replica`:摘句柄 + 删整目录 | **删除** |
+
+`ReplicaManager::drop_replica(pid) -> Result<bool>`(`bool` = 是否真的删了):
+
+- **幂等**:本地没有该副本/目录已不在 → `Ok(false)`,**不报错**(重复、重放的 `DROPPED` 必须安全);
+  真的删了 → `Ok(true)` 并计一次 `store_server_replicas_dropped_total`(`false` 不计)。
+- **删的就是整目录**:`<盘目录>/partition_{pid}` 一次 `remove_dir_all`(`NotFound` 视为成功 —— 竞态下已被删掉也算达到目的)。
+  定位方式:句柄在 → 按该副本的 `disk_id` 找盘;句柄已被 `OFFLINE` 摘掉(盘上数据还在)→ 按盘列表找残留目录。
+  两条路径都覆盖,不留孤儿副本目录。删除前后各记一条 `tracing::info!`(pid + 目录)。
+- **先摘句柄再删**:句柄持有 `BlobStore` 的段文件 fd/mmap,反过来会让已删除的文件仍被句柄钉住
+  (Unix 下 inode 到最后一个引用关闭才释放)。
+- **等在飞持有者退出(有界 2s)再删**:摘出 map 后不会再有**新**持有者,但**老**持有者(在飞请求、
+  本地 worker 的 flush/compaction 快照)各自 clone 过 `Arc<BlobStore>`,它们写盘的 `create_dir_all`
+  (索引水位、段封存)能把刚删掉的目录**复活成只剩 `index/` 的空壳**;空壳会让该分区日后在本节点
+  **再也建不起来**(`ensure_replica` 走 `BlobStore::open`,空壳里没有 log 段 → `Corrupt`)。
+  故先摘句柄、轮询等 `Arc` 计数归 1(通常几毫秒)后删目录。超过 2s(如正在跑的长 compaction)照删不误,
+  **不无限等** —— 本函数跑在阻塞池里,等太久会拖住心跳 loop,而残留空壳只是小概率的可运维问题。
+- **不阻塞心跳**:删除(同步 IO + 上述等待)一律经 `spawn_blocking` offload;失败只记 `warn`,不影响后续指令处理。
+
+### 12.7 运行期暂停拉复制(复制开关)
+
+| 端点 | 请求 | 响应 |
+|---|---|---|
+| `POST /admin/replication-control` | JSON `{"paused": bool}` | 200 `{"paused": true\|false}`(回显操作后状态) |
+| `GET /admin/replication-control` | — | 200 `{"paused": true\|false}` |
+
+语义:
+
+- **只停"我拉别人"**:后台拉复制器每 tick 读一次开关,暂停即**跳过本轮的主动拉取**(不做 peer 发现、不发拉取请求)。
+- **"别人拉我"不受影响**:`GET /partitions/{pid}/blobs/{key}?replication=1`、`replica-metadata`、`segments*`
+  照常服务(复制读端点是**入站**通道);心跳、本地维护 worker、数据面 put/get 同样不受影响。
+- **与 RequestControl 正交**:静默是"拒入站请求",本开关是"停出站拉取";两者互不代偿。两个端点都在 `/admin/**` 下,
+  因而都在 RequestControl 的豁免白名单内(见 §12.3)。
+- **不持久化**:状态只在内存,进程重启即恢复拉取(与静默开关同一取向,避免"残留的暂停"变成难查的隐性故障)。
+- **游标保留**:暂停不重置已积累的复制游标,恢复后从原游标继续拉(可能一次补上暂停期间的全部增量)。
+- 状态变化时 `store_server_replication_paused`(0/1)同步更新,暂停/恢复各记一条 `tracing::info!`。
+
+### 12.8 手动 compaction 的异步任务(台账)
+
+| 端点 | 请求 | 响应 |
+|---|---|---|
+| `POST /admin/partitions/{pid}/compact?async=1` | 无 body | **立即** 200 `{"job_id": <u64>}` |
+| `POST /admin/partitions/{pid}/compact`(不带 `async` 或 `?async=0`) | 无 body | (同步,行为/响应体**不变**)200 `{live_bytes,dead_bytes,segments_before,segments_after}` |
+| `GET /admin/compactions` | — | 200 `{"jobs":[...]}`(最新在前) |
+| `GET /admin/compactions/{job_id}` | — | 200 单条 job;**未知(或已被淘汰)`job_id` → 404** |
+
+job 形状(未完成字段**不出现在 JSON 里** —— 是缺 key,不是 `null`):
+
+```json
+{"job_id": 3, "partition_id": 0, "state": "running", "started_at_ms": 1758000000000}
+{"job_id": 3, "partition_id": 0, "state": "done", "started_at_ms": 1758000000000, "finished_at_ms": 1758000000123,
+ "result": {"live_bytes": 1048576, "dead_bytes": 4096, "segments_before": 2, "segments_after": 1}}
+{"job_id": 4, "partition_id": 0, "state": "failed", "started_at_ms": 1758000000000, "finished_at_ms": 1758000000009,
+ "error": "io: ..."}
+```
+
+台账语义:
+
+- **进程内内存态**:重启即丢;`job_id` 自增(从 1 起),只保留**最近 32 条**(超出淘汰最旧,含仍在跑的那条
+  —— 其终态只是写不回表,不影响 compaction 本身,故 `done`/`failed` 的计数仍会 +1)。
+- **只记异步任务**:同步 compact 不产生 job(它直接返回统计),故无需为同步路径维护台账。
+- `result` 与同步响应**同字段**(同一 DTO 定义,避免两处漂移);`state` 取值 `running`/`done`/`failed`。
+- 提交时计 `store_server_compaction_jobs_total{state="running"}`、完成/失败时分别计
+  `{state="done"}`/`{state="failed"}`(各一次);每次提交也都计 `store_server_manual_compactions_total`。
+  job 失败同时进 `store_server_errors_total{kind}`。
+- `?async=` 的取值口径与 `?replication=` 一致(`非 0` 才算异步);无本地副本 → 404(与同步路径同码)。
+
+### 12.9 副本实然态:`BOOTSTRAP → ACTIVE` 的追平判定
+
+副本的实然态(`ReplicaBeat.current_state`)有三个取值,**建/开副本时一律从 `BOOTSTRAP` 起**,
+只有真追平才转 `ACTIVE`:
+
+| 取值 | 何时置位 | 含义 |
+|---|---|---|
+| `BOOTSTRAP` | `ReplicaManager` 建/开/重装副本时的**初值** | 尚未追平:新建空副本、重启重开的副本、物理 bootstrap 之后(活跃尾还要靠增量拉补) |
+| `ACTIVE` | **仅**拉复制路径判定追平后(`sync_round` → `ReplicaHandle::mark_active`) | 已拉到 peer log 末端,可作数据源/可依赖 |
+| `ERROR` | 引擎 IO 自关 hook 被动置位(S2) | IO 故障;**不被追平覆盖**(否则 master 的"再复制"判据会漏掉故障副本) |
+
+**为什么这是数据安全问题**:master 侧搬迁/evacuation 的删源闸门是"继任者已 `ACTIVE`"
+(`reconcile::plan_move` / `drop_confirmed`,守 CLAUDE.md §3.1 先补后删)。若新副本一出生就自称
+`ACTIVE`,闸门瞬间成立 → 源副本被摘除 + 下发 `DROPPED` 删本地数据;源若是当时**唯一有数据**的副本
+(例如它的增量拉复制正好被暂停/对端不可达),就是丢数据。故这里如实上报"我还没追平"。
+
+**追平判据**(**逐 peer、每轮**判;代码 `crates/store/src/replication.rs` 的 `caught_up_with_peer` /
+`local_has_nothing_past`,与 `sync_round` 同一入口,生产复制器与测试共用):
+
+| 情形 | 判定 |
+|---|---|
+| peer 对 `replica-metadata` 返回 **404**(该 peer 上没有这个分区的副本) | **满足**:peer 没有该分区数据,无数据要同步 |
+| peer 正常应答且本轮**没有待 apply 的条目**(拉到空条目批),且**本地 log 末端与 peer 报的游标一致** | **满足**(两侧都空也算一致) |
+| 其余(还有条目要 apply、本地落后于 peer 游标、拉取报错) | **不满足** → 保守留在 `BOOTSTRAP`,下一轮再看 |
+
+与**某个** peer 的一轮满足判据即可转 `ACTIVE`(不等全部 peer;随后单向、不回退)。生产复制器每 tick
+对该分区的**所有**可达 peer 各拉一轮,"追平到其中一个"通常就意味着最短路径已经走完。
+
+"本地 log 末端与 peer 报的游标一致"的实现口径:拿 peer 的游标再问一次**本地库**的
+`find_entries_since`,返回**空条目且游标未推进**即一致(游标语义是"最后一条已审视记录的**起点**",
+从该游标再问会跳过该记录本身,故"已到末端"表现为空)。两道守卫:本地一条记录都没有时,只有 peer
+游标也是"空"(`Uninitialized`)才算一致;本地读失败一律不算一致。
+
+> **已知边界**(如实记录):store 只看得到"联系得上的 peer"的应答,分不清"整个分区真的空"与
+> "唯一联系得上的 peer 恰好也空、而持有数据的副本暂时不可达"。故本地也空时会对空 peer 放行
+> (否则全新空分区永远无法转正)。这一层的兜底在 master 的 placement 级闸门(`up` 过滤、健康副本
+> 数 ≥ RF、源仍持有),store 侧只负责**如实**报自己追平了没有。
+
+四个场景的落点:
+
+1. **全新空分区**(分区刚建、所有节点都空):peer 无该副本(404)或双方都空 → 立即 `ACTIVE`。
+   否则空分区会永远卡在 `BOOTSTRAP`(master 侧看着像"无健康副本")。
+2. **物理 bootstrap 的新副本**(`install_bootstrap`):只拷了封存段,活跃尾还要增量拉 ——
+   拷完**仍是 `BOOTSTRAP`**,增量拉那一轮判定追平才转 `ACTIVE`。
+3. **重启后重开的副本**(`dir.exists()` → `BlobStore::open_with`):盘上数据可能是旧的,**故意**先报
+   `BOOTSTRAP`,等一轮拉复制确认追平再 `ACTIVE` —— 重启期间短时显示"同步中"是**诚实状态**。
+   它**不会**触发 master 的再复制风暴:master 算"要不要补副本"用的是 `up && !errored`
+   (`reconcile::plan_rereplication`),不看 `BOOTSTRAP`;`BOOTSTRAP` 只进"欠副本主因"展示
+   (`classify_partition` → `bootstrapping`,前端显示"同步中")。
+4. **单副本分区**(RF=1 / 单节点集群):`LookupPartition` 返回的 placement 里本节点之外**没有**其他
+   副本 = 没有 peer 可同步(判据的空集情形)→ 直接 `ACTIVE`。对端存在但 `up=false` 不算:那是
+   "peer 暂时拉不到",保守留在 `BOOTSTRAP`。
+
+其它语义:
+
+- **单向**:`ACTIVE` 是持久事实,不会因为后续某轮暂时拉不到 peer 而回退(不抖动);`ERROR` 例外,
+  它不被 `ACTIVE` 覆盖。
+- **幂等**:重复判定通过只是重复置 `ACTIVE`,无害;状态只由创建路径(初值)与复制路径(转正)写,
+  用现有 `RwLock<String>`,不新增锁。
+- **心跳照旧**:`ReplicaBeat` 逐拍上报该值,只是值更真实;心跳指令 `ACTIVE`/`BOOTSTRAP` 的目标态
+  行为不变(都走 `ensure_replica`——`BOOTSTRAP` 是如实上报的状态,不是要节点"进入同步模式")。
+- 拒绝拉复制(§12.7)只停**主动拉**:暂停期间副本会**一直**留在 `BOOTSTRAP`(拿不到追平判定),
+  这正是"先补后删"要的负例行为(源不会被误删)。
+
+监控项(本节新增,注册处 `crates/store/src/metrics.rs`):
+
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_server_replicas_bootstrapping` | gauge | — | 个 | 本地副本里**尚未追平**的数量(`current_state == "BOOTSTRAP"`,即"同步中");与 `store_server_replicas`(本地副本总数)同步刷新:心跳每拍、心跳指令处理后、复制 loop 每 tick 各一次 | — |
+
+### 12.10 一致性巡检素材:`scrub-report` 与 `verify`(Wave3)
+
+**两个只读端点**(都要求本地有该分区副本,否则 404;都在 RequestControl 的豁免白名单里):
+
+- **`GET /partitions/{pid}/scrub-report`** → `{"partition_id","live_records","tombstones","live_bytes","sealed_segments","segments":[{"position","data_end"}],"token_seg","token_off"}`。
+  **只走索引与 mmap,不读数据体**(开销与 key 数成正比、与数据量无关),供 admin 做副本间摘要比对。
+  `token_seg/token_off` = 本副本 log 末端游标(与 `replica-metadata` 同口径),两侧一致才说明该轮**可比**。
+- **`GET /partitions/{pid}/verify?max_bytes=`** → `{"partition_id","records","bad_records","first_bad_offset":{"segment","offset"}|null,"index_mismatch","truncated"}`。
+  **会读全量数据体**(深扫),`max_bytes` 缺省取配置 `store_server.scrub_max_batch_bytes`,到点提前结束并置 `truncated`。
+
+**`BlobStore::verify` 的口径**(与生产读路径的关键差异):
+
+- 逐记录读 log 并验 CRC,但**遇到坏记录"记下继续"**而不是整体失败(生产读路径仍是坏即 `Err(Corrupt)`):
+  坏记录后尝试从记录头读 `data_len` 重同步到下一条;头也读不出则本段止步并置 `truncated`。
+  这样运维能拿到"坏在哪个段/偏移"(`first_bad_offset`),而不是只知道"这副本坏了"。
+- `index_mismatch`:对**活记录**(索引当前赢家)比对索引里的 `size`/`flags`/`life_version` 与实际记录值,
+  不一致即计 1。**只能发现"索引与 log 对不上"这一类漂移;发现不了"索引指向了 log 中不存在的 offset"**(需反向遍历索引,属后续增强)。
+- `BlobStore::index_stats()`(scrub-report 的数据源):`live_records`/`tombstones`/`live_bytes`(活记录数据字节,不含记录头/CRC)/`sealed_segments`。
+
+**能发现什么 / 发现不了什么**(务必与运维对齐预期):
+
+| 手段 | 能发现 | 发现不了 |
+|---|---|---|
+| `scrub-report` 摘要比对 | 副本整体落后/缺失(记录数、字节数、墓碑数、段数不同) | 具体哪一个 key 不同 |
+| 元数据窗口 key 级比对(admin 侧) | 某副本缺 key、生命版本/标志位不一致 | 窗口外的老 key(受 `max_bytes` 限制,报告里以 `partial` 标注) |
+| `verify`(deep) | **本地静默损坏**(CRC 坏)、索引与 log 漂移 | 数据"内容不同但长度/CRC 都对"的情形;跨副本字节级差异 |
+
+**假不一致**:扫描期间有并发写时,两侧窗口末端本就不同 → 报告会带各副本 `token`/`bytes_read`,
+`partial` 为真时结论只作"部分比对";判为不一致后建议**重跑一次**再定论。
+
+**已知缺口(未修,需产品决策)**:记录损坏会让 `BlobStore::open`(索引重建)整体失败 → 该副本**起不来**,
+因而也无法经这两个端点检查。若要"坏记录也允许启动并大声报错"(对齐 Ambry `IndexRecovery` 的容错方向),
+需改恢复路径语义,属后续增强。
+
+**指标**(§12.5 同步登记):`store_server_verify_runs_total`(counter)、`store_server_verify_bad_records_total`(counter)、
+`store_server_verify_duration_seconds`(histogram)、`store_server_scrub_reports_total`(counter)。
+
+**配置**(§12.4 同步登记):`store_server.scrub_max_batch_bytes`(u64,默认 64 MiB,≥1)= verify 缺省扫描读取上限。

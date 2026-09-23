@@ -1,0 +1,18 @@
+[package]
+name = "antfs-bench-router"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "antfs-bench-router"
+path = "src/main.rs"
+
+[dependencies]
+antfs-bench-common = { path = "../common" }
+antfs-router = { path = "../../crates/common/router" }
+antfs-config = { path = "../../crates/common/config" }
+antfs-metric = { path = "../../crates/common/metric" }
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

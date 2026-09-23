@@ -75,8 +75,11 @@ blobId 计划为 **64bit long**:高位 `partitionId`(自带定位,D3)、低位 `
 
   | key(TOML) | 类型 | 默认 | 范围 | 含义 |
   |---|---|---|---|---|
-  | `master.id_alloc.segment_size` | u32 | 1024 | ≥1 | N:client 单次申请号段大小 |
-  | `master.id_alloc.raft_batch_multiple` | u32 | 2 | ≥1 | B = N × 该倍数;master 向 Raft 预留水位的批次倍数 |
+  | `master.id_alloc_segment_size` | u32 | 1024 | ≥1 | N:client 单次申请号段大小 |
+  | `master.id_alloc_raft_batch_multiple` | u32 | 2 | ≥1 | B = N × 该倍数;master 向 Raft 预留水位的批次倍数 |
+
+  > **key 已扁平化**(实现时定为 `master.id_alloc_segment_size` / `master.id_alloc_raft_batch_multiple`):`[master]` 下
+  > 现网配置项都是扁平的,不为两个 key 引入子表。已落地见 `openspec/changes/blob-io-end-to-end/`。
 
 - 二者皆"越大越省事、崩溃/切主空洞越大";因空洞无害(D3),可按压测放大。
 

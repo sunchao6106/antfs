@@ -29,6 +29,10 @@ export interface Cluster {
   nodes_up: number;
   nodes_total: number;
   under_replicated_partitions: number;
+  /** 维护模式:master 的自动收敛(再复制/迁移/下线迁移)已暂停。 */
+  maintenance: boolean;
+  /** 维护模式下是否连带暂停自动扩容。 */
+  pause_autogrow: boolean;
   grafana_url: string;
 }
 export interface Disk {
@@ -53,12 +57,16 @@ export interface Replica {
   up: boolean;
   current_state: string | null;
   lag_bytes: number | null;
+  /** 该副本上报的分区实际占用字节。 */
+  used_bytes: number;
 }
 export interface Partition {
   partition_id: number;
   state: string;
   replication_factor: number;
   replicas: Replica[];
+  /** 分区实际占用 = 各副本 used_bytes 的最大值。 */
+  used_bytes: number;
   healthy_replicas: number;
   healable: boolean;
   under_replicated_reason: string;
@@ -79,6 +87,75 @@ export interface MoveResult {
   to_disk_id: string;
 }
 
+/** 单个副本节点的 compact 结果:成功带回收统计,失败只有 error(404/超时/网络)。 */
+export interface CompactNodeResult {
+  node_id: number;
+  ok: boolean;
+  live_bytes?: number;
+  dead_bytes?: number;
+  segments_before?: number;
+  segments_after?: number;
+  error?: string;
+}
+
+export interface CompactResult {
+  results: CompactNodeResult[];
+  error: string;
+}
+
+/** 单个副本节点的**异步** compact 提交结果(`job_id` 用于查进度)。 */
+export interface CompactSubmitNodeResult {
+  node_id: number;
+  ok: boolean;
+  job_id?: number;
+  error?: string;
+}
+
+export interface CompactSubmitResult {
+  results: CompactSubmitNodeResult[];
+  error: string;
+}
+
+/** store 侧一条 compact 后台任务;未完成时没有 `finished_at_ms`/`result`/`error` 三个字段。 */
+export interface CompactionJob {
+  job_id: number;
+  partition_id: number;
+  state: "running" | "done" | "failed";
+  started_at_ms: number;
+  finished_at_ms?: number;
+  result?: {
+    live_bytes: number;
+    dead_bytes: number;
+    segments_before: number;
+    segments_after: number;
+  };
+  error?: string;
+}
+
+/** 单个副本节点上该分区的后台任务(节点不可达 → `ok:false` + `error`)。 */
+export interface CompactJobsNodeResult {
+  node_id: number;
+  ok: boolean;
+  jobs?: CompactionJob[];
+  error?: string;
+}
+
+export interface CompactJobsResult {
+  results: CompactJobsNodeResult[];
+}
+
+/** 一条审计记录(`GET /api/audit` 的元素;`remote_addr` 在未启用 connect info 的进程里为空串)。 */
+export interface AuditEntry {
+  ts_ms: number;
+  actor: string;
+  role: string;
+  method: string;
+  path: string;
+  status: number;
+  summary: string;
+  remote_addr: string;
+}
+
 export interface MasterMetrics {
   is_leader: number;
   raft_term: number;
@@ -89,6 +166,26 @@ export interface MasterMetrics {
   replicas_removed_total: number;
   under_replicated_partitions: number;
   registered_nodes: number;
+  assign_requests_total: number;
+  assign_failures_total: number;
+  lookup_requests_total: number;
+  partitions_rw: number;
+  partitions_ro: number;
+  partitions_sealed: number;
+  writable_capacity_bytes: number;
+  nodes_up: number;
+  cluster_free_bytes: number;
+  cluster_used_bytes: number;
+  max_replica_lag_bytes: number;
+  majority_replicas_down_partitions: number;
+  /** 维护模式(1/0)。 */
+  maintenance: number;
+  /** RW 分区的实际占用汇总(每分区取副本最大值再求和)。 */
+  writable_used_bytes: number;
+  /** 可写余量 = 可写容量 − 可写已用。 */
+  writable_free_bytes: number;
+  /** 每盘副本数 max − min(均衡度)。 */
+  disk_skew: number;
 }
 
 export interface AdminMetrics {
@@ -106,17 +203,89 @@ export interface StoreMetrics {
   get_total: number;
   put_bytes: number;
   get_bytes: number;
+  /** 数据面错误数合计(按 kind label 求和:io / unavailable / join_error)。 */
   errors_total: number;
   replicas: number;
   replication_bytes_total: number;
   compactions_total: number;
+  manual_compactions_total: number;
+  /**
+   * 成功 blob 请求计数,按 `op` × `size`(small/medium/large)精确取自
+   * `store_server_blob_request_duration_seconds_count` 的对应标签组合。
+   */
+  blob_put_small_count: number;
+  blob_put_medium_count: number;
+  blob_put_large_count: number;
+  blob_get_small_count: number;
+  blob_get_medium_count: number;
+  blob_get_large_count: number;
 }
 
 export interface Metrics {
   ts_ms: number;
+  /** master 指标是否取到;false = master 不可达,master 段数值是占位 0(前端要另作提示)。 */
+  master_ok: boolean;
+  /** master 不可达时的原因(fetch 失败文本),可读时为空串。 */
+  master_error: string;
   master: MasterMetrics;
   admin: AdminMetrics;
   stores: StoreMetrics[];
+}
+
+
+/** 一致性巡检(scrub)结果:逐副本素材 + admin 侧比对结论。 */
+export interface ScrubReportSummary {
+  live_records: number;
+  tombstones: number;
+  live_bytes: number;
+  sealed_segments: number;
+  segments: { position: number; data_end: number }[];
+  token_seg: number | null;
+  token_off: number | null;
+}
+export interface ScrubVerifySummary {
+  records: number;
+  bad_records: number;
+  index_mismatch: number;
+  truncated: boolean;
+}
+export interface ScrubReplica {
+  node_id: number;
+  ok: boolean;
+  error: string;
+  report: ScrubReportSummary | null;
+  key_count: number | null;
+  /** 该副本的元数据窗口被 `max_bytes` 截断 → 只能算部分比对。 */
+  partial: boolean;
+  verify: ScrubVerifySummary | null;
+}
+export type ScrubDivergence =
+  | { kind: "summary"; field: string; detail: string }
+  | { kind: "verify"; node_id: number; detail: string }
+  | { kind: "key"; key_hex: string; nodes: { node_id: number; state: string }[] };
+export interface ScrubResult {
+  partition_id: number;
+  checked_at_ms: number;
+  deep: boolean;
+  replicas: ScrubReplica[];
+  verdict: {
+    consistent: boolean;
+    inconclusive: boolean;
+    partial: boolean;
+    divergences: ScrubDivergence[];
+  };
+  error: string;
+}
+/** 最近一轮 scrub 的紧凑摘要(`GET /api/scrub`)。 */
+export interface ScrubRun {
+  partition_id: number;
+  checked_at_ms: number;
+  deep: boolean;
+  consistent: boolean;
+  inconclusive: boolean;
+  partial: boolean;
+  divergence_count: number;
+  replicas: { node_id: number; ok: boolean; live_records: number; live_bytes: number }[];
 }
 
 export interface PartitionPage {
@@ -124,6 +293,68 @@ export interface PartitionPage {
   total: number;
   offset: number;
   limit: number;
+}
+
+export type BalancePlanStatus = "PREVIEW" | "RUNNING" | "CANCELLED" | "DONE";
+export type BalanceMoveStatus = "pending" | "in_flight" | "done" | "failed" | "infeasible";
+
+/** 均衡计划里的一条副本搬迁。 */
+export interface BalanceMove {
+  partition_id: number;
+  from_node_id: number;
+  from_disk_id: string;
+  to_node_id: number;
+  to_disk_id: string;
+  status: BalanceMoveStatus;
+  error: string;
+}
+
+/** 一份均衡计划(`status` 取值见 {@link BalancePlanStatus})。 */
+export interface BalancePlan {
+  plan_id: number;
+  status: BalancePlanStatus;
+  created_at_ms: number;
+  /** 同时在搬的副本数上限。 */
+  max_in_flight: number;
+  total: number;
+  pending: number;
+  in_flight: number;
+  done: number;
+  failed: number;
+  moves: BalanceMove[];
+}
+
+/** `GET /api/balance`:`present=false` 时 `plan` 为 null(当前没有计划)。 */
+export interface BalanceState {
+  present: boolean;
+  plan: BalancePlan | null;
+}
+
+export interface BalanceEvalResult {
+  ok: boolean;
+  error: string;
+  plan: BalancePlan | null;
+}
+
+export interface BalanceOpResult {
+  ok: boolean;
+  error: string;
+}
+
+/** `GET /admin/request-control` 的一条禁用记录(`remaining_secs: null` = 永久)。 */
+export interface RequestControlEntry {
+  op: string;
+  /** `null` = 节点级;否则只该分区。 */
+  partition_id: number | null;
+  remaining_secs: number | null;
+}
+
+export interface RequestControlBody {
+  op: string;
+  partition_id?: number;
+  enable: boolean;
+  /** 分钟数换算成秒后提交;**省略该字段** = 用 store 的默认时长(不是永久)。 */
+  ttl_secs?: number;
 }
 
 export type Role = "operator" | "viewer" | "none";
@@ -146,8 +377,10 @@ export const api = {
   me: () => req<{ role: Role }>("/api/me"),
   cluster: () => req<Cluster>("/api/cluster"),
   nodes: () => req<Node[]>("/api/nodes"),
-  partitions: (offset: number, limit: number) =>
-    req<PartitionPage>(`/api/partitions?offset=${offset}&limit=${limit}`),
+  partitions: (offset: number, limit: number, state = "") =>
+    req<PartitionPage>(
+      `/api/partitions?offset=${offset}&limit=${limit}${state ? `&state=${state}` : ""}`,
+    ),
   partition: (id: number) => req<Partition>(`/api/partitions/${id}`),
   repairPartition: (id: number) =>
     req<RepairResult>(`/api/partitions/${id}/repair`, { method: "POST" }),
@@ -156,6 +389,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ from_node_id, to_node_id }),
     }),
+  /** 对该分区所有副本节点并发触发手动 compact;单节点失败不影响其余节点。 */
+  compactPartition: (id: number) =>
+    req<CompactResult>(`/api/partitions/${id}/compact`, { method: "POST" }),
+  /** 后台 compact:各副本立即提交任务并回 `job_id`,进度用 {@link api.compactJobs} 轮询。 */
+  compactPartitionAsync: (id: number) =>
+    req<CompactSubmitResult>(`/api/partitions/${id}/compact?mode=async`, { method: "POST" }),
+  /** 各副本节点上该分区的后台 compact 任务(每节点最近几条,最新在前)。 */
+  compactJobs: (id: number) => req<CompactJobsResult>(`/api/partitions/${id}/compact-jobs`),
+  /** 某节点的复制开关状态(暂停的是该节点**主动拉**复制)。 */
+  storeReplicationControl: (nodeId: number) =>
+    req<{ paused: boolean }>(`/api/stores/${nodeId}/replication-control`),
+  /** 暂停/恢复某节点的主动拉复制(不持久化,重启即恢复)。 */
+  setStoreReplicationControl: (nodeId: number, paused: boolean) =>
+    req<{ paused: boolean }>(`/api/stores/${nodeId}/replication-control`, {
+      method: "POST",
+      body: JSON.stringify({ paused }),
+    }),
+  /** 审计记录(operator 专属;最新在前,limit 默认 200、上限 2000)。 */
+  audit: (limit: number) => req<{ entries: AuditEntry[] }>(`/api/audit?limit=${limit}`),
   metrics: () => req<Metrics>("/api/metrics"),
   createPartitions: (count: number, replication_factor: number) =>
     req<{ partition_ids: number[] }>("/api/partitions", {
@@ -167,9 +419,58 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ state }),
     }),
+  scrubPartition: (id: number, deep = false) =>
+    req<ScrubResult>(`/api/partitions/${id}/scrub?deep=${deep ? 1 : 0}`, { method: "POST" }),
+  scrubRuns: () => req<{ runs: ScrubRun[] }>("/api/scrub"),
   decommission: (nodeId: number, force = false) =>
     req<string>(`/api/nodes/${nodeId}/decommission?force=${force}`, { method: "POST" }),
+  /** 维护模式开关(pause_autogrow 仅 paused=true 时有意义)。 */
+  setMaintenance: (paused: boolean, pause_autogrow: boolean) =>
+    req<string>("/api/maintenance", {
+      method: "POST",
+      body: JSON.stringify({ paused, pause_autogrow }),
+    }),
+  /** 某节点的当前请求静默集(禁用中的 op × 分区)。 */
+  storeRequestControl: (nodeId: number) =>
+    req<RequestControlEntry[]>(`/api/stores/${nodeId}/request-control`),
+  /** 开/关某节点(或某分区)某类数据面请求的静默;返回操作后的禁用集。 */
+  setStoreRequestControl: (nodeId: number, body: RequestControlBody) =>
+    req<RequestControlEntry[]>(`/api/stores/${nodeId}/request-control`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** 当前均衡计划(无计划时 `present=false`)。 */
+  balanceState: () => req<BalanceState>("/api/balance"),
+  /** 评估生成一份预览计划(operator;`maxMoves` 省略时用服务端默认)。 */
+  balanceEval: (maxMoves?: number) =>
+    req<BalanceEvalResult>("/api/balance/eval", {
+      method: "POST",
+      body: JSON.stringify(maxMoves == null ? {} : { max_moves: maxMoves }),
+    }),
+  /** 执行指定计划(operator;按 `max_in_flight` 逐个搬迁)。 */
+  balanceStart: (planId: number) =>
+    req<BalanceOpResult>("/api/balance/start", {
+      method: "POST",
+      body: JSON.stringify({ plan_id: planId }),
+    }),
+  /** 取消指定计划(operator)。 */
+  balanceCancel: (planId: number) =>
+    req<BalanceOpResult>("/api/balance/cancel", {
+      method: "POST",
+      body: JSON.stringify({ plan_id: planId }),
+    }),
 };
+
+/** 数据面可被静默的操作名(store 侧 `DataOp::ALL` 的对外真值,顺序一致)。 */
+export const DATA_OPS = ["put", "get", "delete", "undelete", "ttl_update"] as const;
+
+/** 秒 → 人读时长("-" = 永久)。 */
+export function fmtSecs(secs: number | null): string {
+  if (secs == null) return "∞";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.round(secs / 60)}m`;
+  return `${(secs / 3600).toFixed(1)}h`;
+}
 
 export function fmtBytes(n: number): string {
   const u = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];

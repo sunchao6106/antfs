@@ -38,12 +38,15 @@
 - [x] 6.5 `cargo test` 绿 + `cargo clippy` 无告警(workspace 全量)。
 
 ## M2 — 放置(后续)
-- [ ] `CreatePartitions`(分配 id + 故障域 rack-aware 选盘 + 写 raft placement) + 容量感知选盘(余量 ≥ 分区上界且相近的 N 块盘;盘将满转 RO)。
-- [ ] `LookupPartition` + 路由索引心跳重建 + `AssignPartition`(取 RW 分区)。
-- [ ] Q5 自动扩容:水位监测自动建分区 + 防抖/限速/上限。
+- [x] `CreatePartitions`(分配 id + 故障域 rack-aware 选盘 + 写 raft placement) + 容量感知选盘(余量 ≥ 分区上界且相近的 N 块盘)。已落地:`crates/master/src/placement.rs::select_disks` + proto `CreatePartitions`。
+- [ ] 盘将满**转 RO**:`near_full_ratio` 目前只在选盘时**跳过**该盘(`placement.rs`:74),不会把已落在将满盘上的分区置 RO——这条仍未做。
+- [x] `LookupPartition` + 路由索引心跳重建 + `AssignPartition`(取 RW 分区)。已落地。
+- [x] Q5 自动扩容:水位监测自动建分区 + 防抖/限速/上限。已落地 `crates/master/src/autogrow.rs`。
 
 ## M3 — 调谐(后续)
-- [ ] 副本状态机(BOOTSTRAP→STANDBY/ACTIVE,§7.2)+ 心跳失联检测 → 产再复制任务(下发 `MasterDirective`)。
+- [x] 副本状态机(BOOTSTRAP→STANDBY/ACTIVE,§7.2)+ 心跳失联检测 → 产再复制任务(下发 `MasterDirective`)。已落地:`soft.rs` 软状态 + `reconcile.rs::plan_rereplication`。
 
 ## M4 — 再平衡 / EC 钩子(后续)
-- [ ] 容量均衡、`DecommissionNode`、对接 D5 EC 转换决策。
+- [x] `DecommissionNode`。已落地(详见 `openspec/changes/master-decommission/`)。
+- [ ] 容量均衡:转由 `openspec/changes/balance-and-scrub/` 承接(计划式均衡,含 planner/RPC/执行器)。
+- [ ] 对接 D5 EC 转换决策 —— **EC 仍锁定**,等解锁后再做。

@@ -109,6 +109,37 @@ impl Loader {
 
     /// 合并所有来源并反序列化为 `T`(缺失字段回落到 `T` 的 serde 默认)。
     pub fn load<T: DeserializeOwned>(self) -> Result<T> {
+        Ok(self.build_config()?.try_deserialize()?)
+    }
+
+    /// 同 [`load`](Self::load),但反序列化后调用 [`Validate::validate`]。
+    pub fn load_validated<T: DeserializeOwned + Validate>(self) -> Result<T> {
+        let value: T = self.load()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// 按文档约定的 `[table]` 表加载(如 `[admin]` / `[master]` / `[store_server]`),**同时兼容顶层 flat key**。
+    ///
+    /// 设计文档与各 crate 的 `config.rs` 都写明"字段名即 TOML key(在 `[xxx]` 表下)",但配置文件若真按表写、
+    /// 而加载端只按 flat 反序列化,表里的值会**静默回落到默认值**(serde default 掩盖了错误)。此方法:
+    ///
+    /// - 配置里存在 `table` 表 → 只取该表(`AMBRY_ADMIN__MASTER_ADDR` 这类带 `__` 的环境变量也落在这张表里);
+    /// - 不存在该表 → 回落到顶层 flat(兼容既有 flat 配置文件与 `AMBRY_MASTER_ADDR` 这类环境变量)。
+    ///
+    /// 注意**不要**在同一份配置里混用两种写法:表存在时 flat key 会被忽略。
+    pub fn load_table<T: DeserializeOwned>(self, table: &str) -> Result<T> {
+        let cfg = self.build_config()?;
+        match cfg.get_table(table) {
+            // 表存在:只解析该表。这里的反序列化错误**直接上抛**(不从表静默回落到 flat),
+            // 否则表里写错的字段会变成默认值——正是本方法要消灭的那类静默失效。
+            Ok(_) => Ok(cfg.get::<T>(table)?),
+            Err(_) => Ok(cfg.try_deserialize()?),
+        }
+    }
+
+    /// 构造合并后的 [`Config`](供 [`load_table`](Self::load_table) 判断表是否存在)。
+    fn build_config(self) -> Result<Config> {
         let mut builder = Config::builder();
         for toml in &self.inline_toml {
             builder = builder.add_source(File::from_str(toml, FileFormat::Toml));
@@ -127,14 +158,7 @@ impl Loader {
         for (k, v) in &self.overrides {
             builder = builder.set_override(k.as_str(), v.as_str())?;
         }
-        Ok(builder.build()?.try_deserialize()?)
-    }
-
-    /// 同 [`load`](Self::load),但反序列化后调用 [`Validate::validate`]。
-    pub fn load_validated<T: DeserializeOwned + Validate>(self) -> Result<T> {
-        let value: T = self.load()?;
-        value.validate()?;
-        Ok(value)
+        Ok(builder.build()?)
     }
 }
 
