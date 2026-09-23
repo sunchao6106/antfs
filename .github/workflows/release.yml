@@ -112,6 +112,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
+          cat SHA256SUMS.* > SHA256SUMS
+          rm -f SHA256SUMS.*
           sort -k2 SHA256SUMS > SHA256SUMS.sorted && mv SHA256SUMS.sorted SHA256SUMS
           cat SHA256SUMS
           sha256sum -c SHA256SUMS

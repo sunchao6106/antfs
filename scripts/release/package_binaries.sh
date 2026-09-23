@@ -19,6 +19,7 @@ if [[ -z $bin_dir ]]; then
     bin_dir=$repo_root/target/$target/release
   else
     bin_dir=$repo_root/target/release
+    echo "package_binaries: target/$target/release 不存在,改用 target/release(本机原生构建)" >&2
   fi
 fi
 
@@ -42,11 +43,13 @@ tarball=$name.tar.gz
 tar -C "$dist" -czf "$dist/$tarball" "$name"
 rm -rf "$stage"
 
-# 校验和:两个平台都能跑出同一格式(`<hash>  <file>`),Linux 的 `sha256sum -c` 可直接校验。
+# 校验和:按 target 分文件(`SHA256SUMS.<target>`),发布 job 再合并成一个 —— 四个 target 并行
+# 各自产出同名 SHA256SUMS 会在 artifact 合并时互相覆盖。
+# 两个平台都能跑出同一格式(`<hash>  <file>`),Linux 的 `sha256sum -c` 可直接校验。
 if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$dist" && sha256sum "$tarball" >> SHA256SUMS)
+  (cd "$dist" && sha256sum "$tarball" >> "SHA256SUMS.$target")
 else
-  (cd "$dist" && shasum -a 256 "$tarball" >> SHA256SUMS)
+  (cd "$dist" && shasum -a 256 "$tarball" >> "SHA256SUMS.$target")
 fi
 
 echo "package_binaries: packed $dist/$tarball"

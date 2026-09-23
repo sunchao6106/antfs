@@ -49,7 +49,7 @@ The packaging step is a plain script, so you can reproduce it locally:
 ```bash
 cargo build --release --locked -p antfs-master -p antfs-store -p antfs-frontend -p antfs-admin -p antfs-devcluster
 scripts/release/package_binaries.sh 0.1.0 aarch64-apple-darwin   # 用本机 target triple
-shasum -a 256 -c dist/SHA256SUMS                                 # Linux 用 sha256sum -c
+shasum -a 256 -c dist/SHA256SUMS.aarch64-apple-darwin            # Linux 用 sha256sum -c
 ```
 
 Container images are built and pushed to GHCR by `.github/workflows/docker.yml`.
