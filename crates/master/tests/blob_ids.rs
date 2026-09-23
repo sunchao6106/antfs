@@ -137,6 +137,7 @@ fn placement(node_id: u64) -> ReplicaPlacement {
         node_id,
         disk_id: DISK.to_string(),
         target_state: "ACTIVE".to_string(),
+        incarnation: 0,
     }
 }
 

@@ -63,7 +63,23 @@ pub struct ReplicaHandle {
     pub current_state: Arc<RwLock<String>>,
     /// 该 replica 的拉复制滞后估算(心跳上报;口径与误差见 [`crate::replication::lag_bytes`])。
     pub lag: Arc<LagEstimate>,
+    /// **分区可写态**(master 权威:`RW` / `RO` / `SEALED`),随心跳指令下发;`""` = 未知
+    /// (未接 master 的单机模式,或指令还没到)。
+    ///
+    /// 与 `current_state`(副本实然态:追平了吗/坏了吗)是两码事,别混用:本地维护(定时 compaction)
+    /// 按它挑候选集,见 [`crate::worker`]。
+    pub partition_state: Arc<RwLock<String>>,
+    /// **墓碑回收闸门**(master 权威,随心跳指令每拍全量下发):`true` = 该分区**所有副本都已追平**,
+    /// compaction 才允许回收墓碑;`false` = 墓碑一律照搬。
+    ///
+    /// 为什么需要它(CLAUDE.md §3.1):墓碑一收,还有没追平的副本就永远学不到那条删除,已删对象会
+    /// 以"活数据"永久留在它上面(僵尸数据)。初值 `false` —— **没得到 master 放行前不回收**;
+    /// 单机模式(未接 master)没有别的副本可滞后,由消费侧按放行处理(见 [`crate::worker`])。
+    pub tombstones_reclaim_allowed: Arc<RwLock<bool>>,
 }
+
+/// 分区状态未知(未接 master / 指令未到):本地维护按"可压"处理,保持单机模式的既有行为。
+pub const STATE_UNKNOWN: &str = "";
 
 impl ReplicaHandle {
     /// 追平后置 [`STATE_ACTIVE`];返回是否**真的发生了**状态变化(幂等:已是 `ACTIVE` 返回 `false`)。
@@ -83,6 +99,22 @@ impl ReplicaHandle {
         }
         *state = STATE_ACTIVE.to_string();
         true
+    }
+
+    /// 当前分区可写态(`RW` / `RO` / `SEALED`;`""` = 未知)。本地维护据此挑 compaction 候选集。
+    pub fn partition_state_now(&self) -> String {
+        self.partition_state
+            .read()
+            .expect("partition_state lock poisoned")
+            .clone()
+    }
+
+    /// 当前墓碑回收闸门(master 权威;消费口径见 [`crate::worker::tombstones_allowed`])。
+    pub fn tombstones_reclaim_allowed(&self) -> bool {
+        *self
+            .tombstones_reclaim_allowed
+            .read()
+            .expect("tombstones_reclaim_allowed lock poisoned")
     }
 }
 
@@ -130,17 +162,28 @@ impl ReplicaManager {
     /// **重开**(`dir.exists()` → `open_with`)也走保守路径 —— 盘上数据可能是旧的,先报 `BOOTSTRAP`,
     /// 等一轮拉复制确认追平再转 `ACTIVE`(重启期间短时报"同步中"是诚实状态,不是故障)。
     pub fn ensure_replica(&self, pid: PartitionId) -> Result<ReplicaHandle> {
+        self.ensure_replica_with_origin(pid).map(|(h, _)| h)
+    }
+
+    /// 同 [`ensure_replica`](Self::ensure_replica),但额外告知"这次是不是**从零**建出来的":
+    /// `true` = 盘上原本没有这份副本(本次新建了副本目录)。
+    ///
+    /// 控制面用它决定要不要向 master 申领副本身份(见 `heartbeat::claim_incarnation`):
+    /// **只有从零建副本才换身份**。OFFLINE 摘除后挂回、进程重启重开、幂等心跳重复下发 —— 盘上数据
+    /// 都还在(身份文件也在),身份必须**保持**;否则对端手里绑着这份副本的游标会被无故作废、
+    /// 每挂回一次就全量重拉一轮。
+    pub fn ensure_replica_with_origin(&self, pid: PartitionId) -> Result<(ReplicaHandle, bool)> {
         if let Some(h) = self
             .replicas
             .read()
             .expect("replicas lock poisoned")
             .get(&pid)
         {
-            return Ok(h.clone());
+            return Ok((h.clone(), false));
         }
         let mut guard = self.replicas.write().expect("replicas lock poisoned");
         if let Some(h) = guard.get(&pid) {
-            return Ok(h.clone());
+            return Ok((h.clone(), false));
         }
         let disk = self
             .disks
@@ -148,11 +191,14 @@ impl ReplicaManager {
             .ok_or(Error::NoDiskSpace)?;
         let dir = disk.dir.join(format!("partition_{pid}"));
         let store_id = format!("p{pid}");
+        // 判据取**盘上是否已有副本目录**(而不是"内存里有没有句柄"):OFFLINE 只摘句柄、数据留着,
+        // 挂回时不能被当成"从零建"。
+        let fresh = !dir.exists();
         // `*_partition(..)` 必须带上 `pid`:它同时是段头的 key 前缀与写入校验的准绳 ——
         // 用默认前缀 0 建库,则该分区上**任何真实 blobId 的写都会被拒**(前缀不符 → 400),
         // 读也永远 miss。打开时顺带校验盘上副本的分区正是这个 pid。
-        let store = if dir.exists() {
-            BlobStore::open_with_partition(
+        let store = if fresh {
+            BlobStore::create_with_partition(
                 &dir,
                 self.partition_capacity,
                 &self.store_config,
@@ -161,7 +207,7 @@ impl ReplicaManager {
                 pid,
             )?
         } else {
-            BlobStore::create_with_partition(
+            BlobStore::open_with_partition(
                 &dir,
                 self.partition_capacity,
                 &self.store_config,
@@ -172,7 +218,46 @@ impl ReplicaManager {
         };
         let handle = Self::make_handle(disk.id.clone(), store);
         guard.insert(pid, handle.clone());
-        Ok(handle)
+        Ok((handle, fresh))
+    }
+
+    /// 记下某分区的可写态(来自 master 心跳指令)。本地没有该副本 → 返回 `false`(忽略即可:
+    /// 指令与本地副本建立存在竞态,下一拍还会重发)。
+    pub fn set_partition_state(&self, pid: PartitionId, state: &str) -> bool {
+        let handle = self.get(pid);
+        match handle {
+            Some(h) => {
+                let mut g = h
+                    .partition_state
+                    .write()
+                    .expect("partition_state lock poisoned");
+                if *g == state {
+                    return false;
+                }
+                *g = state.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 记下某分区的**墓碑回收闸门**(来自 master 心跳指令)。本地没有该副本 → 返回 `false`(忽略即可:
+    /// 指令与本地副本建立存在竞态,下一拍还会重发)。返回值 = 是否**真的发生了变化**(幂等)。
+    pub fn set_tombstones_reclaim_allowed(&self, pid: PartitionId, allowed: bool) -> bool {
+        match self.get(pid) {
+            Some(h) => {
+                let mut g = h
+                    .tombstones_reclaim_allowed
+                    .write()
+                    .expect("tombstones_reclaim_allowed lock poisoned");
+                if *g == allowed {
+                    return false;
+                }
+                *g = allowed;
+                true
+            }
+            None => false,
+        }
     }
 
     /// 取某分区的本地 replica(数据面路由用);未建则 `None`。
@@ -204,6 +289,11 @@ impl ReplicaManager {
             store: Arc::new(store),
             current_state: Arc::new(RwLock::new(STATE_BOOTSTRAP.to_string())),
             lag: Arc::new(LagEstimate::new()),
+            // 分区状态由 master 心跳指令填;新副本先按"未知"起步(未知 = 可压,单机模式行为不变)。
+            partition_state: Arc::new(RwLock::new(STATE_UNKNOWN.to_string())),
+            // 墓碑回收闸门同样由 master 心跳指令填;新副本先按"不放行"起步 —— 没得到权威放行前
+            // **宁可不回收**(见字段文档),单机模式由消费侧放行。
+            tombstones_reclaim_allowed: Arc::new(RwLock::new(false)),
         };
         let cs = handle.current_state.clone();
         handle.store.set_io_error_hook(Arc::new(move || {
@@ -222,7 +312,7 @@ impl ReplicaManager {
     pub fn install_bootstrap(
         &self,
         pid: PartitionId,
-        segments: &[(u64, Vec<u8>)],
+        segments: &[(antfs_blob::LogSegmentName, Vec<u8>)],
     ) -> Result<ReplicaHandle> {
         use std::io::Write;
         self.remove_replica(pid);
@@ -233,26 +323,47 @@ impl ReplicaManager {
         let dir = disk.dir.join(format!("partition_{pid}"));
         let _ = std::fs::remove_dir_all(&dir);
         let log_dir = dir.join("log");
-        std::fs::create_dir_all(&log_dir)?;
-        for (pos, bytes) in segments {
-            let final_path = log_dir.join(antfs_blob::LogSegmentName(*pos).filename());
-            let tmp_path = log_dir.join(format!("{pos}_log.seg.tmp"));
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp_path, &final_path)?;
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e.into());
+        }
+        // 逐段按**段名**(位置 + 代次)落盘:段身份必须原样保留,否则该副本的段表与 peer 对不上。
+        // 任一步失败(含最终打开时发现段头与文件名代次不符 —— 那说明对端在拷贝期间重写过 log)
+        // 都**清掉半成品目录**再报错:让调用方干净地回落纯逻辑拉取。
+        let write_all = || -> Result<()> {
+            for (name, bytes) in segments {
+                let final_path = log_dir.join(name.filename());
+                let tmp_path = log_dir.join(format!("{}.tmp", name.filename()));
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(bytes)?;
+                f.sync_all()?;
+                drop(f);
+                std::fs::rename(&tmp_path, &final_path)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = write_all() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
         }
         let store_id = format!("p{pid}");
-        // 拷来的段头自述其分区 —— 必须等于本次 bootstrap 的 pid(拷错分区的段当场拒掉)。
-        let store = antfs_blob::BlobStore::open_rebuild_index_with_partition(
+        // 拷来的段头自述其分区与代次 —— 都必须与本次 bootstrap 对得上(拷错分区 / 拷到别的 incarnation
+        // 的段,当场拒掉)。
+        let opened = antfs_blob::BlobStore::open_rebuild_index_with_partition(
             &dir,
             self.partition_capacity,
             &self.store_config,
             &self.store_metrics,
             &store_id,
             pid,
-        )?;
+        );
+        let store = match opened {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e.into());
+            }
+        };
         let handle = Self::make_handle(disk.id.clone(), store);
         self.replicas
             .write()
@@ -500,6 +611,33 @@ mod tests {
         assert_eq!(a.disk_id, b.disk_id);
         assert!(rm.get(7).is_some());
         assert!(rm.get(8).is_none());
+    }
+
+    /// `ensure_replica_with_origin` 的 `true` = "**盘上原本没有**这份副本"(本次从零建出)——
+    /// 控制面只在这时向 master 申领副本身份(见 `heartbeat::claim_incarnation`)。判据必须落在**盘上**:
+    /// OFFLINE 摘除后挂回、进程重启重开都不算从零建,否则每挂回一次就换一次身份,对端手里的游标被
+    /// 无故作废、白跑一轮全量重拉。
+    #[test]
+    fn ensure_replica_origin_reports_only_from_scratch_creations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rm = manager(tmp.path());
+
+        let (h, fresh) = rm.ensure_replica_with_origin(4).unwrap();
+        assert!(fresh, "盘上本来没有 → 从零建出");
+        assert!(h.store.is_empty());
+
+        let (_, fresh) = rm.ensure_replica_with_origin(4).unwrap();
+        assert!(!fresh, "内存里已有句柄 → 幂等空转,不算从零建");
+
+        // OFFLINE = 只摘句柄,盘上数据留着 → 挂回时是"打开已有副本",不是从零建。
+        rm.remove_replica(4);
+        let (_, fresh) = rm.ensure_replica_with_origin(4).unwrap();
+        assert!(!fresh, "盘上还有副本目录 → 不算从零建(挂回不换身份)");
+
+        // DROPPED = 真删目录 → 再建就是新的一代副本(该换身份)。
+        assert!(rm.drop_replica(4).unwrap());
+        let (_, fresh) = rm.ensure_replica_with_origin(4).unwrap();
+        assert!(fresh, "目录已被删 → 重建属于从零建(该申领新身份)");
     }
 
     /// A6:删本地副本 = 目录消失 + 句柄摘除 + 幂等(重复调用返回 false 且仍成功)。

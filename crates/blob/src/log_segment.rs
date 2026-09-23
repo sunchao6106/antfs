@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Error, Result};
 
 const HEADER_MAGIC: u32 = 0x414D_4253; // "AMBS"
-const HEADER_VERSION: u16 = 2;
+const HEADER_VERSION: u16 = 3;
 const HEADER_SIZE: usize = 64;
 
 /// 段容量硬上界 = **4 GiB**。这不是调优建议,是全引擎的**格式不变量**:
@@ -37,9 +37,35 @@ mod hdr {
     /// u32:本段所属副本的 key 前缀 = blobId 高 32bit(partitionId)。同段内所有记录共享,
     /// 故记录体里只存低 32bit 的 `objectId` 后缀(见 `blob.rs` 记录布局)。
     pub const KEY_PREFIX: usize = 32; // u32
-    pub const CRC: usize = 36; // u32,覆盖 [0, CRC)
+    /// u32:段的**代次**(见 [`LogSegmentName`])。v3 新增:段名里也有它,写进段头是为了
+    /// **自述** —— 物理拷贝/校验时不必信文件名,比对段头即可。
+    pub const GENERATION: usize = 36; // u32
+    pub const CRC: usize = 40; // u32,覆盖 [0, CRC)
     pub const COVERED: usize = CRC;
-    pub const HEADER_LEN: usize = 40;
+    pub const HEADER_LEN: usize = 44;
+}
+
+/// 从一段**段文件前缀字节**里读出段头自述的代次(不落盘、不开文件)。
+///
+/// 物 bootstrap 的接收端用它校验"刚拷来的字节"正是清单里那一段:段头与清单代次不符
+/// 说明对端在拷贝期间重写过 log(同位置指向别的记录),这份拷贝必须丢弃。
+pub fn peek_generation(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < hdr::HEADER_LEN {
+        return None;
+    }
+    let magic = u32::from_le_bytes(bytes[hdr::MAGIC..hdr::MAGIC + 4].try_into().ok()?);
+    if magic != HEADER_MAGIC {
+        return None;
+    }
+    let stored_crc = u32::from_le_bytes(bytes[hdr::CRC..hdr::CRC + 4].try_into().ok()?);
+    if crc32fast::hash(&bytes[0..hdr::COVERED]) != stored_crc {
+        return None;
+    }
+    Some(u32::from_le_bytes(
+        bytes[hdr::GENERATION..hdr::GENERATION + 4]
+            .try_into()
+            .ok()?,
+    ))
 }
 
 fn now_ns() -> u64 {
@@ -85,6 +111,7 @@ pub struct LogSegment {
     data_end: AtomicU64,
     created_ns: u64,
     key_prefix: u32,
+    generation: u32,
 }
 
 impl std::fmt::Debug for LogSegment {
@@ -98,7 +125,15 @@ impl std::fmt::Debug for LogSegment {
 
 impl LogSegment {
     /// 创建新段:预分配容量(跨平台)→ 写 header → fsync。
-    pub fn create(path: impl AsRef<Path>, capacity: u64, key_prefix: u32) -> Result<Self> {
+    ///
+    /// `generation` = 段的代次(见 [`LogSegmentName`]),由上层 [`Log::create`](crate::log::Log::create) /
+    /// 滚动时分配;写进段头与文件名两处(自述,便于物理拷贝后校验)。
+    pub fn create(
+        path: impl AsRef<Path>,
+        capacity: u64,
+        key_prefix: u32,
+        generation: u32,
+    ) -> Result<Self> {
         if capacity <= HEADER_SIZE as u64 {
             return Err(Error::BadArgument(format!(
                 "capacity {capacity} must exceed header size {HEADER_SIZE}"
@@ -127,6 +162,7 @@ impl LogSegment {
             data_end: AtomicU64::new(0),
             created_ns: now_ns(),
             key_prefix,
+            generation,
         };
         seg.write_header()?;
         seg.file.sync_all()?;
@@ -174,6 +210,8 @@ impl LogSegment {
             u64::from_le_bytes(s[hdr::CREATED_NS..hdr::CREATED_NS + 8].try_into().unwrap());
         let key_prefix =
             u32::from_le_bytes(s[hdr::KEY_PREFIX..hdr::KEY_PREFIX + 4].try_into().unwrap());
+        let generation =
+            u32::from_le_bytes(s[hdr::GENERATION..hdr::GENERATION + 4].try_into().unwrap());
 
         Ok(Self {
             file,
@@ -182,6 +220,7 @@ impl LogSegment {
             data_end: AtomicU64::new(data_end),
             created_ns,
             key_prefix,
+            generation,
         })
     }
 
@@ -189,6 +228,12 @@ impl LogSegment {
     #[inline]
     pub fn key_prefix(&self) -> u32 {
         self.key_prefix
+    }
+
+    /// 本段的代次(段头自述;应与文件名里的代次一致,见 [`LogSegmentName`])。
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     /// 段头字节数(物理固定 64B)。供上层算"一条记录最多能用多少段内空间"。
@@ -322,6 +367,7 @@ impl LogSegment {
             .copy_from_slice(&self.data_end.load(Ordering::Acquire).to_le_bytes());
         s[hdr::CREATED_NS..hdr::CREATED_NS + 8].copy_from_slice(&self.created_ns.to_le_bytes());
         s[hdr::KEY_PREFIX..hdr::KEY_PREFIX + 4].copy_from_slice(&self.key_prefix.to_le_bytes());
+        s[hdr::GENERATION..hdr::GENERATION + 4].copy_from_slice(&self.generation.to_le_bytes());
         let crc = crc32fast::hash(&s[0..hdr::COVERED]);
         s[hdr::CRC..hdr::CRC + 4].copy_from_slice(&crc.to_le_bytes());
         let mut hb = [0u8; HEADER_SIZE];
@@ -347,7 +393,7 @@ mod tests {
     #[test]
     fn roundtrip_before_and_after_flush() {
         let path = temp_path("rt");
-        let seg = LogSegment::create(&path, cap(64), 7).unwrap();
+        let seg = LogSegment::create(&path, cap(64), 7, 1).unwrap();
 
         let a = b"hello".to_vec();
         let b = vec![7u8; 100];
@@ -373,7 +419,7 @@ mod tests {
     #[test]
     fn oversized_record_rejected() {
         let path = temp_path("big");
-        let seg = LogSegment::create(&path, cap(2), 7).unwrap();
+        let seg = LogSegment::create(&path, cap(2), 7, 1).unwrap();
         let big = vec![0u8; (cap(2) - HEADER_SIZE as u64) as usize + 1];
         match seg.append(&big) {
             Err(Error::SegmentFull) => {}
@@ -386,7 +432,7 @@ mod tests {
     #[test]
     fn read_out_of_range_rejected() {
         let path = temp_path("oor");
-        let seg = LogSegment::create(&path, cap(4), 7).unwrap();
+        let seg = LogSegment::create(&path, cap(4), 7, 1).unwrap();
         match seg.read(0, 1000) {
             Err(Error::OutOfRange { .. }) => {}
             other => panic!("expected OutOfRange, got {other:?}"),
@@ -402,7 +448,7 @@ mod tests {
         let b = b"tail-record".to_vec();
         let (oa, ob, data_end);
         {
-            let seg = LogSegment::create(&path, cap(64), 7).unwrap();
+            let seg = LogSegment::create(&path, cap(64), 7, 1).unwrap();
             oa = seg.append(&a).unwrap();
             ob = seg.append(&b).unwrap();
             seg.flush().unwrap();
@@ -422,7 +468,7 @@ mod tests {
         let path = temp_path("unflush");
         let flushed_end;
         {
-            let seg = LogSegment::create(&path, cap(64), 7).unwrap();
+            let seg = LogSegment::create(&path, cap(64), 7, 1).unwrap();
             seg.append(b"aaa").unwrap();
             seg.flush().unwrap();
             flushed_end = seg.data_end();
@@ -444,7 +490,7 @@ mod tests {
     #[test]
     fn create_rejects_capacity_above_ceiling() {
         let path = temp_path("ceiling");
-        match LogSegment::create(&path, MAX_CAPACITY + 1, 0) {
+        match LogSegment::create(&path, MAX_CAPACITY + 1, 0, 1) {
             Err(Error::BadArgument(m)) => assert!(m.contains("ceiling"), "got: {m}"),
             other => panic!("expected BadArgument, got {other:?}"),
         }
@@ -473,7 +519,7 @@ mod tests {
     fn key_prefix_survives_reopen_and_flush() {
         let path = temp_path("prefix");
         {
-            let seg = LogSegment::create(&path, cap(4), 0xA1B2_C3D4).unwrap();
+            let seg = LogSegment::create(&path, cap(4), 0xA1B2_C3D4, 1).unwrap();
             assert_eq!(seg.key_prefix(), 0xA1B2_C3D4);
             // flush 重写 header 后前缀不变(CRC 覆盖 key_prefix,写坏会被 open 拒掉)。
             seg.append(b"x").unwrap();
@@ -490,7 +536,7 @@ mod tests {
     #[test]
     fn corrupt_key_prefix_trips_header_crc() {
         let path = temp_path("prefix_crc");
-        LogSegment::create(&path, cap(4), 7)
+        LogSegment::create(&path, cap(4), 7, 1)
             .unwrap()
             .close()
             .unwrap();

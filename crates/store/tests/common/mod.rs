@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use antfs_master::pb::master_server::{Master, MasterServer};
+use antfs_master::pb::{AssignIncarnationRequest, AssignIncarnationResponse};
 use antfs_master::pb::{
     AssignRequest, AssignResponse, BalanceStateRequest, BalanceStateResponse, CancelBalanceRequest,
     CancelBalanceResponse, ClusterState, ClusterStateRequest, CreatePartitionsRequest,
@@ -51,6 +52,8 @@ pub struct FakeMaster {
     peers: Arc<Vec<ReplicaLoc>>,
     /// 收到的心跳 beat 数(用例用它同步「节点心跳仍在跑」,免 sleep 拍脑袋)。
     beats: Arc<AtomicU64>,
+    /// `AssignReplicaIncarnation` 发的号(单调;从一个大数起,便于与本地兜底值区分)。
+    incarnations: Arc<AtomicU64>,
     addr: SocketAddr,
 }
 
@@ -62,6 +65,7 @@ impl FakeMaster {
             directives: Arc::new(Mutex::new(Vec::new())),
             peers: Arc::new(peers),
             beats: Arc::new(AtomicU64::new(0)),
+            incarnations: Arc::new(AtomicU64::new(1000)),
             addr,
         };
         let svc = MasterServer::new(fake.clone());
@@ -98,6 +102,7 @@ impl FakeMaster {
                 target_state: target_state.to_string(),
             }],
             tasks: Vec::new(),
+            partition_states: Vec::new(),
         });
     }
 
@@ -161,6 +166,21 @@ impl Master for FakeMaster {
             partition_id: request.into_inner().partition_id,
             state: "RW".to_string(),
             replicas: (*self.peers).clone(),
+        }))
+    }
+
+    /// 假 master 的 incarnation 发放:每次给一个**全新的更大值**(store 侧只需知道"每次都是新号")。
+    async fn assign_replica_incarnation(
+        &self,
+        _request: Request<AssignIncarnationRequest>,
+    ) -> Result<Response<AssignIncarnationResponse>, Status> {
+        let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed);
+        Ok(Response::new(AssignIncarnationResponse {
+            version: 1,
+            ok: true,
+            incarnation,
+            leader_addr: String::new(),
+            error: String::new(),
         }))
     }
 
@@ -269,6 +289,7 @@ pub fn peer_loc(node_id: u64, addr: &str) -> ReplicaLoc {
         disk_id: String::new(),
         target_state: "ACTIVE".to_string(),
         up: true,
+        incarnation: 1,
     }
 }
 

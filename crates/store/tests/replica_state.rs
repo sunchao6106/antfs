@@ -81,7 +81,7 @@ async fn sync(
     let replicas = srv.replicas();
     tokio::task::spawn_blocking(move || {
         let peer = HttpPeer::new(base, 0, Duration::from_secs(10)).unwrap();
-        sync_round(&replicas, 0, &peer, prior, u64::MAX, bootstrap)
+        sync_round(&replicas, 0, &peer, prior, None, u64::MAX, bootstrap)
     })
     .await
     .unwrap()

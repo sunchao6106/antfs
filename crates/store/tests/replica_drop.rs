@@ -47,6 +47,7 @@ async fn dropped_directive_deletes_replica_data_and_is_idempotent() {
         version: 1,
         transitions: vec![dropped(0), dropped(0), dropped(42)],
         tasks: Vec::new(),
+        partition_states: Vec::new(),
     });
 
     let registry = antfs_metric::Registry::new();

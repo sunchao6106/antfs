@@ -21,6 +21,8 @@ service Master {
   rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
   rpc RepairPartition(RepairPartitionRequest) returns (RepairPartitionResponse);
   rpc MoveReplica(MoveReplicaRequest) returns (MoveReplicaResponse);
+  // 副本身份(incarnation):store 每次**从零建副本目录**时向 leader 申领一个全新身份(新号,非取回旧号)。
+  rpc AssignReplicaIncarnation(AssignIncarnationRequest) returns (AssignIncarnationResponse);
   // 计划式均衡(eval → start → cancel → state):先评估出计划由运维确认,再按并发上限逐个执行。
   rpc EvalBalance(EvalBalanceRequest) returns (EvalBalanceResponse);
   rpc StartBalance(StartBalanceRequest) returns (StartBalanceResponse);
@@ -86,6 +88,17 @@ message Transition {
 }
 
 // master → 节点:后台任务提示(M3:再复制)。
+// 一个分区的**分区级**状态(RW / RO / SEALED);下发方向 master → 节点。
+// 与 `Transition.target_state` 的区别:后者是「副本实然态」(ACTIVE/BOOTSTRAP...),这条是
+// 「分区可写态」—— 数据节点的本地维护(定时 compaction)按它挑候选集。
+message PartitionStateInfo {
+  uint32 partition_id = 1;
+  string state = 2; // RW / RO / SEALED
+  // 墓碑回收闸门(master 权威,每拍重算):true = 该分区的**所有副本都已追平**(各副本上报
+  // ACTIVE 且 lag_bytes==0;节点失联/未上报的副本都算未追平)。false 时 store 侧**不得回收墓碑**:
+  // 墓碑一收,滞后副本就永远学不到那条删除,已删对象会以"活数据"永久留在它上面(僵尸数据)。
+  bool tombstones_reclaim_allowed = 3;
+}
 message Task {
   string kind = 1;          // "rereplicate" ...
   uint32 partition_id = 2;
@@ -95,6 +108,9 @@ message MasterDirective {
   uint32 version = 1;
   repeated Transition transitions = 2; // current!=target 的副本转移指令
   repeated Task tasks = 3;             // 再复制等任务提示
+  // 本节点承载副本的分区状态(每拍全量、只含本节点有副本的分区):store 侧据此选 compaction
+  // 候选集(SEALED 永不入选,RW 是否入选由 store 配置决定)。
+  repeated PartitionStateInfo partition_states = 4;
 }
 
 message ListNodesRequest { uint32 version = 1; }
@@ -154,6 +170,9 @@ message ReplicaLoc {
   string disk_id = 3;
   string target_state = 4;
   bool up = 5;
+  // 该副本当前的**身份**(placement 里的值):store 据此刻画"我这份副本是哪个身份"。
+  // 0 = 未分配(旧数据/旧快照);有身份一律 ≥ 1,且每次从零建副本都换新值。
+  uint64 incarnation = 6;
 }
 
 message LookupRequest {
@@ -308,6 +327,24 @@ message MoveReplicaResponse {
   string error = 4;
   uint64 to_node_id = 5;         // 成功时:实际落点(自动选择时回填)
   string to_disk_id = 6;
+}
+
+// 副本身份申领(store → leader):(partition, node) 上这份副本换个**全新**身份。
+// 是"换新号"而非"取回旧号":重建 / 换盘后的副本不得沿用旧身份,否则拉取方手里的旧复制游标
+// 会看似合法(见 ReplicaPlacement::incarnation)。leader-only + 经 Raft 提交(号由 apply 发放)。
+message AssignIncarnationRequest {
+  uint32 version = 1;
+  string cluster_secret = 2;
+  uint32 partition_id = 3;
+  uint64 node_id = 4;
+}
+
+message AssignIncarnationResponse {
+  uint32 version = 1;
+  bool ok = 2;
+  uint64 incarnation = 3;  // 新身份(ok=true 时有效);已落进 placement,LookupPartition 会返回同一个值
+  string leader_addr = 4;  // 非 leader 时回填,供 client 重定向
+  string error = 5;
 }
 
 // 维护模式开关(对标 Ceph `osd set noout/norecover`):暂停后 master 不再执行再复制/迁移/下线

@@ -217,3 +217,168 @@
   `store-request-control` / `blob-io-end-to-end` / `balance-and-scrub`)加"后续变更"注记;
   `openspec/changes/simplify-delete-model/` 从提案回填为已实施(逐项偏差见其 `tasks.md`「与原提案的偏差」)。
 - 本条目之前的各"步骤"描述的是当时真实的实现,不改写。
+
+## 步骤 20:compaction 策略升级 —— 候选集按可写态、低峰钟点调度、回收 TTL 过期与墓碑(2026-09-23)
+
+- **回收口径(引擎 `blob`)**:`compact` / `compact_if_needed` / `compact_incremental` / `compact_cost_benefit`
+  接 `CompactPolicy{dead_ratio, now_ms, tombstone_retention_ms}`;判活从"是不是当前赢家"扩展为
+  **赢家 且 未过期 且 墓碑未过保留期**。三类字节真正释放:被取代的旧记录(老行为)、**TTL 过期对象**、
+  **过保留期的墓碑**。`CompactionStats` 增 `tombstone_reclaimed_bytes` / `expired_reclaimed_bytes`。
+- **墓碑的删除时刻**:复用索引条目的 `expiration_ms` 槽位(墓碑恒 `-1` → 改存 `deleted_at_ms`)。**磁盘布局不变**
+  (值 21 B、`.idx` 条目 29 B),故不涉格式版本;旧数据 `-1` = 删除时间未知 ⇒ **永不自动回收**(§3.4 兼容,
+  单测 `legacy_tombstone_on_disk_is_readable_and_never_reclaimed` 走"重开重建索引 + 保留期给 0"两段)。删时刻随
+  记录头复制到对端,各副本判定一致。`stat()` 的 TTL 口径走新方法 `ttl_expiration_ms()`,墓碑对外仍报 `-1`。
+- **闸门与选段**:新增 `reclaimable_by_segment`(索引遍历聚合过期/墓碑字节 + `seg_bytes.dead`,**不读数据体**)
+  —— partition 整体可回收占比 ≥ 阈值才动手(partition 级闸门),再对**非活跃段**按同一阈值选段。
+  旧实现只看 `seg_bytes` 死字节,导致"整整一段过期数据"永远不够格被压。
+- **候选集(store `worker`)**:按 master 下发的分区可写态挑 replica —— `SEALED` 永不入选、`RO` 总是入选、
+  `RW` 由 `compaction_include_rw`(默认纳入,只压其封存段)、未知状态(单机模式)按可压处理;未追平
+  (`BOOTSTRAP`)的副本跳过(压了也要从 peer 拉回来,还会让复制游标失效)。
+- **状态下发**:proto `PartitionStateInfo` + `MasterDirective.partition_states = 4`(每拍全量、只含该节点承载
+  副本的分区);master 侧纯函数 `reconcile::plan_partition_states`(带单测);store 侧记在
+  `ReplicaHandle.partition_state`,与"副本实然态" `current_state` 明确区分。
+- **调度**:由"固定 interval 节拍"改为「**首跑钟点 + 周期**」—— 首次对齐本地 `compaction_start_time`,之后每
+  `compaction_interval_secs` 一次。等待时长由纯函数 `next_delay_secs` 算出;本地时区用 libc
+  `localtime_r`/`mktime`(本地日历顺延一天,**夏令时正确**),测试用假时钟故与机器时区无关。
+- **配置**(用户显式指定,非擅自改默认):`compaction_interval_secs` 3600 → **86400**;
+  `compaction_dead_ratio` 0.5 → **0.3**;新增 `compaction_start_time`(默认 `"01:00"`,严格 `HH:MM` 校验)、
+  `compaction_include_rw`(默认 true)、`compaction_tombstone_retention_secs`(默认 86400)。
+- **手动 compact** 不受状态/阈值闸门约束(运维强制),但同一套回收口径(仍守保留期)。
+- **风险(记录在案)**:墓碑回收 = 抹掉"该 key 已删除"的唯一证据;副本若丢失 delete 且滞后超过保留期,修复时
+  可能复活对象。缓解:保留期默认 24h 且可配,文档写明"保留期应 > 副本滞后上界"。另有既有缺口未动:
+  compaction 改写 offset 会让在飞的复制游标失效(resetKey 属复制层)。
+- **验证**:`cargo test --workspace` 全绿(53 个 test target);`cargo clippy --workspace --all-targets` 无告警。
+  新增用例覆盖:过期对象回收 / 墓碑保留期内不回收·过保留期回收 / 重开后删时刻仍在 / partition 闸门看可回收
+  占比 / 旧格式墓碑永不回收 / 候选集状态矩阵 / BOOTSTRAP 跳过 / 首跑与后续节拍(含超时立即跑)。
+- **文档同步**:`docs/design/cluster.md`(proto 片段 + S4 叙述 + `[store_server]` 配置表)、
+  `docs/design/store.md`(新增 §9.1 回收口径);决策档案 `openspec/changes/store-compaction-policy/`。
+
+## 步骤 21:复制游标重定位 —— 段身份/副本身份两层 + 判据收紧 + 墓碑闸门(2026-09-23)
+
+- **问题(静默丢数据链)**:拉复制游标(`FindToken`)记录的是**对端 log 的绝对位置**,而 compaction 会改写
+  坐标系(全库 `compact` 把存活记录重写进新 log、段位置从 0 重来;副本重建 / 换盘 = 全新副本)。旧代码把
+  "游标已作废"误判成"已追上":`scan_candidates` 对"段不存在"静默 `continue` ⇒ 空批 + 原游标 ⇒
+  `replicate_from_peer` 认为到末端 ⇒ `caught_up_with_peer` 再拿同一陈旧游标探本地库也空 ⇒ **判追平 → 置
+  ACTIVE** ⇒ master 删源闸门(`reconcile::plan_move`/`drop_confirmed` 的"搬迁要等继任者已 ACTIVE")误成立 ⇒
+  源副本被摘除 + 下发 `DROPPED` 删源数据 ⇒ **丢数据且无声**。
+- **跟着数据走四遍(大白话版,读不懂上面那段就看这里)**:
+  1. **正常拉一轮**:分区 3 在 A、B 各一份(RF=2),B 是新副本。B 问 A"你有哪些 key",A 回一批并附一句
+     "我给到 **log 第 3 段、第 500 字节**处"——这句话就是**游标**,B 记下;下轮带它继续问,直到 A 说"没了",
+     **这时 B 才向 master 报"我追上了"**。master 收到这句才敢删 A 的副本腾空间:`docs/design/cluster.md`
+     的搬迁规矩是"继任者 ACTIVE 之后才删源",所以早报一次就等于删掉还活着的源。
+  2. **拉的中途 A 做了全库 compaction**:存活数据被重写进新 log、**段号从 0 重新数**,B 那句"第 3 段第 500 字节"
+     成了废话。**危险做法**:A 回一句"那段没了、后面也没了"→ B 以为拉完了 → 报追上 → 删掉还带数据的 A →
+     **数据永久没了且无报错**。**现在的做法**:A 认出这句位置认不出(段没了 / 段还在但版本号变了 / 位置越界 /
+     副本编号不符)→ 回答"从头给你重来"+ 明确告知"这轮作废了你的位置";B 收到就**不许**报追上,下轮接着拉。
+  3. **A 的副本被删掉重建 / 换盘**:新目录从零开始,段号又从 0 数,内容也不一样 —— 老游标"第 3 段第 500 字节"
+     可能**恰好**在新副本上也存在(段号重数了),**光看位置看不出问题**。故给"这份副本"本身也发编号
+     (**重建/换盘就换新号**),B 每轮带着它问,对不上同样作废 + 从头拉;编号存在副本目录的 `LOG_INCARNATION` 里。
+  4. **一个全新副本没领到正式编号**:master 联系不上时它先用**本机时间**开张(全世界唯一,绝不会与对端撞号)。
+     别的机器是**从它这里第一次**听说这个编号的,不存在"把你当成上一代的你"的错觉 ⇒ **不丢数据**;
+     代价仅是 master 账本里这份副本的编号栏还空着(0 = 未发过),要等下次从零重建才补上 —— 目前没有任何
+     代码读那一栏(只有 master 自己的测试在读),放着不管无影响。若要收掉它,最小改法是 `LOG_INCARNATION`
+     分两种写法(`m:<n>` = master 发的 / `l:<n>` = 本机临时值)让心跳对 `l:` 的副本重试申领;**本次未做**
+     (为"显示更体面"去动一个已落盘的文件格式,不划算)。
+- **第一层身份:段身份 = 位置 + 代次**(`LogSegmentName`;段名 `{position}_{generation}_log.seg`,段头 **v3**
+  自述 `generation`)。识别"**同一副本内** log 被 compaction 重写":同一位置、不同代次。代次在同一目录内
+  **单调递增**(滚动 = `max(gen)+1`),**全库 compact 接着旧 log 的最大代次往后取** —— 于是段位置可以复用、
+  段身份永不复用。校验在引擎(`find_entries_since` 入口 `revalidate_token`),理由短名 `segment_missing`
+  (段不在段表)/ `segment_generation_mismatch`(位置上有段但代次不同)/ `offset_out_of_range`(偏移越过数据区);
+  索引值 **21 B 定长布局没变**(代次不进索引,只活在段名与游标里)。
+- **第二层身份:副本 incarnation**(master 发放,落盘 `{store_dir}/LOG_INCARNATION`;文件缺失/损坏时用
+  **本机当前时刻**兜底并落盘 —— 物理 bootstrap 只拷段、换盘后重来走的都是这条路)。识别"**对面整个换了一代副本**"
+  (重建 / 换盘)。核对放**服务层**(`server::replica_metadata`):引擎看不到副本级身份。理由短名
+  `incarnation_mismatch`。
+- **游标与协议**:`FindToken::{Uninitialized, Offset{segment: LogSegmentName, offset: u64}}`;请求参数
+  `pos` / `gen` / `off` / `incarnation` **四件套齐全才可信** —— `pos`/`gen`/`off` 残缺即按"从起点重扫"处理
+  (方向是多拉,安全);有游标却缺 `incarnation`、或 incarnation 不符 ⇒ 从头重扫并经 `token_reset` 报告原因短名。
+- **判据收紧**:`caught_up_with_peer` 前置"本轮没有 `cursor_reset_reason`";`sync_round` 增 `prior_incarnation`,
+  **对端 incarnation 变了那一轮绝不判 ACTIVE**。本地探测 `BlobStore::has_content_after` 是**纯位置**比较
+  (peer 游标的段身份属于对端坐标系,本地无从校验)。会话状态机 `replication::PullSession`(游标 + 对端身份 +
+  无进展计数)由**生产 loop 与集成测试共用同一份**;`incarnation_mismatch` + 连续两轮无进展 ⇒ `no_progress`
+  丢弃游标重拉(防永远卡死在 BOOTSTRAP)。
+- **取段 404 化**:`GET /partitions/{pid}/segments/{position}_{generation}` 按**段身份**寻址 —— 对端认不出
+  该段 ⇒ **404**、名字畸形 ⇒ **400**;`/segments` 响应 = `{incarnation, segments:[{position,generation,data_end}]}`。
+  物理 bootstrap 三条丢弃判据(丢弃后回落**纯逻辑拉取**,幂等、必然收敛,**绝不装混合快照**):①取段 404/出错
+  ②段头自述代次与清单不符 ③拷完再列清单 incarnation 变了。
+- **从零建副本时申领身份**:store 心跳里 `ensure_replica`(**本地本来就有**该副本时是幂等空转,不算从零建)与
+  物理 `install_bootstrap` 成功(`bootstrap.segments > 0`)之后调 RPC `AssignReplicaIncarnation(partition_id,
+  node_id)`;master **每次发一个全新更大的号**(不是取回旧值),leader-only + 经 Raft 提交,`next_incarnation`
+  由 **apply 发放**并落进 placement(`ReplicaPlacement.incarnation`,`0` = 未分配),store 采纳到本地。**申领失败
+  绝不影响建副本**(warn + 保留本地兜底值),**幂等心跳绝不重复申领** —— 否则身份每拍换新,别的节点手里的游标被
+  反复作废(甚至判不出追平)。
+- **墓碑回收闸门(配套)**:`PartitionStateInfo.tombstones_reclaim_allowed`(master 判据 = 该分区**所有副本
+  ACTIVE 且 lag == 0**;空 placement 保守不放行)→ store `ReplicaHandle.tombstones_reclaim_allowed`(初值
+  `false`)→ `CompactPolicy.tombstones_allowed`。关着时墓碑**一律照搬**(连过保留期的也不回收):还有副本没追平
+  就收墓碑,那份副本永远学不到这条删除,已删对象会以"活数据"永久留在它上面(僵尸数据)。**单机模式(未接 master)
+  恒放行**(没有别的副本可滞后)。定时 compaction 与手动 compact 共用同一判据。
+- **指标**:`store_server_replication_cursor_resets_total{reason}` 的 reason 集合 = `incarnation_mismatch` /
+  `segment_generation_mismatch` / `segment_missing` / `offset_out_of_range` / `no_progress`;非零是正常现象
+  (compaction / 重建后的续拉),持续增长才值得查。
+- **不做兼容层**:线上尚未启用,不存在新旧节点并存 ⇒ 不写任何回滚 / 兼容分支(旧格式清单、可选字段都不加)。
+- **被否决的方案**:①**盘级计数器**当身份 —— 换盘会让计数从 1 重数,新盘上的身份"看似旧",那个窗口消不掉;
+  ②**首段 `created_ns`** 当身份 —— 除了"时钟回拨 / 同纳秒重建即可撞号、区分不出'重建'与'重启重开'",
+  它还**取自拷贝来的字节**:物理 bootstrap 装载的副本其首段诞生在**对端**,那个时刻正是对端自己的兜底身份,
+  于是"重建 ⇒ 身份必换"在申领没成功时会失效(与对端撞号 → 对端手里的旧游标看似合法)。最终改为**本机时刻**;
+  ③**滚动升级兼容层**(新节点容忍旧节点不回身份)—— 线上未启用,兼容层只会把"认不出"
+  退化成"认成合法",正是要堵的那条丢数据路径。
+- **验证**:`cargo test -p antfs-blob -p antfs-store -p antfs-master` 全绿。新增
+  `crates/store/tests/compaction_replication.rs` **9 个场景**(边复制边 compact 一族:①追赶中遇对端全库 compact
+  ②追赶中遇增量 compaction ③对端副本 drop 后重建(身份必变大、新数据拉到、本地不丢)④已追平后 compact 的
+  delete 传播 ⑤对端变空而本地有数据(绝不误判追平)⑥**真实后台复制 loop + 指标断言** ⑦**一次排空过程中的
+  批间重写**(`sync_round` 走真链路,断言**重写那一轮绝不转 ACTIVE** —— 旧代码上必然变红:40 条初始数据被静默
+  跳过)⑧**bootstrap 拷段途中对端重写 → 丢弃拷贝**回落逻辑拉取后逐 key 一致)⑨**本端(接收方)在追赶途中做
+  全库 compaction**(游标是对端坐标,本端重写不得让它少拉一段 / 触发重定位;`max_segment_generation` 接续);
+  `crates/store/tests/incarnation_and_gate.rs` **5 个**(申领身份并落盘 / 重复指令不重领 / OFFLINE 挂回不换号 / 闸门关 / 闸门开);
+  `crates/store/tests/data_plane.rs::segment_endpoint_addresses_segments_by_identity`(取段按段身份 200/404/400);
+  引擎侧 `blob.rs` 单测:revalidate 三分支与理由短名 / 合法游标不重定位 / 代次单调与重建换号 / incarnation
+  落盘·本机值兜底·**bootstrapped 副本不继承对端身份**·采纳;master 侧 `crates/master/tests/replica_incarnation.rs`(发放单调、每次换新号、三节点经 Raft
+  一致)、`crates/master/tests/tombstone_gate.rs`(闸门随副本追平)。
+- **文档**:`docs/design/store.md`(§3 + 新增 §9.2 游标重定位)、`docs/design/cluster.md`(S3a 加固段 + 监控项清单);
+  决策档案 `openspec/changes/store-replication-cursor-revalidate/`。
+
+## 步骤 22:router 发号按可写分区轮转 —— 把写 IOPS 摊到多个分区/盘上(2026-09-23)
+
+- **问题**:`Router::allocate_one` 在号段缓存里 `find` 第一个没取完的段,而"要下一段"只在**所有**段都空时发生 ——
+  `IdCache.segments` 恒为 0 或 1 个元素,一段号**连续耗尽在同一个分区**上。于是一个 frontend 进程(= 一个 `Router`,
+  `AppState.router` 单实例)的全部并发写落在同一分区的 RF 个副本、也就是**同一组盘**上;压测二进制同理。
+- **决策**:落实 `blobid-master-assign` D10 的落地形态 —— 补段时 `ListPartitions(state=RW)` 拿可写分区列表,
+  对**每个**分区显式点名 `partition_id` 各申请一小批(`router.id_segment_size` 个)号段,取号在持有的号段之间
+  **顺序轮转**(`IdCache::take_rr`)。取段并发(`MasterClient` 克隆共享同一 channel),整轮仍**在号段锁里单飞**
+  (并发各补一轮会放大 RPC 并可能重号)。单个分区失败(期间转 RO/封存/号耗尽)只跳过它,全失败才报错;
+  已不在可写列表里的分区其未用完段丢弃(余号成空洞,无害,D3)。
+- **`Segment` 语义**:`next` 含 / `end` 不含(旧代码是 `next = start + 1` + 单独返回首个号,单号段 `count=1` 会漏发)。
+- **偏离 D10(显式记)**:负载由"每段一次容量加权随机"变为"可写分区上的**均匀轮转**"。router 仍不自造分区 id、
+  不缓存容量判断(分区集合与合法性都由 master 给并复核)。代价:一次补段 = 1 次 `ListPartitions` + N 次 `GetBlobIds`
+  (N = 可写分区数),稳态持有 N × `id_segment_size` 个号 —— 调小 `id_segment_size` 可保持总预留与换段频率不变。
+- **验证**:`cargo test -p antfs-router` 全绿 —— 4 个新单测(轮转顺序 / 单号段 / 段空跳过与空缓存 / `order` 收缩后游标回绕)
+  + e2e 断言两可写分区下 `allocate_batch(10)` 的分区序列**严格交替**;`cargo clippy -p antfs-router -p antfs-frontend
+  -p antfs-bench-router --all-targets` 无告警。**真集群多盘 IOPS 摊开待压测确认**(tasks 未勾项)。
+- **文档**:`router.md` §2/§5、`frontend.md` 内嵌配置表、`cluster.md`(proto 片段 + §7.5 写路径时序,顺带修掉
+  "`partition_id=0` 表示自动"的陈旧表述);决策档案 `openspec/changes/router-partition-round-robin/`。
+
+## 步骤 23:router 后台刷新可写分区列表 —— 分区增减后自动调账号段池(2026-09-23)
+
+- **问题**:步骤 22 的"每个可写分区各持一段"只在**号段耗尽时**才对一次列表 —— 分区增减(扩容建新分区、盘满转 RO、
+  运维封存)后本地要等整轮号段写完才跟上;更糟的是**已不可写分区的号段还留在本地**,后续写继续往里落。
+- **决策**:`Router::connect` 起一个**后台任务**(`spawn_refresher`),按 `router.partition_refresh_secs`(默认 30s,
+  **0 = 关闭**)周期 `ListPartitions(state=RW)` 并调账号段池:已不在列表里的分区**丢掉号段**(余号成空洞,无害,D3),
+  新出现的可写分区**补一段**。与写路径的补段共用同一份 `sync_segments`(都在号段锁里跑,天然互斥;插入只发生在
+  "该分区当前没段"时,故两边并发也不会互相覆盖号段)。
+  - 任务持号段池的 `Weak<Mutex<IdCache>>`:最后一个 `Router` 析构后引用计数归零,任务下一拍自行退出(不留常驻任务)。
+  - 刷新失败只计 `router_partition_refresh_total{outcome="error"}` 并**保留旧缓存** —— 后台刷新是**增强**:号段耗尽的
+    写路径自己会同步一次,不能让它成为正确性依赖,所以失败不返回给调用方。
+  - 重建轮转顺序时**保持相位**(记下"下一个本该轮到谁",再在新顺序里找回位置):否则一次什么都没补的空刷新会把游标
+    打回起点、让同一分区连出两个号 —— e2e 断言语义时抓到了这个(表现为分区序列不再严格交替)。
+- **配置/指标**:新增 `router.partition_refresh_secs`;新增 `router_writable_partitions`(gauge,本地持有号段的分区数)
+  与 `router_partition_refresh_total{outcome}`。`router.md` §2/§5/§6 与 `frontend.md` 配置表同步。
+- **验证**:`cargo test -p antfs-router` 全绿(7 个 e2e,新增 `background_refresh_tracks_writable_partitions`:
+  两分区各持一段 → 把 p0 置 RO 后其号段被丢掉、取号只剩 p1 → 新建分区后自动补段并参与发号);
+  `cargo test --workspace` + `cargo clippy --workspace --all-targets` 见下。
+
+- **补:物理 bootstrap 与对端 compact 的竞态(同日)** —— 分段拷贝**逐段按段身份取**(认不出即 404)、拷贝
+  **前后各列一次封存段清单**,三条判据任一成立就**丢弃拷贝**、回落纯逻辑拉取:①取段 404/出错;②取回字节
+  自述的代次与清单不符;③拷完再列清单时对端 **incarnation** 变了。对端一重写 log / 换一代副本,"同段位置"
+  就指向别的记录,逐段取来的字节会横跨两代(混合快照 + 可能带回对端已删的活记录);丢弃重来是幂等的、
+  必然收敛。测试:集成场景 8(拷段途中对端整库重写 → 断言 `bootstrap.segments == 0` 且最终与对端逐 key
+  一致,含墓碑)。

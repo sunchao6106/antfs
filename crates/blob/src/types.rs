@@ -2,30 +2,57 @@
 
 use std::fmt;
 
-/// 日志段名(位置序号)。文件名形如 `{position}_log.seg`。
+/// 日志段身份 = **位置序号 + 代次(generation)**。文件名形如 `{position}_{generation}_log.seg`。
+///
+/// - `position`:段在本 log 内的逻辑序号(排序、残段容量计算用),全库 compact 后从 0 重来;
+/// - `generation`:同一 log 目录内**单调递增**(每建新段 `max(gen)+1`),且**跨全库 compact 继续递增**
+///   (新目录从旧目录的最大代次之后起算)。
+///
+/// 两者合起来构成"段身份",在整个副本历史上**永不复用** —— 于是"段被重写/删掉/换掉"必然表现为
+/// **认不出的段身份**,复制侧"认不出即从头重扫"因此是充分的(对齐 Ambry 段名里的 generation;
+/// 见 `docs/design/store.md` 的"复制游标重定位")。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LogSegmentName(pub u64);
+pub struct LogSegmentName {
+    pub position: u32,
+    pub generation: u32,
+}
 
 impl LogSegmentName {
-    pub fn filename(&self) -> String {
-        format!("{}_log.seg", self.0)
+    /// 由位置与代次构造;超出 u32 直接 panic —— 段地址是结构性不变量
+    /// (段内偏移 < 段大小 ≤ 4 GiB,段数与代次都远不到 2³²),宁可崩也不落下截断后的错身份。
+    pub fn new(position: u64, generation: u64) -> Self {
+        Self {
+            position: u32::try_from(position).expect("segment position must fit u32"),
+            generation: u32::try_from(generation).expect("segment generation must fit u32"),
+        }
     }
 
-    /// 从文件名解析位置序号。
+    pub fn filename(&self) -> String {
+        format!("{}_{}_log.seg", self.position, self.generation)
+    }
+
+    /// 从文件名解析段身份(`{position}_{generation}_log.seg`)。
     pub fn parse(filename: &str) -> Option<LogSegmentName> {
-        let pos = filename.strip_suffix("_log.seg")?;
-        pos.parse::<u64>().ok().map(LogSegmentName)
+        let rest = filename.strip_suffix("_log.seg")?;
+        let (pos, gen) = rest.split_once('_')?;
+        Some(LogSegmentName {
+            position: pos.parse().ok()?,
+            generation: gen.parse().ok()?,
+        })
     }
 }
 
 impl fmt::Display for LogSegmentName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}_{}", self.position, self.generation)
     }
 }
 
-/// 跨段的全局偏移:段位置 + 段内逻辑偏移(数据区,字节粒度)。
+/// 跨段的全局偏移:段位置序号 + 段内逻辑偏移(数据区,字节粒度)。
 /// 这将是 `PersistentIndex` 引用一条记录的地址。
+///
+/// 注:`segment` 是**位置序号**,不含代次 —— 代次只活在**段名**与**复制游标**里(见
+/// [`LogSegmentName`]),这样索引值保持 21B 定长布局不变,而"段号被复用"仍能被识别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LogOffset {
     pub segment: u64,

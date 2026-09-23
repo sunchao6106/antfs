@@ -1,5 +1,8 @@
 //! 接入 master:注册 + 双向流心跳 + 消费 `MasterDirective` 的 ReplicaLifecycle(S2)。
 //!
+//! 还负责"从零建副本时向 master 申领副本身份(incarnation)"的 RPC(见 [`claim_incarnation`])——
+//! 与心跳共用同一个 `MasterClient`(连接复用),拉复制侧(`install_bootstrap` 之后)也复用它。
+//!
 //! 复用 `master` crate 的 gRPC pb(控制面契约单一来源)。同步 store 调用(`ensure_replica`)经
 //! `spawn_blocking` offload。
 
@@ -7,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use antfs_master::pb::master_client::MasterClient;
-use antfs_master::pb::{DiskBeat, NodeBeat, RegisterRequest, ReplicaBeat};
+use antfs_master::pb::{
+    AssignIncarnationRequest, DiskBeat, NodeBeat, RegisterRequest, ReplicaBeat,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -15,9 +20,68 @@ use crate::config::StoreServerConfig;
 use crate::disk::DiskManager;
 use crate::health::HealthMap;
 use crate::metrics::StoreServerMetrics;
-use crate::replica::ReplicaManager;
+use crate::replica::{ReplicaHandle, ReplicaManager};
+use crate::PartitionId;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+/// 「从零建副本」时向 master 申领这份副本的**全新身份**(incarnation)并采纳到本地句柄。
+///
+/// 两条调用路径:心跳里 `ensure_replica_with_origin` 返回 `true`(**盘上原本没有**这份副本,本次新建)
+/// 与 `install_bootstrap`(物理重装 —— 目录被整体重建)。**重开已有副本(OFFLINE 挂回 / 进程重启)
+/// 不走这里**:数据与身份文件都在,换号只会白白作废对端的游标。
+/// 为什么必须申领:重建/换盘后的副本**不得沿用旧身份** —— 其它节点手里那条旧复制游标会看似合法,
+/// 于是带着缺数据被误判"已追平"(`ACTIVE` 是 master 删源的闸门),那就是丢数据(CLAUDE.md §3.1)。
+/// master 侧语义是"每次调用发一个全新的更大的号"(已落进 placement,拉取方 `LookupPartition`
+/// 看到的是同一个值)。
+///
+/// **失败绝不影响建副本**:网络不通 / 非 leader / 该 (partition, node) 不在 placement / 老 master
+/// 未实现 —— 一律只 `warn` 并**保留本地兜底值**(建库时从首段诞生时刻推出的单调值,已落盘在
+/// `LOG_INCARNATION`),副本照常建、照常服务。单机模式没有 master,这条兜底就是最终值。
+/// 非 leader 时 master 会回 `leader_addr`,这里**不代转**(store 侧的控制面调用一贯只记不追)——
+/// 下次从零建这份副本时再申领。
+///
+/// 用**已有的** `MasterClient`(连接复用),不为罕路径另建连接。
+pub async fn claim_incarnation(
+    client: &mut MasterClient<tonic::transport::Channel>,
+    config: &StoreServerConfig,
+    pid: PartitionId,
+    handle: &ReplicaHandle,
+) {
+    let request = AssignIncarnationRequest {
+        version: 1,
+        cluster_secret: config.cluster_secret.clone(),
+        partition_id: pid,
+        node_id: config.node_id,
+    };
+    match client.assign_replica_incarnation(request).await {
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            if !resp.ok {
+                tracing::warn!(
+                    partition = pid,
+                    error = %resp.error,
+                    leader = %resp.leader_addr,
+                    "master refused to assign a replica incarnation; keeping the local one"
+                );
+                return;
+            }
+            if let Err(e) = handle.store.adopt_incarnation(resp.incarnation) {
+                tracing::warn!(
+                    partition = pid,
+                    incarnation = resp.incarnation,
+                    error = %e,
+                    "adopting the assigned replica incarnation failed"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            partition = pid,
+            error = %e,
+            "assigning a replica incarnation failed; keeping the local one"
+        ),
+    }
+}
 
 fn disk_beats(disks: &DiskManager, health: &HealthMap) -> Vec<DiskBeat> {
     let hm = health.read().expect("health map poisoned");
@@ -127,13 +191,37 @@ async fn run(
 
     while let Some(directive) = inbound.message().await? {
         metrics.heartbeats.inc();
+        // 分区可写态(master 权威,每拍全量):本地维护(定时 compaction)按它挑候选集。
+        // 先吸收再处理转移 —— 转移会让副本增删,状态记在"当时存在的副本"上更有意义。
+        for st in &directive.partition_states {
+            replicas.set_partition_state(st.partition_id, &st.state);
+            // 墓碑回收闸门(同一份权威状态里的另一个字段):记到句柄上供 compaction 判活
+            // (见 `crate::worker::tombstones_allowed`)。本地没该副本时忽略 —— 下一拍还会重发。
+            replicas.set_tombstones_reclaim_allowed(st.partition_id, st.tombstones_reclaim_allowed);
+        }
         for t in directive.transitions {
             match t.target_state.as_str() {
                 "ACTIVE" | "BOOTSTRAP" => {
+                    // **只有从零建副本才申领身份** —— 判据是"盘上原本有没有这份副本"(不是"内存里有没有
+                    // 句柄"):OFFLINE 摘除后挂回、进程重启重开、以及**幂等心跳重复下发**都不算从零建,
+                    // 身份必须保持;否则对端手里绑着这份副本的游标会被反复作废(甚至判不出追平)。
                     let r = replicas.clone();
                     let pid = t.partition_id;
                     // ensure_replica 同步阻塞(建 BlobStore),offload 到阻塞池。
-                    let _ = tokio::task::spawn_blocking(move || r.ensure_replica(pid)).await;
+                    match tokio::task::spawn_blocking(move || r.ensure_replica_with_origin(pid))
+                        .await
+                    {
+                        Ok(Ok((h, true))) => {
+                            claim_incarnation(&mut client, &config, pid, &h).await;
+                        }
+                        Ok(Ok((_, false))) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(partition = pid, error = %e, "ensure local replica failed")
+                        }
+                        Err(_) => {
+                            tracing::warn!(partition = pid, "ensure local replica join error")
+                        }
+                    }
                 }
                 // OFFLINE = 临时摘除(只摘内存句柄,盘上数据保留 —— 副本可能再回来),
                 // **不删数据**:删盘只在 DROPPED 时做(见下)。

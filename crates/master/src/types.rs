@@ -65,6 +65,19 @@ pub struct ReplicaPlacement {
     pub disk_id: DiskId,
     /// master 决定的目标副本态(§7.2;M1 折叠为 `ACTIVE`,Q4)。
     pub target_state: String,
+    /// **副本身份**(incarnation):「(partition, node) 上的这一份副本」的代号,由 master 单调
+    /// 发放、**永不复用**。每次**从零建一份新副本**(首建 / 再复制 / 迁移补副本 / 换盘重建)都换新号。
+    ///
+    /// 用途:拉取方的复制游标是**对端 log 的绝对位置**,而 compaction(重写 log)会让旧位置失效。
+    /// 副本若在重建后沿用旧身份,拉取方手里的旧游标就"看似合法",空批会被误判追平 → 副本带缺数据
+    /// 转 `ACTIVE` → master 删源闸门成立 → 源被删 → **静默丢数据**。身份不符即判"不可信",保守方向
+    /// 是从头重扫。
+    ///
+    /// 权威值一律由 **apply 侧**发放([`MasterState::assign_incarnation`],apply 只存不算 → 全副本
+    /// 确定性一致);提案(命令)里该字段只是**占位**(`0`),apply 会覆盖,leader 侧不采信。
+    /// `0` = 未分配(旧快照里的历史副本,§3.4 后向兼容);真身份一律 ≥ 1。
+    #[serde(default)]
+    pub incarnation: u64,
 }
 
 /// 分区放置(应然)。M1 空,M2 起写入。
@@ -93,10 +106,17 @@ impl Default for Policy {
 /// Raft 状态机的**全部** hard state(Q2 边界:只这四块进 Raft)。
 ///
 /// 规模估算(§7.1):~22 万副本 × ~100B ≈ ~20MB,内存放得下、快照几十 MB → `redb` 足够。
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MasterState {
     /// 单调 partition id 分配器(类 SeaweedFS `MaxVolumeId`)。
     pub next_partition_id: PartitionId,
+    /// 单调副本身份(incarnation)分配器:下一个可发放的号。
+    ///
+    /// **从 1 起**(`0` 保留给"未分配",见 [`ReplicaPlacement::incarnation`]),只在
+    /// [`MasterState::assign_incarnation`] 里自增 —— 发放随状态一起提交,故切主/重启后从已提交值
+    /// 续发,永不复用。旧快照(无此字段)读作 1:历史副本的号是 `0`,新发的号一律 ≥ 1,不会撞。
+    #[serde(default = "default_next_incarnation")]
+    pub next_incarnation: u64,
     /// per-partition objectId 高水位:下一个可发放的 objectId(号段发放的已提交上界)。
     ///
     /// blobid-master-assign 正确性骨架:抬高水位 SHALL 先提交进 Raft 再据此发号;切主后新主从
@@ -150,6 +170,34 @@ pub struct MasterState {
     pub balance: Option<BalancePlanRecord>,
 }
 
+/// [`MasterState::next_incarnation`] 的缺省/反序列化缺省:1。
+///
+/// 不用裸 `#[serde(default)]`(u64 缺省是 0):`0` 是"未分配"哨兵,老快照读出来的历史副本号是 0,
+/// 新发的号必须 ≥ 1 才与它区分得开。
+fn default_next_incarnation() -> u64 {
+    1
+}
+
+impl Default for MasterState {
+    fn default() -> Self {
+        Self {
+            next_partition_id: 0,
+            next_incarnation: default_next_incarnation(),
+            object_next: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            partitions: BTreeMap::new(),
+            policy: Policy::default(),
+            decommissioning: BTreeSet::new(),
+            moving: BTreeSet::new(),
+            move_targets: BTreeMap::new(),
+            pending_drop: BTreeSet::new(),
+            maintenance: false,
+            pause_autogrow: false,
+            balance: None,
+        }
+    }
+}
+
 /// 均衡计划状态(语义与 proto `BalancePlan.status` 一一对应)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BalanceStatus {
@@ -197,10 +245,35 @@ pub struct BalancePlanRecord {
 }
 
 impl MasterState {
+    /// 发放一个全新的副本身份(单调、**永不复用**;`0` 保留给"未分配")。
+    ///
+    /// **只在 [`Self::apply_command`] 里调用**:号必须从已提交状态里取(apply 只存不算),leader 侧算
+    /// 会破坏确定性 —— 同一 log 序列必须在任意节点产出同一状态(模块头铁律)。
+    fn assign_incarnation(&mut self) -> u64 {
+        // max(1) 兜住持久态里的 0(哨兵值绝不外发给真副本)。
+        let v = self.next_incarnation.max(1);
+        self.next_incarnation = v + 1;
+        v
+    }
+
+    /// 该分区是否**已含**这个 `(node, disk)` 副本(即"无需再添加")。
+    ///
+    /// 分区不存在也返回 `true`:整条添加都是空操作,不该白白烧一个身份号。
+    fn replica_present(&self, partition_id: PartitionId, replica: &ReplicaPlacement) -> bool {
+        match self.partitions.get(&partition_id) {
+            None => true,
+            Some(p) => p
+                .replicas
+                .iter()
+                .any(|r| r.node_id == replica.node_id && r.disk_id == replica.disk_id),
+        }
+    }
+
     /// 确定性地应用一条命令,返回响应。**不得**引入时钟 / 随机 / 迭代顺序不确定性。
     ///
     /// 幂等(§design 2):`RegisterNode` 以 `node_id` 覆盖(重放安全);`AllocatePartitionId`
-    /// 经 Raft 线性化后单调自增(不重不漏)。
+    /// 经 Raft 线性化后单调自增(不重不漏)。**注意 `AssignReplicaIncarnation` 例外**:它本就
+    /// 是"换新号",幂等指的是"重放同一 log entry 产出同一结果",而非"多次提案同号"。
     pub fn apply_command(&mut self, cmd: &MasterCommand) -> MasterResponse {
         match cmd {
             MasterCommand::AllocatePartitionId => {
@@ -240,12 +313,20 @@ impl MasterState {
                 // 选盘在 leader 侧已算好(读软状态,非确定);apply 只做确定动作:分配 id + 写 placement。
                 let id = self.next_partition_id;
                 self.next_partition_id += 1;
+                // 每份新副本在此**发放新身份**(提案里的 incarnation 是占位,不采信)。
+                let placed = replicas
+                    .iter()
+                    .map(|r| ReplicaPlacement {
+                        incarnation: self.assign_incarnation(),
+                        ..r.clone()
+                    })
+                    .collect();
                 self.partitions.insert(
                     id,
                     PartitionInfo {
                         replication_factor: *replication_factor,
                         state: PartitionState::ReadWrite,
-                        replicas: replicas.clone(),
+                        replicas: placed,
                     },
                 );
                 MasterResponse::PartitionId(id)
@@ -254,14 +335,14 @@ impl MasterState {
                 partition_id,
                 replica,
             } => {
-                if let Some(p) = self.partitions.get_mut(partition_id) {
-                    // 幂等:同 (node, disk) 已在该分区则不重复追加。
-                    let exists = p
-                        .replicas
-                        .iter()
-                        .any(|r| r.node_id == replica.node_id && r.disk_id == replica.disk_id);
-                    if !exists {
-                        p.replicas.push(replica.clone());
+                // 幂等:同 (node, disk) 已在该分区则不重复追加(也**不换身份**——重放同一 log 必须同结果)。
+                if !self.replica_present(*partition_id, replica) {
+                    let placed = ReplicaPlacement {
+                        incarnation: self.assign_incarnation(),
+                        ..replica.clone()
+                    };
+                    if let Some(p) = self.partitions.get_mut(partition_id) {
+                        p.replicas.push(placed);
                     }
                 }
                 MasterResponse::Registered
@@ -273,23 +354,53 @@ impl MasterState {
             } => {
                 // add-before-remove:先补新副本(同 AddReplica 幂等),from 源记入 moving,
                 // 由 reconciler 在新副本健康后 RemoveReplica(守 §3.1)。
-                if let Some(p) = self.partitions.get_mut(partition_id) {
-                    let exists = p
-                        .replicas
-                        .iter()
-                        .any(|r| r.node_id == replica.node_id && r.disk_id == replica.disk_id);
-                    if !exists {
-                        p.replicas.push(replica.clone());
-                        self.moving.insert((*partition_id, *from_node_id));
-                        // 继任者记账(与 moving 同源):"后删"闸门与 DROPPED 下发都要问它目标是谁、
-                        // 目标是否已 ACTIVE(追平完成)。
-                        self.move_targets
-                            .entry(*partition_id)
-                            .or_default()
-                            .insert(*from_node_id, replica.node_id);
+                if !self.replica_present(*partition_id, replica) {
+                    // 补上的是**全新一份**副本 → 新身份(旧身份属于别的机器/别的盘上的那份数据)。
+                    let placed = ReplicaPlacement {
+                        incarnation: self.assign_incarnation(),
+                        ..replica.clone()
+                    };
+                    self.moving.insert((*partition_id, *from_node_id));
+                    // 继任者记账(与 moving 同源):"后删"闸门与 DROPPED 下发都要问它目标是谁、
+                    // 目标是否已 ACTIVE(追平完成)。
+                    self.move_targets
+                        .entry(*partition_id)
+                        .or_default()
+                        .insert(*from_node_id, replica.node_id);
+                    if let Some(p) = self.partitions.get_mut(partition_id) {
+                        p.replicas.push(placed);
                     }
                 }
                 MasterResponse::Registered
+            }
+            MasterCommand::AssignReplicaIncarnation {
+                partition_id,
+                node_id,
+            } => {
+                // **换新号,不是取回旧号**:store 每次从零建副本目录都申领一个全新身份,所以重建 /
+                // 换盘后的副本绝不沿用旧身份(见 ReplicaPlacement::incarnation)。每次调用都是更大的
+                // 新值(重放同一 log entry 才相等 —— 确定性)。
+                //
+                // 只认 placement 里已有的副本:不存在的分区/节点不发号(号发出去也存不下来,而
+                // LookupPartition 读的是 placement,两边会分叉)→ 回 None 让 RPC 侧报错。
+                let known = self
+                    .partitions
+                    .get(partition_id)
+                    .is_some_and(|p| p.replicas.iter().any(|r| r.node_id == *node_id));
+                let incarnation = known.then(|| {
+                    let v = self.assign_incarnation();
+                    if let Some(p) = self.partitions.get_mut(partition_id) {
+                        if let Some(r) = p.replicas.iter_mut().find(|r| r.node_id == *node_id) {
+                            r.incarnation = v;
+                        }
+                    }
+                    v
+                });
+                MasterResponse::Incarnation {
+                    partition_id: *partition_id,
+                    node_id: *node_id,
+                    incarnation,
+                }
             }
             MasterCommand::DecommissionNode { node_id } => {
                 self.decommissioning.insert(*node_id);
@@ -419,6 +530,16 @@ pub enum MasterCommand {
         partition_id: PartitionId,
         replica: ReplicaPlacement,
     },
+    /// 为某 `(partition, node)` 上**已有**的副本**重新发放**一个全新身份(incarnation)。
+    ///
+    /// 用途:store 每次**从零建一个副本目录**时向 master 申领身份 —— 是新号而非取回旧号,故重建 /
+    /// 换盘后的副本拿不到旧身份(旧身份会让拉取方手里的旧游标看似合法,见
+    /// [`ReplicaPlacement::incarnation`])。号由 **apply 发放**(确定性地自增),RPC 侧
+    /// leader-only + 经 Raft 提交。placement 里没有该副本 → 不发号(响应 `Incarnation` 回 `None`)。
+    AssignReplicaIncarnation {
+        partition_id: PartitionId,
+        node_id: NodeId,
+    },
     /// 标记节点下线(M4):加入 `decommissioning`,不再作为放置候选。
     DecommissionNode { node_id: NodeId },
     /// 移除分区的一个副本(M4 evacuation 的"删",幂等)。
@@ -484,6 +605,15 @@ pub enum MasterResponse {
     ObjectIdExhausted { partition_id: PartitionId },
     /// `RegisterNode` 成功。
     Registered,
+    /// `AssignReplicaIncarnation` 的结果:该 `(partition, node)` 副本的**新**身份。
+    ///
+    /// `incarnation: None` = placement 里没有这个副本(未发号、状态不变);`Some(v)` 时 `v` 已落进
+    /// placement,随后的 `LookupPartition` 会返回同一个值。
+    Incarnation {
+        partition_id: PartitionId,
+        node_id: NodeId,
+        incarnation: Option<u64>,
+    },
     /// 非应用 entry(membership / blank)。
     Empty,
 }
@@ -614,11 +744,13 @@ mod tests {
                 node_id: 1,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             },
             ReplicaPlacement {
                 node_id: 2,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             },
         ];
         let r = s.apply_command(&MasterCommand::CreatePartition {
@@ -630,7 +762,23 @@ mod tests {
         let p = &s.partitions[&0];
         assert_eq!(p.replication_factor, 2);
         assert_eq!(p.state, PartitionState::ReadWrite);
-        assert_eq!(p.replicas, replicas);
+        // 落点是提案里的那份(逐字段),但**身份是 apply 现发的**:提案里的 0 是占位,不采信。
+        assert_eq!(
+            p.replicas
+                .iter()
+                .map(|x| (x.node_id, x.disk_id.as_str(), x.target_state.as_str()))
+                .collect::<Vec<_>>(),
+            replicas
+                .iter()
+                .map(|x| (x.node_id, x.disk_id.as_str(), x.target_state.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            p.replicas.iter().map(|x| x.incarnation).collect::<Vec<_>>(),
+            vec![1, 2],
+            "每份新副本各拿一个新身份(从 1 起,按 placement 顺序)"
+        );
+        assert_eq!(s.next_incarnation, 3);
     }
 
     #[test]
@@ -642,6 +790,7 @@ mod tests {
                 node_id: 1,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             }],
         });
         let add = MasterCommand::AddReplica {
@@ -650,6 +799,7 @@ mod tests {
                 node_id: 2,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             },
         };
         s.apply_command(&add);
@@ -672,11 +822,13 @@ mod tests {
                     node_id: 1,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 2,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         });
@@ -706,6 +858,7 @@ mod tests {
                 node_id: 1,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             }],
         });
         assert_eq!(s.partitions[&0].state, PartitionState::ReadWrite);
@@ -771,11 +924,13 @@ mod tests {
                     node_id: 1,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 2,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         });
@@ -786,6 +941,7 @@ mod tests {
                 node_id: 3,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             },
         };
         s.apply_command(&mv);
@@ -838,11 +994,13 @@ mod tests {
                     node_id: 1,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 2,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         });
@@ -917,6 +1075,7 @@ mod tests {
                 node_id: 1,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             }],
         });
         s.apply_command(&MasterCommand::MoveReplica {
@@ -926,6 +1085,7 @@ mod tests {
                 node_id: 2,
                 disk_id: "d0".into(),
                 target_state: "ACTIVE".into(),
+                incarnation: 0,
             },
         });
         s.apply_command(&MasterCommand::RemoveReplica {

@@ -1,12 +1,12 @@
-//! M3 调谐的**纯决策函数**(承 §7.2/§7.3):转移下发 + 再复制判定。无 IO/时钟/随机。
+//! M3 调谐的**纯决策函数**(承 §7.2/§7.3):转移下发 + 再复制判定 + 墓碑回收闸门。无 IO/时钟/随机。
 //!
-//! master 只决策(D1):这里算出"该给节点下发哪些转移"和"哪些分区需补副本",执行/搬数据在
-//! store server(后续)。
+//! master 只决策(D1):这里算出"该给节点下发哪些转移"、"哪些分区需补副本"和"某分区此刻能否回收
+//! 墓碑",执行/搬数据/回收在 store server。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
-use crate::types::{NodeId, PartitionId, PartitionInfo};
+use crate::types::{NodeId, PartitionId, PartitionInfo, PartitionState};
 
 /// 调谐稳定期判定(承 §7.3):master 启动或切主后,软状态(节点存活/副本实然态)靠 store 心跳
 /// **从零重建**;重建前"暂无心跳"不等于"失联",据此触发再复制会引发切主/重启后的再复制风暴。
@@ -86,6 +86,45 @@ pub fn plan_transitions(
         }
     }
     out
+}
+
+/// 为某节点算出其承载副本的**分区状态**(RW/RO/SEALED),随心跳下行给 store 端挑 compaction 候选集。
+///
+/// 只报 `reported` 里出现过的分区(= 该节点确实承载副本、本拍有上报),缺失的不臆造;
+/// 状态取 master 状态机的权威值(store 侧不自行推断可写性)。
+///
+/// 同一份 `PartitionStateInfo` 里的墓碑回收闸门由 [`tombstones_reclaim_allowed`] 单独算
+/// (它要的是"该分区全副本是否追平",与本节点上报与否无关)。
+pub fn plan_partition_states(
+    partitions: &BTreeMap<PartitionId, PartitionInfo>,
+    reported: &BTreeMap<PartitionId, String>,
+) -> Vec<(PartitionId, PartitionState)> {
+    reported
+        .keys()
+        .filter_map(|pid| partitions.get(pid).map(|info| (*pid, info.state)))
+        .collect()
+}
+
+/// 墓碑回收闸门:该分区**此刻可否回收墓碑**(compaction 会回收删除标记,故必须先确认删除已传播到所有副本)。
+///
+/// **为什么是闸门而不是时间水位**:master 不知道"每个副本看到了哪个删除时刻",但知道"是否还有副本没追平",
+/// 所以下发的是一道 bool。`true` ⟺ placement 里的**每个副本**都"已追平"。
+///
+/// `replica_caught_up`:单个副本是否已追平,由调用方用软状态给出(节点存活 **且** 上报
+/// `current_state == "ACTIVE"` 且 `lag_bytes == 0`;缺上报 / 节点 down 都算未追平)。
+///
+/// **保守性**:只要有一个副本没追平 → 整体不放行。墓碑一旦被回收,滞后副本就永远学不到那条删除,
+/// 已删对象会以"活数据"永久留在它上面(僵尸数据)。无副本(空 placement)也返回 `false` ——
+/// 没有任何副本能证明删除已传播出去,"看不见"不等于"已传播";宁可让墓碑多留一拍(追平后自然放行)。
+pub fn tombstones_reclaim_allowed(
+    part: &PartitionInfo,
+    replica_caught_up: impl Fn(NodeId) -> bool,
+) -> bool {
+    // 无副本 → 没有任何副本能证明删除已传播出去:保守不放行(见上文)。
+    if part.replicas.is_empty() {
+        return false;
+    }
+    part.replicas.iter().all(|r| replica_caught_up(r.node_id))
 }
 
 /// 算出需要再复制(补副本恢复冗余)的分区:健康副本数 < RF **且**存在不健康副本。
@@ -255,6 +294,7 @@ mod tests {
                     node_id: *n,
                     disk_id: (*d).to_string(),
                     target_state: (*t).to_string(),
+                    incarnation: 0,
                 })
                 .collect(),
         }
@@ -276,6 +316,77 @@ mod tests {
         let parts = BTreeMap::from([(0, part(1, &[(1, "d0", "ACTIVE")]))]);
         let reported = BTreeMap::from([(0u32, "ACTIVE".to_string())]);
         assert!(plan_transitions(1, &parts, &reported).is_empty());
+    }
+
+    /// 分区状态下发:只报本节点上报过的分区,状态取状态机权威值(`SEALED`/`RO` 不得被吞掉)。
+    #[test]
+    fn partition_states_only_for_reported_partitions() {
+        let mut parts = BTreeMap::from([
+            (0, part(1, &[(1, "d0", "ACTIVE")])),
+            (1, part(1, &[(1, "d0", "ACTIVE")])),
+            (2, part(1, &[(9, "d0", "ACTIVE")])), // 别的节点承载
+        ]);
+        parts.get_mut(&1).unwrap().state = PartitionState::ReadOnly;
+        parts.get_mut(&2).unwrap().state = PartitionState::Sealed;
+
+        let reported = BTreeMap::from([(0u32, "ACTIVE".to_string()), (1u32, "ACTIVE".to_string())]);
+        let mut got = plan_partition_states(&parts, &reported);
+        got.sort_by_key(|(pid, _)| *pid);
+        assert_eq!(
+            got,
+            vec![
+                (0, PartitionState::ReadWrite),
+                (1, PartitionState::ReadOnly)
+            ],
+            "本节点承载的 RW/RO 都要下发,未承载的分区不下发"
+        );
+
+        // 未上报(如副本刚被摘掉)= 不下发,不使用陈旧认知。
+        assert!(plan_partition_states(&parts, &BTreeMap::new()).is_empty());
+    }
+
+    /// 墓碑回收闸门:全副本已追平才放行;任一副本没追平(追平中 / 报错 / 仍有滞后 / 未上报)一律不放行。
+    #[test]
+    fn tombstones_reclaim_only_when_every_replica_caught_up() {
+        let p = part(
+            3,
+            &[
+                (1, "d0", "ACTIVE"),
+                (2, "d0", "ACTIVE"),
+                (3, "d0", "ACTIVE"),
+            ],
+        );
+
+        // 闭包 = 软状态口径(节点存活 且 上报 ACTIVE 且 lag==0);表里没有该节点 = 未上报 / 节点 down = 未追平。
+        let reports: BTreeMap<NodeId, (&str, u64)> =
+            BTreeMap::from([(1, ("ACTIVE", 0)), (2, ("ACTIVE", 0)), (3, ("ACTIVE", 0))]);
+        let allowed = |reports: &BTreeMap<NodeId, (&str, u64)>| {
+            tombstones_reclaim_allowed(&p, |n| matches!(reports.get(&n), Some(("ACTIVE", 0))))
+        };
+
+        assert!(allowed(&reports), "全副本 ACTIVE 且 lag=0 → 允许回收墓碑");
+
+        let with = |node: NodeId, st: (&'static str, u64)| {
+            let mut r = reports.clone();
+            r.insert(node, st);
+            r
+        };
+        assert!(!allowed(&with(3, ("BOOTSTRAP", 0))), "有副本还在追平");
+        assert!(!allowed(&with(3, ("ERROR", 0))), "有副本上报错误");
+        assert!(!allowed(&with(3, ("ACTIVE", 1))), "有副本还有滞后字节");
+        let mut missing = reports.clone();
+        missing.remove(&3);
+        assert!(!allowed(&missing), "有副本未上报(等价于节点 down)");
+    }
+
+    /// 无副本(空 placement):没法证明删除已传播 → 保守拒绝,而不是"没人没追平"就放行。
+    #[test]
+    fn tombstones_reclaim_denied_without_replicas() {
+        let empty = part(3, &[]);
+        assert!(
+            !tombstones_reclaim_allowed(&empty, |_| true),
+            "空副本表必须拒绝:看不见 ≠ 已传播"
+        );
     }
 
     #[test]

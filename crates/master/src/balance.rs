@@ -452,6 +452,7 @@ mod tests {
                     node_id: *n,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 })
                 .collect(),
         }

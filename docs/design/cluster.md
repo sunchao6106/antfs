@@ -159,7 +159,7 @@ Nodes         map<NodeId, { dc, rack, addr, disks: map<DiskId,   // 自注册后
 Partitions    map<PartitionId, {
                   replication_factor,
                   state: RW | RO | SEALED,                       // 分区级写入闸门
-                  replicas: [ { node_id, disk_id, target_state } ]  // ← ideal placement(应然)
+                  replicas: [ { node_id, disk_id, target_state, incarnation } ]  // ← ideal placement(应然)
               }>
 Policy        { default_replication_factor, placement_constraints }
 ```
@@ -241,7 +241,7 @@ master **只决策、只下发任务**,不亲自搬数据(D1);执行在 server/s
 - partition 是**段级懒增长 + 定容上界**(不预留整块;对齐 store.md"定容上界 + 写满滚动新 partition"),空间不浪费——长到上界或盘满即封存(RO)。
 - **副本尺寸受最小盘拖累**:一个 partition 的 N 副本装同一批对象,有效容量 = 各副本盘余量的**最小值**;若余量悬殊,大盘空间被小盘拖累浪费。
 - 故放置(`CreatePartitions` / 失联补副本)选盘约束:**从心跳 `DiskUsage.free_bytes`(§7.1 软状态)里,选余量 ≥ partition 上界、且彼此相近的 N 块盘**,并按故障域(dc/rack)打散。
-- **盘将满 → 其上活跃 partition 转 RO、不再放新 partition**(对齐 Ambry `storeReadOnlyEnableSizeThresholdPercentage≈95%`);写流量由 `AssignPartition` 只返回 RW 分区自动导流。
+- **盘将满 → 其上活跃 partition 转 RO、不再放新 partition**(对齐 Ambry `storeReadOnlyEnableSizeThresholdPercentage≈95%`;本项目 `disk_near_full_ratio` 默认取更保守的 **0.8**);写流量由 `AssignPartition` 只返回 RW 分区自动导流。
   - 转 RO 由 reconciler 每周期自动执行:某 RW 分区的**任一副本所在盘**用量 > `disk_near_full_ratio` → 提交 `SetPartitionState(RO)` + `warn` 日志。
   - **只置不回**:空间释放后**不自动恢复 RW**(盘余量抖动就自动切回会把写流量又引回将满的盘);恢复由运维走 `POST /api/partitions/{id}/state` 显式设定。因为只在当前为 RW 时写,天然幂等,不会每 tick 空转 Raft。
   - 该规则是**止损**(不是"恢复动作"),故在维护模式(`maintenance=true`)下**仍然生效**,见 §7.3 维护模式段。
@@ -260,10 +260,11 @@ service Master {
 
   // 写路径:申请一段 blobId(objectId 号段)= 可写分区 + 号段 + 副本位置。
   // leader-only + 准入密钥;水位经 Raft 抬升,只发已提交水位以内、永不复用(blobid-master-assign D1–D4)。
-  // count=0 → 用 master.id_alloc_segment_size;partition_id=0 → 由 master 按剩余容量加权挑(RW,D10)。
+  // count=0 → 用 master.id_alloc_segment_size;partition_id 缺省(optional)= 由 master 按剩余容量加权挑(RW,D10)。
   rpc GetBlobIds(GetBlobIdsRequest) returns (GetBlobIdsResponse);
 
-  // 读路由:某 partition 的存活副本位置 + 状态(据此按 §7.2 门控选副本)。
+  // 读路由:某 partition 的存活副本位置 + 状态(据此按 §7.2 门控选副本);
+  // 每个 `ReplicaLoc` 带该副本的 `incarnation` 身份(0 = 未分配,权威值由 AssignReplicaIncarnation 发放)。
   rpc LookupPartition(LookupRequest) returns (PartitionLocations);
   // 取一个可写(RW)分区(不带号;发号走 GetBlobIds)。
   rpc AssignPartition(AssignRequest) returns (AssignResponse);
@@ -286,6 +287,10 @@ service Master {
   // (hard state,`PartitionEntry.moving_out_nodes` 可见),新副本补上且健康副本(不含迁出源)
   // ≥ RF 后由 reconciler 移除迁出源;to_node_id=0 = 自动选目标。
   rpc MoveReplica(MoveReplicaRequest) returns (MoveReplicaResponse);
+  // 副本身份(incarnation):store 每次**从零建副本目录**时向 leader 申领一个**全新身份**
+  // (每次发一个更大的新号,不是取回旧号;leader-only + 经 Raft 提交,号由 apply 发放)。
+  // 用途:重建 / 换盘后的副本不得沿用旧身份,否则拉取方手里的旧复制游标会"看似合法"(见 §9.1 S3a)。
+  rpc AssignReplicaIncarnation(AssignIncarnationRequest) returns (AssignIncarnationResponse);
   // 维护模式开关(对标 Ceph `osd set/unset noout|norecover`):`paused` 暂停自动动作,
   // `pause_autogrow` 是否连带暂停自动扩容(默认 false)。仅 leader 受理,以 Raft 命令
   // `SetMaintenance` 提交(切主后仍生效);响应 `ok=true` ⟺ 已提交的 `ClusterState.maintenance`
@@ -310,10 +315,13 @@ message NodeBeat {
 message MasterDirective {
   repeated Transition transitions = 1; // partition_id, disk_id, target_state
   repeated Task tasks = 2;             // 再复制 / 再平衡 / EC 转换(from,to_hint)
+  repeated PartitionStateInfo partition_states = 3; // partition_id, state(RW/RO/SEALED), tombstones_reclaim_allowed
 }
 ```
 - master↔master 的 Raft 内部 RPC 走 openraft 自己的网络层(可另起一个 gRPC `RaftInternal` 服务),与上面控制面服务分开。
 - proto **带版本字段**(D2 要求)。
+- **`partition_states`(已实现)**:每拍**全量**下发该节点承载副本的分区可写态(`RW`/`RO`/`SEALED`)**+ 墓碑回收闸门 `tombstones_reclaim_allowed`**(master 权威:该分区的**所有副本都已追平** —— 各副本上报 `ACTIVE` 且 `lag_bytes == 0`;缺上报 / 节点 down / 空 placement 都算未追平)。前者供 store 侧挑本地维护(定时 compaction)的候选集,后者是 compaction 的**判活口径**闸门 —— store 不自行从"能不能写"反推可写态、也不自行推断删除是否已传播,只认 master 的权威值(见 §9.1)。与 `Transition.target_state`(副本实然态 `ACTIVE`/`BOOTSTRAP`/`DROPPED`)是两码事。
+- **`AssignReplicaIncarnation`(已实现)**:store **从零建副本目录**时申领副本身份。四条语义要点:① master 每次发**全新的更大号**(不是取回旧号),号由 apply 发放并已写进 placement,故 `LookupPartition` 里 `ReplicaLoc.incarnation` 看到的是同一个值;② leader-only + 准入密钥,非 leader 回 `leader_addr`(store 侧**不代转**,只记 `warn` 并保留本地兜底值 = 建库/装载时取的**本机时刻**);③ 副本不在 placement → `ok=false`,不发号也不改状态;④ **幂等空转不重领** —— 判据是"**盘上原本没有**这份副本"(而不是"内存里没有句柄"):OFFLINE 摘除后挂回、进程重启重开都不申领(否则身份每换一次,别的节点手里的复制游标就被作废一次、白跑一轮全量)。
 - **`Transition.target_state` 取值**:placement 的目标态(现阶段统一 `ACTIVE`)或 **`DROPPED`**(删源副本 —— 迁移/下线完成后让源节点删掉本地副本/目录;**proto 不新增字段**,复用既有 `target_state`)。下发 DROPPED 的**三条确认**(placement 已移除 + 继任者已 `ACTIVE`(无 move 记账时退化为"其余副本 ≥ RF 且无 ERROR")+ 源仍上报该副本)与"保守性/不拖延/幂等重发"细则见 §7.3;拿不准一律不发。
 - **维护模式语义**(`SetMaintenance`;`ClusterState.maintenance`/`pause_autogrow` 对外可见):
   - **停**(`paused=true`):reconciler 不再执行**自动动作** —— 失联/`ERROR` 触发的再复制、下线 evacuation 的"先补"与"后删"(节点已标 `decommissioning`,但副本停在原地不搬)、`MoveReplica` 的"后删"(中间态停在"源仍持有副本",**不丢数据**,守 §3.1);`pause_autogrow=true` 时另停 Q5 自动扩容(默认 false = 维护不连带停扩容)。
@@ -328,7 +336,8 @@ message MasterDirective {
 ② 建分区:       admin CreatePartitions → 分配 id(raft 单调)→ 故障域选盘置 N 副本(写 raft placement,target=BOOTSTRAP)
                  → 心跳下发 transition → 副本 BOOTSTRAP 追平 → STANDBY
 ③ 读:           client/frontend LookupPartition → 按副本 current_state 门控(§7.2)选一个 → 直连该 SN 走 HTTP 读(R=1,首个成功即返回)
-④ 写:           client/frontend GetBlobIds(要 RW 分区 + objectId 号段)→ 向其副本并行 HTTP 写,收 W=副本数/2+1 个 ack 即返回(§10)
+④ 写:           client/frontend ListPartitions(RW)+ 对每个分区 GetBlobIds(各一小批 objectId 号段)
+                 → 本地按分区**轮转**取号 → 向该号所属分区副本并行 HTTP 写,收 W=副本数/2+1 个 ack 即返回(§10)
 ⑤ 节点失联:     心跳超时 → 相关副本标 ERROR → reconciler 选新盘补副本(target=BOOTSTRAP)→ 产再复制任务 → scheduler 执行
 ```
 
@@ -370,7 +379,7 @@ message MasterDirective {
 | `master.cluster_secret` | String | `""` | — | 准入密钥(Q1);空=关校验(仅本地测试) |
 | `master.heartbeat_timeout_secs` | u64 | 15 | ≥1 | 超过则软状态标节点 down |
 | `master.partition_capacity_bytes` | u64 | 100 GiB | ≥1 | 分区容量上界;选盘时盘可用容量须 ≥ 它(M2,§7.3) |
-| `master.disk_near_full_ratio` | f64 | 0.95 | (0,1] | 盘用量超此比例:① 不再放新分区/新副本(选盘跳过);② 其上 RW 分区被 reconciler 自动转 RO(**只置不回**,恢复靠运维)(对齐 Ambry ≈95%) |
+| `master.disk_near_full_ratio` | f64 | 0.8 | (0,1] | 盘用量超此比例:① 不再放新分区/新副本(选盘跳过);② 其上 RW 分区被 reconciler 自动转 RO(**只置不回**,恢复靠运维)(本项目默认 0.8,较 Ambry ≈95% 更保守) |
 | `master.auto_grow_enabled` | bool | false | — | Q5 自动扩容开关(默认关,安全) |
 | `master.auto_grow_min_writable` | u64 | 4 | — | 低水位:RW 分区数低于它就补建 |
 | `master.auto_grow_max_partitions` | u64 | 100000 | — | 分区总量上限(护栏) |
@@ -537,14 +546,30 @@ store server(一个进程 / 一台数据节点)
 
 **S3a(拉复制逻辑核心)已实现**(见 `openspec/changes/store-server-replication/`):store 引擎新增**忠实 apply 原语** `BlobStore::apply_replicated`(**墓碑恒胜**:peer 墓碑覆盖本地 PUT,peer PUT 永不覆盖本地 PUT/墓碑;只增不删幂等,原样保留 peer 的 flags/expiration,守 §3.1;防副本发散);store-server 新增 `replica-metadata` HTTP 端点(step-1,`find_entries_since`)+ blob 读 `?replication=1`(step-2,含**已过期**活记录的数据体;墓碑只写状态、不再传数据体,见 `simplify-delete-model`)+ `replication.rs`(`PeerSource` trait + `replicate_from_peer` 收敛循环 + `HttpPeer` 阻塞 adapter);后台复制器经 master `LookupPartition` 发现 peer(排除自身、按 `up` 过滤),对每个本地 replica 的每个 peer 周期拉一轮;BOOTSTRAP 从 `token=Uninitialized` 全量逻辑回放追平。过单测(apply 四态 + 收敛/幂等/bootstrap)+ 集成测试(两 store-server 真 HTTP 收敛 + delete 传播)。
   - **N3 分期(文档化,非代码就地另选,见该 change design.md D-A)**:S3a 只落**逻辑拉复制**(正确收敛的完备核,含 bootstrap 全量逻辑回放);**S3b** 再叠加封存段**物理流式拷贝**(MTTR 优化)。N3 最终形态(混合)不变。
+
+**S3a 加固:复制游标重定位已实现**(见 `openspec/changes/store-replication-cursor-revalidate/`):游标是对端 log 坐标系的绝对位置,而 compaction 会改写坐标系 —— 全库 compact 段位置从 0 重来、增量 compaction 把记录搬到更高位置的新代次段。若把"拿陈旧游标问对端、对端返回空批"当成"已追上",就会在**作废的坐标系**上判追平 → 副本带着缺失数据转 `ACTIVE` → master 删源闸门误成立 → **静默丢数据**。现按 Ambry `revalidateStoreFindToken` 补齐两道:
+  - **两层身份**:**段身份** = `LogSegmentName`(位置 + 代次;段名 `{position}_{generation}_log.seg`,段头也**自述**同一个代次)。代次在**同一 log 目录内单调递增**(每滚一段 +1),全库 compact 接着旧 log 的**最大代次**往后取 ⇒ 段身份**永不复用**;凡"整体重写 log、段位置从头开始"的操作(全库 compact)、滚动、增量 compaction 建新代次段,都会让旧游标认不出自己的段(段没了,**或位置还在、代次不同**)。**副本身份** = `LOG_INCARNATION`(副本目录里的 u64 文本),由 master 在**从零建这份副本**时发放(见 §7.4 `AssignReplicaIncarnation`),副本重建 / **换盘后重来**必然换新号;同一份副本的全库/增量 compaction **不换** incarnation。身份文件缺失(物理 bootstrap 只拷段;或单机模式没有 master)时由 `BlobStore::open` 用**本机当前时刻**兜底并落盘 —— **刻意不从段头取 `created_ns`**(拷贝来的段诞生在对端,那个时刻正是对端自己的兜底身份,拿它当本副本身份会在"申领没成功"时与对端撞号,使"重建 ⇒ 身份必换"失效)。
+  - **重定位**:对端认不出游标(段没了 / **代次不符** / 偏移越界 / **incarnation 不符** / 四件套 `pos`+`gen`+`off`+`incarnation` 残缺)**或**本轮发现对端 incarnation 变化 ⇒ 一律**重置为从头重扫**(方向是多拉,安全),并在元数据响应里报 `token_reset`;**那一轮不得判追平**。会话状态(游标 + 对端 incarnation + 无进展计数)收在 `replication::PullSession`,生产 loop 与集成测试共用同一份;连续两轮"游标没动且没 apply" ⇒ 丢弃游标从头重拉(防永远卡 `BOOTSTRAP`)。
+  - **判据前置**:转 `ACTIVE` 的判据 `caught_up_with_peer` **先看 `cursor_reset_reason` 是否为空**(非空直接不算追平 —— 那种"末端一致"是在刚作废的坐标系上算出来的),再看"peer 无该副本"与本地末端。**本地末端探测是纯位置的** `BlobStore::has_content_after`(不校验段身份、不触发重定位)—— peer 游标的段身份属**对端坐标系**(本地段位置/代次与对端并不一一对应),拿它进 `find_entries_since` 会被重定位判定误伤。
   - **传输(细化 D2,见 design.md D-B)**:node↔node 复制元数据走 store-server 现有 **HTTP(axum)**(非新起 gRPC server);master↔node 控制面仍 gRPC。
 
-**S3b(封存段物理拷贝,N3 混合完成)已实现**(见 `openspec/changes/store-bootstrap-copy/`):`blob` 引擎加封存段只读拷贝原语(`sealed_segments`/`read_segment_prefix`/`LogSegment::raw_prefix`)+ `open_rebuild_index_with`;数据节点加发送端点(`GET .../segments`、`GET .../segments/{position}`)+ 接收装载 `ReplicaManager::install_bootstrap`(段文件 `tmp→fsync→rename` 崩溃安全 + 重建打开);复制器对**空**副本首次先物理拷贝封存段(不可变),续拉游标 = 最高封存段末尾,再逻辑补活跃尾;无 peer/无封存段回落纯逻辑。过单测(封存段枚举/拷贝重建)+ 集成测试(多封存段 + 活跃尾混合 bootstrap,真 HTTP 收敛)。
+**S3b(封存段物理拷贝,N3 混合完成)已实现**(见 `openspec/changes/store-bootstrap-copy/`):`blob` 引擎加封存段只读拷贝原语(`sealed_segments`/`read_segment_prefix`/`LogSegment::raw_prefix`)+ `open_rebuild_index_with`;数据节点加发送端点(`GET .../segments`、`GET .../segments/{position}_{generation}`)+ 接收装载 `ReplicaManager::install_bootstrap`(段文件 `tmp→fsync→rename` 崩溃安全 + 重建打开);复制器对**空**副本首次先物理拷贝封存段(不可变),续拉游标 = 最高封存段末尾(**并绑定 peer 的 incarnation**),再逻辑补活跃尾;无 peer/无封存段回落纯逻辑。过单测(封存段枚举/拷贝重建)+ 集成测试(多封存段 + 活跃尾混合 bootstrap,真 HTTP 收敛)。
+  - **清单与取段的形态**:`GET .../segments` 回 `{incarnation, segments:[{position, generation, data_end}]}`(每段带**代次**,清单连同**本副本 incarnation** 一起回来 —— bootstrap 后的初始游标据此绑定副本身份);取段是 `GET .../segments/{position}_{generation}`,路径参数就是**段身份**:认不出该段 → **404**,畸形名(位置/代次解析不出)→ **400**。
+  - **与 compact 的竞态(已加固)**:分段拷贝**前后各列一次清单**,任一条成立即**丢弃整份拷贝**、回落纯逻辑拉取:① **取段 404 / 出错**(段身份已变,或网络失败);② 取回的字节**段头自述代次**与清单不符(`peek_generation` 再核一道,防"不发 404 的换段路径");③ 拷完再列清单发现对端 **incarnation 变了**(整份副本被重建)。否则"同位置、新代次"的字节会被当成清单里那一段装进去 —— 逐段取来的字节横跨两代副本,拼出的是**混合快照**(还可能带着对端已删的活记录)。丢弃重来是幂等的、必然收敛。
  - 待续:disk-aware 每盘并发限流(N4);放置据 `DiskHealth` 避让;`DROPPED` 删目录回收。**EC 仍锁定(暂不解锁)**。
  - **已补齐(见 `blob-io-end-to-end`)**:router SDK(router 库 + CLI)、frontend(REST 网关)、master 发号 `GetBlobIds`、
    流式 put(网络流式 + 落盘暂存 + 引擎 `put_from_reader`)、`.../metadata` 端点、`StoreFull → 507`、`PUT ?expiration_ms=`。
 
-**S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分**两条**独立周期 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(`compact_if_needed(compaction_dead_ratio)`,按封存段死数据占比阈值增量压缩);各周期时长独立可配置;同步引擎调用经 `spawn_blocking` offload。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据)。
+**S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分**两条**独立 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(增量压缩);同步引擎调用经 `spawn_blocking` offload。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据)。
+
+**compaction 策略已升级**(见 `openspec/changes/store-compaction-policy/`):候选集与回收口径都不再是"无脑扫一遍"——
+
+- **候选集**:按 master 下发的分区可写态挑 replica(`MasterDirective.partition_states`)—— `SEALED` 永不入选;`RO` 总是入选;`RW` 由 `compaction_include_rw` 决定(默认纳入,且**只压其封存段**,活跃段照写);状态未知(未接 master 的单机模式)按可压处理;未追平(`BOOTSTRAP`)的副本跳过(压了也要从 peer 拉回来,还会让复制游标失效)。
+- **回收口径**(引擎 `CompactPolicy`):**被取代的旧记录 + TTL 已过期对象 + 墓碑已过保留期**三类字节真正释放。墓碑的删除时刻复用索引条目 `expiration_ms` 槽位存放(磁盘布局不变;旧数据 `-1` = 删除时间未知 ⇒ 永不自动回收)。
+- **墓碑回收闸门**(`CompactPolicy.tombstones_allowed`):过保留期**只说明**"删除已足够久",还要过 master 这道闸门 —— 判据 = 该分区**所有副本都已追平**(各副本上报 `ACTIVE` 且 `lag_bytes == 0`;缺上报 / 节点 down / 空 placement 都算未追平),随心跳 `MasterDirective.partition_states` **每拍全量**下发,store 逐条落到对应副本句柄上。闸门关闭时墓碑**一律照搬**(连已过保留期的也留):还有副本没追平时一收,那份滞后副本就永远学不到这条删除,已删对象会以"活数据"永久留在它上面(僵尸数据)。**单机模式**(未接 master)没有别的副本可滞后,恒放行;句柄初值 `false`(没拿到权威放行前不回收)。
+- **闸门**:partition 整体可回收占比 ≥ `compaction_dead_ratio` 才动手,再对达阈的非活跃段按同一阈值选段。
+- **调度**:「首跑钟点 + 周期」—— 首次对齐本地 `compaction_start_time`,之后每 `compaction_interval_secs` 一次(默认 `01:00` + 86400s = 每天凌晨一次,跑在低峰)。
+- **手动 compact**(`POST /admin/partitions/{pid}/compact`):不受状态/阈值闸门约束(运维强制),但回收口径与定时一致(仍守墓碑保留期)。
 
 **配置项清单**(`StoreServerConfig`,TOML `[store_server]` 表下;加载用 `Loader::load_table("store_server")`,**同时兼容顶层 flat key**):
 
@@ -566,8 +591,11 @@ store server(一个进程 / 一台数据节点)
 | `store_server.bootstrap_copy_enabled` | bool | true | — | 封存段物理拷贝加速 bootstrap(S3b);随 `replication_enabled` 生效 |
 | `store_server.local_worker_enabled` | bool | true | — | 本地维护 worker 开关(S4:周期 flush/compaction) |
 | `store_server.flush_interval_secs` | u64 | 30 | ≥1 | 本地 worker flush 周期(推进持久化边界)(S4) |
-| `store_server.compaction_interval_secs` | u64 | 3600 | ≥1 | 本地 worker compaction 检查周期(S4) |
-| `store_server.compaction_dead_ratio` | f64 | 0.5 | (0,1] | 封存段死数据占比 ≥ 此值才压缩(S4) |
+| `store_server.compaction_interval_secs` | u64 | 86400 | ≥1 | 本地 worker **compaction 周期**:跑一次之后隔多久再跑(默认一天一次)(S4) |
+| `store_server.compaction_start_time` | String | `"01:00"` | 严格 `HH:MM`(本地时间) | compaction **首跑钟点**:首次对齐到下一个该钟点(今天没过即今天,过了即明天),之后每 `compaction_interval_secs` 一次(S4) |
+| `store_server.compaction_dead_ratio` | f64 | 0.3 | (0,1] | **可回收**字节占比 ≥ 此值才压缩(partition 级闸门与段级选择同一阈值);可回收 = 被取代的旧记录 + TTL 过期对象 + 墓碑过保留期(S4) |
+| `store_server.compaction_include_rw` | bool | true | — | 是否把 **RW 分区**也纳入候选集(仅压其封存段);`SEALED` 永不入选,`false` = 只压 RO(S4) |
+| `store_server.compaction_tombstone_retention_secs` | u64 | 86400 | ≥0 | **墓碑保留期**:`delete` 后满此时长才允许回收(`0` = 立即允许);应大于副本可能滞后的上界,防副本修复复活已删对象(S4) |
 | `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限(挂在数据面路由的 `DefaultBodyLimit`;**流式 PUT 另按 `Content-Length` 前置校验,超限 413 且不读 body**)。默认与 axum 的 `DefaultBodyLimit` 默认值一致(§5.1 不擅改默认),要收真正的大 blob 须显式调大 |
 | `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0 | `/admin/request-control` 请求未传 `ttl_secs` 时的默认静默时长(秒);**0 = 不设默认时长(即留空即永久禁用)**(批 1) |
 | `store_server.scrub_max_batch_bytes` | u64 | 67108864 | ≥1 | `GET /partitions/{pid}/verify` 缺省的单次扫描读取字节上限(深扫读全量数据体,限流防打爆盘;到点响应 `truncated=true`)(Wave3) |
@@ -592,6 +620,7 @@ store server(一个进程 / 一台数据节点)
 | `store_server_replication_applied_total` | counter | 条 | 从 peer apply 的记录数(S3a) |
 | `store_server_replication_bytes_total` | counter | 字节 | 从 peer apply 的字节数(S3a) |
 | `store_server_replication_errors_total` | counter | 次 | 拉复制错误数(S3a) |
+| `store_server_replication_cursor_resets_total` | counter | 次 | 复制游标**重定位**次数,label `reason` = `incarnation_mismatch` / `segment_generation_mismatch` / `segment_missing` / `offset_out_of_range` / `no_progress`(**非零正常**,持续增长才值得查)(S3a 加固) |
 | `store_server_bootstrap_segments_total` | counter | 个 | bootstrap 物理拷贝的封存段数(S3b) |
 | `store_server_bootstrap_bytes_total` | counter | 字节 | bootstrap 物理拷贝字节数(S3b) |
 | `store_server_flushes_total` | counter | 次 | 本地 worker flush 次数(S4) |
@@ -635,7 +664,7 @@ client/frontend: 解析 partitionId → LookupPartition(master,可缓存;副本�
 每 STANDBY 副本 对每 peer:周期发 ReplicaMetadataRequest(token=log offset 游标)
   → peer 返 token 后的新记录元数据 → 算缺失 key → GetRequest 拉 → apply(墓碑恒胜) → 推进 token
 ```
-- 复用 store 已有 `FindToken`(每-peer log offset 游标)。**bootstrap 拉全量 = 混合(§9 N3,全部实现)**:封存段物理流式拷贝(快,MTTR 优先)+ 活跃段尾巴 token 逻辑补;非纯 token=0 逻辑回放。
+- 复用 store 已有 `FindToken`(每-peer 游标:**段身份**(位置 + 代次)+ 段内偏移;副本 incarnation 由复制会话另持并随请求带上,见 §9.1 S3a)。**bootstrap 拉全量 = 混合(§9 N3,全部实现)**:封存段物理流式拷贝(快,MTTR 优先)+ 活跃段尾巴 token 逻辑补;非纯 token=0 逻辑回放。
 - **S3a 落地(见 §9.1 + `store-server-replication`)**:step-1 ReplicaMetadata 与 step-2 拉 blob **均走 store-server 现有 HTTP(axum)**(细化 D2:node↔node 复制走 HTTP,master↔node 仍 gRPC);写入用 store `apply_replicated`(**墓碑恒胜**)。物理段拷贝(N3 的 MTTR 优化)分期到 S3b。
 
 **参数(默认,已定)**:

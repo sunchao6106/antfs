@@ -13,7 +13,8 @@ pub mod metrics;
 pub mod types;
 
 pub use blob::{
-    ApplyOutcome, BlobStore, CompactionStats, FindInfo, FindToken, MessageInfo, ReplicatedRecord,
+    ApplyOutcome, BlobStore, CompactPolicy, CompactionStats, FindInfo, FindToken, MessageInfo,
+    ReplicatedRecord, TokenResetReason, LOG_INCARNATION_FILE,
 };
 pub use config::StoreConfig;
 pub use error::{Error, Result};
@@ -21,6 +22,6 @@ pub use error::{Error, Result};
 pub use index::value::NO_EXPIRATION;
 pub use index::{IndexValue, PersistentIndex};
 pub use log::Log;
-pub use log_segment::LogSegment;
+pub use log_segment::{peek_generation, LogSegment};
 pub use metrics::{StoreMetricHandles, StoreMetrics};
 pub use types::{LogOffset, LogSegmentName, StoreKey, KEY_SIZE};

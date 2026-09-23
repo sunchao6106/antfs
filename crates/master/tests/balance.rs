@@ -147,6 +147,7 @@ async fn create_partition(leader: &MasterNode, replicas: &[u64]) -> u32 {
                     node_id: *n,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 })
                 .collect(),
         })

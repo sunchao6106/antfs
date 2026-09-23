@@ -29,24 +29,55 @@
 ```
 [ Header ] [ 数据区(变长记录顺序打包) ]
 ```
-**段头(v2)** —— 物理固定 64 B(其中 40 B 有意义),小端;末尾 crc32 覆盖其前:
+**段头(v3)** —— 物理固定 64 B(其中 44 B 有意义),小端;末尾 crc32 覆盖其前:
 
 | 偏移 | 字段 | 长度 | 说明 |
 |---|---|---|---|
 | 0..4 | `magic("AMBS")` | u32 | |
-| 4..6 | `version` | u16 | `= 2` |
+| 4..6 | `version` | u16 | `= 3` |
 | 6..8 | `reserved` | 2 | |
 | 8..16 | `capacity` | u64 | 段容量 |
 | 16..24 | `data_end` | u64 | 持久化水位 |
 | 24..32 | `created_ns` | u64 | |
 | 32..36 | `key_prefix` | u32 | blobId **高 32bit**(该副本的 partitionId) |
-| 36..40 | `crc` | u32 | 覆盖 `[0,36)` |
+| 36..40 | `generation` | u32 | 段的**代次**(v3 新增;与段名同值,见下) |
+| 40..44 | `crc` | u32 | 覆盖 `[0,40)` |
 
+- **段名即段身份**:文件名 `{position}_{generation}_log.seg`;段头**自述**同一个 `generation`(两者不一致 →
+  `Corrupt`:段文件被替换或名字被改过)。`generation` 在**同一 log 目录内单调递增**(每滚一段 = 当前最大代次 + 1),
+  且**跨全库 `compact` 接着旧 log 的最大代次往后取**,故"段身份(位置 + 代次)在整个副本历史上永不复用"。
+  自述的用途:物理拷贝/校验时**不必信文件名** —— `peek_generation` 直接从段文件前缀字节读出代次。
 - `key_prefix` **每段一份、整副本恒定**:一个 log 段只属于一个 partition-replica。`create` 时写入,rollover 建新段继承同一前缀;`open` 时读回并核对(**所有段必须一致,否则 `Corrupt`**)。
 - 追加走 buffered `write_at`,推进内存 `data_end`;对象 offset 0 映射到物理 `HEADER_SIZE`。
 - `flush()` = 写 header(data_end)+ `sync_all`;恢复时按 header 的 data_end 还原。
 - 未 flush 数据恢复时不可见(header 未更新)——刻意的持久化契约。
 - **段容量硬上界 4 GiB**(`log_segment::MAX_CAPACITY`,亦由 `StoreConfig::validate` 的 `MAX_SEGMENT_SIZE_BYTES` 校验,见 §10.1)。理由是**格式不变量而非调优旋钮**:段内偏移要放进索引条目 u32 的偏移半区,且"单条记录 ≤ 段 − 64 < `u32::MAX`"使记录的 u32 `data_len` 结构性无法回绕。
+
+**段身份 = 位置 + 代次(`LogSegmentName`)** —— 段文件名 `{position}_{generation}_log.seg`,段头也**自述**同一个代次
+(v3 新增,见下表)。`position` 是段在本 log 内的逻辑序号(全库 `compact` 后从 0 重来);
+`generation` 在**同一 log 目录内单调递增**(每滚一段 = 当前最大代次 + 1),且**跨全库 `compact` 继续递增**
+(新目录接旧 log 的最大代次往后取)—— 故段身份在整个副本历史上**永不复用**。凡"整体重写 log、段位置从头开始"
+的操作(全库 `compact`),新段身份必然陌生 ⇒ 旧游标认不出自己的段;增量 compaction 也往同目录建**更高代次**
+的新段(位置更高)、并删掉被压的旧段 ⇒ 指向被压段的游标同样认不出(方向是多拉,安全)。段身份不参与读写路径,
+只用于复制侧判定"游标是否还在同一个坐标系里"(对齐 Ambry `StoreFindToken` 的**段名**校验;见 §9.2)。
+
+**副本身份 = `LOG_INCARNATION`(u64 文本)** —— 每个副本目录一份,记「这份副本是第几代」。**由 master 在
+"从零建这份副本"时颁发**(单调、永不复用;见 cluster.md §7.4 `AssignReplicaIncarnation`),副本重建、
+**换盘后重来**都是新号 ⇒ 别的节点手里的旧游标一律作废。身份本身不参与读写路径,只用于复制侧判定
+"对面这份副本是不是我游标所在的那一代"(对齐 Ambry `StoreFindToken` 的 incarnation 语义;见 §9.2)。
+
+- **两层各管一件事**:**段身份**(位置 + 代次)由引擎在 `find_entries_since` 入口校验,认不出 = 我方 log 被 compaction 改写;
+  **副本 incarnation** 由服务层在 `replica_metadata` 校验(引擎看不到副本级身份),不符 = 对面整份副本换了代。
+- 之所以落成**文件**而不是每次从首段现算:增量 compaction 有可能把首段压掉删掉,那时"首段"就换人了,
+  身份会无故改变(→ 每次 compaction 都迫使拉取方全量重拉)。
+- **不含盘级计数器**:身份由 master 发放(单机/离线时从首段兜底),故"换盘导致计数复位"这类窗口在结构上不存在
+  —— **盘级计数器方案已被否决**(换盘即复位,旧游标会看似合法)。
+- 文件缺失或损坏(如物理 bootstrap 只拷段):`BlobStore::open` 用**本机当前时刻**(纳秒)兜底并落盘 ——
+  **绝不用段头里的 `created_ns`**:物理拷贝来的段诞生在**对端**,那时刻正是对端自己的兜底身份,拿它当
+  本副本的身份,重建两次就可能与对端**撞号**,"重建 ⇒ 身份必换"（下面这条保证）就会在"申领没成功"时失效。
+  用本机时钟则身份永远**本机独有**:重建必得新号,重启重开因文件已落盘而保持不变。
+  master 不可达 / 拒绝发号时同样保留这个本地兜底值,副本照常建、照常服务(下次从零建这份副本时再申领)。
+- 崩溃一致性:先建首段、再落身份;崩在中间只会留下"没有身份文件"的目录,由 `BlobStore::open` 自愈。
 
 **记录(v4)** —— `magic(2) | version(1) | flags(1) | key_suffix(4) | expiration_ms(8) | data_len(4) | data | crc(4)`,固定开销 **24 B**(一条记录的物理总长 = `24 + data_len`):
 
@@ -89,9 +120,11 @@
 - 单条记录不超过一个段的数据容量(与 Ambry 一致);**总容量不必是段容量的整数倍** —— 末段为"残段"
   (容量 = `total − k × segment`),装不下记录时该部分空间按写满处理(`SegmentFull` → `StoreFull`),
   故配置项之间解耦(如 100 GiB 分区 + 3 GiB 段 = 33 整段 + 1 个 1 GiB 残段;段上限 4 GiB,见 §10.1),`total < segment` 亦退化为单段。
-- 活跃段放不下 → 先 flush 旧段 → 滚动到新段;段文件名 `{position}_log.seg`。
-- `LogOffset { segment, offset }` 为跨段全局地址(PersistentIndex 引用它)。
-- `open()` 扫描目录、按位置排序恢复所有段。
+- 活跃段放不下 → 先 flush 旧段 → **滚动到新段**(同目录新建,代次取当前最大 + 1);段文件名 `{position}_{generation}_log.seg`。
+- `LogOffset { segment, offset }` 为跨段全局地址(PersistentIndex 引用它);`segment` 只是**位置序号**,
+  **不含代次** —— 代次只活在**段名**与**复制游标**里(见 §3、§9.2),故索引值保持 21B 定长布局不变。
+- `open()` 扫描目录、按段名解析出段身份、按**位置**排序恢复所有段(代次只做身份,不参与排序);
+  段头自述的代次与文件名不一致 → `Corrupt`。
 
 ## 5. PersistentIndex(索引)
 
@@ -105,6 +138,8 @@ key(`StoreKey`,**8B** = 64bit blobId:高 32bit partitionId + 低 32bit objectId,
 ```
 
 索引条目 = 8B key + 21B value = **29B**(`VALUE_SIZE = 21`、`ENTRY_SIZE = 29`、`RECORD_OVERHEAD = 24`),较上一版 67B(59B value + 8B key)每条省 38B。**索引的 key 仍是完整 8B blobId**(它是跨段的全局查找键;段内前缀只有 log 段才知道,故只有记录里才缩成 4B 后缀,见 §3)。
+
+**21B 布局未因段身份改版而变**:offset 半区里只有段**位置**(u32)与段内偏移(u32),**段代次不进索引** —— 代次只活在段名与复制游标里(见 §3、§9.2)。故"段身份 = 位置 + 代次"落地后,索引值仍是 21B 定长、`.idx` 条目仍是 29B。
 
 - **活跃段**:并发 `SkipMap`,写入即插入;无过滤器。
 - **封存段**:活跃段达阈值 → 写 `.idx`(排序条目)+ `.fuse`(**Binary Fuse 过滤器持久化**:
@@ -236,15 +271,118 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] 只读查询与自省(stat / get 选项 / size_in_bytes / is_empty / is_key_deleted)
 - [x] 有效数据字节(`valid_data_size()`:未删除赢家 size 之和,墓碑不计;**不区分过期**——过期但未回收对象仍占盘故计入,避免按过期时刻分桶的复杂度)。增量计数 O(1) 查询,写路径维护、compaction/open 重算,全扫基准差分对拍守护
 - [x] 内存参考模型全量对拍
-- [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 简化:`FindToken` 仅 offset 游标,sessionId/incarnationId/resetKey(重启/compaction 失效重定位)属复制层职责,待其落地补
+- [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 游标重定位已补齐(见 §9.2):`FindToken` 带**段身份**(位置 + 代次),引擎做段身份校验、服务层做**副本 incarnation** 校验(两层),认不出即重置为从头重扫;sessionId 仍未落(重启后游标本就只在内存里,清零即从头)
 - [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction 换入、无重试循环、不引 `arc-swap`;并发测试守护)
-- [x] **存储模型简化:对象不可变 + 删除不可逆**(去掉复活/改 TTL/硬删;**段头 v2**(每段 4B `key_prefix`)、**记录 v4**(24B 开销)、**索引 v2**(29B 条目);复制合并改为**墓碑恒胜**;TTL 只在写入时定)—— 见 `openspec/changes/simplify-delete-model/`
+- [x] **存储模型简化:对象不可变 + 删除不可逆**(去掉复活/改 TTL/硬删;**段头 v2→v3**(每段 4B `key_prefix`;v3 起再带 4B 段代次 `generation`,见 §3)、**记录 v4**(24B 开销)、**索引 v2**(29B 条目)、复制合并改为**墓碑恒胜**;TTL 只在写入时定)—— 见 `openspec/changes/simplify-delete-model/`
 - [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
+- [x] **compaction 回收口径 + 候选集策略**(见 §9.1;`CompactPolicy{dead_ratio, now_ms, tombstone_retention_ms, tombstones_allowed}`:回收被取代的旧记录 + TTL 过期对象 + 过保留期墓碑(**还要过墓碑回收闸门**);墓碑删除时刻复用索引 `expiration_ms` 槽位,布局不变)—— 见 `openspec/changes/store-compaction-policy/`
 - [x] 每 Log 定容上界(store 层):`total_capacity`(per-replica 构造参数,对齐 Ambry `capacityInBytes`)+ 写满归一为 `Error::StoreFull` + 容量自省(`total_capacity`/`available_capacity`/`is_full`)。**「写满自动滚动新 partition」是集群/路由层职责,不在 store**
 - [x] 压测:`benchmark/blob`(`antfs-bench-blob` 二进制)—— 多线程共享 `Arc<BlobStore>` 压 PUT/GET,报吞吐(ops/s、MB/s)+ 延迟分位(p50/p99/max);**集群/数据面端到端压测见 `antfs-bench-router / antfs-bench-frontend`**(`crates/common/router`,直连或经 frontend,见 [`router.md` §8](./router.md))
 - [ ] **封存段 EC 冷层**(热副本→冷 EC,封存段级;转换/读/修复在服务层)——见 [`cluster.md` §5 (D5)](./cluster.md);store 侧需支持封存段的 EC 读路径(有整副本直读,否则读 k 分片重构)
 - [ ] (已废弃)monoio / io_uring / O_DIRECT / 自管块缓存——路线甲,已撤销
+
+### 9.1 compaction 触发与回收口径(已实现)
+
+> 见 `openspec/changes/store-compaction-policy/`。**调度在 store 层**(`worker.rs`),**判定在引擎层**(`blob::CompactPolicy`)。
+
+**回收什么**:三类字节为"可回收",compaction 时真正释放(不再搬进新 log/新段):
+
+| 类别 | 判据(索引赢家) | 回收后行为 |
+|---|---|---|
+| 被取代的旧记录 | 非当前赢家(由 `seg_bytes.dead` 记账) | 老行为,本就回收 |
+| TTL 过期对象 | `!deleted && expiration_ms != -1 && now >= expiration_ms` | 记录与索引条目一并消失:读由 `Expired` 变 `NotFound` |
+| 墓碑过保留期 | `deleted && deleted_at_ms != -1 && now - deleted_at_ms >= retention`**且过了墓碑回收闸门** | 同上:已删对象的墓碑与索引条目消失 |
+
+**墓碑的删除时刻**:`delete` 把 `now` 写进墓碑记录的 `expiration` 字段**与**索引条目的 `expiration_ms`。布局不变(21B 值、`.idx` 条目 29B),旧数据 `-1` = 删除时间未知 ⇒ **永不自动回收**(§3.4 兼容,带测试)。复制按记录头带删时刻,各副本判定一致;`stat()` 的 TTL 口径走 `IndexValue::ttl_expiration_ms()`(墓碑对外仍报 `-1`)。
+
+**墓碑回收闸门(`CompactPolicy.tombstones_allowed`)**:过保留期**只说明**"删除已足够久",还要过**跨副本传播**这一关 —— 墓碑一收,还有没追平的副本就永远学不到那条删除,已删对象会以"活数据"永久留在它上面(僵尸数据)。判据是**副本级**的:
+
+| 项 | 口径 |
+|---|---|
+| master 判据 | 该分区**所有副本都已追平** = 各副本上报 `ACTIVE` **且** `lag_bytes == 0`;缺上报 / 节点 down / 空 placement 都算未追平(保守) |
+| 下发路径 | 随心跳 `MasterDirective.partition_states` **每拍全量**下发,store 逐条落到对应副本句柄上(`ReplicaHandle.tombstones_reclaim_allowed`,初值 `false` = 没拿到权威放行前不回收) |
+| 闸门关闭时 | 墓碑**一律照搬**(连已过保留期的也留),其余可回收口径不受影响 |
+| 单机模式 | 未接 master(没有别的副本可滞后)⇒ **恒放行**;否则墓碑会在这类部署里永久堆在盘上 |
+
+**闸门与选段**:先算 partition 整体可回收占比(索引遍历聚合过期/墓碑字节 + `seg_bytes.dead`,**不读数据体**)≥ `dead_ratio` 才动手;再对**非活跃段**按同一阈值选段压缩(活跃段不动)。cost-benefit 的 `cost` 用"剔除可回收字节后的存活量"。
+
+**取消判活的例外**:`?replication=1` 的拉取仍能读到**尚未被回收**的过期对象(复制忠实 apply);被回收后该对象不再可复制 —— 对端本就视其为过期,可接受。
+
+### 9.2 复制游标重定位(已实现)
+
+> 见 `openspec/changes/store-replication-cursor-revalidate/`。**引擎做段身份校验,服务层做副本 incarnation 校验**(两层),复制侧据此"多拉"而非"误判已追上"。
+
+**两层身份**:① **段身份** = `LogSegmentName`(位置 + 代次,见 §3)—— 全库 `compact` 段位置从 0 重来但代次接着涨,增量 compaction 与滚动只往同目录建**更高代次**的段,故"旧游标认不出自己的段"(段没了 / **位置还在而代次不同**)必然会发生;② **副本身份 = `LOG_INCARNATION`**(master 在**从零建这份副本**时发放,副本重建 / 换盘后重来必然换新号)。游标把段身份(位置 + 代次 + 段内偏移)跨请求传递,incarnation 由复制会话单独持有、随请求带上。
+
+**为什么必须有**:复制游标(`FindToken`)是**对端 log 坐标系的绝对位置**,而 compaction 会改写坐标系 ——
+全库 `compact` 段位置从 0 重来、增量 compaction 把记录搬到更高的段;副本重建 / 换盘则让"这份副本"整体换代。
+把"拿陈旧游标问对端、对端返回空批"当成"已追上",就会在**作废的坐标系**上判追平:副本带着缺失数据转 `ACTIVE`
+→ master 的删源闸门(`reconcile::plan_move`)误成立 → 源副本被 `DROPPED` → **静默丢数据**。对齐 Ambry `revalidateStoreFindToken`
+(段名/代次认不出即 `new StoreFindToken()` 从头重扫)。
+
+> **跟着数据走四遍(大白话,读不懂上面那段黑话就看这里)**
+>
+> **① 正常拉一轮**:分区 3 在 A、B 两台机上各一份(RF=2),B 是刚被指派的新副本。B 问 A"你有哪些 key",
+> A 一次回一批,并附一句话:"我给到 **log 第 3 段、第 500 字节**处"。这句话就是游标,B 记下来。
+> 下一轮 B 带着它继续问"第 3 段第 500 字节之后还有啥",直到 A 说"没了"。**这时 B 才向 master 报"我追上了"**。
+> master 收到这句才敢删掉 A 的副本腾空间 —— 所以"报追上"必须诚实,早报一次就等于删掉还活着的源。
+>
+> **② 拉的中途 A 做了全库 compaction**:compaction 把 A 的存活数据重写进新 log,**段号从 0 重新数**。
+> B 手里"第 3 段第 500 字节"就成了一句废话(第 3 段已经不是原来那段了)。
+> **危险做法**:A 面对认不出的位置回一句"那段没了、后面也没了"→ B 以为拉完了 → 报追上 → master 删掉
+> 还带着数据的 A → **数据永久没了,而且没有任何报错**。
+> **现在的做法**:A 认出"这句话我认不出"(段不在了 / 段还在但版本号变了 / 位置越界 / 你说的副本编号对不上),
+> 一律回答"从头给你重来",并明确告诉 B"这轮我把你的位置作废了";B 收到这句就**不许**报追上,
+> 下一轮拿新位置继续拉,真拉齐了才报。
+>
+> **③ A 的副本被删掉重建(或换盘重来)**:新副本目录从零开始,段号又从 0 数起,内容也不一样。
+> B 手里"第 3 段第 500 字节"**可能恰好**在新副本上也存在(段号又从头数了),**光看位置看不出问题**。
+> 所以给"这份副本"本身也发一个编号:重建/换盘就换新号,B 每轮都带着它问,对不上同样作废 + 从头拉。
+> 这个编号就存在副本目录里的 `LOG_INCARNATION` 小文件中。
+>
+> **④ 一个"全新副本"没领到正式编号会怎样**(见 §9.2 末尾的诚实边界):master 当时联系不上,它就先拿
+> **本机时间**当临时编号开张。别的机器是**从它这里第一次**听说这个编号的,不存在"别人以为你还是上一代的你"
+> 这种错觉 —— **不会丢数据**;唯一的不体面是 master 的账本里这份副本的编号栏还空着(0 = 没发过),要等它
+> 下次从零重建才会补上。目前没有任何代码读那一栏(只有 master 自己的测试在读),所以放着不管没有影响。
+
+**判定与动作**(动作里的短名 = `store_server_replication_cursor_resets_total{reason}` 的取值):
+
+| 触发 | 判据 | 动作(短名) |
+|---|---|---|
+| 游标位置上的段不在段表 | 引擎 `find_entries_since` 入口(对齐 Ambry `floorKey` 名字不符) | 重置为 `Uninitialized`,`FindInfo.token_reset = Some(...)` → `segment_missing` |
+| 位置还在、**代次不同**(该位置已换成另一个段) | 同上(引擎按段名表比对代次) | `segment_generation_mismatch` |
+| 偏移越过该段数据区 | 同上 | `offset_out_of_range` |
+| 游标声明的 incarnation ≠ 本副本 incarnation,**或四件套残缺** | 服务层 `replica_metadata`(incarnation 是**本副本**的事实,引擎无从校验) | 从头重扫,`token_reset` → `incarnation_mismatch` |
+| 本轮对端 incarnation 变化 | 复制侧会话(`PullSession`)+ `sync_round` | 记 `incarnation_mismatch`,**本轮不判追平** |
+| 连续两轮游标没动且没 apply | 同上 | 丢弃游标(`no_progress`),下轮从头重拉 |
+
+**不变量**:
+
+- `scan_candidates` **不得**把"段不存在"静默当成"已越过"(那是"看似追上"的根源);重定位之后才允许从游标扫。
+- 响应里 `token_reset` 非空、或本轮对端 incarnation 变化 ⇒ `caught_up_with_peer` **一律返回 false**(`ACTIVE` 是 master 删源闸门的输入,判据收紧)。
+- 比较只比**位置**:`local_has_nothing_past` 用纯位置的 `BlobStore::has_content_after`(不校验段身份、不触发重定位)—— peer 游标的段身份属**对端坐标系**(本地段位置/代次与对端并不一一对应),拿它进 `find_entries_since` 会被重定位判定误伤。
+- 游标必须**四件套齐全**(`pos` / `gen` / `off` / `incarnation`)才可信;残缺游标按"身份不符"处理(服务层从头重扫并如实报 `incarnation_mismatch`)。
+
+**物理 bootstrap 与对端 compact 的竞态(已加固)**:分段拷贝**前后各列一次封存段清单**,任一条成立即**丢弃整份拷贝**、
+回落纯逻辑拉取:① 取段 **404 / 出错**(段身份已变,或网络失败);② 取回的字节**段头自述代次**与清单不符
+(`peek_generation` 再核一道,防"不发 404 的换段路径");③ 拷完再列清单时对端的 **incarnation 变了**(整份副本被重建)。
+理由:身份一变,"同段号"在两个代次里指向不同记录,逐段取来的字节会横跨两代副本,装出来是**混合快照**
+(还可能带着对端已删的活记录)。丢弃重来是幂等的、必然收敛;不这么做就只能指望后续"墓碑恒胜"把混进来的活记录修回去
+—— 而墓碑一旦过保留期被回收,就修不回来了。
+
+**不做兼容层**:线上尚未启用,不存在新旧节点并存,故不写任何回滚 / 兼容分支 —— 不认的旧格式一律按"认不出"处理(从头重扫,方向是多拉),不保留旧段名 / 旧段头 / 旧清单形状的解析分支。
+
+**观测**:`store_server_replication_cursor_resets_total{reason}`(reason 集合见 cluster.md §9.1 监控项清单);
+`warn`/`info` 日志带 `partition`、段 `position`/`generation` 与 incarnation 的 `prior`/`current`
+(bootstrap 丢弃拷贝那几处是 `before`/`after`/`expected`)。非零是**正常**的(说明发生过 compaction/重建后的续拉)。
+
+**覆盖测试**:`crates/store/tests/compaction_replication.rs`(**9 个场景**:追赶中遇全库/增量 compact、对端副本重建、
+已追平后 compact 的 delete 传播、对端变空、真实后台 loop + 指标、**一次排空过程中的批间重写**、
+**物理 bootstrap 途中对端重写 ⇒ 丢弃拷贝**、**本端在追赶途中做 compaction**)+ `crates/store/tests/incarnation_and_gate.rs`(假 master + 真 gRPC 心跳 loop:
+建副本时申领身份、重复指令不重领、OFFLINE 挂回不换号、墓碑闸门开合)+ `blob`/`replication` 单测(重定位各短名的映射、段代次同目录单调且永不复用、
+全库 compact 后旧游标被重定位而**同一份副本的 incarnation 不变**、incarnation 落盘/重开读到同一号/采纳 master 权威值/缺失时用**本机值**兜底且不继承对端身份、
+`PullSession` 的"重定位 + 换代 + 停滞"状态推进)。
 
 ## 10. 配置项清单(对齐 Ambry `StoreConfig`)
 
@@ -457,7 +595,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 |---|---|
 | `GET /partitions/{pid}/blobs/{key}?replication=1` | 与普通 GET **同 method + 同 path**,只能按 query 区分;它是拉复制 step-2 取数据体的通道,挡掉 ⇒ 副本永久不收敛/掉数据 |
 | `GET /partitions/{pid}/replica-metadata` | 拉复制 step-1(元数据游标),挡掉 ⇒ 复制停摆 |
-| `GET /partitions/{pid}/segments`、`GET /partitions/{pid}/segments/{position}` | 拉复制 bootstrap 的物理段拷贝,挡掉 ⇒ 空副本无法 bootstrap |
+| `GET /partitions/{pid}/segments`、`GET /partitions/{pid}/segments/{position}_{generation}` | 拉复制 bootstrap 的物理段拷贝(取段按**段身份**:认不出 → 404、畸形名 → 400),挡掉 ⇒ 空副本无法 bootstrap |
 | `GET /metrics` | 运维抓取入口 |
 | 任何 `/admin/**`(**含 `/admin/request-control` 自身**) | 否则做出一个"无法远程恢复"的节点 |
 | 其余未知路径/方法 | 默认豁免(失败方向刻意选"宁可禁不掉,不可禁出数据问题") |
@@ -599,17 +737,20 @@ job 形状(未完成字段**不出现在 JSON 里** —— 是缺 key,不是 `nu
 
 | 情形 | 判定 |
 |---|---|
-| peer 对 `replica-metadata` 返回 **404**(该 peer 上没有这个分区的副本) | **满足**:peer 没有该分区数据,无数据要同步 |
+| peer 对 `replica-metadata` 返回 **404**(该 peer 上没有这个分区的副本) | **满足**:peer 没有该分区数据,无数据要同步(仅当本轮**也没从它身上拉到东西**;拉到一半对方把副本删了 → 保守不追平) |
 | peer 正常应答且本轮**没有待 apply 的条目**(拉到空条目批),且**本地 log 末端与 peer 报的游标一致** | **满足**(两侧都空也算一致) |
+| **本轮游标被重定位**(响应的 `token_reset` 非空)**或本轮发现对端换了一代副本**(incarnation 变化) | **不满足**:那种"末端一致"是在**刚作废的坐标系**上算出来的(守卫见 §9.2)→ 下一轮从对端给的新游标继续 |
 | 其余(还有条目要 apply、本地落后于 peer 游标、拉取报错) | **不满足** → 保守留在 `BOOTSTRAP`,下一轮再看 |
 
 与**某个** peer 的一轮满足判据即可转 `ACTIVE`(不等全部 peer;随后单向、不回退)。生产复制器每 tick
 对该分区的**所有**可达 peer 各拉一轮,"追平到其中一个"通常就意味着最短路径已经走完。
 
-"本地 log 末端与 peer 报的游标一致"的实现口径:拿 peer 的游标再问一次**本地库**的
-`find_entries_since`,返回**空条目且游标未推进**即一致(游标语义是"最后一条已审视记录的**起点**",
-从该游标再问会跳过该记录本身,故"已到末端"表现为空)。两道守卫:本地一条记录都没有时,只有 peer
-游标也是"空"(`Uninitialized`)才算一致;本地读失败一律不算一致。
+"本地 log 末端与 peer 报的游标一致"的实现口径:把 peer 的游标(段位置 + 段内偏移)交给本地
+`BlobStore::has_content_after` —— **纯位置扫描**:游标处那条记录**本身**不算"之后的内容"(游标是
+exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer 游标里的段身份属于**对端坐标系**
+(本地段位置/代次与对端并不一一对应),拿它进 `find_entries_since` 会被重定位判定误伤,故这里专门用
+这个不触发重定位的探测。三道守卫:本地一条记录都没有时,只有 peer 游标也是"空"(`Uninitialized`)
+才算一致;peer 游标为空而本地非空 ⇒ 保守不判追平;本地读失败一律按"还有内容"处理(不判追平)。
 
 > **已知边界**(如实记录):store 只看得到"联系得上的 peer"的应答,分不清"整个分区真的空"与
 > "唯一联系得上的 peer 恰好也空、而持有数据的副本暂时不可达"。故本地也空时会对空 peer 放行
@@ -652,7 +793,7 @@ job 形状(未完成字段**不出现在 JSON 里** —— 是缺 key,不是 `nu
 
 **两个只读端点**(都要求本地有该分区副本,否则 404;都在 RequestControl 的豁免白名单里):
 
-- **`GET /partitions/{pid}/scrub-report`** → `{"partition_id","live_records","tombstones","live_bytes","sealed_segments","segments":[{"position","data_end"}],"token_seg","token_off"}`。
+- **`GET /partitions/{pid}/scrub-report`** → `{"partition_id","live_records","tombstones","live_bytes","sealed_segments","segments":[{"position","generation","data_end"}],"token_seg","token_off"}`。
   **只走索引与 mmap,不读数据体**(开销与 key 数成正比、与数据量无关),供 admin 做副本间摘要比对。
   `token_seg/token_off` = 本副本 log 末端游标(与 `replica-metadata` 同口径),两侧一致才说明该轮**可比**。
 - **`GET /partitions/{pid}/verify?max_bytes=`** → `{"partition_id","records","bad_records","first_bad_offset":{"segment","offset"}|null,"index_mismatch","truncated"}`。

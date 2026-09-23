@@ -7,7 +7,8 @@
 //! - `offset`:记录位置,`LogOffset::pack()`(段号 u32 ‖ 段内偏移 u32);
 //! - `size`:**整条记录**的字节数(记录头 + 数据体 + crc),用于跳过/统计;段 ≤ 4 GiB 故 u32 够;
 //! - `flags`:目前只有 `DELETED`(墓碑没有数据体);
-//! - `expiration_ms`:TTL,`NO_EXPIRATION` = 不过期。
+//! - `expiration_ms`:非墓碑 = TTL(`NO_EXPIRATION` = 不过期);**墓碑 = 删除时刻 `deleted_at_ms`**
+//!   (复用同一槽位,布局不变 → 无需索引格式迁移;`NO_EXPIRATION` = 删除时间未知,永不自动回收)。
 //!
 //! 索引的 key 是 8B blobId(`KEY_SIZE`),即每条目 29B。
 
@@ -44,6 +45,43 @@ impl IndexValue {
 
     pub fn is_deleted(&self) -> bool {
         self.flags & FLAG_DELETED != 0
+    }
+
+    /// 该条目的 TTL 语义值:**墓碑恒为[`NO_EXPIRATION`]**(墓碑的 `expiration_ms` 槽位存的是删除时刻,
+    /// 不是 TTL)。对外汇报 TTL/过期判定一律走这个口径,避免把删除时间当成过期时刻。
+    pub fn ttl_expiration_ms(&self) -> i64 {
+        if self.is_deleted() {
+            NO_EXPIRATION
+        } else {
+            self.expiration_ms
+        }
+    }
+
+    /// 墓碑的删除时刻(仅墓碑有意义);`None` = 删除时间未知(旧数据),永不被自动回收。
+    pub fn deleted_at_ms(&self) -> Option<i64> {
+        (self.is_deleted() && self.expiration_ms != NO_EXPIRATION).then_some(self.expiration_ms)
+    }
+
+    /// 非墓碑且 TTL 已到(`now >= expiration`)。
+    pub fn is_expired_at(&self, now_ms: i64) -> bool {
+        !self.is_deleted() && self.expiration_ms != NO_EXPIRATION && now_ms >= self.expiration_ms
+    }
+
+    /// 墓碑已满保留期(`now − deleted_at >= retention_ms`)。删除时间未知(`-1`)或保留期为
+    /// [`i64::MAX`] 时恒为 false —— 回收方向永远"宁可不回收"。
+    pub fn is_reclaimable_tombstone(&self, now_ms: i64, retention_ms: i64) -> bool {
+        match self.deleted_at_ms() {
+            Some(at) => now_ms.saturating_sub(at) >= retention_ms,
+            None => false,
+        }
+    }
+
+    /// compaction 可回收:TTL 已过期,或墓碑已过保留期。
+    ///
+    /// 这是「死数据」在 compaction 里的完整口径 —— 除了"被更新版本取代的旧记录"(那份字节由
+    /// `seg_bytes.dead` 记账,不经本方法),赢家里只有这两类是真正不再需要保留的字节。
+    pub fn is_reclaimable_at(&self, now_ms: i64, retention_ms: i64) -> bool {
+        self.is_expired_at(now_ms) || self.is_reclaimable_tombstone(now_ms, retention_ms)
     }
 
     /// `size` 的 u64 视图(统计累加用)。
@@ -106,5 +144,52 @@ mod tests {
     #[test]
     fn from_bytes_rejects_short_slice() {
         assert!(IndexValue::from_bytes(&[0u8; VALUE_SIZE - 1]).is_none());
+    }
+
+    /// 本模块的条目构造器(`crate::index::tests::put` 不可见)。
+    fn entry() -> IndexValue {
+        IndexValue::put(LogOffset::new(0, 0), 100)
+    }
+
+    /// 墓碑的 `expiration_ms` 槽位存删除时刻:TTL 口径必须仍报 `NO_EXPIRATION`。
+    #[test]
+    fn tombstone_reuses_expiration_slot_for_deleted_at() {
+        let now = 1_700_000_000_000;
+        let mut del = entry();
+        del.flags = FLAG_DELETED;
+        del.expiration_ms = now - 3_600_000;
+
+        assert_eq!(del.ttl_expiration_ms(), NO_EXPIRATION);
+        assert_eq!(del.deleted_at_ms(), Some(now - 3_600_000));
+        assert!(!del.is_expired_at(now), "墓碑不参与 TTL 过期判定");
+        assert!(del.is_reclaimable_tombstone(now, 1_800_000));
+        assert!(!del.is_reclaimable_tombstone(now, 7_200_000), "未满保留期");
+    }
+
+    /// 旧数据的墓碑(`expiration_ms = -1`)删除时间未知 → 永不回收。
+    #[test]
+    fn legacy_tombstone_with_unknown_delete_time_is_never_reclaimed() {
+        let mut del = entry();
+        del.flags = FLAG_DELETED;
+        assert_eq!(del.deleted_at_ms(), None);
+        assert!(!del.is_reclaimable_tombstone(i64::MAX / 2, 0));
+        assert!(!del.is_reclaimable_at(i64::MAX / 2, 0));
+    }
+
+    #[test]
+    fn expiration_and_reclaimability_by_ttl() {
+        let now = 1_700_000_000_000;
+        let mut live = entry();
+        live.expiration_ms = now + 1;
+        assert!(!live.is_expired_at(now));
+        assert!(!live.is_reclaimable_at(now, 0));
+
+        live.expiration_ms = now;
+        assert!(live.is_expired_at(now), "now >= expiration 即过期");
+        assert!(live.is_reclaimable_at(now, 0));
+
+        let no_ttl = entry();
+        assert_eq!(no_ttl.ttl_expiration_ms(), NO_EXPIRATION);
+        assert!(!no_ttl.is_expired_at(i64::MAX / 2), "不过期永不回收");
     }
 }

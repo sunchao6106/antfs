@@ -157,16 +157,19 @@ async fn reconcile_transitions_and_rereplication() {
                     node_id: 101,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 102,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 103,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         })
@@ -287,16 +290,19 @@ async fn decommission_evacuates_replicas_add_before_remove() {
                     node_id: 101,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 102,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 103,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         })
@@ -420,16 +426,19 @@ async fn repair_and_move_replica_validation() {
                     node_id: 101,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 102,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 103,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         })
@@ -511,11 +520,13 @@ async fn repair_and_move_replica_validation() {
                     node_id: 101,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 102,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         })
@@ -682,16 +693,19 @@ async fn move_replica_completes_add_before_remove() {
                     node_id: 101,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 102,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
                 ReplicaPlacement {
                     node_id: 103,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 },
             ],
         })
@@ -884,16 +898,19 @@ async fn assign_lookup_counters_and_cluster_gauges() {
                         node_id: 101,
                         disk_id: "d0".into(),
                         target_state: "ACTIVE".into(),
+                        incarnation: 0,
                     },
                     ReplicaPlacement {
                         node_id: 102,
                         disk_id: "d0".into(),
                         target_state: "ACTIVE".into(),
+                        incarnation: 0,
                     },
                     ReplicaPlacement {
                         node_id: 103,
                         disk_id: "d0".into(),
                         target_state: "ACTIVE".into(),
+                        incarnation: 0,
                     },
                 ],
             })
@@ -1064,6 +1081,7 @@ async fn create_partition(leader: &MasterNode, replicas: &[u64]) -> u32 {
                     node_id: *n,
                     disk_id: "d0".into(),
                     target_state: "ACTIVE".into(),
+                    incarnation: 0,
                 })
                 .collect(),
         })
@@ -1870,5 +1888,106 @@ async fn move_completion_drops_source_dir_and_clears_pending_drop() {
     assert_eq!(
         targets_cleared, None,
         "confirmed drop must also clear the successor bookkeeping"
+    );
+}
+
+/// 分区可写态随心跳指令下发:store 侧靠它挑本地 compaction 候选集
+/// (`crates/store/src/worker.rs`),两侧字段/消费点任一处对不上,`SEALED` 会被照压、
+/// `RO` 又压不到 —— 而各自单测看不出这个接缝。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heartbeat_directive_carries_partition_states() {
+    use antfs_master::pb::PartitionStateInfo;
+    use antfs_master::types::PartitionState;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut nodes = Vec::new();
+    let mut members = BTreeMap::new();
+    for id in 1u64..=3 {
+        let dir = tmp.path().join(format!("n{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg(id, &dir, free_port(), free_port());
+        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let registry = antfs_metric::Registry::new();
+        let node = MasterNode::start(c, &registry).await.expect("start");
+        node.serve().expect("serve");
+        nodes.push(node);
+    }
+    nodes[0].initialize(members).await.expect("initialize");
+    for n in &nodes {
+        n.raft
+            .wait(Some(Duration::from_secs(15)))
+            .metrics(|m| m.current_leader.is_some(), "leader")
+            .await
+            .expect("leader elected");
+    }
+    let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
+
+    // 注册一个数据节点并显式建 1 个 RF=1 分区(副本落在它上面)。
+    leader
+        .raft
+        .client_write(MasterCommand::RegisterNode {
+            node_id: 101,
+            info: data_node("rA"),
+        })
+        .await
+        .expect("register data node");
+    let resp = leader
+        .raft
+        .client_write(MasterCommand::CreatePartition {
+            replication_factor: 1,
+            replicas: vec![ReplicaPlacement {
+                node_id: 101,
+                disk_id: "d0".into(),
+                target_state: "ACTIVE".into(),
+                incarnation: 0,
+            }],
+        })
+        .await
+        .expect("create partition");
+    let pid = match resp.data {
+        antfs_master::MasterResponse::PartitionId(id) => id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
+        .await
+        .expect("connect");
+
+    // 新分区默认 RW:该节点上报承载副本 → 指令里必须带 (pid, RW)。
+    let d = send_beat(&mut client, 101, vec![replica(pid, "ACTIVE", 0)]).await;
+    let got = |d: &antfs_master::pb::MasterDirective| {
+        d.partition_states
+            .iter()
+            .find(|s: &&PartitionStateInfo| s.partition_id == pid)
+            .map(|s| s.state.clone())
+    };
+    assert_eq!(
+        got(&d).as_deref(),
+        Some("RW"),
+        "本节点承载的分区状态应随指令下发: {:?}",
+        d.partition_states
+    );
+
+    // 置 RO 后再发一拍 → 变成 RO(store 侧据此把它当回收候选)。
+    leader
+        .raft
+        .client_write(MasterCommand::SetPartitionState {
+            partition_id: pid,
+            state: PartitionState::ReadOnly,
+        })
+        .await
+        .expect("set RO");
+    let d = send_beat(&mut client, 101, vec![replica(pid, "ACTIVE", 0)]).await;
+    assert_eq!(got(&d).as_deref(), Some("RO"));
+
+    // 该节点没上报的分区不下发(避免把"节点上没有的分区"塞进指令)。
+    let d = send_beat(&mut client, 101, Vec::new()).await;
+    assert!(
+        d.partition_states.is_empty(),
+        "无副本上报时不应下发任何分区状态"
     );
 }

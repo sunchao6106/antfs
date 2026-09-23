@@ -53,7 +53,7 @@ impl DataOp {
 /// - `GET /partitions/{pid}/blobs/{key}?replication=1`:与普通 GET **同 method + 同 path**,
 ///   只能按 query 区分。它是拉复制 step-2 取数据体的通道,挡掉它 = 副本永久不收敛/掉数据。
 /// - `GET /partitions/{pid}/replica-metadata`:拉复制 step-1(元数据游标),挡掉它 = 复制停摆。
-/// - `GET /partitions/{pid}/segments` 与 `GET /partitions/{pid}/segments/{position}`:
+/// - `GET /partitions/{pid}/segments` 与 `GET /partitions/{pid}/segments/{position}_{generation}`:
 ///   拉复制 bootstrap 的物理段拷贝,挡掉它 = 空副本无法 bootstrap(只能退化为慢速逻辑补)。
 /// - `GET /metrics`:运维抓取入口(挡掉它等于自瞎双眼)。
 /// - 任何 `/admin/**`(**含 `POST|GET /admin/request-control` 自身**):否则禁用后无法远程恢复。
@@ -76,7 +76,7 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Data
                 Some(DataOp::Get)
             }
         }
-        // replica-metadata / segments / segments/{position} 与任何未知路径:豁免。
+        // replica-metadata / segments / segments/{name} 与任何未知路径:豁免。
         _ => None,
     }
 }

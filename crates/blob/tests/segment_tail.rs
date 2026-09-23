@@ -39,8 +39,9 @@ fn payload() -> Vec<u8> {
     vec![7u8; DATA as usize]
 }
 
+/// 段文件大小:本测试里每个目录都是从零建的单副本,段代次 = 位置 + 1(每次滚动 +1)。
 fn seg_file_size(dir: &Path, pos: u64) -> u64 {
-    std::fs::metadata(dir.join(LogSegmentName(pos).filename()))
+    std::fs::metadata(dir.join(LogSegmentName::new(pos, pos + 1).filename()))
         .expect("segment file")
         .len()
 }
@@ -52,7 +53,7 @@ fn non_multiple_capacity_uses_remainder_segment() {
     let seg = 4096u64;
     let tail = 2048u64;
     let total = seg * 2 + tail;
-    let log = Log::create(&dir, total, seg, 0).unwrap();
+    let log = Log::create(&dir, total, seg, 0, 1).unwrap();
 
     let per_full = fits(seg, LOG_REC);
     let in_tail = fits(tail, LOG_REC);
@@ -90,7 +91,7 @@ fn remainder_too_small_is_treated_as_full_not_bad_argument() {
     let dir = tmpdir("tiny");
     let seg = 4096u64;
     let total = seg * 2 + 20; // 残段 20B < 段头 64B
-    let log = Log::create(&dir, total, seg, 0).unwrap();
+    let log = Log::create(&dir, total, seg, 0, 1).unwrap();
 
     let per_full = fits(seg, LOG_REC);
     let mut n = 0u64;
@@ -103,7 +104,7 @@ fn remainder_too_small_is_treated_as_full_not_bad_argument() {
         "残段放不下 → SegmentFull(而非参数错)"
     );
     assert_eq!(log.segment_spans().len(), 2, "不该建出用不了的残段文件");
-    assert!(!dir.join(LogSegmentName(2).filename()).exists());
+    assert!(!dir.join(LogSegmentName::new(2, 1).filename()).exists());
 }
 
 /// `total < segment`:退化为**单段**(容量 = total,对齐 Ambry `segmentCapacity = min(capacity, segment)`)。
@@ -112,7 +113,7 @@ fn total_smaller_than_segment_is_a_single_partial_segment() {
     let dir = tmpdir("single");
     let total = 1000u64;
     let seg = 4096u64;
-    let log = Log::create(&dir, total, seg, 0).unwrap();
+    let log = Log::create(&dir, total, seg, 0, 1).unwrap();
 
     let n_fit = fits(total, LOG_REC);
     let mut n = 0u64;
@@ -133,7 +134,7 @@ fn remainder_geometry_survives_reopen() {
     let total = seg * 2 + 2048;
 
     let spans_before = {
-        let log = Log::create(&dir, total, seg, 0).unwrap();
+        let log = Log::create(&dir, total, seg, 0, 1).unwrap();
         while log.append(&payload()).is_ok() {}
         log.flush().unwrap();
         log.segment_spans()

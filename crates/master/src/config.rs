@@ -27,7 +27,7 @@ pub struct MasterConfig {
     pub heartbeat_timeout_secs: u64,
     /// 分区容量上界(字节):选盘时盘可用容量须 ≥ 它(§7.3)。
     pub partition_capacity_bytes: u64,
-    /// 盘将满阈值(0,1]:用量超此比例的盘不再放新分区(对齐 Ambry ≈95%)。
+    /// 盘将满阈值(0,1]:用量超此比例的盘不再放新分区(本项目默认 0.8,较 Ambry ≈95% 更保守)。
     pub disk_near_full_ratio: f64,
     /// 是否开启自动扩容(Q5)。**默认关**(安全):开启才后台按水位建分区。
     pub auto_grow_enabled: bool,
@@ -74,7 +74,7 @@ impl Default for MasterConfig {
             cluster_secret: String::new(),
             heartbeat_timeout_secs: 15,
             partition_capacity_bytes: 100 * 1024 * 1024 * 1024,
-            disk_near_full_ratio: 0.95,
+            disk_near_full_ratio: 0.8,
             auto_grow_enabled: false,
             auto_grow_min_writable: 4,
             auto_grow_max_partitions: 100_000,

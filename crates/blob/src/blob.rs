@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::StoreConfig;
@@ -57,6 +57,14 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 本机当前时刻(纳秒)。用作副本身份的**本地兜底值**(见 [`ensure_incarnation`])。
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
 
@@ -195,6 +203,8 @@ pub struct BlobStore {
     /// 本副本的 key 前缀 = blobId 高 32bit(partitionId)。写入 log 段头,记录体内只存低 32bit;
     /// 写路径据此**拒绝不属于本分区的 key**(否则落盘后读不回来)。
     key_prefix: u32,
+    /// 副本级坐标系身份(见 [`BlobStore::incarnation`]);热路径只读,故用原子。
+    incarnation: AtomicU64,
     inner: RwLock<Arc<Inner>>,
     write_lock: Mutex<()>,
     seg_bytes: Mutex<BTreeMap<u64, SegBytes>>,
@@ -250,12 +260,78 @@ impl ValidStats {
 }
 
 /// compaction 结果统计。
+///
+/// `dead_bytes` = 本次**未搬入**的字节(被取代的旧记录 + 被回收的过期对象/墓碑),`live` = 搬入的。
+/// 后两个字段是回收构成的分项(观测用,已含在 `dead_bytes` 内)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionStats {
     pub live_bytes: u64,
     pub dead_bytes: u64,
+    /// `dead_bytes` 中来自**墓碑**(已过保留期)的字节。
+    pub tombstone_reclaimed_bytes: u64,
+    /// `dead_bytes` 中来自 **TTL 过期对象**的字节。
+    pub expired_reclaimed_bytes: u64,
     pub segments_before: usize,
     pub segments_after: usize,
+}
+
+/// compaction 策略(纯参数,由上层按配置构造):判活口径 + 触发阈值。
+///
+/// 「可回收」= 被取代的旧记录(死字节)+ TTL 已过期对象 + 已过保留期的墓碑(后者还要过
+/// [`tombstones_allowed`](Self::tombstones_allowed) 这道闸门)。阈值 `dead_ratio`
+/// 同时用于 **partition 级闸门** 与 **段级选择**。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactPolicy {
+    /// 触发阈值 (0,1]:可回收字节占比 ≥ 此值才压缩。
+    pub dead_ratio: f64,
+    /// 判定「现在」的 unix 毫秒(过期与保留期都以它为准)。
+    pub now_ms: i64,
+    /// 墓碑保留期(毫秒):`delete` 之后满此时长才允许回收墓碑,防副本修复把已删对象复活。
+    /// [`i64::MAX`] = 永不回收墓碑。
+    pub tombstone_retention_ms: i64,
+    /// **墓碑回收闸门**:`false` 时墓碑一律照搬(连已过保留期的也不回收)。
+    ///
+    /// 保留期只说"删除已足够久",但如果**还有副本没追平**,墓碑一收,那份滞后副本就永远学不到
+    /// 这条删除,已删对象会以"活数据"永久留在它上面(僵尸数据)。故集群侧由 master 权威下发
+    /// ("该分区所有副本都已追平"才放行),store 侧按副本的闸门值填本字段(见 `crate::worker`)。
+    ///
+    /// [`Self::new`] 给的是 `true`(保留期本身就是判活口径,与改造前的行为一致);单机 / 不关心
+    /// 跨副本传播的调用方可不设。
+    pub tombstones_allowed: bool,
+}
+
+impl CompactPolicy {
+    pub fn new(dead_ratio: f64, now_ms: i64, tombstone_retention_ms: i64) -> Self {
+        Self {
+            dead_ratio,
+            now_ms,
+            tombstone_retention_ms,
+            tombstones_allowed: true,
+        }
+    }
+
+    /// 设定墓碑回收闸门(`false` = 墓碑一律照搬,见 [`Self::tombstones_allowed`])。
+    pub fn with_tombstones_allowed(mut self, tombstones_allowed: bool) -> Self {
+        self.tombstones_allowed = tombstones_allowed;
+        self
+    }
+
+    /// 历史口径:只回收被取代的旧记录,不判定过期、墓碑永留(供不关心新回收口径的调用方/测试用)。
+    pub fn preserve_legacy(dead_ratio: f64) -> Self {
+        Self {
+            dead_ratio,
+            now_ms: 0,
+            tombstone_retention_ms: i64::MAX,
+            tombstones_allowed: false,
+        }
+    }
+
+    /// 该索引赢家是否可回收(过期对象 / 过保留期墓碑)。
+    fn is_reclaimable(&self, v: &IndexValue) -> bool {
+        v.is_expired_at(self.now_ms)
+            || (self.tombstones_allowed
+                && v.is_reclaimable_tombstone(self.now_ms, self.tombstone_retention_ms))
+    }
 }
 
 /// **打开副本时的容错恢复报告**:`open` 遇到坏记录不再整体失败,而是跳过坏记录、尽力恢复,
@@ -332,17 +408,74 @@ pub struct MessageInfo {
     pub deleted: bool,
 }
 
-/// 复制增量拉取游标(对齐 Ambry `StoreFindToken` 的核心:log offset 游标)。
+/// 复制增量拉取游标(对齐 Ambry `StoreFindToken`:log offset 游标 + **段身份**)。
 ///
-/// 简化说明:仅保留 offset 游标(足以按 log 追加序恢复拉取);Ambry 的 sessionId/incarnationId
-/// (重启/重建失效检测)与 resetKey(compaction 失效重定位)属复制/集群层职责,待其落地时再补。
+/// 游标记录的是"最后一条已审视记录"所在的**段身份**(位置 + 代次,见 [`LogSegmentName`])与段内偏移。
+/// 段身份在副本历史上永不复用(位置会随全库 compact 从 0 重来,但代次接着涨),所以"认不出这个段"
+/// 就等价于"这个游标作废了"(对齐 Ambry 按段名校验 `revalidateStoreFindToken`)。
+///
+/// 副本级身份(incarnation)不放进这里:它属于**副本**而不是段,由复制层单独持有与校验
+/// (见 `docs/design/store.md` 的"复制游标重定位")。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FindToken {
     /// 从 log 起点开始。
     #[default]
     Uninitialized,
-    /// 上次返回的最后 offset(下次从其之后继续,exclusive)。
-    Offset(LogOffset),
+    /// 上次返回的最后 offset(下次从其之后继续,exclusive)+ 它所属的段身份。
+    Offset {
+        segment: LogSegmentName,
+        offset: u64,
+    },
+}
+
+impl FindToken {
+    pub fn at(segment: LogSegmentName, offset: u64) -> Self {
+        Self::Offset { segment, offset }
+    }
+
+    /// 游标位置(段位置 + 段内偏移);`Uninitialized` = 无(从起点)。
+    pub fn offset(&self) -> Option<LogOffset> {
+        match self {
+            Self::Uninitialized => None,
+            Self::Offset { segment, offset } => {
+                Some(LogOffset::new(segment.position as u64, *offset))
+            }
+        }
+    }
+
+    /// 游标所属的段身份;`Uninitialized` = 无游标。
+    pub fn segment_name(&self) -> Option<LogSegmentName> {
+        match self {
+            Self::Uninitialized => None,
+            Self::Offset { segment, .. } => Some(*segment),
+        }
+    }
+}
+
+/// 游标为什么被重定位(复制侧据此收紧判据与打点,对齐 Ambry `revalidateStoreFindToken`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenResetReason {
+    /// 游标所在段已不在段表里(compaction 删了它,或对方整体重写过 log)。
+    SegmentMissing,
+    /// 游标位置上有段,但**代次不同** —— 段号被复用(全库 compact 后段位置从 0 重来)。
+    SegmentReplaced,
+    /// 游标偏移超出该段数据区(段被截断,或该游标根本不属于这个 log)。
+    OffsetOutOfRange,
+    /// 游标声明的**副本 incarnation** 与服务端不符(副本被重建 / 换盘后重来)。由**服务层**判定并置入
+    /// —— 引擎看不到副本级身份。
+    IncarnationMismatch,
+}
+
+impl TokenResetReason {
+    /// 指标/日志用的稳定短名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SegmentMissing => "segment_missing",
+            Self::OffsetOutOfRange => "offset_out_of_range",
+            Self::SegmentReplaced => "segment_generation_mismatch",
+            Self::IncarnationMismatch => "incarnation_mismatch",
+        }
+    }
 }
 
 /// [`find_entries_since`](BlobStore::find_entries_since) 结果:本批条目 + 新游标 + 已读日志字节。
@@ -352,6 +485,8 @@ pub struct FindInfo {
     pub token: FindToken,
     /// 从 log 起点到新游标的累计字节(复制滞后度量,对齐 Ambry `FindInfo` bytesRead)。
     pub bytes_read: u64,
+    /// 本轮游标是否被重定位(`Some(reason)`);**重定位那轮不得据此判"已追上"**。
+    pub token_reset: Option<TokenResetReason>,
 }
 
 /// [`apply_replicated`](BlobStore::apply_replicated) 结果。
@@ -405,14 +540,20 @@ impl BlobStore {
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let (log_dir, index_dir) = sub_dirs(&dir);
-        let log = Log::create(&log_dir, total_capacity, segment_capacity, partition_id)?;
+        // 新副本:段代次从 1 起(段身份 = 位置 + 代次,见 `LogSegmentName`)。
+        let log = Log::create(&log_dir, total_capacity, segment_capacity, partition_id, 1)?;
         let index = PersistentIndex::create(&index_dir, max_index_entries_per_segment)?;
+        // 新副本的 incarnation:本地先给一个**本机唯一**的值(当前时刻),master 随后会用它颁发的值
+        // 纠正(见 `adopt_incarnation`)。单机模式没有 master,这个本地值就是最终值。
+        let incarnation = now_ns().max(1);
+        write_incarnation(&dir, incarnation)?;
         Ok(Self {
             dir,
             total_capacity,
             segment_capacity,
             max_index_entries_per_segment,
             key_prefix: partition_id,
+            incarnation: AtomicU64::new(incarnation),
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(BTreeMap::new()),
@@ -467,12 +608,14 @@ impl BlobStore {
         };
         log_open_damage(&dir, &open_damage);
         let valid_stats = compute_valid_stats(&log, &index)?;
+        let incarnation = ensure_incarnation(&dir)?;
         Ok(Self {
             dir,
             total_capacity,
             segment_capacity,
             max_index_entries_per_segment,
             key_prefix: log.key_prefix(),
+            incarnation: AtomicU64::new(incarnation),
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(seg_bytes),
@@ -504,6 +647,7 @@ impl BlobStore {
             max_index_entries_per_segment,
         )?;
         let (log_dir, index_dir) = sub_dirs(&dir);
+        // 物理 bootstrap 装载的目录只有段文件:身份由 `Log::open` 从首段 `created_ns` 自愈补写。
         let log = Log::open(&log_dir, total_capacity, segment_capacity)?;
         let (index, open_damage) =
             rebuild_index_tolerant(&log, &index_dir, max_index_entries_per_segment)?;
@@ -516,12 +660,14 @@ impl BlobStore {
         log_open_damage(&dir, &open_damage);
 
         let valid_stats = compute_valid_stats(&log, &index)?;
+        let incarnation = ensure_incarnation(&dir)?;
         Ok(Self {
             dir,
             total_capacity,
             segment_capacity,
             max_index_entries_per_segment,
             key_prefix: log.key_prefix(),
+            incarnation: AtomicU64::new(incarnation),
             inner: RwLock::new(Arc::new(Inner { log, index })),
             write_lock: Mutex::new(()),
             seg_bytes: Mutex::new(seg_bytes),
@@ -706,13 +852,52 @@ impl BlobStore {
     }
 
     /// 封存段(不可变,除活跃段外)的 `(position, data_end)`,S3b 物理拷贝发送方枚举。
-    pub fn sealed_segments(&self) -> Vec<(u64, u64)> {
-        self.inner().log.sealed_spans()
+    /// 封存段清单(`(段身份, data_end)`,按位置升序;不含活跃段)。S3b 物理拷贝与复制清单用。
+    pub fn sealed_segments(&self) -> Vec<(LogSegmentName, u64)> {
+        self.inner().log.sealed_segment_names()
+    }
+
+    /// 本地 log 在 `after`(段位置 + 段内偏移)**之后还有记录**吗?
+    ///
+    /// **纯位置扫描,不校验段身份/代次、不触发重定位** —— 这是复制侧"本地是否已 apply 到 peer 游标
+    /// 处"的辅助判据:peer 游标里的段身份属于**对端坐标系**(本地段位置与代次跟对端并不一一对应),
+    /// 拿它进 [`find_entries_since`](Self::find_entries_since) 会被重定位判定误伤。
+    ///
+    /// 语义与 [`find_entries_since`](Self::find_entries_since) 的游标一致:游标处那条记录**本身**
+    /// 不算"之后的内容"(游标是 exclusive 的)。读失败一律按"还有内容"(= 不判追平,保守)。
+    pub fn has_content_after(&self, after: LogOffset) -> bool {
+        let inner = self.inner();
+        for (position, data_end) in inner.log.segment_spans() {
+            if position < after.segment {
+                continue;
+            }
+            let begin = if position == after.segment {
+                after.offset
+            } else {
+                0
+            };
+            let mut off = begin;
+            while off < data_end {
+                if position == after.segment && off == after.offset {
+                    // 跳过游标处那条记录本身(其长度从记录头读;读不出就保守认为"还有内容")。
+                    match read_full_record(&inner.log, LogOffset::new(position, off)) {
+                        Ok((raw, _)) => off += raw.len() as u64,
+                        Err(_) => return true,
+                    }
+                    continue;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// 读某封存段的原始前缀字节(header + 有效数据),S3b 物理拷贝发送方。
-    pub fn read_segment_prefix(&self, position: u64) -> Result<Vec<u8>> {
-        self.inner().log.read_segment_prefix(position)
+    ///
+    /// 按**段身份**(位置 + 代次)取:同位置不同代次 → 报"没有这段"(取段方 404 化后丢弃拷贝
+    /// 回落纯逻辑拉取),避免把"已经被 compaction 重写过的段"当同一段发出去。
+    pub fn read_segment_prefix(&self, name: LogSegmentName) -> Result<Vec<u8>> {
+        self.inner().log.read_segment_prefix(name)
     }
 
     /// 打开时的容错恢复报告(空 = 干净副本)。`store` 经 `scrub-report` 把它转给运维,
@@ -973,12 +1158,16 @@ impl BlobStore {
 
     /// 查询 blob 元数据(状态/TTL/数据长度),**不读数据体**(对齐 Ambry `findKey`)。
     /// key 不存在报 [`NotFound`](crate::error::Error::NotFound);已删除/已过期仍返回其元数据。
+    ///
+    /// TTL 口径走 [`IndexValue::ttl_expiration_ms`]:墓碑的 `expiration_ms` 槽位存的是删除时刻,
+    /// 不能当成过期时刻对外汇报。
     pub fn stat(&self, key: &StoreKey) -> Result<BlobMeta> {
         let v = self.inner().index.find(key).ok_or(Error::NotFound)?;
+        let now = now_ms() as i64;
         Ok(BlobMeta {
             deleted: v.is_deleted(),
-            expired: v.expiration_ms != NO_EXPIRATION && now_ms() as i64 >= v.expiration_ms,
-            expiration_ms: v.expiration_ms,
+            expired: v.is_expired_at(now),
+            expiration_ms: v.ttl_expiration_ms(),
             data_len: v.size_bytes().saturating_sub(RECORD_OVERHEAD as u64),
         })
     }
@@ -1039,18 +1228,36 @@ impl BlobStore {
     /// 路径:游标落在 journal 覆盖窗口内 → journal 快路径(免扫 log);否则(初次/滞后过久)→ 扫 log。
     /// 已追平 → 空条目 + 原游标。批内按 key 去重;跨批次同一 key 可能重复返回(复制侧幂等应用)。
     ///
-    /// 注:compaction 改写 offset 会使其之前发放的游标失效——该失效重定位(Ambry resetKey)属复制层
-    /// 职责,当前未处理。
+    /// **第一步是 revalidate**(对齐 Ambry `PersistentIndex.findEntriesSince` 的
+    /// `revalidateStoreFindToken`):游标必须能在**当前**段表里认出来,认不出就**重置为从头重扫**
+    /// (方向是多拉,安全)。绝不把失效游标当成"已越过" —— 那会让调用方以为已经追上,静默漏数据。
+    ///
+    /// 返回的游标**自带段身份**(位置 + 代次,见 [`FindToken`])。副本级 incarnation 不在游标里 ——
+    /// 那是**对端**的事实,由服务层/复制会话另外持有与比对(见 `store::server::replica_metadata`
+    /// 与 `store::replication::PullSession`)。
     pub fn find_entries_since(&self, token: &FindToken, max_total_size: u64) -> Result<FindInfo> {
         let inner = self.inner();
 
+        // 0) revalidate:段没了 / 段号被复用(代次不同)/ 偏移越界 ⇒ 从头重扫,并如实报告
+        //    "本轮发生过重定位"(对齐 Ambry `revalidateStoreFindToken`:段名认不出即 `new StoreFindToken()`)。
+        let (token, token_reset) = match token.segment_name() {
+            None => (*token, None),
+            Some(segment) => {
+                let offset = token.offset().expect("Offset token has a position").offset;
+                match revalidate_token(&inner.log, segment, offset) {
+                    Ok(()) => (*token, None),
+                    Err(reason) => (FindToken::Uninitialized, Some(reason)),
+                }
+            }
+        };
+
         // 1) 取「游标之后的 (offset,key) 候选序列」,按 log 追加序;log 扫描按 max_total_size 限量。
-        let candidates: Vec<(LogOffset, StoreKey)> = match token {
-            FindToken::Offset(o) => match inner.index.journal_entries_since(*o, false) {
+        let candidates: Vec<(LogOffset, StoreKey)> = match token.offset() {
+            Some(o) => match inner.index.journal_entries_since(o, false) {
                 Some(j) => j,
-                None => scan_candidates(&inner.log, Some(*o), max_total_size)?,
+                None => scan_candidates(&inner.log, Some(o), max_total_size)?,
             },
-            FindToken::Uninitialized => scan_candidates(&inner.log, None, max_total_size)?,
+            None => scan_candidates(&inner.log, None, max_total_size)?,
         };
 
         // 2) 按序去重到「每 key 当前最新状态」,累计大小达上限即止,推进游标到最后审视的 offset。
@@ -1077,12 +1284,27 @@ impl BlobStore {
             }
         }
 
-        let new_token = last.map(FindToken::Offset).unwrap_or(*token);
+        // 本轮没有候选(已追平)= 游标停在原处;重定位过(且 log 已空)= Uninitialized,不假装有进展。
+        // 游标带回**段身份**(位置 + 代次):代次从段表取,服务层无需再补。
+        let new_token = match last.or(token.offset()) {
+            Some(o) => {
+                let generation = inner
+                    .log
+                    .generation_of(o.segment)
+                    .expect("winning record lives in a segment of this log");
+                FindToken::at(
+                    LogSegmentName::new(o.segment, u64::from(generation)),
+                    o.offset,
+                )
+            }
+            None => FindToken::Uninitialized,
+        };
         let bytes_read = bytes_read_to(&inner.log, &new_token);
         Ok(FindInfo {
             entries,
             token: new_token,
             bytes_read,
+            token_reset,
         })
     }
 
@@ -1231,6 +1453,36 @@ impl BlobStore {
         self.inner().log.segment_spans().last().copied()
     }
 
+    /// 本 log 用过的最大段代次(诊断/测试用;全库 compact 会把它推高,增量 compaction 只在同目录建新段)。
+    pub fn max_segment_generation(&self) -> u64 {
+        self.inner().log.max_generation()
+    }
+
+    /// 本副本的 **incarnation**(副本级坐标系身份)。
+    ///
+    /// 由 master 在"建这份副本"时颁发(单调、永不复用;单机模式退化为本地生成),落盘在
+    /// `{store_dir}/LOG_INCARNATION`。复制侧用它判定"对面这份副本是不是我游标所在的那一代":
+    /// 副本被重建、或换盘后重来 ⇒ 新号 ⇒ 旧游标一律作废。
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation.load(Ordering::Acquire)
+    }
+
+    /// 采纳 master 颁发的 incarnation(与本地不同则改写并**作废此前发出的游标** —— 保守方向)。
+    ///
+    /// 只在新副本建库时调用;master 是唯一权威(它记得"这份副本该是第几代")。
+    pub fn adopt_incarnation(&self, incarnation: u64) -> Result<()> {
+        let previous = self.incarnation.swap(incarnation, Ordering::AcqRel);
+        if previous != incarnation {
+            write_incarnation(&self.dir, incarnation)?;
+            tracing::info!(
+                previous,
+                current = incarnation,
+                "replica incarnation adopted"
+            );
+        }
+        Ok(())
+    }
+
     /// 副本摘要(活记录数/墓碑数/活数据字节/封存段数);只走索引与 mmap,不读数据体。
     pub fn index_stats(&self) -> IndexStats {
         let inner = self.inner();
@@ -1275,6 +1527,9 @@ impl BlobStore {
 
     /// 删除一个对象:追加墓碑记录并在索引写入删除条目。
     /// 不存在报 NotFound;已删除(墓碑)幂等成功(不写第二条墓碑),对应 HTTP 204。
+    ///
+    /// 墓碑记录索引条目与记录头都带**删除时刻**(见 [`IndexValue::deleted_at_ms`]):compaction 只在
+    /// 删除满保留期后才回收墓碑,时间戳随复制传给各副本(故各副本的回收判定一致)。
     pub fn delete(&self, key: StoreKey) -> Result<()> {
         if !self.is_available() {
             return Err(Error::Unavailable);
@@ -1293,10 +1548,13 @@ impl BlobStore {
             Some(v) if v.is_deleted() => return Ok(()),
             Some(v) => v,
         };
-        let record = encode_record(&key, FLAG_DELETED, NO_EXPIRATION, &[])?;
+        let deleted_at_ms = now_ms() as i64;
+        // 墓碑的 `expiration` 槽位存**删除时刻**(非 TTL):保留期判定与复制的删除时间传播都靠它。
+        let record = encode_record(&key, FLAG_DELETED, deleted_at_ms, &[])?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
         let mut value = IndexValue::put(offset, record_size_u32(record.len() as u64)?);
         value.flags = FLAG_DELETED;
+        value.expiration_ms = deleted_at_ms;
         inner.index.add(key, value)?;
         // 墓碑成为新赢家(live);被取代的旧 PUT 转为该段的死数据。
         let mut seg_bytes = self.seg_bytes.lock().expect("blob seg_bytes poisoned");
@@ -1361,6 +1619,7 @@ impl BlobStore {
     }
 
     /// 返回全库存活/死亡字节统计(读增量计数,死 = 被更新版本取代/删除的旧记录)。
+    /// `stats` 是**全量口径**(不含 TTL/墓碑的可回收判定),回收构成见各次 compaction 的返回值。
     pub fn stats(&self) -> Result<CompactionStats> {
         let mut live = 0u64;
         let mut dead = 0u64;
@@ -1377,6 +1636,8 @@ impl BlobStore {
         Ok(CompactionStats {
             live_bytes: live,
             dead_bytes: dead,
+            tombstone_reclaimed_bytes: 0,
+            expired_reclaimed_bytes: 0,
             segments_before: segments,
             segments_after: segments,
         })
@@ -1395,23 +1656,74 @@ impl BlobStore {
         CompactionStats {
             live_bytes: live,
             dead_bytes: dead,
+            tombstone_reclaimed_bytes: 0,
+            expired_reclaimed_bytes: 0,
             segments_before: segments,
             segments_after: segments,
         }
     }
 
-    /// 周期性 GC 入口:对**每个非活跃段**按其死数据占比 ≥ `threshold` 增量压缩(热/末段不动),
-    /// 对齐 Ambry StatsBased 的按段触发,而非全库 CompactAll。无达阈段返回 `None`。
-    /// 需要全库重写时显式调用 [`compact`](Self::compact)。
-    pub fn compact_if_needed(&self, threshold: f64) -> Result<Option<CompactionStats>> {
-        self.compact_incremental(threshold)
+    /// 每段的 `(总字节, 可回收字节)` —— compaction 的闸门与段选择共用这一份口径。
+    ///
+    /// - 总字节 = `seg_bytes` 的 `live + dead`;
+    /// - 可回收 = 被更新版本取代的旧记录(`seg_bytes.dead`)+ 该段内**已过期 / 墓碑已过保留期**的
+    ///   索引赢家字节(后者仍记在 `seg_bytes.live` 里,故只看死字节计数看不见 TTL 与墓碑的空间)。
+    ///
+    /// 只走索引(内存 + mmap),**不读数据体**,开销与 key 数成正比。
+    fn reclaimable_by_segment(
+        &self,
+        inner: &Inner,
+        policy: &CompactPolicy,
+    ) -> BTreeMap<u64, (u64, u64)> {
+        let mut m: BTreeMap<u64, (u64, u64)> = self
+            .seg_bytes
+            .lock()
+            .expect("blob seg_bytes poisoned")
+            .iter()
+            .map(|(&pos, v)| (pos, (v.live + v.dead, v.dead)))
+            .collect();
+        inner.index.for_each(|_k, v| {
+            if policy.is_reclaimable(&v) {
+                let e = m.entry(v.offset.segment).or_insert((0, 0));
+                e.1 += v.size_bytes();
+            }
+        });
+        m
     }
 
-    /// CompactAll:重写整个 log 只保留存活记录(newest-wins 赢家),重建索引,原子换入。
+    /// 全库可回收字节占比(partition 级闸门:低于阈值连段选择都不必做)。
+    fn reclaimable_ratio(&self, inner: &Inner, policy: &CompactPolicy) -> f64 {
+        let m = self.reclaimable_by_segment(inner, policy);
+        let total: u64 = m.values().map(|(t, _)| *t).sum();
+        let reclaimable: u64 = m.values().map(|(_, r)| *r).sum();
+        if total == 0 {
+            0.0
+        } else {
+            reclaimable as f64 / total as f64
+        }
+    }
+
+    /// 周期性 GC 入口:先过 **partition 级闸门**(全库可回收占比 ≥ `policy.dead_ratio` 才动手,
+    /// 免得小比例回收白跑一趟),再对达阈的**非活跃段**增量压缩(热/末段不动),
+    /// 对齐 Ambry StatsBased 的按段触发而非全库 CompactAll。无达阈段返回 `None`。
+    ///
+    /// 可回收口径 = 被取代的旧记录 + TTL 已过期对象 + 墓碑已过保留期(见 [`CompactPolicy`])。
+    /// 需要全库重写时显式调用 [`compact`](Self::compact)。
+    pub fn compact_if_needed(&self, policy: &CompactPolicy) -> Result<Option<CompactionStats>> {
+        if self.reclaimable_ratio(&self.inner(), policy) < policy.dead_ratio {
+            return Ok(None);
+        }
+        self.compact_incremental(policy)
+    }
+
+    /// CompactAll:重写整个 log,只保留存活记录(newest-wins 赢家),重建索引,原子换入。
+    ///
+    /// 「存活」按 `policy` 判定:被取代的旧记录、TTL 已过期的对象、墓碑已过保留期的条目都**不复入**
+    /// 新 log(即真正回收),其余包括保留期内的墓碑照常搬运(它仍是该 key 的赢家)。
     ///
     /// 崩溃安全:先建 `log.new` 并 fsync → 写提交标记 → 目录 rename 换入(log→log.old,log.new→log)
     /// → 重建索引 → 删标记与 log.old。任一步崩溃,`open()` 依据标记修复(见 `recover_compaction`)。
-    pub fn compact(&self) -> Result<CompactionStats> {
+    pub fn compact(&self, policy: &CompactPolicy) -> Result<CompactionStats> {
         let _t = self.metrics.compaction_duration.start_timer();
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
         let old = self.inner();
@@ -1424,22 +1736,42 @@ impl BlobStore {
         rm_rf(&log_new)?;
         rm_rf(&log_old)?;
 
-        // COPY:扫旧 log,存活记录(当前赢家)重写进 log.new。
+        // COPY:扫旧 log,存活记录(当前赢家且未过期/未过保留期)重写进 log.new。
+        //
+        // **段代次接着旧 log 往后取**(位置从 0 重来):于是新目录里的段身份与旧目录**绝不重复**,
+        // 旧游标必然"认不出自己的段"(见 `docs/design/store.md` 的"复制游标重定位")。
+        let next_generation = old.log.max_generation() + 1;
         let new_log = Log::create(
             &log_new,
             self.total_capacity,
             self.segment_capacity,
             self.key_prefix,
+            next_generation,
         )?;
         let mut live = 0u64;
         let mut dead = 0u64;
+        let mut tombstones = 0u64;
+        let mut expired = 0u64;
         for_each_record(&old.log, |off, raw, decoded| {
-            let is_live = matches!(old.index.find(&decoded.key), Some(v) if v.offset == off);
-            if is_live {
-                new_log.append(raw)?;
-                live += raw.len() as u64;
-            } else {
-                dead += raw.len() as u64;
+            let winner = match old.index.find(&decoded.key) {
+                Some(v) if v.offset == off => Some(v),
+                _ => None,
+            };
+            match winner {
+                // 过期对象 / 过保留期墓碑:不予搬运 → 字节真正释放。
+                Some(v) if policy.is_reclaimable(&v) => {
+                    if v.is_deleted() {
+                        tombstones += raw.len() as u64;
+                    } else {
+                        expired += raw.len() as u64;
+                    }
+                    dead += raw.len() as u64;
+                }
+                Some(_) => {
+                    new_log.append(raw)?;
+                    live += raw.len() as u64;
+                }
+                None => dead += raw.len() as u64,
             }
             Ok(())
         })?;
@@ -1474,6 +1806,8 @@ impl BlobStore {
         Ok(CompactionStats {
             live_bytes: live,
             dead_bytes: dead,
+            tombstone_reclaimed_bytes: tombstones,
+            expired_reclaimed_bytes: expired,
             segments_before: before,
             segments_after: after,
         })
@@ -1497,53 +1831,64 @@ impl BlobStore {
         Ok(out)
     }
 
-    /// 增量 compaction:只压缩死数据占比 ≥ `threshold` 的**非活跃**段(热/末段不动)。
+    /// 增量 compaction:只压缩**可回收占比 ≥ `policy.dead_ratio`** 的**非活跃**段(热/末段不动)。
     /// 执行机制与崩溃安全见 [`compact_segments`](Self::compact_segments)。无达阈段返回 `None`。
-    pub fn compact_incremental(&self, threshold: f64) -> Result<Option<CompactionStats>> {
+    pub fn compact_incremental(&self, policy: &CompactPolicy) -> Result<Option<CompactionStats>> {
         let _t = self.metrics.compaction_duration.start_timer();
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
         let old = self.inner();
         self.flush_inner(&old)?;
+        let active_pos = old.log.segment_spans().last().map(|(p, _)| *p);
         let selected: Vec<u64> = self
-            .segment_stats()?
-            .iter()
-            .filter(|(_, live, dead)| {
-                let total = live + dead;
-                total > 0 && (*dead as f64 / total as f64) >= threshold
+            .reclaimable_by_segment(&old, policy)
+            .into_iter()
+            .filter(|(pos, (total, reclaimable))| {
+                Some(*pos) != active_pos
+                    && *total > 0
+                    && (*reclaimable as f64 / *total as f64) >= policy.dead_ratio
             })
-            .map(|(pos, _, _)| *pos)
+            .map(|(pos, _)| pos)
             .collect();
         if selected.is_empty() {
             return Ok(None);
         }
-        Ok(Some(self.run_compact_segments(&old, &selected)?))
+        Ok(Some(self.run_compact_segments(&old, &selected, policy)?))
     }
 
     /// cost-benefit compaction(对齐 Ambry `StatsBasedCompactionPolicy`):在非活跃段的**连续区间**里,
-    /// 按「cost = 存活字节、benefit = 回收段数 = 源段数 − ceil(cost/段容量)」选 cost/benefit 最优
-    /// 且 `benefit ≥ min_reclaim` 的区间压缩。无合格区间返回 `None`。
-    pub fn compact_cost_benefit(&self, min_reclaim: usize) -> Result<Option<CompactionStats>> {
+    /// 按「cost = 需搬走的存活字节、benefit = 回收段数 = 源段数 − ceil(cost/段容量)」选 cost/benefit
+    /// 最优且 `benefit ≥ min_reclaim` 的区间压缩。无合格区间返回 `None`。
+    ///
+    /// `cost` 用**剔除可回收字节后的存活量**:过期对象/过保留期墓碑本就不必搬运,不计入成本。
+    pub fn compact_cost_benefit(
+        &self,
+        policy: &CompactPolicy,
+        min_reclaim: usize,
+    ) -> Result<Option<CompactionStats>> {
         let _t = self.metrics.compaction_duration.start_timer();
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
         let old = self.inner();
         self.flush_inner(&old)?;
-        let selected = self.best_compaction_range(&old, min_reclaim.max(1));
+        let selected = self.best_compaction_range(&old, policy, min_reclaim.max(1));
         if selected.is_empty() {
             return Ok(None);
         }
-        Ok(Some(self.run_compact_segments(&old, &selected)?))
+        Ok(Some(self.run_compact_segments(&old, &selected, policy)?))
     }
 
     /// 在非活跃段的连续区间中选 cost/benefit 最优区间(`benefit ≥ min_reclaim`),返回段位置列表。
-    fn best_compaction_range(&self, old: &Inner, min_reclaim: usize) -> Vec<u64> {
+    fn best_compaction_range(
+        &self,
+        old: &Inner,
+        policy: &CompactPolicy,
+        min_reclaim: usize,
+    ) -> Vec<u64> {
         let active = old.log.segment_spans().last().map(|(p, _)| *p);
         let segs: Vec<(u64, u64)> = self
-            .seg_bytes
-            .lock()
-            .expect("blob seg_bytes poisoned")
-            .iter()
-            .filter(|(p, _)| Some(**p) != active)
-            .map(|(p, v)| (*p, v.live))
+            .reclaimable_by_segment(old, policy)
+            .into_iter()
+            .filter(|(p, _)| Some(*p) != active)
+            .map(|(p, (total, reclaimable))| (p, total.saturating_sub(reclaimable)))
             .collect();
         let cap = self.segment_capacity.max(1);
         let mut best: Option<(f64, usize, usize, usize)> = None; // (ratio, benefit, i, j)
@@ -1575,8 +1920,13 @@ impl BlobStore {
     }
 
     /// 包装 [`compact_segments`](Self::compact_segments):成功后记录回收字节并刷新容量 gauge。
-    fn run_compact_segments(&self, old: &Inner, selected: &[u64]) -> Result<CompactionStats> {
-        let stats = self.compact_segments(old, selected)?;
+    fn run_compact_segments(
+        &self,
+        old: &Inner,
+        selected: &[u64],
+        policy: &CompactPolicy,
+    ) -> Result<CompactionStats> {
+        let stats = self.compact_segments(old, selected, policy)?;
         self.metrics
             .compaction_reclaimed_bytes
             .inc_by(stats.dead_bytes);
@@ -1588,7 +1938,14 @@ impl BlobStore {
     /// 存活记录写入位置更高的新段(temp→fsync→rename),删旧段,重建索引后原子换入新 Inner。
     /// 存活赢家搬到更高位置仍是其 key 最新记录,newest-wins 不变。崩溃安全:复用 `COMPACT_COMMIT`
     /// 标记 + open 重建索引;残留 `.tmp`/重复记录在重建时被忽略/收敛。
-    fn compact_segments(&self, old: &Inner, selected: &[u64]) -> Result<CompactionStats> {
+    ///
+    /// 「存活」按 `policy` 判定:过期对象与过保留期墓碑**不搬**(回收),保留期内的墓碑照搬。
+    fn compact_segments(
+        &self,
+        old: &Inner,
+        selected: &[u64],
+        policy: &CompactPolicy,
+    ) -> Result<CompactionStats> {
         let before = old.log.segment_count();
         let (log_dir, index_dir) = sub_dirs(&self.dir);
         let marker = self.dir.join("COMPACT_COMMIT");
@@ -1602,8 +1959,12 @@ impl BlobStore {
             .max()
             .unwrap()
             + 1;
+        // 新段代次接着旧 log 的最大值往后 —— 段身份(位置 + 代次)永不复用。
+        let mut next_gen = old.log.max_generation() + 1;
         let mut live_bytes = 0u64;
         let mut dead_bytes = 0u64;
+        let mut tombstone_bytes = 0u64;
+        let mut expired_bytes = 0u64;
         let mut tmp_paths: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, final)
         let mut cur: Option<LogSegment> = None;
 
@@ -1616,10 +1977,27 @@ impl BlobStore {
                 .map(|(_, e)| *e)
                 .unwrap_or(0);
             scan_segment(&old.log, pos, data_end, |off, raw, decoded| {
-                let is_live = matches!(old.index.find(&decoded.key), Some(v) if v.offset == off);
-                if !is_live {
-                    dead_bytes += raw.len() as u64;
-                    return Ok(());
+                let winner = match old.index.find(&decoded.key) {
+                    Some(v) if v.offset == off => Some(v),
+                    _ => None,
+                };
+                match winner {
+                    // 被取代的旧记录:本就不是赢家。
+                    None => {
+                        dead_bytes += raw.len() as u64;
+                        return Ok(());
+                    }
+                    // 过期对象 / 过保留期墓碑:不予搬运 → 字节真正释放。
+                    Some(v) if policy.is_reclaimable(&v) => {
+                        if v.is_deleted() {
+                            tombstone_bytes += raw.len() as u64;
+                        } else {
+                            expired_bytes += raw.len() as u64;
+                        }
+                        dead_bytes += raw.len() as u64;
+                        return Ok(());
+                    }
+                    Some(_) => {}
                 }
                 live_bytes += raw.len() as u64;
                 let need = raw.len() as u64;
@@ -1629,15 +2007,18 @@ impl BlobStore {
                         c.flush()?;
                         c.close()?;
                     }
-                    let final_path = log_dir.join(LogSegmentName(next_pos).filename());
+                    let final_path =
+                        log_dir.join(LogSegmentName::new(next_pos, next_gen).filename());
                     let mut tmp = final_path.as_os_str().to_owned();
                     tmp.push(".tmp");
                     let tmp = PathBuf::from(tmp);
                     next_pos += 1;
+                    next_gen += 1;
                     cur = Some(LogSegment::create(
                         &tmp,
                         self.segment_capacity,
                         self.key_prefix,
+                        u32::try_from(next_gen - 1).expect("generation must fit u32"),
                     )?);
                     tmp_paths.push((tmp, final_path));
                 }
@@ -1654,9 +2035,15 @@ impl BlobStore {
         for (tmp, final_path) in &tmp_paths {
             std::fs::rename(tmp, final_path)?;
         }
-        // 删被压缩的旧段。老 Inner 读者的 fd 仍有效(Unix),末次释放后 inode 才回收。
+        // 删被压缩的旧段(按 (位置, 代次) 定位文件)。老 Inner 读者的 fd 仍有效(Unix),
+        // 末次释放后 inode 才回收。
         for &pos in selected {
-            let _ = std::fs::remove_file(log_dir.join(LogSegmentName(pos).filename()));
+            let Some(generation) = old.log.generation_of(pos) else {
+                continue;
+            };
+            let _ = std::fs::remove_file(
+                log_dir.join(LogSegmentName::new(pos, u64::from(generation)).filename()),
+            );
         }
 
         let new_log = Log::open(&log_dir, self.total_capacity, self.segment_capacity)?;
@@ -1675,6 +2062,8 @@ impl BlobStore {
         Ok(CompactionStats {
             live_bytes,
             dead_bytes,
+            tombstone_reclaimed_bytes: tombstone_bytes,
+            expired_reclaimed_bytes: expired_bytes,
             segments_before: before,
             segments_after,
         })
@@ -1683,6 +2072,44 @@ impl BlobStore {
 
 fn sub_dirs(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join("log"), dir.join("index"))
+}
+
+/// 副本 incarnation 文件名(内容 = u64 文本)。见 [`BlobStore::incarnation`]。
+pub const LOG_INCARNATION_FILE: &str = "LOG_INCARNATION";
+
+/// 读 `{store_dir}/LOG_INCARNATION`;缺失/不可解析 → `None`。
+fn read_incarnation(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(LOG_INCARNATION_FILE))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// 写 `{store_dir}/LOG_INCARNATION` 并 fsync。
+fn write_incarnation(dir: &Path, incarnation: u64) -> Result<()> {
+    use std::io::Write;
+    let path = dir.join(LOG_INCARNATION_FILE);
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(incarnation.to_string().as_bytes())?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// 打开副本目录时确定 incarnation:优先读文件;文件缺失(物理 bootstrap 只拷段、或换盘后重来)时
+/// 用**本机当前时刻**兜底并落盘,master 随后可用 [`BlobStore::adopt_incarnation`] 纠正为权威值。
+///
+/// **绝不用段头里的 `created_ns` 兜底**(曾经如此):物理 bootstrap 拷来的段诞生在**对端**,那个时刻
+/// 正是对端自己的兜底身份 —— 拿它当本副本的身份,重建两次就可能与对端**撞号**,于是"重建 ⇒ 身份必换"
+/// 这条保证在"申领没成功"时失效(对端手里的旧游标会看似合法)。用本机时钟则身份永远是**本机独有**的:
+/// 重建必得新号,重启重开因文件已落盘而保持不变。
+fn ensure_incarnation(store_dir: &Path) -> Result<u64> {
+    if let Some(v) = read_incarnation(store_dir) {
+        return Ok(v);
+    }
+    let derived = now_ns().max(1);
+    write_incarnation(store_dir, derived)?;
+    Ok(derived)
 }
 
 /// `expected` 非空时校验盘上副本的 key 前缀正是它 —— 不符即 [`Corrupt`](Error::Corrupt)。
@@ -1733,8 +2160,37 @@ fn read_full_record(log: &Log, at: LogOffset) -> Result<(Vec<u8>, DecodedRecord)
     Ok((raw, decoded))
 }
 
+/// 对齐 Ambry `revalidateStoreFindToken`:游标必须能在**当前**段表里认出来。
+///
+/// - 段不在表里(compaction 删了它 / 对方整体重写过 log)→ [`TokenResetReason::SegmentMissing`];
+/// - 偏移越过该段数据区 → [`TokenResetReason::OffsetOutOfRange`]。
+///
+/// 认不出即"重置为从头重扫",绝不把失效游标当成"已越过"(那会静默漏数据)。
+fn revalidate_token(
+    log: &Log,
+    segment: LogSegmentName,
+    offset: u64,
+) -> std::result::Result<(), TokenResetReason> {
+    match log
+        .segment_spans()
+        .iter()
+        .find(|(pos, _)| *pos == u64::from(segment.position))
+    {
+        None => Err(TokenResetReason::SegmentMissing),
+        // 位置还在、代次不同 ⇒ 段号被复用(全库 compact 后位置从 0 重来)⇒ 游标作废。
+        Some(_) if log.generation_of(u64::from(segment.position)) != Some(segment.generation) => {
+            Err(TokenResetReason::SegmentReplaced)
+        }
+        Some((_, data_end)) if offset > *data_end => Err(TokenResetReason::OffsetOutOfRange),
+        Some(_) => Ok(()),
+    }
+}
+
 /// 扫 log 收集 `start` 之后(exclusive;`None`=从头 inclusive)按追加序的 `(offset, key)`,
 /// 累计记录字节达 `max_total_size` 即止(上界近似,批内去重在调用方)。避免滞后拉取每次全扫 log。
+///
+/// **调用方必须先 [`revalidate_token`]**:`start` 所在段必须存在且偏移不越界(同一 `Inner` 快照内段表
+/// 不会变)。这里**不再**把"段不存在"静默当成"已越过"——那样会让失效游标看起来已经追上。
 fn scan_candidates(
     log: &Log,
     start: Option<LogOffset>,
@@ -1742,19 +2198,27 @@ fn scan_candidates(
 ) -> Result<Vec<(LogOffset, StoreKey)>> {
     let mut out = Vec::new();
     let mut acc = 0u64;
-    for (pos, data_end) in log.segment_spans() {
-        if let Some(s) = start {
-            if pos < s.segment {
-                continue;
-            }
-        }
+    let spans = log.segment_spans();
+    let begin_at = match start {
+        None => 0,
+        Some(s) => spans
+            .iter()
+            .position(|(pos, _)| *pos == s.segment)
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "scan start segment {} is not in the log (cursor not revalidated)",
+                    s.segment
+                ))
+            })?,
+    };
+    for (i, (pos, data_end)) in spans.iter().enumerate().skip(begin_at) {
         let begin = match start {
-            Some(s) if pos == s.segment => s.offset,
+            Some(s) if i == begin_at => s.offset,
             _ => 0,
         };
         let mut off = begin;
-        while off < data_end {
-            let at = LogOffset::new(pos, off);
+        while off < *data_end {
+            let at = LogOffset::new(*pos, off);
             let (raw, decoded) = read_full_record(log, at)?;
             off += raw.len() as u64;
             if start != Some(at) {
@@ -1771,22 +2235,21 @@ fn scan_candidates(
 
 /// 从 log 起点到 `token` 游标的累计字节(复制滞后度量):游标段之前的段全计 + 段内到游标 offset。
 fn bytes_read_to(log: &Log, token: &FindToken) -> u64 {
-    match token {
-        FindToken::Uninitialized => 0,
-        FindToken::Offset(o) => log
-            .segment_spans()
-            .iter()
-            .map(|(pos, data_end)| {
-                if *pos < o.segment {
-                    *data_end
-                } else if *pos == o.segment {
-                    o.offset
-                } else {
-                    0
-                }
-            })
-            .sum(),
-    }
+    let Some(o) = token.offset() else {
+        return 0;
+    };
+    log.segment_spans()
+        .iter()
+        .map(|(pos, data_end)| {
+            if *pos < o.segment {
+                *data_end
+            } else if *pos == o.segment {
+                o.offset
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 /// 遍历单个段 `position` 内 `[0, data_end)` 的全部记录。
@@ -2173,6 +2636,12 @@ mod tests {
         StoreKey::new(n.to_be_bytes())
     }
 
+    /// 历史口径策略:只回收被取代的旧记录(不判 TTL 过期、墓碑永留)。
+    /// 既有断言的语义基准都在这个口径上(墓碑回收与 TTL 回收由专门的新测试覆盖)。
+    fn legacy_policy(dead_ratio: f64) -> CompactPolicy {
+        CompactPolicy::preserve_legacy(dead_ratio)
+    }
+
     #[test]
     fn io_error_threshold_trips_shutdown_and_hook() {
         let dir = temp_dir("ioerr");
@@ -2488,8 +2957,12 @@ mod tests {
         let before = store.stats().unwrap();
         assert!(before.dead_bytes > 0, "should have dead data");
 
-        let st = store.compact().unwrap();
+        let st = store.compact(&legacy_policy(0.5)).unwrap();
         assert!(st.dead_bytes > 0);
+        assert_eq!(
+            st.tombstone_reclaimed_bytes, 0,
+            "历史口径不回收墓碑(保留期内的墓碑照搬)"
+        );
         // compact 后死数据应清零(全库只剩赢家:5..9 的 PUT + 0..4 的墓碑)。
         let after = store.stats().unwrap();
         assert_eq!(after.dead_bytes, 0, "no dead data after compaction");
@@ -2530,8 +3003,172 @@ mod tests {
         for i in 0..5u64 {
             store.put(key(i), b"v").unwrap();
         }
-        // 全是存活数据,死占比为 0 → 高阈值不触发。
-        assert!(store.compact_if_needed(0.5).unwrap().is_none());
+        // 全是存活数据,可回收占比为 0 → 高阈值不触发。
+        assert!(store
+            .compact_if_needed(&legacy_policy(0.5))
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 判定用的"现在":远在未来,确保短 TTL 对象都已过期,且不会与真实时钟打架。
+    const NOW_FAR_FUTURE: i64 = 10_000_000_000_000;
+
+    #[test]
+    fn compaction_reclaims_expired_objects() {
+        let dir = temp_dir("compact_ttl");
+        let seg = seg_cap(4);
+        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        // 三条短 TTL(1ms,出生即过期)+ 两条不过期。载荷 ~2KB、段容量 ~4KB ⇒ 过期数据必然
+        // 落在**封存段**里(活跃段不参与增量压缩,闸门放行也不代表有段可选)。
+        let expired = vec![0xE1u8; 2000];
+        let live = vec![0x11u8; 2000];
+        for i in 0..3u64 {
+            store.put_ttl(key(i), &expired, 1).unwrap();
+        }
+        for i in 3..5u64 {
+            store.put(key(i), &live).unwrap();
+        }
+        let used_before = store.valid_data_size();
+        let size_before = store.size_in_bytes();
+
+        let st = store
+            .compact_if_needed(&CompactPolicy::new(0.3, NOW_FAR_FUTURE, 86_400_000))
+            .unwrap()
+            .expect("过半字节已过期,闸门应放行");
+        assert!(
+            st.expired_reclaimed_bytes >= 3 * expired.len() as u64,
+            "过期对象的数据体应被回收: {st:?}"
+        );
+        // 索引条目一并消失:过期对象从「Expired」变为「NotFound」(盘上已无此记录)。
+        for i in 0..3u64 {
+            assert!(
+                matches!(store.get(&key(i)), Err(Error::NotFound)),
+                "key {i} 的过期记录应已被回收"
+            );
+        }
+        for i in 3..5u64 {
+            assert_eq!(store.get(&key(i)).unwrap(), live);
+        }
+        assert!(
+            store.valid_data_size() <= used_before,
+            "有效数据口径只减不增"
+        );
+        assert!(store.size_in_bytes() < size_before, "盘上占用应真正下降");
+        assert_eq!(store.stats().unwrap(), store.stats_by_scan());
+
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        assert!(matches!(store.get(&key(0)), Err(Error::NotFound)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tombstones_are_reclaimed_only_after_retention() {
+        let dir = temp_dir("compact_tomb");
+        let seg = seg_cap(8);
+        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        for i in 0..6u64 {
+            store.put(key(i), b"payload-to-be-deleted").unwrap();
+        }
+        for i in 0..3u64 {
+            store.delete(key(i)).unwrap();
+        }
+        let deleted_at = store.expiration_of(&key(0)).expect("墓碑留下删除时刻");
+        let retention = 86_400_000;
+        // 各墓碑的删除时刻略有先后(同一测试内逐条写),判定"满保留期"时留 1 分钟余量,
+        // 免得卡在边界上(这正是保留期判定必须用真实时间戳的体现)。
+        let slack = 60_000;
+
+        // 未满保留期:墓碑照搬,已删对象仍是 Deleted(而非 NotFound)。
+        let st = store
+            .compact(&CompactPolicy::new(
+                0.3,
+                deleted_at + retention - slack,
+                retention,
+            ))
+            .unwrap();
+        assert_eq!(st.tombstone_reclaimed_bytes, 0, "保留期内不得回收墓碑");
+        for i in 0..3u64 {
+            assert!(matches!(store.get(&key(i)), Err(Error::Deleted)));
+        }
+
+        // 满保留期:墓碑连同其索引条目一起消失。
+        let st = store
+            .compact(&CompactPolicy::new(
+                0.3,
+                deleted_at + retention + slack,
+                retention,
+            ))
+            .unwrap();
+        assert!(st.tombstone_reclaimed_bytes > 0, "{st:?}");
+        for i in 0..3u64 {
+            assert!(
+                matches!(store.get(&key(i)), Err(Error::NotFound)),
+                "key {i} 的墓碑应已被回收"
+            );
+        }
+        for i in 3..6u64 {
+            assert_eq!(
+                store.get(&key(i)).unwrap(),
+                b"payload-to-be-deleted".to_vec()
+            );
+        }
+        assert_eq!(store.stats().unwrap(), store.stats_by_scan());
+
+        store.close().unwrap();
+        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        assert!(matches!(store.get(&key(0)), Err(Error::NotFound)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 墓碑的删除时刻随记录落盘:重开后保留期判定不变(否则重启就会提前回收墓碑)。
+    #[test]
+    fn tombstone_delete_time_survives_reopen() {
+        let dir = temp_dir("tomb_reopen");
+        let seg = seg_cap(8);
+        let deleted_at;
+        {
+            let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+            store.put(key(1), b"v").unwrap();
+            store.delete(key(1)).unwrap();
+            deleted_at = store.expiration_of(&key(1)).unwrap();
+            store.close().unwrap();
+        }
+        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        assert_eq!(store.expiration_of(&key(1)), Some(deleted_at));
+        // 元数据口径:墓碑的 TTL 仍是 -1,不当成过期时刻对外汇报。
+        let stat = store.stat(&key(1)).unwrap();
+        assert!(stat.deleted);
+        assert_eq!(stat.expiration_ms, NO_EXPIRATION);
+        assert!(!stat.expired);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// partition 级闸门用「可回收占比」(含 TTL/墓碑空间),不是只看死字节计数。
+    #[test]
+    fn compact_if_needed_gate_counts_expired_bytes() {
+        let dir = temp_dir("compact_gate");
+        let seg = seg_cap(4);
+        let store = BlobStore::create(&dir, seg * 32, seg, 4).unwrap();
+        let payload = vec![0xABu8; 512];
+        for i in 0..4u64 {
+            store.put_ttl(key(i), &payload, 1).unwrap(); // 过期
+        }
+        for i in 4..10u64 {
+            store.put(key(i), &payload).unwrap(); // 存活
+        }
+        let policy = |ratio: f64| CompactPolicy::new(ratio, NOW_FAR_FUTURE, 86_400_000);
+
+        assert!(
+            store.compact_if_needed(&policy(0.6)).unwrap().is_none(),
+            "4/10 已过期,0.6 的闸门不该放行"
+        );
+        let st = store
+            .compact_if_needed(&policy(0.3))
+            .unwrap()
+            .expect("0.3 的闸门应放行");
+        assert!(st.expired_reclaimed_bytes > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2548,7 +3185,7 @@ mod tests {
             for i in 0..4u64 {
                 store.delete(key(i)).unwrap();
             }
-            store.compact().unwrap();
+            store.compact(&legacy_policy(0.5)).unwrap();
             store.close().unwrap();
         }
         // 人为伪造"提交中崩溃":放一个标记 + 残留 log.old / log.new,open 必须收敛。
@@ -2568,6 +3205,44 @@ mod tests {
         for i in 0..4u64 {
             assert!(matches!(store.get(&key(i)), Err(Error::Deleted)));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **磁盘格式前后兼容**(CLAUDE.md §3.4):改造前的墓碑 `expiration = -1`(删除时间未知),
+    /// 新代码必须"读得进、且不回收" —— 否则升级瞬间会抹掉老副本上的删除标记,滞后副本一修复就把
+    /// 已删对象复活回来。
+    #[test]
+    fn legacy_tombstone_on_disk_is_readable_and_never_reclaimed() {
+        let dir = temp_dir("legacy_tomb");
+        let seg = seg_cap(8);
+        {
+            let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+            store.put(key(7), b"v").unwrap();
+            // 手工造一条"旧格式"墓碑:记录头与索引条目的 expiration 都是 -1。
+            let record = encode_record(&key(7), FLAG_DELETED, NO_EXPIRATION, &[]).unwrap();
+            let inner = store.inner();
+            let off = inner.log.append(&record).unwrap();
+            let mut value = IndexValue::put(off, record_size_u32(record.len() as u64).unwrap());
+            value.flags = FLAG_DELETED; // expiration 保持 NO_EXPIRATION
+            inner.index.add(key(7), value).unwrap();
+            store.flush().unwrap();
+            store.close().unwrap();
+        }
+
+        // 重开走"由 log 重建索引"的路径:删除时间从记录头还原,仍是 -1。
+        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        assert_eq!(store.expiration_of(&key(7)), Some(NO_EXPIRATION));
+        assert!(matches!(store.get(&key(7)), Err(Error::Deleted)));
+
+        // 保留期给 0(最激进的回收口径)也不得回收删除时间未知的墓碑。
+        let st = store
+            .compact(&CompactPolicy::new(0.0, NOW_FAR_FUTURE, 0))
+            .unwrap();
+        assert_eq!(
+            st.tombstone_reclaimed_bytes, 0,
+            "旧格式墓碑(删除时间未知)永不自动回收"
+        );
+        assert!(matches!(store.get(&key(7)), Err(Error::Deleted)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2627,7 +3302,7 @@ mod tests {
 
         let before_segs = store.log_segment_count_for_test();
         assert!(before_segs > 2, "should span multiple segments");
-        let st = store.compact_incremental(0.5).unwrap();
+        let st = store.compact_incremental(&legacy_policy(0.5)).unwrap();
         assert!(st.is_some(), "high-dead old segments should be compacted");
         let st = st.unwrap();
         assert!(st.dead_bytes > 0);
@@ -2681,7 +3356,7 @@ mod tests {
 
         let before = store.log_segment_count_for_test();
         let st = store
-            .compact_cost_benefit(1)
+            .compact_cost_benefit(&legacy_policy(0.3), 1)
             .unwrap()
             .expect("high-dead range should be picked");
         assert!(
@@ -2715,7 +3390,10 @@ mod tests {
             fresh.put(key(i), &big(&format!("v{i}"))).unwrap();
         }
         assert!(
-            fresh.compact_cost_benefit(1).unwrap().is_none(),
+            fresh
+                .compact_cost_benefit(&legacy_policy(0.3), 1)
+                .unwrap()
+                .is_none(),
             "no dead data → no candidate"
         );
         fresh.close().unwrap();
@@ -2746,14 +3424,14 @@ mod tests {
             "after put/delete"
         );
 
-        store.compact_if_needed(0.3).unwrap();
+        store.compact_if_needed(&legacy_policy(0.3)).unwrap();
         assert_eq!(
             store.stats().unwrap(),
             store.stats_by_scan(),
             "after incremental compaction"
         );
 
-        store.compact().unwrap();
+        store.compact(&legacy_policy(0.3)).unwrap();
         assert_eq!(
             store.stats().unwrap(),
             store.stats_by_scan(),
@@ -3055,11 +3733,11 @@ mod tests {
                         verify_all(&store, &model, &format!("step {step} after reopen"));
                     }
                     87..=92 => {
-                        store.compact().unwrap();
+                        store.compact(&legacy_policy(0.3)).unwrap();
                         verify_all(&store, &model, &format!("step {step} after compact"));
                     }
                     _ => {
-                        store.compact_incremental(0.2).unwrap();
+                        store.compact_incremental(&legacy_policy(0.2)).unwrap();
                         verify_all(
                             &store,
                             &model,
@@ -3172,7 +3850,7 @@ mod tests {
                 let done = Arc::clone(&done);
                 s.spawn(move || {
                     for _ in 0..3 {
-                        store.compact().unwrap();
+                        store.compact(&legacy_policy(0.3)).unwrap();
                     }
                     done.store(true, Ordering::Release);
                 });
@@ -3345,7 +4023,7 @@ mod tests {
                 }
                 _ => {
                     if step % 40 == 39 {
-                        store.compact().unwrap();
+                        store.compact(&legacy_policy(0.3)).unwrap();
                     }
                 }
             }
@@ -3606,7 +4284,9 @@ mod tests {
         let spans = store.inner().log.segment_spans();
         let active_pos = spans.last().unwrap().0;
         assert!(
-            sealed.iter().all(|(p, _)| *p != active_pos),
+            sealed
+                .iter()
+                .all(|(name, _)| u64::from(name.position) != active_pos),
             "封存段不含活跃段 {active_pos}"
         );
 
@@ -3614,9 +4294,9 @@ mod tests {
         let dst = temp_dir("s3b_dst");
         let (log_dir, _) = sub_dirs(&dst);
         std::fs::create_dir_all(&log_dir).unwrap();
-        for (pos, _) in &sealed {
-            let bytes = store.read_segment_prefix(*pos).unwrap();
-            std::fs::write(log_dir.join(LogSegmentName(*pos).filename()), &bytes).unwrap();
+        for (name, _) in &sealed {
+            let bytes = store.read_segment_prefix(*name).unwrap();
+            std::fs::write(log_dir.join(name.filename()), &bytes).unwrap();
         }
         let cfg = StoreConfig {
             segment_size_bytes: seg,
@@ -3638,6 +4318,293 @@ mod tests {
         copied.close().unwrap();
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
+    }
+    // ── 段身份(代次)+ 副本 incarnation + 游标重定位(对齐 Ambry `revalidateStoreFindToken`)──────
+
+    /// incarnation:建库即落盘、重开读到同一个值;`adopt_incarnation`(master 权威)会改写它。
+    #[test]
+    fn incarnation_is_persisted_and_adoptable() {
+        let dir = temp_dir("incarnation");
+        let seg = seg_cap(4);
+        let created;
+        {
+            let s = BlobStore::create(&dir, seg * 4, seg, 4).unwrap();
+            created = s.incarnation();
+            assert!(created >= 1);
+            assert_eq!(
+                std::fs::read_to_string(dir.join(LOG_INCARNATION_FILE))
+                    .unwrap()
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap(),
+                created,
+                "建库即落盘"
+            );
+            s.close().unwrap();
+        }
+        let again = BlobStore::open(&dir, seg * 4, seg, 4).unwrap();
+        assert_eq!(again.incarnation(), created, "重开必须读到同一号");
+        again.adopt_incarnation(created + 100).unwrap();
+        assert_eq!(again.incarnation(), created + 100);
+        again.close().unwrap();
+        let third = BlobStore::open(&dir, seg * 4, seg, 4).unwrap();
+        assert_eq!(third.incarnation(), created + 100, "采纳后必须持久");
+        third.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 副本目录被删后重建(等价 `DROPPED`,或**换盘后重来**):身份文件随之消失,重建时会写一个新号
+    /// (master 随后可用 `adopt_incarnation` 纠正为权威值)。
+    #[test]
+    fn recreated_replica_gets_a_new_incarnation_file() {
+        let root = temp_dir("incarnation_recreate");
+        let store_dir = root.join("partition_0");
+        let seg = seg_cap(4);
+        let first = BlobStore::create(&store_dir, seg * 4, seg, 4).unwrap();
+        first.close().unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+        assert!(read_incarnation(&store_dir).is_none());
+
+        let second = BlobStore::create(&store_dir, seg * 4, seg, 4).unwrap();
+        assert!(second.incarnation() >= 1);
+        assert_eq!(read_incarnation(&store_dir), Some(second.incarnation()));
+        second.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 身份文件缺失(物理 bootstrap 只拷段):`open` 用**本机当前时刻**兜底并落盘。
+    #[test]
+    fn missing_incarnation_file_is_healed() {
+        let dir = temp_dir("incarnation_heal");
+        let seg = seg_cap(4);
+        {
+            let s = BlobStore::create(&dir, seg * 4, seg, 4).unwrap();
+            s.put(key(1), b"v").unwrap();
+            s.close().unwrap();
+        }
+        std::fs::remove_file(dir.join(LOG_INCARNATION_FILE)).unwrap();
+        let store = BlobStore::open(&dir, seg * 4, seg, 4).unwrap();
+        assert!(store.incarnation() >= 1, "缺失 → 用本机时刻兜底补写");
+        assert_eq!(read_incarnation(&dir), Some(store.incarnation()));
+        assert_eq!(store.get(&key(1)).unwrap(), b"v");
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **兜底值不得取自段头**:物理 bootstrap 拷来的段诞生在**对端**,其 `created_ns` 正是对端自己的
+    /// 兜底身份 —— 若拿它当本副本的身份,重建两次就可能与对端撞号,于是"重建 ⇒ 身份必换"在"申领没
+    /// 成功"时失效:对端手里的旧游标会看似合法 → 误判追平 → master 删源 → 丢数据(CLAUDE.md §3.1)。
+    ///
+    /// 本用例构造"逐字节拷来的段 + 没有身份文件"这一路(物理 bootstrap 的落盘形态),断言新副本的身份
+    /// **不等于对端的身份**:在"用首段 `created_ns` 兜底"的旧实现上,这里必然相等(红)。
+    #[test]
+    fn bootstrapped_replica_identity_is_not_inherited_from_the_peer() {
+        let src = temp_dir("incarnation_peer_src");
+        let dst = temp_dir("incarnation_peer_dst");
+        let seg = seg_cap(2);
+        let peer = BlobStore::create(&src, seg * 4, seg, 4).unwrap();
+        for i in 0..3u64 {
+            peer.put(key(i), &[9u8; 700]).unwrap();
+        }
+        peer.flush().unwrap();
+        let sealed = peer.sealed_segments();
+        assert!(!sealed.is_empty(), "前置:对端要有封存段");
+        let peer_incarnation = peer.incarnation();
+
+        // 物理拷贝:段文件原样落盘(对端时刻原封不动带过来),不带 LOG_INCARNATION。
+        let (log_dir, _) = sub_dirs(&dst);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        for (name, _) in &sealed {
+            let bytes = peer.read_segment_prefix(*name).unwrap();
+            std::fs::write(log_dir.join(name.filename()), &bytes).unwrap();
+        }
+        assert!(read_incarnation(&dst).is_none(), "bootstrap 不带身份文件");
+        let local = BlobStore::open_rebuild_index(&dst, seg * 8, seg, 4).unwrap();
+        assert!(
+            local.incarnation() >= 1 && local.incarnation() != peer_incarnation,
+            "本副本身份必须从本机取,绝不复用对端的:local={} peer={peer_incarnation}",
+            local.incarnation()
+        );
+        // 重建(换盘)后会再取一个新号:身份永不与"上一次"相同。
+        local.close().unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        for (name, _) in &sealed {
+            let bytes = peer.read_segment_prefix(*name).unwrap();
+            std::fs::write(log_dir.join(name.filename()), &bytes).unwrap();
+        }
+        let again = BlobStore::open_rebuild_index(&dst, seg * 8, seg, 4).unwrap();
+        assert_ne!(
+            again.incarnation(),
+            peer_incarnation,
+            "第二次 bootstrap 也不得撞上对端"
+        );
+
+        peer.close().unwrap();
+        again.close().unwrap();
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// 全库 compact 必须换身份,且旧游标被**重定位**(段已不存在)而不是"看似已追上"。
+    #[test]
+    fn full_compact_changes_identity_and_revalidates_old_cursor() {
+        let dir = temp_dir("epoch_compact");
+        let seg = seg_cap(2);
+        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        let payload = vec![7u8; 600];
+        for i in 0..15u64 {
+            store.put(key(i), &payload).unwrap();
+        }
+        // 取一个落在**深处**的游标(旧坐标系里的段 ≥ 1)。
+        let info = store
+            .find_entries_since(&FindToken::Uninitialized, 8 * 700)
+            .unwrap();
+        let old_token = info.token;
+        assert!(
+            old_token.offset().unwrap().segment >= 1,
+            "前置:数据必须跨段,游标才够深: {old_token:?}"
+        );
+        let max_gen_before = store.inner().log.max_generation();
+        let incarnation_before = store.incarnation();
+
+        // 删掉大部分数据 → compact 后只剩一小段,旧游标指向的段必然消失。
+        for i in 0..12u64 {
+            store.delete(key(i)).unwrap();
+        }
+        let st = store.compact(&legacy_policy(0.3)).unwrap();
+        assert!(st.live_bytes > 0);
+        assert!(
+            store.inner().log.max_generation() > max_gen_before,
+            "全库重写后段代次必须接着旧 log 往后取(位置会从 0 重来)"
+        );
+        assert_eq!(
+            store.incarnation(),
+            incarnation_before,
+            "全库 compact 是**同一份副本**的重写,副本身份(incarnation)不变"
+        );
+
+        let after = store.find_entries_since(&old_token, u64::MAX).unwrap();
+        assert!(
+            matches!(
+                after.token_reset,
+                Some(TokenResetReason::SegmentMissing | TokenResetReason::SegmentReplaced)
+            ),
+            "旧游标必须被重定位(段没了 / 段号被复用),而不是返回空批: {:?}",
+            after.token_reset
+        );
+        let got: Vec<StoreKey> = after.entries.iter().map(|e| e.key).collect();
+        for i in 12..15u64 {
+            assert!(got.contains(&key(i)), "重定位后从起点重扫必须覆盖活数据");
+        }
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **代次正是用来识破"段号被复用"的**:全库 compact 后新 log 的段位置从 0 重来,但代次接着涨,
+    /// 于是"同位置、不同代次"必须判重定位(否则位置校验会静默放行,复制漏数据)。
+    ///
+    /// 这条与 [`LogSegmentName`] 的存在理由一一对应;谁把代次从段身份里去掉,它会立刻变红。
+    #[test]
+    fn reused_segment_positions_are_detected_by_generation() {
+        let dir = temp_dir("gen_reuse");
+        let seg = seg_cap(4);
+        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        let payload = vec![9u8; 900];
+        for i in 0..8u64 {
+            store.put(key(i), &payload).unwrap();
+        }
+        let old_gen = store.inner().log.generation_of(1).expect("段 1 存在");
+        let stale = FindToken::at(LogSegmentName::new(1, u64::from(old_gen)), 0);
+        assert!(
+            revalidate_token(
+                &store.inner().log,
+                LogSegmentName::new(1, old_gen.into()),
+                0
+            )
+            .is_ok(),
+            "前置:代次一致时放行"
+        );
+
+        store.compact(&legacy_policy(0.3)).unwrap();
+
+        // compact 后新 log 仍可能有"位置 1",但代次一定不同 ⇒ 必须判重定位。
+        let new_gen = store.inner().log.generation_of(1);
+        assert!(new_gen.is_some(), "前置:重写后位置 1 仍有段");
+        assert_ne!(new_gen, Some(old_gen), "同位置的代次必须换成新的");
+        let info = store.find_entries_since(&stale, u64::MAX).unwrap();
+        assert_eq!(
+            info.token_reset,
+            Some(TokenResetReason::SegmentReplaced),
+            "同位置、不同代次 ⇒ 段号被复用 ⇒ 游标作废"
+        );
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 重定位的三种原因逐个盯死;合法游标**不得**被误重置(否则每次拉取都从头重扫)。
+    #[test]
+    fn revalidate_reports_reasons_and_keeps_valid_cursors() {
+        let dir = temp_dir("revalidate");
+        let seg = seg_cap(4);
+        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        for i in 0..8u64 {
+            store.put(key(i), &data_for(i, 0)).unwrap();
+        }
+
+        // 段不存在(位置 999 没有段)。
+        let missing = store
+            .find_entries_since(&FindToken::at(LogSegmentName::new(999, 1), 0), u64::MAX)
+            .unwrap();
+        assert_eq!(
+            missing.token_reset,
+            Some(TokenResetReason::SegmentMissing),
+            "段不存在 ⇒ 重定位"
+        );
+        assert_eq!(missing.entries.len(), 8, "重定位后从头重扫:全都在");
+
+        // 偏移越界(位置 0 有段、代次也对,但偏移越过数据区)。
+        let gen0 = store.inner().log.generation_of(0).expect("段 0 存在");
+        let beyond = store
+            .find_entries_since(
+                &FindToken::at(LogSegmentName::new(0, u64::from(gen0)), u64::MAX),
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(
+            beyond.token_reset,
+            Some(TokenResetReason::OffsetOutOfRange),
+            "偏移越过段数据区 ⇒ 重定位"
+        );
+
+        // 合法游标(批量拉取中途)⇒ 不重定位,且只给增量。
+        let mut token = FindToken::Uninitialized;
+        let mut reset_seen = false;
+        for _ in 0..8 {
+            let info = store.find_entries_since(&token, 1).unwrap();
+            reset_seen |= info.token_reset.is_some();
+            token = info.token;
+        }
+        assert!(!reset_seen, "合法游标一律不得被重置");
+        let tail = store.find_entries_since(&token, u64::MAX).unwrap();
+        assert!(tail.entries.is_empty(), "已到末端");
+
+        // 身份相关的原因由**服务层**置入(引擎看不到跨库身份):这里只钉住短名稳定。
+        assert_eq!(
+            TokenResetReason::IncarnationMismatch.as_str(),
+            "incarnation_mismatch"
+        );
+        assert_eq!(
+            TokenResetReason::SegmentReplaced.as_str(),
+            "segment_generation_mismatch"
+        );
+        assert_eq!(TokenResetReason::SegmentMissing.as_str(), "segment_missing");
+        assert_eq!(
+            TokenResetReason::OffsetOutOfRange.as_str(),
+            "offset_out_of_range"
+        );
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

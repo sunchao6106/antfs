@@ -146,6 +146,8 @@ pub fn select_disks(
             node_id: c.node_id,
             disk_id: c.disk_id.clone(),
             target_state: ACTIVE.to_string(),
+            // incarnation 占位由 apply 覆盖(见 types.rs ReplicaPlacement::incarnation)。
+            incarnation: 0,
         })
         .collect())
 }

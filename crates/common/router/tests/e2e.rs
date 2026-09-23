@@ -119,6 +119,8 @@ fn placement(node_id: u64) -> ReplicaPlacement {
         node_id,
         disk_id: "d0".to_string(),
         target_state: "ACTIVE".to_string(),
+        // 占位:真身份由 master 的 apply 发放(见 ReplicaPlacement::incarnation)。
+        incarnation: 0,
     }
 }
 

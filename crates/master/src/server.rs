@@ -23,21 +23,22 @@ use crate::network::GrpcNetworkFactory;
 use crate::pb::master_server::{Master, MasterServer};
 use crate::pb::raft_internal_server::{RaftInternal, RaftInternalServer};
 use crate::pb::{
-    AssignRequest, AssignResponse, BalanceStateRequest, BalanceStateResponse, CancelBalanceRequest,
-    CancelBalanceResponse, ClusterState, ClusterStateRequest, CreatePartitionsRequest,
-    CreatePartitionsResponse, DecommissionRequest, DecommissionResponse, EvalBalanceRequest,
-    EvalBalanceResponse, GetBlobIdsRequest, GetBlobIdsResponse, ListNodesRequest,
-    ListPartitionsRequest, ListPartitionsResponse, LookupRequest, MasterDirective, MetricsRequest,
-    MetricsResponse, MoveReplicaRequest, MoveReplicaResponse, NodeBeat, NodeEntry, NodeList,
-    PartitionEntry, PartitionLocations, RaftMessage, RegisterRequest, RegisterResponse,
-    RepairPartitionRequest, RepairPartitionResponse, ReplicaCurrent, ReplicaLoc,
-    SetMaintenanceRequest, SetMaintenanceResponse, SetPartitionStateRequest,
-    SetPartitionStateResponse, StartBalanceRequest, StartBalanceResponse,
+    AssignIncarnationRequest, AssignIncarnationResponse, AssignRequest, AssignResponse,
+    BalanceStateRequest, BalanceStateResponse, CancelBalanceRequest, CancelBalanceResponse,
+    ClusterState, ClusterStateRequest, CreatePartitionsRequest, CreatePartitionsResponse,
+    DecommissionRequest, DecommissionResponse, EvalBalanceRequest, EvalBalanceResponse,
+    GetBlobIdsRequest, GetBlobIdsResponse, ListNodesRequest, ListPartitionsRequest,
+    ListPartitionsResponse, LookupRequest, MasterDirective, MetricsRequest, MetricsResponse,
+    MoveReplicaRequest, MoveReplicaResponse, NodeBeat, NodeEntry, NodeList, PartitionEntry,
+    PartitionLocations, RaftMessage, RegisterRequest, RegisterResponse, RepairPartitionRequest,
+    RepairPartitionResponse, ReplicaCurrent, ReplicaLoc, SetMaintenanceRequest,
+    SetMaintenanceResponse, SetPartitionStateRequest, SetPartitionStateResponse,
+    StartBalanceRequest, StartBalanceResponse,
 };
 use crate::placement::{select_disks, DiskFree, PlacementError};
 use crate::reconcile::{
-    drop_confirmed, plan_evacuation, plan_move, plan_rereplication, plan_transitions, EvacAction,
-    SuccessorConfirm,
+    drop_confirmed, plan_evacuation, plan_move, plan_partition_states, plan_rereplication,
+    plan_transitions, tombstones_reclaim_allowed, EvacAction, SuccessorConfirm,
 };
 use crate::soft::{DiskUsage, SoftState};
 use crate::store::{open, StateMachineData};
@@ -880,6 +881,23 @@ fn plan_drops(
     out
 }
 
+/// 某分区某副本是否"已追平"(墓碑回收闸门的单个副本判据,喂 [`tombstones_reclaim_allowed`]):
+/// 节点存活 **且** 上报 `ACTIVE` 且 `lag_bytes == 0`。
+///
+/// 任一不满足都算未追平:节点失联 / 缺上报(如副本刚补上还没报过) / 报 BOOTSTRAP/ERROR/OFFLINE /
+/// 仍有滞后字节。判据一律取软状态最新一拍(心跳每拍先 `record_replicas` 再算指令)。
+fn replica_caught_up(
+    soft: &SoftState,
+    pid: PartitionId,
+    node: NodeId,
+    up_timeout: Duration,
+) -> bool {
+    soft.is_up(node, up_timeout)
+        && soft
+            .replica_state(pid, node)
+            .is_some_and(|st| st.current_state == "ACTIVE" && st.lag_bytes == 0)
+}
+
 /// 在一个健康、非排除的节点上给分区补一个副本(re-replication / evacuation / repair 共用)。
 ///
 /// 返回:`Ok(Some((node, disk)))` = 提案成功及落点;`Ok(None)` = 提案失败(可重试);
@@ -1170,6 +1188,7 @@ impl Master for MasterService {
         let sm_data = self.sm_data.clone();
         let metrics = self.metrics.clone();
         let secret = self.config.cluster_secret.clone();
+        let up_timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let (tx, rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
@@ -1218,7 +1237,7 @@ impl Master for MasterService {
                     }),
                     beat.full_report,
                 );
-                let transitions: Vec<crate::pb::Transition> = {
+                let (transitions, partition_states) = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => break,
@@ -1233,7 +1252,29 @@ impl Master for MasterService {
                             })
                             .collect();
                     out.extend(plan_drops(&soft, &g.state, beat.node_id, &reported));
-                    out
+                    // 分区状态每拍全量随指令下行:store 端据此挑本地 compaction 候选集,
+                    // 不必自己从"能不能写"反推可写态。
+                    let states = plan_partition_states(&g.state.partitions, &reported)
+                        .into_iter()
+                        .map(|(partition_id, state)| crate::pb::PartitionStateInfo {
+                            partition_id,
+                            state: pstate(state).to_string(),
+                            // 墓碑回收闸门:该分区**所有副本**都已追平才放行(见
+                            // [`tombstones_reclaim_allowed`]) —— 还有副本没追平时回收墓碑,它
+                            // 就永远学不到那条删除,已删对象会以"活数据"永久留在它上面。
+                            // 每拍重算(软状态刚 `record_replicas` 过),追平的下一拍自然翻 true。
+                            tombstones_reclaim_allowed: g
+                                .state
+                                .partitions
+                                .get(&partition_id)
+                                .is_some_and(|info| {
+                                    tombstones_reclaim_allowed(info, |n| {
+                                        replica_caught_up(&soft, partition_id, n, up_timeout)
+                                    })
+                                }),
+                        })
+                        .collect();
+                    (out, states)
                 };
                 if !transitions.is_empty() {
                     metrics.transitions_issued.inc_by(transitions.len() as u64);
@@ -1250,6 +1291,7 @@ impl Master for MasterService {
                         version: PROTO_VERSION,
                         transitions,
                         tasks: vec![],
+                        partition_states,
                     }))
                     .await
                     .is_err()
@@ -1421,6 +1463,7 @@ impl Master for MasterService {
                     .unwrap_or_default(),
                 disk_id: r.disk_id.clone(),
                 target_state: r.target_state.clone(),
+                incarnation: r.incarnation,
                 up: self.soft.is_up(r.node_id, timeout),
             })
             .collect();
@@ -1485,6 +1528,7 @@ impl Master for MasterService {
                             .unwrap_or_default(),
                         disk_id: r.disk_id.clone(),
                         target_state: r.target_state.clone(),
+                        incarnation: r.incarnation,
                         up: self.soft.is_up(r.node_id, timeout),
                     })
                     .collect();
@@ -1688,6 +1732,7 @@ impl Master for MasterService {
                             .unwrap_or_default(),
                         disk_id: r.disk_id.clone(),
                         target_state: r.target_state.clone(),
+                        incarnation: r.incarnation,
                         up: self.soft.is_up(r.node_id, timeout),
                     })
                     .collect();
@@ -1796,6 +1841,7 @@ impl Master for MasterService {
                                 .unwrap_or_default(),
                             disk_id: r.disk_id.clone(),
                             target_state: r.target_state.clone(),
+                            incarnation: r.incarnation,
                             up: self.soft.is_up(r.node_id, timeout),
                         })
                         .collect::<Vec<_>>()
@@ -2100,6 +2146,76 @@ impl Master for MasterService {
                 to_disk_id,
             })),
             Err(e) => fail(format!("{e}")),
+        }
+    }
+
+    /// AssignReplicaIncarnation:为某 `(partition, node)` 上已有的副本**发放一个全新身份**。
+    ///
+    /// store 每次**从零建一个副本目录**时调用(重建 / 换盘后的副本不得沿用旧身份:旧身份会让拉取方
+    /// 手里的复制游标看似合法,进而误判追平 → 带缺数据转 `ACTIVE` → master 删源 → 丢数据)。
+    /// **每次调用都是更大的新号**,不是取回旧号。号由 apply 发放(确定性),返回的值已落进 placement
+    /// —— 随后的 `LookupPartition` 会看到同一个值。
+    ///
+    /// leader-only + 需准入密钥:非 leader 回 `ok=false` + `leader_addr` 供重定向(不代转)。
+    /// 副本不在 placement(分区不存在 / 该节点没这份副本)→ `ok=false`,**不发号也不改状态**。
+    async fn assign_replica_incarnation(
+        &self,
+        request: Request<AssignIncarnationRequest>,
+    ) -> Result<Response<AssignIncarnationResponse>, Status> {
+        let req = request.into_inner();
+        self.check_secret(&req.cluster_secret)?;
+        let fail = |leader_addr: String, error: String| {
+            Ok(Response::new(AssignIncarnationResponse {
+                version: PROTO_VERSION,
+                ok: false,
+                incarnation: 0,
+                leader_addr,
+                error,
+            }))
+        };
+
+        let is_leader = self.raft.metrics().borrow().current_leader == Some(self.config.node_id);
+        if !is_leader {
+            return fail(
+                self.leader_addr().unwrap_or_default(),
+                "not leader".to_string(),
+            );
+        }
+
+        match self
+            .raft
+            .client_write(MasterCommand::AssignReplicaIncarnation {
+                partition_id: req.partition_id,
+                node_id: req.node_id,
+            })
+            .await
+        {
+            Ok(resp) => match resp.data {
+                crate::types::MasterResponse::Incarnation {
+                    incarnation: Some(v),
+                    ..
+                } => Ok(Response::new(AssignIncarnationResponse {
+                    version: PROTO_VERSION,
+                    ok: true,
+                    incarnation: v,
+                    leader_addr: String::new(),
+                    error: String::new(),
+                })),
+                crate::types::MasterResponse::Incarnation {
+                    incarnation: None, ..
+                } => fail(
+                    String::new(),
+                    format!(
+                        "node {} holds no replica of partition {}",
+                        req.node_id, req.partition_id
+                    ),
+                ),
+                other => fail(
+                    String::new(),
+                    format!("unexpected apply response: {other:?}"),
+                ),
+            },
+            Err(e) => fail(self.leader_addr().unwrap_or_default(), format!("{e}")),
         }
     }
 

@@ -56,6 +56,10 @@ pub struct StoreServerMetrics {
     pub replication_paused: IntGauge,
     /// 手动 compaction 的异步任务数,按 `state`(running/done/failed)各计一次。
     pub compaction_jobs: IntCounterVec,
+    /// 拉复制游标被**重定位**的次数,按 `reason`(incarnation_mismatch/segment_generation_mismatch/
+    /// segment_missing/offset_out_of_range/no_progress)各计一次。对齐 Ambry `revalidateStoreFindToken`
+    /// +resetKey:非零是**正常**的(说明发生过 compaction/重建后的续拉),持续增长才值得看。
+    pub replication_cursor_resets: IntCounterVec,
     /// 本地完整性校验(`GET /partitions/{pid}/verify`)调用次数。
     pub verify_runs: IntCounter,
     /// 校验中发现的坏记录总数(CRC/解码失败)。
@@ -143,6 +147,12 @@ impl StoreServerMetrics {
                 "store_server_compaction_jobs_total",
                 "async manual compaction jobs by state",
                 &["state"],
+            )?,
+            replication_cursor_resets: counter_vec(
+                registry,
+                "store_server_replication_cursor_resets_total",
+                "pull-replication cursor revalidations (reasons: incarnation_mismatch/segment_generation_mismatch/segment_missing/offset_out_of_range/no_progress)",
+                &["reason"],
             )?,
             verify_runs: counter(
                 registry,

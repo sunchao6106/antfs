@@ -185,6 +185,8 @@ mod tests {
         antfs_blob::CompactionStats {
             live_bytes: live,
             dead_bytes: dead,
+            tombstone_reclaimed_bytes: 0,
+            expired_reclaimed_bytes: 0,
             segments_before: 3,
             segments_after: 1,
         }

@@ -39,8 +39,31 @@ struct AppState {
     scrub_max_batch_bytes: u64,
     /// A3 手动 compaction 的异步任务台账(内存态,最多保留最近 [`MAX_TRACKED_JOBS`] 条)。
     compactions: Arc<CompactionJobs>,
+    /// 手动 compaction 的墓碑保留期(毫秒):与定时 compaction 同一套回收口径
+    /// (手动触发不享受"豁免保留期"—— 保留期防的是复制复活,与谁发起无关)。
+    compaction_tombstone_retention_ms: i64,
     /// 单请求 body 上限(字节):流式 put 用它做 `Content-Length` 前置校验,缓冲回落路径用它做抽取上限。
     max_body_bytes: u64,
+    /// 未接 master 的单机模式(`master_addr` 为空):副本的**墓碑回收闸门**恒放行 —— 没有别的副本
+    /// 可滞后。集群模式则只在 master 放行时开(见 [`crate::worker::tombstones_allowed`])。
+    standalone: bool,
+}
+
+impl AppState {
+    /// 手动 compact 的策略:运维强制动作,故**不受 partition 状态/可回收占比闸门约束**
+    /// (阈值给 0 ⇒ 有可回收数据就动手),但回收口径与定时 compaction 一致:TTL 过期对象与
+    /// 过保留期的墓碑同样被真正回收,保留期内的墓碑照搬。
+    ///
+    /// **墓碑回收闸门照样过**(`tombstones_allowed`):"还有副本没追平"时回收墓碑会造僵尸数据,
+    /// 这条不因为"是运维手动发起"就豁免(CLAUDE.md §3.1)。
+    fn manual_compact_policy(&self, tombstones_allowed: bool) -> antfs_blob::CompactPolicy {
+        antfs_blob::CompactPolicy::new(
+            0.0,
+            crate::worker::now_epoch_ms(),
+            self.compaction_tombstone_retention_ms,
+        )
+        .with_tombstones_allowed(tombstones_allowed)
+    }
 }
 
 /// 装配好的数据节点。
@@ -83,6 +106,9 @@ impl StoreServer {
         // 先取出标量再 move `config`(handlers 需要 body 上限做流式 put 的前置校验)。
         let max_body_bytes = config.max_body_bytes;
         let scrub_max_batch_bytes = config.scrub_max_batch_bytes;
+        let standalone = config.master_addr.is_empty();
+        let compaction_tombstone_retention_ms =
+            (config.compaction_tombstone_retention_secs as i64).saturating_mul(1000);
         Ok(StoreServer {
             config,
             state: AppState {
@@ -93,7 +119,9 @@ impl StoreServer {
                 replication_paused,
                 scrub_max_batch_bytes,
                 compactions,
+                compaction_tombstone_retention_ms,
                 max_body_bytes,
+                standalone,
             },
             disks,
             health,
@@ -118,7 +146,7 @@ impl StoreServer {
             .route("/partitions/{pid}/scrub-report", get(scrub_report))
             .route("/partitions/{pid}/verify", get(verify_partition))
             .route("/partitions/{pid}/segments", get(list_segments))
-            .route("/partitions/{pid}/segments/{position}", get(get_segment))
+            .route("/partitions/{pid}/segments/{name}", get(get_segment))
             .layer(DefaultBodyLimit::max(body_limit(
                 self.config.max_body_bytes,
             )))
@@ -476,8 +504,11 @@ struct GetParams {
 /// 复制元数据请求参数:`seg`/`off` 为游标(均缺 = 从头);`max_bytes` 批上限。
 #[derive(serde::Deserialize)]
 struct MetaParams {
-    seg: Option<u64>,
+    /// 游标 = 段身份(位置 + 代次)+ 段内偏移 + 副本 incarnation;四件套齐全才可信。
+    pos: Option<u32>,
+    gen: Option<u32>,
     off: Option<u64>,
+    incarnation: Option<u64>,
     #[serde(default = "default_max_bytes")]
     max_bytes: u64,
 }
@@ -530,10 +561,14 @@ async fn compact_partition(
     };
     st.metrics.manual_compactions.inc();
     let store = handle.store.clone();
+    // 墓碑回收闸门:按**该副本当前值**走(与定时 compaction 同一判据)。
+    let tombstones_allowed = crate::worker::tombstones_allowed(st.standalone, &handle);
     if params.is_async.unwrap_or(0) != 0 {
-        return submit_compaction(&st, pid, store);
+        let policy = st.manual_compact_policy(tombstones_allowed);
+        return submit_compaction(&st, pid, store, policy);
     }
-    match tokio::task::spawn_blocking(move || store.compact()).await {
+    let policy = st.manual_compact_policy(tombstones_allowed);
+    match tokio::task::spawn_blocking(move || store.compact(&policy)).await {
         Ok(Ok(stats)) => Json(CompactionResult::from(stats)).into_response(),
         Ok(Err(e)) => {
             record_err(&st.metrics, err_kind(&e));
@@ -566,6 +601,7 @@ fn submit_compaction(
     st: &AppState,
     pid: PartitionId,
     store: Arc<antfs_blob::BlobStore>,
+    policy: antfs_blob::CompactPolicy,
 ) -> Response {
     let job_id = st.compactions.submit(pid);
     st.metrics
@@ -575,7 +611,7 @@ fn submit_compaction(
     let jobs = st.compactions.clone();
     let metrics = st.metrics.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || store.compact()).await {
+        match tokio::task::spawn_blocking(move || store.compact(&policy)).await {
             Ok(Ok(stats)) => {
                 jobs.finish(job_id, Ok(stats));
                 metrics.compaction_jobs.with_label_values(&["done"]).inc();
@@ -918,7 +954,13 @@ async fn scrub_report(State(st): State<AppState>, Path(pid): Path<PartitionId>) 
         let segments: Vec<serde_json::Value> = store
             .sealed_segments()
             .into_iter()
-            .map(|(position, data_end)| serde_json::json!({ "position": position, "data_end": data_end }))
+            .map(|(name, data_end)| {
+                serde_json::json!({
+                    "position": name.position,
+                    "generation": name.generation,
+                    "data_end": data_end,
+                })
+            })
             .collect();
         let (token_seg, token_off) = match store.log_end() {
             Some((position, data_end)) => (Some(position), Some(data_end)),
@@ -1015,10 +1057,29 @@ async fn replica_metadata(
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
     };
     let store = handle.store.clone();
-    let token = token_from(params.seg, params.off);
+    let incarnation = store.incarnation();
+    // 对齐 Ambry `revalidateStoreFindToken` 的"副本身份"那一半:游标声明的 incarnation 与服务端不符
+    // (对面换了**一代副本** —— 重建/换盘),或游标残缺 → 一律从头重扫,并如实报"本轮发生过重定位"。
+    // 这一层放服务端:incarnation 是**本副本**的事实,引擎(段级)看不到。
+    // 没有游标(四件套全空)= 全新拉取,不算重定位。
+    let has_cursor = params.pos.is_some() || params.gen.is_some() || params.off.is_some();
+    let incarnation_mismatch = match params.incarnation {
+        Some(inc) => inc != incarnation,
+        None => has_cursor,
+    };
+    let token = if incarnation_mismatch {
+        antfs_blob::FindToken::Uninitialized
+    } else {
+        token_from(params.pos, params.gen, params.off)
+    };
     let max_bytes = params.max_bytes;
     match tokio::task::spawn_blocking(move || store.find_entries_since(&token, max_bytes)).await {
-        Ok(Ok(info)) => Json(MetadataResponse::from_find(info)).into_response(),
+        Ok(Ok(mut info)) => {
+            if incarnation_mismatch {
+                info.token_reset = Some(antfs_blob::TokenResetReason::IncarnationMismatch);
+            }
+            Json(MetadataResponse::from_find(info, incarnation)).into_response()
+        }
         Ok(Err(e)) => {
             record_err(&st.metrics, err_kind(&e));
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
@@ -1035,29 +1096,60 @@ async fn list_segments(State(st): State<AppState>, Path(pid): Path<PartitionId>)
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
     };
-    let segs: Vec<crate::replication::SegmentInfo> = handle
+    let segments: Vec<crate::replication::SegmentInfo> = handle
         .store
         .sealed_segments()
         .into_iter()
-        .map(|(position, data_end)| crate::replication::SegmentInfo { position, data_end })
+        .map(|(name, data_end)| crate::replication::SegmentInfo {
+            position: name.position,
+            generation: name.generation,
+            data_end,
+        })
         .collect();
-    Json(segs).into_response()
+    // 清单连同**本副本的 incarnation** 与每段的**代次**一起回:bootstrap 的初始游标据此绑定副本身份,
+    // 且"拷段途中对端重写 log"能被段头代次当场识破(见 `replication::SealedListing`)。
+    Json(crate::replication::SealedListing {
+        incarnation: handle.store.incarnation(),
+        segments,
+    })
+    .into_response()
 }
 
+/// 取一段封存段的字节(物理 bootstrap 的接收端)。
+///
+/// 路径参数是**段身份** `{position}_{generation}`(列清单给出的正是这个)而不是裸位置:
+/// 对端若在"列清单"与"取这一段"之间重写了 log,同一位置上已经不是同一段了 —— 这时**必须**回 404
+/// 让取段方丢弃这份拷贝,而不是把新代次的字节当成清单里那一段发出去(那会装出混合快照)。
 async fn get_segment(
     State(st): State<AppState>,
-    Path((pid, position)): Path<(PartitionId, u64)>,
+    Path((pid, name)): Path<(PartitionId, String)>,
 ) -> Response {
     let _t = OpTimer::start(&st.metrics, "segments");
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
     };
+    let Some(name) = parse_segment_name(&name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "segment name must be {position}_{generation}",
+        )
+            .into_response();
+    };
     let store = handle.store.clone();
-    match tokio::task::spawn_blocking(move || store.read_segment_prefix(position)).await {
+    match tokio::task::spawn_blocking(move || store.read_segment_prefix(name)).await {
         Ok(Ok(bytes)) => (StatusCode::OK, bytes).into_response(),
         Ok(Err(_)) => (StatusCode::NOT_FOUND, "no such segment").into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "join error").into_response(),
     }
+}
+
+/// 解析 `{position}_{generation}` 形式的段身份(`LogSegmentName` 的 `Display` 形状)。
+fn parse_segment_name(s: &str) -> Option<antfs_blob::LogSegmentName> {
+    let (pos, gen) = s.split_once('_')?;
+    Some(antfs_blob::LogSegmentName::new(
+        pos.parse().ok()?,
+        gen.parse().ok()?,
+    ))
 }
 
 async fn delete_blob(

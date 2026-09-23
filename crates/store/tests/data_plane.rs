@@ -1258,3 +1258,107 @@ async fn damaged_replica_still_starts_and_is_reported() {
         "打开时跳过的坏记录应上指标: {text}"
     );
 }
+
+/// 物理 bootstrap 的取段端点按**段身份**(位置 + 代次)寻址:列清单给出 `{position}_{generation}`,
+/// 取段必须原样用它;位置对上但**代次不符**(对端在列清单与取段之间重写过那段)→ 404,
+/// 而不是把新代次的字节当成旧段发出去(那会让接收端装出混合快照)。名字畸形 → 400。
+#[tokio::test]
+async fn segment_endpoint_addresses_segments_by_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 小段(1 MiB):几条 400 KiB 的记录即可封出多个段。
+    let srv = server_with(tmp.path(), store_config(1 << 20), 4 << 20, 2 * 1024 * 1024);
+    let router = srv.router();
+    create_replica(&router).await;
+
+    let big = vec![7u8; 400 * 1024];
+    for n in 0..5u32 {
+        let put = Request::put(format!("/partitions/0/blobs/{}", data_key(n)))
+            .body(Body::from(big.clone()))
+            .unwrap();
+        assert_eq!(status_of(&router, put).await, StatusCode::CREATED);
+    }
+
+    let (code, body) = get_body(&router, "/partitions/0/segments").await;
+    assert_eq!(code, StatusCode::OK);
+    let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let segments = listing["segments"].as_array().expect("应带段清单");
+    assert!(segments.len() >= 2, "前置:应有多个封存段: {listing}");
+    assert!(
+        listing["incarnation"].is_u64(),
+        "清单必须带 peer 的副本 incarnation: {listing}"
+    );
+
+    for s in segments {
+        let position = s["position"].as_u64().unwrap();
+        let generation = s["generation"].as_u64().unwrap();
+        let data_end = s["data_end"].as_u64().unwrap();
+        assert!(data_end > 0, "封存段应有数据: {s}");
+
+        // 清单里的身份 → 200,且回的就是这一段(段头自述代次一致)。
+        let (code, bytes) = get_body(
+            &router,
+            &format!("/partitions/0/segments/{position}_{generation}"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "清单里的段身份必须可取: {s}");
+        assert_eq!(
+            antfs_blob::peek_generation(&bytes),
+            Some(generation as u32),
+            "取回的字节必须自述清单里的代次"
+        );
+
+        // 同位置、**别的**代次 = 那段已被重写 → 404(取段方据此丢弃拷贝回落逻辑拉取)。
+        assert_eq!(
+            status_of(
+                &router,
+                Request::get(format!(
+                    "/partitions/0/segments/{position}_{}",
+                    generation + 1
+                ))
+                .body(Body::empty())
+                .unwrap()
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "代次不符必须 404: position={position}"
+        );
+    }
+
+    // 名字畸形(缺代次 / 非数字)→ 400,不是 500。
+    for bad in ["3", "3_x", "x_3", "_"] {
+        assert_eq!(
+            status_of(
+                &router,
+                Request::get(format!("/partitions/0/segments/{bad}"))
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "畸形段名 {bad:?} 应 400"
+        );
+    }
+    // 不存在的段(位置对、代次也在,但该位置根本没有段)→ 404。
+    assert_eq!(
+        status_of(
+            &router,
+            Request::get("/partitions/0/segments/999_1")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "不存在的段应 404"
+    );
+    // 未建副本的分区 → 404(与"段不存在"同一码,调用方反正都是丢弃拷贝)。
+    assert_eq!(
+        status_of(
+            &router,
+            Request::get("/partitions/7/segments/0_1")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+}

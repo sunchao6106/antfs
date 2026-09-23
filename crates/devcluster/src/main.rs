@@ -34,7 +34,7 @@ struct Args {
     admin_port: u16,
     /// store 节点数(默认 3;≥4 才能在 RF=3 时真正执行 move/均衡——devcluster 用于验证搬迁与删源)。
     store_count: u32,
-    /// master 的 `disk_near_full_ratio`(默认 0.95;调小可在本地复现"盘将满 → 分区转 RO")。
+    /// master 的 `disk_near_full_ratio`(默认 0.8;调小可在本地复现"盘将满 → 分区转 RO")。
     disk_near_full_ratio: f64,
     /// store 是否开启主动盘探测(`disk_health_enabled`,默认 false;开启后心跳会带 HEALTHY/... 健康值)。
     disk_health: bool,
@@ -62,7 +62,7 @@ impl Default for Args {
             store_base_port: 7200,
             admin_port: 7300,
             store_count: 3,
-            disk_near_full_ratio: 0.95,
+            disk_near_full_ratio: 0.8,
             disk_health: false,
             frontend_port: 7400,
             host: "127.0.0.1".to_string(),
