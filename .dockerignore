@@ -4,6 +4,7 @@
 .run
 .localcluster
 target
+dist
 **/node_modules
 docs
 openspec

@@ -7,9 +7,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/sunchao6106/antfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sunchao6106/antfs/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
-  <a href="https://github.com/sunchao6106/ambry-rs/pkgs/container/antfs"><img alt="容器镜像" src="https://img.shields.io/badge/ghcr.io-antfs-2496ED?logo=docker&logoColor=white"></a>
+  <a href="https://github.com/sunchao6106/antfs/pkgs/container/antfs"><img alt="容器镜像" src="https://img.shields.io/badge/ghcr.io-antfs-2496ED?logo=docker&logoColor=white"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange?logo=rust">
   <a href="docs/design/README.md"><img alt="Docs" src="https://img.shields.io/badge/docs-design%20docs-green"></a>
   <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
@@ -100,11 +100,11 @@ cargo run -p antfs-devcluster
 
 ### 预编译二进制
 
-打 `v*` tag 会在 [Releases 页面](https://github.com/sunchao6106/ambry-rs/releases)产出 Linux(x86_64 / aarch64)与 macOS(arm64 / x86_64)四个平台的包,每个包里含 `antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-admin`、`antfs-devcluster`:
+打 `v*` tag 会在 [Releases 页面](https://github.com/sunchao6106/antfs/releases)产出 Linux(x86_64 / aarch64)与 macOS(arm64 / x86_64)四个平台的包,每个包里含 `antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-admin`、`antfs-devcluster`:
 
 ```bash
 target=x86_64-unknown-linux-gnu    # 或 aarch64-unknown-linux-gnu / aarch64-apple-darwin / x86_64-apple-darwin
-base=https://github.com/sunchao6106/ambry-rs/releases/latest/download
+base=https://github.com/sunchao6106/antfs/releases/latest/download
 curl -LO "$base/antfs-$target.tar.gz" && curl -LO "$base/SHA256SUMS"
 sha256sum "antfs-$target.tar.gz"   # macOS 用 shasum -a 256,与 SHA256SUMS 对应行比对
 tar xzf "antfs-$target.tar.gz" && cd "antfs-$target" && ./antfs-devcluster
@@ -183,7 +183,7 @@ docker run --rm ghcr.io/sunchao6106/antfs:latest --run-bench router --bench-ops 
 
 ## 参与贡献
 
-欢迎贡献!请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md),也欢迎直接提 [issue](https://github.com/sunchao6106/ambry-rs/issues) 或 pull request。
+欢迎贡献!请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md),也欢迎直接提 [issue](https://github.com/sunchao6106/antfs/issues) 或 pull request。
 
 ## 许可证
 

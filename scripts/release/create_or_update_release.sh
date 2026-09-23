@@ -33,14 +33,17 @@ prerelease=()
 if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
   current=$(gh release view "$tag" --repo "$repo" --json body --jq .body)
   if [[ $current == *"$marker"* ]]; then
-    gh release edit "$tag" --repo "$repo" --notes "$body" "${prerelease[@]}" >/dev/null
+    edit_cmd=(gh release edit "$tag" --repo "$repo" --notes "$body")
+    (( ${#prerelease[@]} )) && edit_cmd+=("${prerelease[@]}")
+    "${edit_cmd[@]}" >/dev/null
     echo "create_or_update_release: refreshed notes for $tag"
   else
     echo "create_or_update_release: $tag 正文被人工改过,保留不动"
   fi
 else
-  gh release create "$tag" --repo "$repo" --title "$tag" --notes "$body" \
-    --verify-tag "${prerelease[@]}"
+  create_cmd=(gh release create "$tag" --repo "$repo" --title "$tag" --notes "$body" --verify-tag)
+  (( ${#prerelease[@]} )) && create_cmd+=("${prerelease[@]}")
+  "${create_cmd[@]}"
   echo "create_or_update_release: created $tag"
 fi
 

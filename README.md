@@ -7,9 +7,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sunchao6106/ambry-rs/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/sunchao6106/antfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sunchao6106/antfs/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
-  <a href="https://github.com/sunchao6106/ambry-rs/pkgs/container/antfs"><img alt="Container image" src="https://img.shields.io/badge/ghcr.io-antfs-2496ED?logo=docker&logoColor=white"></a>
+  <a href="https://github.com/sunchao6106/antfs/pkgs/container/antfs"><img alt="Container image" src="https://img.shields.io/badge/ghcr.io-antfs-2496ED?logo=docker&logoColor=white"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange?logo=rust">
   <a href="docs/design/README.md"><img alt="Docs" src="https://img.shields.io/badge/docs-design%20docs-green"></a>
   <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
@@ -98,11 +98,11 @@ cargo run -p antfs-devcluster
 
 ### Prebuilt binaries
 
-Every `v*` tag produces tarballs for Linux (x86_64 / aarch64) and macOS (arm64 / x86_64) on the [Releases page](https://github.com/sunchao6106/ambry-rs/releases). Each tarball contains `antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-admin` and `antfs-devcluster`:
+Every `v*` tag produces tarballs for Linux (x86_64 / aarch64) and macOS (arm64 / x86_64) on the [Releases page](https://github.com/sunchao6106/antfs/releases). Each tarball contains `antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-admin` and `antfs-devcluster`:
 
 ```bash
 target=x86_64-unknown-linux-gnu    # or aarch64-unknown-linux-gnu / aarch64-apple-darwin / x86_64-apple-darwin
-base=https://github.com/sunchao6106/ambry-rs/releases/latest/download
+base=https://github.com/sunchao6106/antfs/releases/latest/download
 curl -LO "$base/antfs-$target.tar.gz" && curl -LO "$base/SHA256SUMS"
 sha256sum "antfs-$target.tar.gz"   # macOS: shasum -a 256 — compare with the matching line in SHA256SUMS
 tar xzf "antfs-$target.tar.gz" && cd "antfs-$target" && ./antfs-devcluster
@@ -181,7 +181,7 @@ The production target is Linux ext4. For fidelity, large-data, or performance te
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first, and feel free to open an [issue](https://github.com/sunchao6106/ambry-rs/issues) or a pull request.
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first, and feel free to open an [issue](https://github.com/sunchao6106/antfs/issues) or a pull request.
 
 ## License
 

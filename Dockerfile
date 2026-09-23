@@ -24,7 +24,7 @@ RUN cargo build --release --locked \
 # ---- 运行时阶段:只带二进制 ----
 FROM debian:bookworm-slim
 
-LABEL org.opencontainers.image.source="https://github.com/sunchao6106/ambry-rs" \
+LABEL org.opencontainers.image.source="https://github.com/sunchao6106/antfs" \
       org.opencontainers.image.title="antfs" \
       org.opencontainers.image.description="antfs — a distributed blob storage system in Rust, purpose-built for massive small files" \
       org.opencontainers.image.licenses="Apache-2.0"

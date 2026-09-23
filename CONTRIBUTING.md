@@ -35,9 +35,28 @@ CI runs all three on every pull request (see `.github/workflows/ci.yml`), plus a
 - **DEVLOG** ([`docs/DEVLOG.md`](docs/DEVLOG.md)) records implementation steps with verification evidence; add an entry for notable work.
 - Comments and identifiers follow the style of the surrounding code.
 
+## Releases
+
+Releases are cut from tags. Pushing a `v*` tag (or running the **Release** workflow manually with an existing tag) builds the server binaries for four targets — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (cross-compiled with `cargo-zigbuild`), `aarch64-apple-darwin` and `x86_64-apple-darwin` — packages each as `antfs-<version>-<target>.tar.gz` plus a version-less alias, writes a `SHA256SUMS`, and publishes everything to [GitHub Releases](https://github.com/sunchao6106/antfs/releases).
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+The packaging step is a plain script, so you can reproduce it locally:
+
+```bash
+cargo build --release --locked -p antfs-master -p antfs-store -p antfs-frontend -p antfs-admin -p antfs-devcluster
+scripts/release/package_binaries.sh 0.1.0 aarch64-apple-darwin   # 用本机 target triple
+shasum -a 256 -c dist/SHA256SUMS                                 # Linux 用 sha256sum -c
+```
+
+Container images are built and pushed to GHCR by `.github/workflows/docker.yml`.
+
 ## Reporting bugs & proposing features
 
-Use the [issue templates](https://github.com/sunchao6106/ambry-rs/issues/new/choose). A minimal reproduction and your environment (OS, rustc version, commit) make bugs much faster to fix.
+Use the [issue templates](https://github.com/sunchao6106/antfs/issues/new/choose). A minimal reproduction and your environment (OS, rustc version, commit) make bugs much faster to fix.
 
 ## License
 
