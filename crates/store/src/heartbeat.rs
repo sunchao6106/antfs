@@ -430,4 +430,54 @@ mod tests {
             before
         );
     }
+
+    /// **本拍绝不等未归的刷新**(openspec 8.4 的核心不变式):盘真挂死时 `statvfs` 不会返回 —— 若这里
+    /// `await` 了未完成的句柄,心跳循环就停在这一拍,master 见不到心跳 ⇒ 判节点死 ⇒ 全节点再复制。
+    /// 用 `timeout` 兜底:一旦退化成"等",测试**红**而不是挂死。
+    #[tokio::test]
+    async fn an_unfinished_refresh_never_blocks_the_beat_round() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dm = manager(tmp.path());
+        let id = dm.disks()[0].id.clone();
+
+        // 一发"永不返回"的刷新(模拟卡在大 D 状态的 `statvfs`);用 channel 放行以保证测试能收尾。
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let slow_id = id.clone();
+        let mut slots: RefreshSlots = HashMap::new();
+        slots.insert(
+            id.clone(),
+            tokio::task::spawn_blocking(move || {
+                let _ = blocked.recv();
+                (slow_id, None)
+            }),
+        );
+
+        let capacity_before = dm.disks()[0].capacity_bytes;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            collect_refresh(&mut slots, &mut dm),
+        )
+        .await
+        .expect("未完成的刷新不许把这一拍堵住");
+
+        assert_eq!(slots.len(), 1, "没回来的刷新要留在在飞表里,下拍接着等");
+        assert_eq!(
+            dm.disks()[0].capacity_bytes,
+            capacity_before,
+            "没回来就沿用上一拍的容量(陈旧一拍无害,心跳必须发出去)"
+        );
+
+        // 同盘再发一次:单飞守卫必须挡住(盘挂死时阻塞线程收不回来,重复发会吃光池)。
+        spawn_refresh(&mut slots, dm.disks());
+        assert_eq!(slots.len(), 1, "同盘至多一发在飞");
+
+        // 放行后应能在有限次让出内收掉,且**不写回**(模拟的这次没有 statfs 结果)。
+        release.send(()).expect("放行阻塞的刷新");
+        assert!(drain(&mut slots, &mut dm).await, "放行后应能收干净");
+        assert_eq!(
+            dm.disks()[0].capacity_bytes,
+            capacity_before,
+            "没有结果就不改容量(不猜测、不清零)"
+        );
+    }
 }

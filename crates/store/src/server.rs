@@ -96,6 +96,19 @@ impl StoreServer {
         registry: &antfs_metric::Registry,
     ) -> Result<Self> {
         antfs_config::Validate::validate(&config)?;
+        // 启动自检(openspec 7.2 / `cluster.md` §9.5 A):盘故障的两条**被动**输入默认都是关的 ——
+        // 设备层 EIO 不会让引擎自关、主动探测也不跑;此时"某块盘 hang"只能靠 IO 看门狗兜,而看门狗
+        // 拿不到 errno,只能超时隔离。这里只说清楚当前状态,**不动默认值**(CLAUDE.md §5.1)。
+        if store_config.io_error_count_to_trigger_shutdown == 0 || !config.disk_health_enabled {
+            tracing::warn!(
+                io_error_shutdown_at = store_config.io_error_count_to_trigger_shutdown,
+                active_probing = config.disk_health_enabled,
+                "启动自检:两条被动输入未开齐 —— 设备层 EIO 不会让引擎自关(建议 \
+                 store.io_error_count_to_trigger_shutdown 显式开 3~10),主动盘探测也没开 \
+                 (store_server.disk_health_enabled);此时只有 IO 看门狗能产出 UNAVAILABLE。\
+                 见 docs/design/cluster.md §9.2 与 §9.5"
+            );
+        }
         let disks = DiskManager::mount_with(&config.data_dirs, staging_dir(&config))?;
         let store_metrics = antfs_blob::StoreMetrics::new(registry)?;
         let metrics = Arc::new(StoreServerMetrics::new(registry)?);
@@ -215,10 +228,7 @@ impl StoreServer {
             );
         } else {
             // 默认部署走的就是这条路:探测关着,但**看门狗照开**(见 `disk_watchdog_ms` 的字段注释)。
-            tracing::warn!(
-                "disk_health_enabled = false: active probing is off, so the only source of \
-                 UNAVAILABLE is the IO watchdog; consider enabling store.io_error_count_to_trigger_shutdown"
-            );
+            // 提示语不在这里打 —— 它要和"引擎自关阈值"一起说才完整,故统一挪到 `start_with` 的启动自检。
         }
         // 看门狗:**独立于每盘池**(否则它自己会被卡死在同一批线程里),也**不受探测开关约束**。
         crate::disk_health::spawn_watchdog(

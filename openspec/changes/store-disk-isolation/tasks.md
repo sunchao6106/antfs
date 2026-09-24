@@ -1,11 +1,12 @@
 # tasks — store-disk-isolation(N4 每盘隔离 + 盘故障处置)
 
-> 状态约定:本 change **部分落地** —— §0(前置 Phase 0)、§2(D1 每盘有界池)、§3(D2 健康闸门)、§4(D3 IO 看门狗)
-> 的 **store 侧**已落地(见 `docs/design/store.md` §12.11/§12.12);**§5–§7(master 侧 D4/D5/D6 与部署前提 D7)未开工**。
-> 勾选项 = 已有代码 + 测试覆盖;未勾选项 = 尚未开始。每处落地都记了与原始设想的**差异**,别把勾选当成"和原文一模一样"。
-> 任务里的 `file:line` 按**已提交版本(HEAD)**给出;工作树里的未提交改动已改写
-> `crates/store/src/{health.rs,metrics.rs,server.rs,worker.rs,replication.rs,heartbeat.rs,config.rs}` 并新增
-> `crates/store/src/{disk_pool.rs,disk_health.rs}`,行号会漂移——以代码为准。
+> 状态约定:**已全部落地并提交**(store 侧 D1/D2/D3 + master 侧 D4/D5/D6 + 部署前提 D7 的**文档**),
+> **只剩"真机执行"类条目未勾** —— 即阈值标定(1.2 / 8.5)与需要真机故障注入的端到端断言(8.4 的一半)。
+> 勾选项 = 已有代码 + 测试覆盖;未勾选项 = 尚未开始或只能真机做(见
+> [`cluster.md` §9.5 上线前真机核对清单](../../../docs/design/cluster.md))。每处落地都记了与原始设想的**差异**,
+> 别把勾选当成"和原文一模一样"。
+> 任务里的 `file:line` 按**当时的 HEAD**给出;后续改动(尤其 `crates/store/src/{server,heartbeat,worker,
+> replication,config}.rs` 与新增的 `disk_pool.rs` / `disk_health.rs`)会让行号漂移 —— 以代码为准。
 
 ## 0. 前置(Phase 0,单独小 commit;本 change 依赖其完成,但不重复验收)
 
@@ -24,8 +25,10 @@
 
 ## 1. 文档骨架(先写,后实现)
 
-- [ ] 1.1 `openspec/changes/store-disk-isolation/{proposal,design,tasks}.md` + `specs/store-disk-isolation/spec.md`;`openspec validate store-disk-isolation --strict` 通过
+- [x] 1.1 `openspec/changes/store-disk-isolation/{proposal,design,tasks}.md` + `specs/store-disk-isolation/spec.md`;`openspec validate store-disk-isolation --strict` 通过
 - [ ] 1.2 配置/监控默认值**标定后再落**:§10/§11 标 **【提案】** 的默认值必须先压测标定,再改代码 `impl Default`,再改文档表(CLAUDE.md §5.1:不擅自定默认值)
+      —— **待真机**:12 个数字目前全是"经验初值",已由单测钉住、并在 `docs/design/store.md` §12.12 / §9.4 显式标注;
+      标定步骤见 [`cluster.md` §9.4](../../../docs/design/cluster.md)、执行清单见同文 §9.5
 
 ## 2. D1 每盘有界池(N4)
 
@@ -145,9 +148,12 @@
 
 ## 7. D7 内核 fail-fast(部署前提;只文档 + 一条启动告警)
 
-- [ ] 7.1 `docs/design/cluster.md` 新增「部署前提:设备级超时」小节:SCSI `/sys/class/scsi_device/*/device/timeout`=30s、`nvme_core.io_timeout`=30s / `max_retries`=5、dm-multipath `no_path_retry`(**禁用 `queue_if_no_path`**)、NFS `timeo`/`retrans`;并说明"否则 D2/D3 永远观察不到错误,整条阶梯是空响"
-- [ ] 7.2 启动自检:`io_error_count_to_trigger_shutdown == 0` 时记一条 `tracing::warn!`(建议 3–10);**不改默认值**(CLAUDE.md §5.1)
-- [ ] 7.3 `docs/design/store.md` §10.1 的 `store.io_error_count_to_trigger_shutdown` 行补一句"上线建议显式打开 + 与 D2/D3 的关系"
+- [x] 7.1 `docs/design/cluster.md` 新增「部署前提:设备级超时」小节:SCSI `/sys/class/scsi_device/*/device/timeout`=30s、`nvme_core.io_timeout`=30s / `max_retries`=5、dm-multipath `no_path_retry`(**禁用 `queue_if_no_path`**)、NFS `timeo`/`retrans`;并说明"否则 D2/D3 永远观察不到错误,整条阶梯是空响" —— 见 §9.2(含 §9.5 A 的逐机核对项)
+- [x] 7.2 启动自检:`io_error_count_to_trigger_shutdown == 0` 时记一条 `tracing::warn!`(建议 3–10);**不改默认值**(CLAUDE.md §5.1)
+      —— **落地差异**:合并成**一条**启动自检(`crates/store/src/server.rs` 的 `start_with`),条件是
+      "`io_error_count_to_trigger_shutdown == 0` **或** `disk_health_enabled == false`",一次把两条被动输入
+      的状态与后果说清(默认部署两条都关,打两条告警纯属噪声);原来挂在 `serve()` 里那条单独告警已撤掉
+- [x] 7.3 `docs/design/store.md` §10.1 的 `store.io_error_count_to_trigger_shutdown` 行补一句"上线建议显式打开 + 与 D2/D3 的关系" —— 见 `store.md` 的 §10.1 表格该行
 
 ## 8. 集成验证与收口
 
@@ -155,6 +161,10 @@
 - [x] 8.2 集成测试:坏盘 replica 不被 worker flush/compaction 选中(`background_worker_skips_the_unavailable_disk`);恢复后自动回归(`recovering_the_disk_restores_service`)。**"游标未失效"只做了结构性保证**(跳过点在 `sessions` 之前 ⇒ 不碰 prior token),**没有**端到端断言游标值 —— 诚实标注
 - [x] 8.3 集成测试:master 撤离全链路 —— `tests/reconcile.rs::bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_active`:坏盘 → 补副本 → 在"继任者已就位但未 `ACTIVE`"的窗口里**反复断言源仍在** → 继任者 `ACTIVE` 后才删源;并断言最终放置仍是 RF 份、在途 gauge 归 0
 - [ ] 8.4 集成测试:`refresh` 超时 ⇒ 心跳照常、master 不判 down。**待 D5/D6 落地**(store 侧"心跳照发"已有前置 commit 的单飞守卫,但端到端断言未写)
+      —— **核心不变式已由单测钉住**(`crates/store/src/heartbeat.rs::an_unfinished_refresh_never_blocks_the_beat_round`):
+      未归的刷新**绝不被 `await`**(用 `timeout` 兜底,退化成"等"就红)、同盘至多一发在飞、没有结果就不改容量。
+      **仍缺**:让 `statvfs` 真的卡住(需要故障注入 seam 或真机挂盘)+ 由**真 master** 断言"节点没被判 down" ——
+      归入 [`cluster.md` §9.5](../../../docs/design/cluster.md) B 组的真机项
 - [ ] 8.5 压测标定:`cluster.md` **§9.3 阈值标定手册**已写好(12 个数字各自的测量查询、判据、以及标定后
   必须做的三步收口动作),**但数字本身必须在真实机器 + 真实负载上跑出来** —— 在拿到真实数据之前**不填数字**
   (抄一组数字进来比留着"未标定"更危险)。防静默变更的单测已就位

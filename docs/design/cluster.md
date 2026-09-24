@@ -707,8 +707,9 @@ store server(一个进程 / 一台数据节点)
 | antfs 引擎 | `[store] io_error_count_to_trigger_shutdown = 3..10` | **建议部署显式打开**(默认 0 = 关,§5.1 不擅改默认)。打开后"设备层 EIO → 连续错误 → 引擎自关 → hook → replica `ERROR` → 心跳上报 → master 再复制"这条**已有**闭环才真正工作 |
 | 进程守护 | `systemd Restart=always` / `docker-compose restart: always` | D3 的逃生舱(`disk_watchdog_escalate_secs`,**默认关**)一旦开启,靠它把自杀的进程拉回来 |
 
-代码侧只做一件便宜的事:启动时若 `disk_health_enabled == false`,记一条 `tracing::warn!` 提示
-"探测关着 ⇒ `UNAVAILABLE` 只剩看门狗一个来源,建议开启引擎自关";**不改任何默认值**(CLAUDE.md §5.1)。
+代码侧只做一件便宜的事:**启动自检** —— `store_server.disk_health_enabled == false` **或**
+`[store] io_error_count_to_trigger_shutdown == 0` 时记一条 `tracing::warn!`,把两条被动输入的当前状态
+一起说清楚("此时只有 IO 看门狗能产出 `UNAVAILABLE`");**不改任何默认值**(CLAUDE.md §5.1)。
 
 ### 9.3 慢盘:客户端侧的延迟感知读路由(**已落地**)
 
