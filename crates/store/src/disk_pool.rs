@@ -1555,7 +1555,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn slow_io_counters_are_exact_and_reset_on_read() {
         let mut c = cfg(2, 0, 5_000);
-        c.disk_degraded_io_ms = 1; // 任何 ≥1ms 的 IO 都算"慢" —— 便于构造
+        // 阈值 100ms、慢 IO 睡 500ms:"慢"这一侧留 5 倍余量;而"不慢"那一侧是**空闭包**,
+        // 要被算成慢需要一次 >100ms 的调度停顿。旧写法阈值 1ms + 空跑,CI runner 抖动一下就会把
+        // 空跑也计成慢,断言 (2, 3) 会变成 (3, 3) —— 用例不能依赖机器速度。
+        c.disk_degraded_io_ms = 100;
         let f = fixture(1, &c);
         let id = f.ids[0].clone();
 
@@ -1577,10 +1580,12 @@ mod tests {
             "阈值 0 = 不分类:计数器一个都不该动"
         );
 
-        // 两发慢 IO + 一发瞬时 IO。
+        // 两发慢 IO(500ms,远超 100ms 的阈值)+ 一发瞬时 IO(空闭包)。
         for _ in 0..2 {
             f.pool
-                .run(&id, "put", || std::thread::sleep(Duration::from_millis(5)))
+                .run(&id, "put", || {
+                    std::thread::sleep(Duration::from_millis(500))
+                })
                 .await
                 .expect("准入");
         }
@@ -1608,7 +1613,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn watchdog_marks_a_consistently_slow_disk_degraded_without_disabling_it() {
         let mut c = cfg(2, 4, 5_000);
-        c.disk_degraded_io_ms = 1; // 任何 ≥1ms 的 IO 都算慢
+        // 阈值 50ms、慢 IO 睡 200ms:两侧都留 4 倍以上余量,不依赖机器速度(见本用例末尾的说明)。
+        c.disk_degraded_io_ms = 50;
         let f = fixture(1, &c);
         let id = f.ids[0].clone();
 
@@ -1629,18 +1635,25 @@ mod tests {
                 recover_stable_secs: 0,
             },
             crate::disk_health::WatchdogSettings {
+                // tick 取**所有门槛的最小值**:保持 10ms 的快观察周期。
                 default_deadline: Duration::from_millis(10),
-                by_op_ms: std::collections::BTreeMap::new(),
+                // 但本用例只跑 `put`,把它的门槛放到 60s —— 否则 CI runner 上一次调度抖动就能把
+                // 200ms 的"慢 IO"量成"超期 IO",迟滞(bad_rounds = 1)立刻判 UNAVAILABLE,下一发
+                // 准入被拒 `DiskUnavailable`(实测在 GitHub runner 上就是这么红的)。DEGRADED 的判定
+                // 走池里的**增量计数**(阈值 `disk_degraded_io_ms`),与这个门槛无关。
+                by_op_ms: BTreeMap::from([("put".to_string(), 60_000)]),
                 escalate_secs: 0,
                 degraded: Some(judge),
             },
             metrics,
         );
 
-        // 跑几发慢 IO(每发 5ms,远超 1ms 的阈值)。
+        // 跑几发慢 IO(每发 200ms,4 倍于 50ms 的阈值)。
         for _ in 0..3 {
             f.pool
-                .run(&id, "put", || std::thread::sleep(Duration::from_millis(5)))
+                .run(&id, "put", || {
+                    std::thread::sleep(Duration::from_millis(200))
+                })
                 .await
                 .expect("准入");
         }
