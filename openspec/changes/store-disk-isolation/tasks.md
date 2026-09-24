@@ -163,7 +163,8 @@
 - [x] 8.3 集成测试:master 撤离全链路 —— `tests/reconcile.rs::bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_active`:坏盘 → 补副本 → 在"继任者已就位但未 `ACTIVE`"的窗口里**反复断言源仍在** → 继任者 `ACTIVE` 后才删源;并断言最终放置仍是 RF 份、在途 gauge 归 0
 - **8.4 / 8.5(真机类)** 见文末「未执行:真机项」—— 8.4 的核心不变式已由单测钉住,真机那半本轮不做;
   8.5 的标定数字未跑(不填数字)
-- [x] 8.6 `cargo test` 绿 + `cargo clippy` 无告警(跨 Linux/macOS)—— macOS 侧已验证;Linux 待 CI
+- [x] 8.6 `cargo test` 绿 + `cargo clippy` 无告警(跨 Linux/macOS)—— **已由 CI 双平台验证**(run `35962964815`:
+  build-and-test 的 macOS + ubuntu 与 Rustfmt / Clippy 全绿;其中两条吃墙钟的用例曾把 CI 弄红,已改成不依赖机器速度)
 - [x] 8.7 `openspec validate store-disk-isolation --strict` 通过
 
 ## 后续(不在本 change)
