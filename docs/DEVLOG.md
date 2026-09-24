@@ -895,3 +895,25 @@
 - **注意**:幂等只保证"不少于目标",**不会替谁删分区**。本地若已经跑出 6 个分区,想回到 3 个得删掉
   数据目录重来(或把 `partitions` 提到 6)。
 - **验证**:`cargo test -p antfs-devcluster`(8 条配置用例)仍全绿;`cargo fmt` 干净。
+
+## 步骤 33:收掉三处"只有结构性论证"的缺口(其中两处其实是过期话)(2026-09-24)
+
+上一轮在 [`cluster.md` §9.5](./design/cluster.md) E 组列了三处"只有结构性论证、无用例守着"的缺口。逐条查证后:
+**一处补齐、两处是过期话(其实早有用例)**,一并改正 —— 错话比缺口更坏,它会让下一个人去做已经做过的事。
+
+1. **盘恢复后不自动回填副本**(设计里明写的"只置不回")—— **原来确实只有一个"没有回填路径"的结构性论证**,
+   现在并入 `crates/master/tests/reconcile.rs::bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_active`
+   的**第 ⑤ 阶段**:把坏盘改回健康后跑 4 个调谐周期,断言放置**一动不动**(仍是 `[102, 103]`)、撤离计划计数
+   不涨。顺带把该用例的心跳 keepalive 从 40 拍加到 80 拍(≈32s)——阶段变多后不能让它比用例先停,
+   否则软状态过期会把节点判死,后面的断言会看到"计划外的迁移"(这类 flaky 比不写用例更坏)。
+2. **复制游标"段被换掉即失效"** —— **这条过期了**:`crates/store/tests/compaction_replication.rs` 早就端到端
+   断言了("对端重写 log ⇒ 陈旧游标被作废,而不是返回空批 / 更不是报追上 ⇒ 重写后的数据必须补回来",
+   三个用例覆盖全库 compact / 增量 compaction / 对端重建)。真正只剩结构性论证的是**更窄**的一块:
+   坏盘被后台 worker 跳过时"不碰 prior token"(跳过点在 `sessions` 之前),已在 openspec 8.2 标注。
+3. **`UNKNOWN` 参与撤离判据的可达性** —— **已核对**(D4 落地后):`pick_evicted_disks` 只认 `UNAVAILABLE`
+   且需持续 ≥ `disk_evac_min_bad_secs`,`UNKNOWN` **不参与**;默认关探测时 `UNAVAILABLE` 只能由看门狗迟滞产出,
+   该链路每一环都有用例。**仍待真机**的只剩物理触发(挂盘 / `dm-error`)—— 已在 §9.5 B 组。
+
+- **验证**:`cargo test -p antfs-master --test reconcile bad_disk_evacuation` 通过(11.0s);
+  全量 `cargo test --workspace` 558 通过 / 0 失败(断言是并入**已有**用例的,故用例数不变);clippy `-D warnings`
+  0 告警;fmt 干净。

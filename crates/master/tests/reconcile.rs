@@ -2430,17 +2430,44 @@ async fn bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_ac
         ids
     };
 
+    // `master_disk_evac_planned_total{result="planned"}` 的当前值。阶段 ⑤ 用它证明"盘恢复不再产生计划"。
+    let planned_now = || -> f64 {
+        antfs_metric::gather(&leader.registry)
+            .ok()
+            .and_then(|d| {
+                antfs_metric::parse(&d)
+                    .into_iter()
+                    .find(|s| {
+                        s.name == "master_disk_evac_planned_total"
+                            && s.labels
+                                .iter()
+                                .any(|(k, v)| k == "result" && *v == "planned")
+                    })
+                    .map(|s| s.value)
+            })
+            .unwrap_or(0.0)
+    };
+
     // 继任者是否已"追平"由测试控制:置位之后 103 才开始上报 ACTIVE。
     let successor_active = Arc::new(AtomicBool::new(false));
     let flag = successor_active.clone();
+    // 101 的盘是否已"恢复"(只有阶段 ⑤ 才置位):在那之前它持续报 UNAVAILABLE。
+    let disk_101_healthy = Arc::new(AtomicBool::new(false));
+    let healthy101 = disk_101_healthy.clone();
     let keepalive = tokio::spawn(async move {
         let mut c = MasterClient::connect(format!("http://{grpc}"))
             .await
             .expect("connect");
-        for _ in 0..40 {
+        // 80 × 400ms ≈ 32s:够本用例所有阶段跑完(阶段变多时别把它压到比用例还短,否则心跳一停,
+        // 软状态过期会把节点判死,后面的断言就会看到"计划外的迁移")。
+        for _ in 0..80 {
             for id in [101u64, 102, 103, 104] {
-                // 101 的盘**持续报 UNAVAILABLE**;其余节点盘健康。
-                let health = if id == 101 { "UNAVAILABLE" } else { "" };
+                // 101 的盘**持续报 UNAVAILABLE**(直到阶段 ⑤ 把它改回健康);其余节点盘健康。
+                let health = if id == 101 && !healthy101.load(Ordering::Relaxed) {
+                    "UNAVAILABLE"
+                } else {
+                    ""
+                };
                 let mut replicas = Vec::new();
                 if id == 101 || id == 102 {
                     replicas.push(antfs_master::pb::ReplicaBeat {
@@ -2501,20 +2528,7 @@ async fn bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_ac
         1,
         "在途撤离数应如实暴露(受 disk_evac_max_in_flight 约束)"
     );
-    let planned = antfs_metric::gather(&leader.registry)
-        .ok()
-        .and_then(|d| {
-            antfs_metric::parse(&d)
-                .into_iter()
-                .find(|s| {
-                    s.name == "master_disk_evac_planned_total"
-                        && s.labels
-                            .iter()
-                            .any(|(k, v)| k == "result" && *v == "planned")
-                })
-                .map(|s| s.value)
-        })
-        .unwrap_or(0.0);
+    let planned = planned_now();
     assert!(planned >= 1.0, "撤离计划应计数(planned)");
 
     // ③ 继任者追平 ⇒ 现在才允许删源。
@@ -2546,6 +2560,24 @@ async fn bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_ac
         "撤离走完后在途应归 0(实际 {:?})",
         gauge(leader, "master_disk_evacuating")
     );
+
+    // ⑤ **盘恢复后不自动回填**(设计里明写的"只置不回"):把 101 的盘改回健康,再跑够几个调谐周期,
+    //    放置必须**一动不动** —— 否则一块盘抖一下就会来回搬数据(搬一次就是搬 GB 级,且会反复)。
+    let planned_before_recovery = planned_now();
+    disk_101_healthy.store(true, Ordering::Relaxed);
+    for round in 0..4 {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            placement_now(&sm),
+            vec![102, 103],
+            "第 {round} 轮:盘恢复后副本绝不该自动搬回去(放置只由撤离 / 下线 / 显式均衡改)"
+        );
+        assert_eq!(
+            planned_now(),
+            planned_before_recovery,
+            "盘恢复不该产生新的撤离计划"
+        );
+    }
 
     keepalive.abort();
 }

@@ -833,11 +833,20 @@ store server(一个进程 / 一台数据节点)
 - `ensure_replica` 建目录与流式 put 暂存的 `unlink` 仍走**进程级**池(D1 只覆盖数据面 IO);
   `DROPPED` 副本的目录不回收 —— 完整清单见 [`store.md` §12.12](./store.md) 的"残留风险"。
 
-#### E. 仍缺端到端证据的三处(只有结构性论证)
+#### E. 三处"曾只有结构性论证"的缺口(现状见下 —— 只剩一小块没有端到端断言)
 
-1. 盘恢复后不自动回填副本 —— 事实上成立,**没有专门用例守着**;
-2. 复制游标"段被换掉即失效" —— 只有结构性保证,无端到端断言;
-3. `UNKNOWN` 参与撤离判据的**可达性**(`master.disk_evac_*` 那条链)只在实现期核对过。
+1. ~~盘恢复后不自动回填副本~~ **已钉住**:并入 `bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_active`
+   的第 ⑤ 阶段 —— 盘改回健康后跑 4 个调谐周期,断言放置**一动不动**、撤离计划计数不涨;
+2. ~~复制游标"段被换掉即失效"~~ **已端到端覆盖**:`crates/store/tests/compaction_replication.rs` 的三个用例
+   (`catchup_survives_peer_full_compact_between_rounds` / `..._incremental_compaction` /
+   `peer_replica_recreated_resets_session_and_keeps_data`)断言"对端重写 log ⇒ 陈旧游标被**作废**(而不是返回空批、
+   更不是报追上)⇒ 重写后的数据必须补回来"。**仍只有结构性论证的那一小块**:坏盘被后台 worker 跳过时
+   "不碰 prior token"(跳过点在 `sessions` 之前),见 openspec 8.2;
+3. ~~`UNKNOWN` 参与撤离判据~~ **已核对**:`pick_evicted_disks` 只认 `UNAVAILABLE` 且需持续
+   ≥ `disk_evac_min_bad_secs`,`UNKNOWN` **不参与**;默认关探测时 `UNAVAILABLE` 只能由看门狗迟滞产出,
+   该链路每一环都有用例(store 侧 `repeated_watchdog_trips_take_the_disk_out_via_hysteresis` /
+   `disk_beats_report_unknown_and_unavailable_never_a_blank_string`,master 侧撤离全链路用例)。
+   **仍待真机**:物理触发(见 B 组)。
 
 ## 10. 数据面读写 + quorum(D4 展开)
 

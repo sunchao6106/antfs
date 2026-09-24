@@ -128,7 +128,8 @@
 > ④ 在途预算用 leader 本地 `evac_started` 记账,而**不是**"硬放置里含坏盘副本的分区" —— 后者在开出
 > **第一发之前**就成立,会把预算一开始占满,于是**永远开不出第一发**(实测踩到)。
 >
-> **未做**:5.5 的"盘恢复后不自动回填"事实上成立(没有任何回填路径),但没有专门的用例守着。
+> **已补齐**:5.5 的"盘恢复后不自动回填"由用例钉住了 —— 撤离全链路用例的第 ⑤ 阶段把坏盘改回健康后
+> 跑 4 个调谐周期,断言放置**一动不动**、撤离计划计数不涨(设计里明写的"只置不回")。
 
 - [x] 5.1 `crates/master/src/reconcile.rs`:`plan_evacuation` 的"抖出集"从 `BTreeSet<NodeId>` 推广为 `(NodeId, DiskId)` 集合(`decommission` = 该节点所有盘进集合的特例),保持"先补后删"语义不变
 - [x] 5.2 `crates/master/src/server.rs`:从软状态各盘 `health` 构建"`UNAVAILABLE` 且已持续 ≥ `disk_evac_min_bad_secs`"的抖出集;计划生成计 `master_disk_evac_planned_total{result}`

@@ -1252,8 +1252,12 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 2. **阈值未压测标定**:上面 6 个数字都是经验值 —— **测量步骤与判据见
    [`cluster.md` §9.4 阈值标定手册](./cluster.md)**(全部 12 个数字一并列出,含"标定完成后必须做的三步")。
    每个数字都有单测钉着,改默认值必须显式改测试,不会悄悄漂。
-3. **`UNKNOWN` 参与撤离判据这件事还没法验证**:D4 未落地,故"只有 `UNAVAILABLE` 触发撤离"这条
-   在默认关探测的部署里**只能靠看门狗产出 `UNAVAILABLE`** —— 这条路径的可达性在 D4 落地时要一并核对。
+3. ~~**`UNKNOWN` 参与撤离判据这件事还没法验证**~~ **已核对**(D4 落地后):`pick_evicted_disks` 只认
+   `UNAVAILABLE`(且需持续 ≥ `disk_evac_min_bad_secs`),**`UNKNOWN` 不参与**撤离判据;而默认关探测的部署里
+   `UNAVAILABLE` 只能由**看门狗迟滞**产出,这条链路每一环都有用例(store 侧
+   `repeated_watchdog_trips_take_the_disk_out_via_hysteresis` 与
+   `disk_beats_report_unknown_and_unavailable_never_a_blank_string`,master 侧撤离全链路用例)。
+   **仍待真机**:物理触发(挂盘 / `dm-error`),见 [`cluster.md` §9.5](./cluster.md) B 组。
 4. **已进 syscall 的 IO 无法取消**(见「五」的诚实边界):盘真挂死时,该盘最多 `pool_size` 个请求
    仍会挂着,直到客户端放弃或盘恢复;看门狗只保证"后续请求不再进来"。
 5. ~~**`disk_watchdog_ms` 与 compaction 大 IO 的关系**~~ **已由"按 op 分档"解决**:
