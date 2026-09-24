@@ -1,10 +1,10 @@
 # tasks — store-disk-isolation(N4 每盘隔离 + 盘故障处置)
 
-> 状态约定:**已全部落地并提交**(store 侧 D1/D2/D3 + master 侧 D4/D5/D6 + 部署前提 D7 的**文档**),
-> **只剩"真机执行"类条目未勾** —— 即阈值标定(1.2 / 8.5)与需要真机故障注入的端到端断言(8.4 的一半)。
-> 勾选项 = 已有代码 + 测试覆盖;未勾选项 = 尚未开始或只能真机做(见
-> [`cluster.md` §9.5 上线前真机核对清单](../../../docs/design/cluster.md))。每处落地都记了与原始设想的**差异**,
-> 别把勾选当成"和原文一模一样"。
+> 状态约定:**已收口(2026-09-24)** —— store 侧 D1/D2/D3 + master 侧 D4/D5/D6 + 部署前提 D7 的文档**全部落地并提交**,
+> 代码/文档类待办**清零**。勾选项 = 已有代码 + 测试覆盖;每处落地都记了与原始设想的**差异**,别把勾选当成"和原文一模一样"。
+> **真机类条目(阈值标定 1.2 / 8.5、故障注入端到端 8.4 的一半)按决策本轮不做**,已从"待办"移出、改成下方
+> 「未执行:真机项」一节(不带勾选框,措辞保留"未执行")—— 清单与判据留在
+> [`cluster.md` §9.4 / §9.5](../../../docs/design/cluster.md),将来上真机时按它做。
 > 任务里的 `file:line` 按**当时的 HEAD**给出;后续改动(尤其 `crates/store/src/{server,heartbeat,worker,
 > replication,config}.rs` 与新增的 `disk_pool.rs` / `disk_health.rs`)会让行号漂移 —— 以代码为准。
 
@@ -26,9 +26,9 @@
 ## 1. 文档骨架(先写,后实现)
 
 - [x] 1.1 `openspec/changes/store-disk-isolation/{proposal,design,tasks}.md` + `specs/store-disk-isolation/spec.md`;`openspec validate store-disk-isolation --strict` 通过
-- [ ] 1.2 配置/监控默认值**标定后再落**:§10/§11 标 **【提案】** 的默认值必须先压测标定,再改代码 `impl Default`,再改文档表(CLAUDE.md §5.1:不擅自定默认值)
-      —— **待真机**:12 个数字目前全是"经验初值",已由单测钉住、并在 `docs/design/store.md` §12.12 / §9.4 显式标注;
-      标定步骤见 [`cluster.md` §9.4](../../../docs/design/cluster.md)、执行清单见同文 §9.5
+- **1.2(标定类)** 配置/监控默认值**标定后再落**:§10/§11 标 **【提案】** 的默认值必须先压测标定,再改代码 `impl Default`,
+  再改文档表(CLAUDE.md §5.1:不擅自定默认值)—— **本轮不做,见文末「未执行:真机项」**:12 个数字目前全是"经验初值",
+  已由单测钉住、并在 `docs/design/store.md` §12.12 与 `cluster.md` §9.4 显式标注
 
 ## 2. D1 每盘有界池(N4)
 
@@ -161,14 +161,8 @@
 - [x] 8.1 集成测试(真 HTTP 数据面,故障注入 = `StoreServer::force_disk_unavailable`,**走与生产同一台迟滞状态机**):该盘分区 503 且**另一块盘的 PUT/GET 不受影响** —— `tests/disk_health_gate.rs::unavailable_disk_fails_fast_on_every_data_plane_route` / `a_bad_disk_does_not_take_down_requests_on_another_disk`
 - [x] 8.2 集成测试:坏盘 replica 不被 worker flush/compaction 选中(`background_worker_skips_the_unavailable_disk`);恢复后自动回归(`recovering_the_disk_restores_service`)。**"游标未失效"只做了结构性保证**(跳过点在 `sessions` 之前 ⇒ 不碰 prior token),**没有**端到端断言游标值 —— 诚实标注
 - [x] 8.3 集成测试:master 撤离全链路 —— `tests/reconcile.rs::bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_active`:坏盘 → 补副本 → 在"继任者已就位但未 `ACTIVE`"的窗口里**反复断言源仍在** → 继任者 `ACTIVE` 后才删源;并断言最终放置仍是 RF 份、在途 gauge 归 0
-- [ ] 8.4 集成测试:`refresh` 超时 ⇒ 心跳照常、master 不判 down。**待 D5/D6 落地**(store 侧"心跳照发"已有前置 commit 的单飞守卫,但端到端断言未写)
-      —— **核心不变式已由单测钉住**(`crates/store/src/heartbeat.rs::an_unfinished_refresh_never_blocks_the_beat_round`):
-      未归的刷新**绝不被 `await`**(用 `timeout` 兜底,退化成"等"就红)、同盘至多一发在飞、没有结果就不改容量。
-      **仍缺**:让 `statvfs` 真的卡住(需要故障注入 seam 或真机挂盘)+ 由**真 master** 断言"节点没被判 down" ——
-      归入 [`cluster.md` §9.5](../../../docs/design/cluster.md) B 组的真机项
-- [ ] 8.5 压测标定:`cluster.md` **§9.3 阈值标定手册**已写好(12 个数字各自的测量查询、判据、以及标定后
-  必须做的三步收口动作),**但数字本身必须在真实机器 + 真实负载上跑出来** —— 在拿到真实数据之前**不填数字**
-  (抄一组数字进来比留着"未标定"更危险)。防静默变更的单测已就位
+- **8.4 / 8.5(真机类)** 见文末「未执行:真机项」—— 8.4 的核心不变式已由单测钉住,真机那半本轮不做;
+  8.5 的标定数字未跑(不填数字)
 - [x] 8.6 `cargo test` 绿 + `cargo clippy` 无告警(跨 Linux/macOS)—— macOS 侧已验证;Linux 待 CI
 - [x] 8.7 `openspec validate store-disk-isolation --strict` 通过
 
@@ -178,3 +172,18 @@
 - [ ] 引擎 IO 模型不变(仍同步阻塞;**不**迁 AIO/io_uring)——`io-index-design` D1 已锁
 - [ ] 自动换硬件、跨节点新协调协议:均不做
 - [ ] 待议(Open Questions):池大小是否按盘分档、看门狗 deadline 是否按 op 分阈、`abort()` 前是否尽力上报一次
+
+## 未执行:真机项(2026-09-24 按决策本轮不做 —— 不带勾选框)
+
+> 下面三项**一条都没执行过**。它们不在"待办"里(本 change 的代码/文档待办已清零),而是**移交**给真机阶段:
+> 步骤、查询与判据在 [`cluster.md` §9.4 / §9.5](../../../docs/design/cluster.md),将来做完在**那份清单**上打勾。
+
+- **1.2 阈值标定后再落**:§10/§11 标【提案】的默认值必须先压测标定,再改代码 `impl Default`、再改两张文档表。
+  现状:12 个数字全是**经验初值**,已由单测钉住(`pool_defaults_match_documented_values` /
+  `disk_health_defaults_match_documented_proposal` / `degraded_defaults_are_off_pending_calibration` /
+  `disk_fault_defaults_are_pinned_pending_calibration`),文档里也显式标着"经验值"。
+- **8.4 端到端:refresh 超时 ⇒ 心跳照常、master 不判 down**。已钉住的只是**核心不变式**
+  (`heartbeat::an_unfinished_refresh_never_blocks_the_beat_round`:未归的刷新绝不被 `await`、同盘至多一发在飞、
+  没有结果就不改容量);**仍缺**"让 `statvfs` 真卡住 + 由真 master 断言没被判 down" —— 需真机挂盘或故障注入 seam。
+- **8.5 压测标定**:数字必须在真实机器 + 真实负载上跑出来;拿到真实数据前**不填数字**
+  (抄一组数字进来比留着"未标定"更危险)。
