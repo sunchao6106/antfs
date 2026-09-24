@@ -322,6 +322,44 @@ const en: Dict = {
   balanceCancelled: "Plan {id} cancelled",
   balanceInvalidMaxMoves: "max moves must be a positive integer (or leave empty for the server default)",
   balanceLoadError: "Failed to load balance state: {err}",
+  // 主机磁盘页
+  tab_hostdisks: "Host disks",
+  hostTitle: "Store node {node}",
+  hostDisksNote:
+    "Per-disk numbers are request-level: store_server_disk_* summed across ops (put/get/delete/metadata/replica_metadata/segments). The two RT columns are each shown as average / p99 over the process lifetime (reset on restart): the average comes from the histogram _sum/_count, p99 from linear interpolation over the le buckets summed across ops for that disk. A p99 whose rank falls in the +Inf bucket can only be a LOWER BOUND (= highest finite bucket), so read it as \"≥ X\" — never as an exact quantile; no bucket samples at all shows \"—\", never 0.00 ms. IOPS / bandwidth / timeouts come from the diff between two 5s scrapes; pool columns are instantaneous. RT comes in two flavours on purpose: end-to-end (incl. pool queueing) vs syscall-only (measured inside the blocking closure) — the latter is the only correct ruler for \"is this disk slow\". Health shows the disk's serviceability state (HEALTHY / UNAVAILABLE / UNKNOWN / a specific failure): UNAVAILABLE means its requests now fail fast with 503. Engine-internal IO (flush / compaction / inbound replication) is still not attributed to a disk.",
+  hostSumIops: "Σ IOPS (/s)",
+  hostSumBandwidth: "Σ bandwidth",
+  hostAvgRt: "RT e2e (avg / p99, worst disk)",
+  hostSumSlow: "Σ timeouts (/s)",
+  hostSumInFlight: "Σ in-flight",
+  hostSumQueue: "Σ queue depth",
+  hostCapacity: "Capacity (free / total)",
+  hostDiskCol: "Disk",
+  hostDiskCapacity: "Capacity",
+  hostDiskIops: "IOPS (/s)",
+  hostDiskRt: "RT e2e (avg / p99 ms)",
+  hostDiskRtHint:
+    "End-to-end latency (incl. blocking-pool queueing), shown as average / p99 over the process lifetime — resets on restart. Average = _sum/_count; p99 = linear interpolation over the le buckets (summed across ops, this disk only). When the p99 rank falls in the +Inf bucket only a lower bound is available (the highest finite bucket): read that number as \"≥ X\".",
+  hostDiskP50:
+    "p50 = {v} — same ruler as this column (le buckets summed across ops, linear interpolation). A lower bound when the rank falls in the +Inf bucket; \"—\" when no bucket samples exist.",
+  hostDiskBandwidth: "Bandwidth",
+  hostDiskSlow: "Timeouts (/s)",
+  hostDiskInFlight: "In-flight (running + queued)",
+  hostDiskInFlightHint:
+    "Admitted but unfinished tasks in this disk's own bounded pool (running + queued). Counts data-plane requests only — engine-internal IO (flush/compaction/inbound replication) is not attributed.",
+  hostDiskRtSyscall: "RT syscall (avg / p99 ms)",
+  hostDiskRtSyscallHint:
+    "Latency measured INSIDE the blocking closure (the syscall itself, excluding pool queueing), shown as average / p99 — same ruler as the column next to it, same +Inf lower-bound caveat for p99. This is \"how fast is this disk\"; the RT column next to it is \"how slow did the user see it\" — they diverge when the pool is busy but the disk is fine.",
+  hostDiskQueue: "Queue",
+  hostDiskQueueHint:
+    "TRUE queue depth: admitted but not yet picked up by a worker, out of the disk's worker count. Sustained queueing means the pool is too small for this disk.",
+  hostDiskEvicted: "evicted",
+  hostDiskWatchdog: "watchdog {n}",
+  hostDiskPoolRejected: "pool rejected {n}",
+  hostDiskWorkSkipped: "bg skipped {n}",
+  hostDiskProbe: "Probe stuck",
+  hostProbeStuck: "stuck",
+  hostProbeSkipped: "skipped {n}",
 };
 
 const zh: Dict = {
@@ -637,6 +675,44 @@ const zh: Dict = {
   balanceCancelled: "计划 {id} 已取消",
   balanceInvalidMaxMoves: "最大迁移数需为正整数(或留空用服务端默认)",
   balanceLoadError: "读取均衡状态失败:{err}",
+  // 主机磁盘页
+  tab_hostdisks: "磁盘指标",
+  hostTitle: "Store 节点 {node}",
+  hostDisksNote:
+    "每盘数值来自 store 的 store_server_disk_* 指标,跨 op(put/get/delete/metadata/replica_metadata/segments)求和;IOPS / 带宽 / 超时取自相邻两次抓取(5s)的差分,池相关列是当前瞬时值,RT 两列都是进程生命周期累计的**平均 / p99**(重启清零):平均来自直方图的 `_sum`/`_count`,p99 由该盘 `le` 桶(跨 op 求和)线性插值而来。分位点落在最高桶(`+Inf`)时**只能给下界**(= 最高有限桶),读到的是「≥ X」而不是精确分位点;连桶样本都没有时显示「—」,绝不显示成 `0.00 ms`。**RT 刻意分两把尺子**:端到端(含池排队)与 syscall(闭包内计时,不含排队)—— 后者才是「这盘慢不慢」的正确判据。主机汇总卡里的 p99 取**该主机最差盘**的 p99(分位点不能相加,这是主机 p99 的上界)。健康列是该盘的**可服务性状态**(HEALTHY / UNAVAILABLE / UNKNOWN / 具体故障值):`UNAVAILABLE` = 已被隔离,该盘请求会 503 快失败。口径是请求级:引擎内部 IO(flush / compact / 入向复制)暂未归盘。",
+  hostSumIops: "Σ IOPS(次/s)",
+  hostSumBandwidth: "Σ 带宽",
+  hostAvgRt: "RT 端到端(平均 / p99 · 最差盘)",
+  hostSumSlow: "Σ 超时速率(次/s)",
+  hostSumInFlight: "Σ 在飞",
+  hostSumQueue: "Σ 队列深度",
+  hostCapacity: "容量(可用 / 总)",
+  hostDiskCol: "盘",
+  hostDiskCapacity: "容量",
+  hostDiskIops: "IOPS(次/s)",
+  hostDiskRt: "RT 端到端(平均 / p99 ms)",
+  hostDiskRtHint:
+    "端到端延迟(含 blocking 池排队),显示为进程生命周期累计的**平均 / p99** —— 重启即清零。平均 = `_sum`/`_count`;p99 = 该盘 `le` 桶跨 op 求和后**线性插值**。分位点落在最高桶(`+Inf`)时只能给**下界**(= 最高有限桶),那个数字要读作「≥ X」;没有桶样本则显示「—」而不是 0。",
+  hostDiskP50:
+    "p50 = {v} —— 与本列同一把尺子(`le` 桶跨 op 求和后线性插值)。落在最高桶(`+Inf`)时是**下界**;没有桶样本时为「—」。",
+  hostDiskBandwidth: "带宽",
+  hostDiskSlow: "超时速率(次/s)",
+  hostDiskInFlight: "在飞(运行中 + 排队中)",
+  hostDiskInFlightHint:
+    "该盘**自己的**有界池里已准入未完成的任务数(运行中 + 排队中)。仅统计数据面请求:引擎内部 IO(flush / compact / 入向复制)暂未归盘。",
+  hostDiskRtSyscall: "RT syscall(平均 / p99 ms)",
+  hostDiskRtSyscallHint:
+    "**闭包内**测得的耗时(即 syscall 本身,**不含池排队**),同样是**平均 / p99**、同样有 `+Inf` 只给下界的边界。它回答「这盘自己快不快」;旁边那列端到端 RT 回答「用户看到多慢」—— 池忙而盘健康时两者会明显分叉。",
+  hostDiskQueue: "队列",
+  hostDiskQueueHint:
+    "**真队列深度**:已准入但还没被 worker 取走 ÷ 该盘 worker 数。**持续排队**= 这个盘的池开小了。",
+  hostDiskEvicted: "已隔离",
+  hostDiskWatchdog: "看门狗 {n}",
+  hostDiskPoolRejected: "池拒绝 {n}",
+  hostDiskWorkSkipped: "后台跳过 {n}",
+  hostDiskProbe: "探测卡住",
+  hostProbeStuck: "卡住",
+  hostProbeSkipped: "跳过 {n}",
 };
 
 const dicts: Record<Lang, Dict> = { en, zh };

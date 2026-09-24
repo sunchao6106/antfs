@@ -555,55 +555,259 @@ async fn scrape_store(
 ) -> serde_json::Value {
     let url = format!("http://{}/metrics", node.addr);
     match store_client::get_text(&client, &url).await {
-        Some(text) => {
-            let s = antfs_metric::parse(&text);
-            json!({
-                "node_id": node.node_id,
-                "addr": node.addr,
-                "up": node.up,
-                "scrape_ok": true,
-                "put_total": sum_by_name(&s, "store_server_put_total"),
-                "get_total": sum_by_name(&s, "store_server_get_total"),
-                "put_bytes": sum_by_name(&s, "store_server_put_bytes_total"),
-                "get_bytes": sum_by_name(&s, "store_server_get_bytes_total"),
-                "errors_total": sum_by_name(&s, "store_server_errors_total"),
-                "replicas": sum_by_name(&s, "store_server_replicas"),
-                "replication_bytes_total": sum_by_name(&s, "store_server_replication_bytes_total"),
-                "compactions_total": sum_by_name(&s, "store_server_compactions_total"),
-                "manual_compactions_total": sum_by_name(&s, "store_server_manual_compactions_total"),
-                "blob_put_small_count": blob_count(&s, "put", "small"),
-                "blob_put_medium_count": blob_count(&s, "put", "medium"),
-                "blob_put_large_count": blob_count(&s, "put", "large"),
-                "blob_get_small_count": blob_count(&s, "get", "small"),
-                "blob_get_medium_count": blob_count(&s, "get", "medium"),
-                "blob_get_large_count": blob_count(&s, "get", "large"),
-            })
-        }
+        Some(text) => store_scrape_json(&node, true, &antfs_metric::parse(&text)),
         None => {
             metrics.store_scrape_errors.inc();
-            json!({
-                "node_id": node.node_id,
-                "addr": node.addr,
-                "up": node.up,
-                "scrape_ok": false,
-                "put_total": 0,
-                "get_total": 0,
-                "put_bytes": 0,
-                "get_bytes": 0,
-                "errors_total": 0,
-                "replicas": 0,
-                "replication_bytes_total": 0,
-                "compactions_total": 0,
-                "manual_compactions_total": 0,
-                "blob_put_small_count": 0,
-                "blob_put_medium_count": 0,
-                "blob_put_large_count": 0,
-                "blob_get_small_count": 0,
-                "blob_get_medium_count": 0,
-                "blob_get_large_count": 0,
-            })
+            // 失败分支:样本为空 → 各指标按"取不到填 0"得 0;与成功分支共用同一处构造,
+            // 两个分支的键集不可能漂移(前端不做存在性判断)。
+            store_scrape_json(&node, false, &[])
         }
     }
+}
+
+/// 单节点抓取结果的 JSON:除 `scrape_ok` 外全部字段由 `s` 推导(空样本 = 失败分支的占位 0)。
+fn store_scrape_json(
+    node: &NodeDto,
+    scrape_ok: bool,
+    s: &[antfs_metric::Sample],
+) -> serde_json::Value {
+    json!({
+        "node_id": node.node_id,
+        "addr": node.addr,
+        "up": node.up,
+        "scrape_ok": scrape_ok,
+        "put_total": sum_by_name(s, "store_server_put_total"),
+        "get_total": sum_by_name(s, "store_server_get_total"),
+        "put_bytes": sum_by_name(s, "store_server_put_bytes_total"),
+        "get_bytes": sum_by_name(s, "store_server_get_bytes_total"),
+        "errors_total": sum_by_name(s, "store_server_errors_total"),
+        "replicas": sum_by_name(s, "store_server_replicas"),
+        "replication_bytes_total": sum_by_name(s, "store_server_replication_bytes_total"),
+        "compactions_total": sum_by_name(s, "store_server_compactions_total"),
+        "manual_compactions_total": sum_by_name(s, "store_server_manual_compactions_total"),
+        "blob_put_small_count": blob_count(s, "put", "small"),
+        "blob_put_medium_count": blob_count(s, "put", "medium"),
+        "blob_put_large_count": blob_count(s, "put", "large"),
+        "blob_get_small_count": blob_count(s, "get", "small"),
+        "blob_get_medium_count": blob_count(s, "get", "medium"),
+        "blob_get_large_count": blob_count(s, "get", "large"),
+        "disks": disks_json(s),
+    })
+}
+
+/// 每盘一条的明细,按 `disk_id` 升序。盘列表**从样本的 `disk_id` label 枚举**(不假设盘号/盘数),
+/// 故加盘/换盘号无需改代码;数值跨 `op` 求和(同名样本每个 op 一条)。
+/// 口径提醒:`*_requests_total` / `*_bytes_total` 是**请求级**数字,引擎内部 IO(flush / compaction /
+/// 入向复制)尚未归盘;`rt_sum`/`rt_count` 是延迟直方图的 `_sum`/`_count` 原样透出(平均在 UI 侧算);
+/// `*_p50`/`*_p99` 由 `_bucket` 的 `le` 桶**线性插值**得到(平均会掩盖长尾,分位点才看得出),
+/// 与同一指标的 `_sum`/`_count` 是**同一批观测**(都跨 op 求和),两把尺子(端到端 / syscall)不混。
+fn disks_json(s: &[antfs_metric::Sample]) -> Vec<serde_json::Value> {
+    let mut ids: Vec<&str> = s.iter().filter_map(|x| disk_label(&x.labels)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter().map(|id| disk_json(s, id)).collect()
+}
+
+/// 样本的 `disk_id` label 值(无该 label = 不是磁盘维度样本)。
+fn disk_label(labels: &[(String, String)]) -> Option<&str> {
+    labels
+        .iter()
+        .find(|(k, _)| k == "disk_id")
+        .map(|(_, v)| v.as_str())
+}
+
+fn disk_json(s: &[antfs_metric::Sample], id: &str) -> serde_json::Value {
+    let sum = |name: &str| sum_disk(s, name, id);
+    json!({
+        "disk_id": id,
+        "requests_total": sum("store_server_disk_requests_total"),
+        "bytes_total": sum("store_server_disk_bytes_total"),
+        "slow_requests_total": sum("store_server_disk_slow_requests_total"),
+        "in_flight": sum("store_server_disk_in_flight_requests"),
+        // 探测卡住是 0/1 gauge(每盘一条):求和会得出 2、3 这类假数,任一为 1 即取 1。
+        "probe_stuck": u64::from(s.iter().any(|x| {
+            x.name == "store_server_disk_probe_stuck"
+                && disk_label(&x.labels) == Some(id)
+                && x.value != 0.0
+        })),
+        "probe_skipped_total": sum("store_server_disk_probe_skipped_total"),
+        "rt_sum_seconds": sum_disk_f64(s, "store_server_disk_request_duration_seconds_sum", id),
+        "rt_count": sum("store_server_disk_request_duration_seconds_count"),
+        // 分位点:端到端口径(含池排队)。取不到桶样本 → `null`(UI 显示「—」),**不是 0**。
+        "rt_p50_seconds": disk_quantile_seconds(
+            s,
+            "store_server_disk_request_duration_seconds",
+            id,
+            0.50,
+        ),
+        "rt_p99_seconds": disk_quantile_seconds(
+            s,
+            "store_server_disk_request_duration_seconds",
+            id,
+            0.99,
+        ),
+        // ── 每盘池(D1):**真队列深度**终于有了 —— 以前只有"在飞代偿"(in_flight 含正在执行的)。
+        "pool_workers": sum("store_server_disk_pool_workers"),
+        "pool_queued": sum("store_server_disk_pool_queued"),
+        "pool_in_flight": sum("store_server_disk_pool_in_flight"),
+        "pool_rejected_total": sum("store_server_disk_pool_rejected_total"),
+        // ── 健康(D2)/ 看门狗(D3) ──
+        // 状态是 0/1 的 gauge 族(`state` 各异):求和没有意义,故走"取当前为 1 的那一个状态名"。
+        "health_state": disk_health_state(s, id),
+        "io_watchdog_trips_total": sum("store_server_disk_io_watchdog_trips_total"),
+        "worker_skipped_total": sum("store_server_disk_worker_skipped_total"),
+        // syscall 口径的 IO 直方图(与上面 rt_* 的端到端口径**刻意区分**,见 store.md §12.12)。
+        "io_sum_seconds": sum_disk_f64(s, "store_server_disk_io_duration_seconds_sum", id),
+        "io_count": sum("store_server_disk_io_duration_seconds_count"),
+        "io_p50_seconds": disk_quantile_seconds(s, "store_server_disk_io_duration_seconds", id, 0.50),
+        "io_p99_seconds": disk_quantile_seconds(s, "store_server_disk_io_duration_seconds", id, 0.99),
+    })
+}
+
+/// 该盘**当前**的健康状态串(D2):`disk_health_state{disk_id,state}` 是一族 0/1 gauge
+/// (每次刷新**整族摆平**:当前状态 1、其余 0),故取"值为 1 的那一个 `state`"。
+///
+/// 取不到任何样本(老版本 store / 抓取失败)→ `"UNKNOWN"`:与 store 侧"从未观测"同一口径 ——
+/// **不谎报 HEALTHY**(否则看板上"没数据"会被读成"盘很好")。
+fn disk_health_state(s: &[antfs_metric::Sample], id: &str) -> String {
+    s.iter()
+        .find(|x| {
+            x.name == "store_server_disk_health_state"
+                && disk_label(&x.labels) == Some(id)
+                && x.value != 0.0
+        })
+        .and_then(|x| {
+            x.labels
+                .iter()
+                .find(|(k, _)| k == "state")
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or_else(|| "UNKNOWN".to_string())
+}
+
+/// 该盘某指标的求和(跨 `op`),整数口径:计数 / 字节 / gauge 类样本。
+fn sum_disk(samples: &[antfs_metric::Sample], name: &str, disk_id: &str) -> u64 {
+    samples
+        .iter()
+        .filter(|s| s.name == name && disk_label(&s.labels) == Some(disk_id))
+        .map(|s| s.value as u64)
+        .sum()
+}
+
+/// 该盘某指标的求和(跨 `op`),浮点口径:延迟直方图的 `_sum` 截成整数会丢秒级以下精度。
+fn sum_disk_f64(samples: &[antfs_metric::Sample], name: &str, disk_id: &str) -> f64 {
+    samples
+        .iter()
+        .filter(|s| s.name == name && disk_label(&s.labels) == Some(disk_id))
+        .map(|s| s.value)
+        .sum()
+}
+
+/// 该盘某延迟直方图的分位点(秒),口径 = `_bucket` 的 `le` 桶**跨 `op` 求和**后线性插值。
+///
+/// 为什么要它:平均值会把长尾平均掉 —— 「平均 3ms、p99 900ms」与「平均 3ms、p99 5ms」在平均那一列
+/// **长得一模一样**,而前者的用户已经在超时了。两把尺子(端到端 / syscall)各自出各自的分位点,不混。
+///
+/// 取不到桶样本(老版本 store / 该盘零请求)→ `None` → JSON `null`,UI 显示「—」:
+/// **没数据 ≠ 零延迟**,不许显示成 `0.00 ms`。
+fn disk_quantile_seconds(
+    samples: &[antfs_metric::Sample],
+    metric: &str,
+    disk_id: &str,
+    q: f64,
+) -> Option<f64> {
+    // 出口再把非有限值挡掉:JSON 里绝不允许出现 NaN / Inf。
+    histogram_quantile(&disk_buckets(samples, metric, disk_id), q).filter(|v| v.is_finite())
+}
+
+/// 该盘某直方图的 `_bucket` 样本 → `(le 上界, 累计计数)` 列表,按 `le` 升序。
+///
+/// **按 `le` 跨 `op` 求和**:同名 `_bucket` 每个 op 各一条,每个 op 都是各自完整的直方图;
+/// 求和后得到的是"该盘全部 op 的合并分布" —— 与 `rt_sum_seconds`/`rt_count` 跨 op 求和是**同一批观测**,
+/// 否则平均与 p99 来自两批不同的样本,放一起看会误导。
+fn disk_buckets(samples: &[antfs_metric::Sample], metric: &str, disk_id: &str) -> Vec<(f64, f64)> {
+    let name = format!("{metric}_bucket");
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for s in samples {
+        if s.name != name || disk_label(&s.labels) != Some(disk_id) {
+            continue;
+        }
+        // 没有 `le` 就不是桶样本(用 `None` 跳过,不猜)。
+        let Some(le) = bucket_le(&s.labels) else {
+            continue;
+        };
+        match out.iter_mut().find(|(k, _)| *k == le) {
+            Some((_, c)) => *c += s.value,
+            None => out.push((le, s.value)),
+        }
+    }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// 样本的 `le` label → 桶上界(`"+Inf"` → `f64::INFINITY`);缺 label / 解析失败 / NaN → `None`。
+fn bucket_le(labels: &[(String, String)]) -> Option<f64> {
+    labels
+        .iter()
+        .find(|(k, _)| k == "le")
+        .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+        .filter(|v| !v.is_nan())
+}
+
+/// 分位点估计(口径照抄 Prometheus `histogram_quantile`:累计各 `le` 桶计数 → 找到目标秩所在的桶 →
+/// 在桶内**线性插值**)。
+///
+/// 边界(如实标注,不谎报精度):
+/// - 无桶样本 / 总计数为 0 / 算出非有限值 → `None`;
+/// - 目标秩落在 **`+Inf` 桶**:该桶没有上界,**不插值**,只返回最高有限 `le` 作**下界**
+///   (即"p99 ≥ X"),绝不声称超出最高桶的精度;
+/// - 只有一个桶时同样只能给该桶区间内的插值(首个桶的下界按 0 算,与 Prometheus 一致);
+///   只有一个 `+Inf` 桶时连下界都无从谈起 → `None`;
+/// - 计数先做**单调化**(取前缀最大值):跨 op 求和理论上仍单调,但导出的瞬时快照可能不是,
+///   不单调会让"第一个 `>= 秩` 的桶"落错位置。
+fn histogram_quantile(buckets: &[(f64, f64)], q: f64) -> Option<f64> {
+    if buckets.is_empty() || !q.is_finite() {
+        return None;
+    }
+    // 单调化(前缀最大值):跨 op 求和在理论上仍单调,但瞬时导出的快照可能不是;
+    // 不单调会让"第一个 `>= 秩` 的桶"落错位置。顺带把 NaN 计数抹掉(`f64::max` 忽略 NaN)。
+    let mut cum: Vec<(f64, f64)> = Vec::with_capacity(buckets.len());
+    let mut prev = 0.0_f64;
+    for (le, c) in buckets {
+        prev = c.max(prev);
+        cum.push((*le, prev));
+    }
+    // 总计数 = 最高桶的累计计数(有 `+Inf` 时它就是全量)。
+    let total = cum.last()?.1;
+    if !total.is_finite() || total <= 0.0 {
+        return None; // 零请求 / 计数坏了:分位点无从谈起
+    }
+    let rank = q.clamp(0.0, 1.0) * total;
+
+    for (i, (le, count)) in cum.iter().enumerate() {
+        if *count < rank {
+            continue; // 秩不在这桶里
+        }
+        // 当前桶的下界 = 上一个桶的上界(首桶按 0 算,与 Prometheus 一致)。
+        let (lower, lower_count) = match i.checked_sub(1).and_then(|j| cum.get(j)) {
+            Some((pl, pc)) => (*pl, *pc),
+            None => (0.0, 0.0),
+        };
+        if !le.is_finite() {
+            // `+Inf` 桶没有上界:不插值,只返回**下界**(即"分位点 ≥ 这个值")。
+            // 连一个有限桶都没有(整盘只有一个 `+Inf` 桶)时下界是空洞的 0 —— 那等于没数据,给 None。
+            return if i == 0 { None } else { Some(lower) };
+        }
+        if *count <= lower_count {
+            // 防御性:该桶区间内没有新增观测(累计与前一桶相同)时退化为桶上界,避免 0/0 得到 NaN。
+            return Some(*le);
+        }
+        let fraction = (rank - lower_count) / (*count - lower_count);
+        return Some(lower + fraction * (*le - lower));
+    }
+    // 不可达兜底:秩 ≤ 总计数 = 最高桶的累计计数,上面的循环必然已返回
+    // (最高桶无论有限还是 `+Inf` 都会命中)。
+    None
 }
 
 /// 成功 blob 请求数,按 `op` × `size` **精确取自** `store_server_blob_request_duration_seconds_count`
@@ -2234,6 +2438,241 @@ mod tests {
             "带 kind label 的 counter 按名求和: {v}"
         );
         assert_eq!(s["manual_compactions_total"], 7);
+    }
+
+    #[tokio::test]
+    async fn api_metrics_store_disk_breakdown_sorted_and_summed_across_ops() {
+        // 文本里 d2 在前,d1 在后 → 输出必须按 disk_id 升序;每个指标跨 op 求和。
+        let addr = spawn_fake_store(
+            "store_server_disk_requests_total{disk_id=\"d2\",op=\"put\"} 5\n\
+             store_server_disk_requests_total{disk_id=\"d2\",op=\"get\"} 7\n\
+             store_server_disk_requests_total{disk_id=\"d1\",op=\"put\"} 3\n\
+             store_server_disk_bytes_total{disk_id=\"d1\",op=\"put\"} 2\n\
+             store_server_disk_bytes_total{disk_id=\"d1\",op=\"get\"} 40\n\
+             store_server_disk_bytes_total{disk_id=\"d2\",op=\"put\"} 100\n\
+             store_server_disk_slow_requests_total{disk_id=\"d1\",op=\"get\"} 1\n\
+             store_server_disk_in_flight_requests{disk_id=\"d1\",op=\"put\"} 2\n\
+             store_server_disk_in_flight_requests{disk_id=\"d1\",op=\"get\"} 1\n\
+             store_server_disk_in_flight_requests{disk_id=\"d2\",op=\"put\"} 4\n\
+             store_server_disk_request_duration_seconds_sum{disk_id=\"d1\",op=\"put\"} 0.25\n\
+             store_server_disk_request_duration_seconds_sum{disk_id=\"d1\",op=\"get\"} 0.75\n\
+             store_server_disk_request_duration_seconds_count{disk_id=\"d1\",op=\"put\"} 3\n\
+             store_server_disk_request_duration_seconds_count{disk_id=\"d1\",op=\"get\"} 2\n\
+             store_server_disk_probe_stuck{disk_id=\"d1\"} 0\n\
+             store_server_disk_probe_stuck{disk_id=\"d2\"} 1\n\
+             store_server_disk_probe_skipped_total{disk_id=\"d2\"} 4\n\
+             store_server_put_total 9\n",
+            false,
+        )
+        .await;
+        let router = app_with(
+            Arc::new(FakeMaster::default().with_node(101, &addr)),
+            AuthConfig::default(),
+        );
+
+        let req = Request::get("/api/metrics").body(Body::empty()).unwrap();
+        let v = body_json(&router, req).await;
+        let s = &v["stores"][0];
+        let disks = s["disks"].as_array().unwrap();
+        assert_eq!(disks.len(), 2, "两块盘: {v}");
+        assert_eq!(disks[0]["disk_id"], "d1");
+        assert_eq!(disks[1]["disk_id"], "d2");
+
+        assert_eq!(disks[0]["requests_total"], 3);
+        assert_eq!(disks[0]["bytes_total"], 42);
+        assert_eq!(disks[0]["slow_requests_total"], 1);
+        assert_eq!(disks[0]["in_flight"], 3);
+        assert_eq!(disks[0]["rt_sum_seconds"].as_f64().unwrap(), 1.0);
+        assert_eq!(disks[0]["rt_count"], 5);
+        assert_eq!(disks[0]["probe_stuck"], 0);
+        assert_eq!(disks[0]["probe_skipped_total"], 0);
+
+        assert_eq!(disks[1]["requests_total"], 12);
+        assert_eq!(disks[1]["bytes_total"], 100);
+        assert_eq!(disks[1]["slow_requests_total"], 0);
+        assert_eq!(disks[1]["in_flight"], 4);
+        assert_eq!(disks[1]["rt_sum_seconds"].as_f64().unwrap(), 0.0);
+        assert_eq!(disks[1]["rt_count"], 0);
+        assert_eq!(disks[1]["probe_stuck"], 1, "任一为 1 即 1,不做求和");
+        assert_eq!(disks[1]["probe_skipped_total"], 4);
+
+        // 新样本不得漏进既有的按名求和(键集/口径都要原样保持)。
+        assert_eq!(s["put_total"], 9);
+        assert_eq!(s["blob_put_small_count"], 0);
+
+        // 没有 `_bucket` 样本 → 分位点是 `null`(UI 显示「—」),**不是 0**:
+        // 「没数据」与「零延迟」必须能分辨。
+        assert!(disks[0]["rt_p50_seconds"].is_null(), "无桶样本: {v}");
+        assert!(disks[0]["rt_p99_seconds"].is_null());
+        assert!(disks[1]["io_p50_seconds"].is_null());
+        assert!(disks[1]["io_p99_seconds"].is_null());
+    }
+
+    #[tokio::test]
+    async fn api_metrics_store_disk_quantiles_sum_buckets_across_ops() {
+        // 桶**按 `le` 跨 op 求和**后再插值(与 rt_sum/rt_count 同一批观测):
+        // put: le 0.005 → 1, le 0.01 → 3, +Inf → 4;get: le 0.005 → 0, le 0.01 → 1, +Inf → 1
+        // 合并: 0.005 → 1, 0.01 → 4, +Inf → 5(总 5)。
+        // p50 秩 = 2.5 → 落在 (0.005, 0.01] → 0.005 + (2.5-1)/(4-1) × 0.005 = 0.0075。
+        // p99 秩 = 4.95 → 落在 `+Inf` 桶 → **只能给下界** = 0.01(不插值、不谎报精度)。
+        let addr = spawn_fake_store(
+            "store_server_disk_request_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"0.005\"} 1\n\
+             store_server_disk_request_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"0.01\"} 3\n\
+             store_server_disk_request_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"+Inf\"} 4\n\
+             store_server_disk_request_duration_seconds_bucket{disk_id=\"d1\",op=\"get\",le=\"0.005\"} 0\n\
+             store_server_disk_request_duration_seconds_bucket{disk_id=\"d1\",op=\"get\",le=\"0.01\"} 1\n\
+             store_server_disk_request_duration_seconds_bucket{disk_id=\"d1\",op=\"get\",le=\"+Inf\"} 1\n\
+             store_server_disk_io_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"0.1\"} 1\n\
+             store_server_disk_io_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"1\"} 2\n\
+             store_server_disk_io_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"+Inf\"} 3\n",
+            false,
+        )
+        .await;
+        let router = app_with(
+            Arc::new(FakeMaster::default().with_node(101, &addr)),
+            AuthConfig::default(),
+        );
+
+        let req = Request::get("/api/metrics").body(Body::empty()).unwrap();
+        let v = body_json(&router, req).await;
+        let d = &v["stores"][0]["disks"][0];
+        assert_eq!(d["disk_id"], "d1");
+        let f = |k: &str| d[k].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            (f("rt_p50_seconds") - 0.0075).abs() < 1e-9,
+            "p50 桶内线性插值: {d}"
+        );
+        assert!(
+            (f("rt_p99_seconds") - 0.01).abs() < 1e-9,
+            "秩落在 +Inf 桶 → 只给下界(最高有限 le): {d}"
+        );
+        // syscall 口径独立一套桶:le 0.1 → 1, le 1 → 2, +Inf → 3(总 3)。
+        // p50 秩 1.5 → 落在 (0.1, 1] → 0.1 + (1.5-1)/(2-1) × 0.9 = 0.55。
+        // p99 秩 2.97 → 落在 `+Inf` 桶 → 下界 = 1(该盘最高有限桶)。
+        assert!(
+            (f("io_p50_seconds") - 0.55).abs() < 1e-9,
+            "syscall 口径: {d}"
+        );
+        assert!(
+            (f("io_p99_seconds") - 1.0).abs() < 1e-9,
+            "同上,+Inf 桶给下界: {d}"
+        );
+    }
+
+    /// 桶内插值必然带浮点舍入,断言用近似(`1e-9`)而不是 `==`。
+    fn close(got: Option<f64>, want: f64) -> bool {
+        got.is_some_and(|g| (g - want).abs() < 1e-9)
+    }
+
+    #[test]
+    fn histogram_quantile_edges() {
+        // 空输入 → None(UI 显示「—」,不是 0.00 ms)。
+        assert_eq!(histogram_quantile(&[], 0.5), None);
+        // 有桶但总计数为 0(该盘零请求)→ None,而不是 0。
+        assert_eq!(
+            histogram_quantile(&[(0.01, 0.0), (f64::INFINITY, 0.0)], 0.5),
+            None
+        );
+        // 只有一个桶:秩只能在这桶区间内插值,首桶下界按 0 算(与 Prometheus 一致)。
+        let one = [(0.005, 3.0)];
+        assert!(
+            close(histogram_quantile(&one, 0.5), 0.0025),
+            "p50 = 1.5/3 × 0.005"
+        );
+        assert!(close(histogram_quantile(&one, 1.0), 0.005));
+        // 秩正好落在桶边界上(秩 == 该桶累计计数)→ 恰好是该桶上界,不多插一格。
+        let b = [(0.01, 2.0), (0.1, 4.0), (f64::INFINITY, 4.0)];
+        assert!(
+            close(histogram_quantile(&b, 0.5), 0.01),
+            "秩 2 = 第一桶累计"
+        );
+        assert!(close(histogram_quantile(&b, 1.0), 0.1), "秩 4 = 第二桶累计");
+        // 桶内线性插值:`0.01 + (3.6-2)/(4-2) × 0.09`。
+        assert!(close(histogram_quantile(&b, 0.9), 0.082));
+        // 秩落在 `+Inf` 桶 → 只给下界 = 最高有限 `le`(绝不声称超出最高桶的精度)。
+        assert_eq!(
+            histogram_quantile(&[(0.01, 1.0), (f64::INFINITY, 10.0)], 0.99),
+            Some(0.01)
+        );
+        // 没有 `+Inf` 兜底桶(导出不完整)时,秩仍落在最高那个有限桶的区间内 → 照常桶内插值。
+        assert!(close(histogram_quantile(&[(0.01, 1.0)], 0.99), 0.0099));
+        // 只有一个 `+Inf` 桶:连下界都无从谈起 → None(不给空洞的 0)。
+        assert_eq!(histogram_quantile(&[(f64::INFINITY, 3.0)], 0.5), None);
+        // 计数非单调(瞬时导出可能如此)先单调化再定桶,不许选错桶。
+        let messy = [(0.01, 9.0), (0.1, 4.0), (f64::INFINITY, 10.0)];
+        assert!(close(histogram_quantile(&messy, 0.5), 5.0 / 9.0 * 0.01));
+        assert!(
+            close(histogram_quantile(&messy, 0.95), 0.1),
+            "秩 9.5 落到 +Inf"
+        );
+        // 非有限的分位参数不猜值;结果一律有限(JSON 里不许出现 NaN / Inf)。
+        assert_eq!(histogram_quantile(&b, f64::NAN), None);
+        assert!(histogram_quantile(&b, 0.5).is_some_and(f64::is_finite));
+    }
+
+    #[test]
+    fn disk_buckets_sums_by_le_across_ops_and_skips_non_bucket_samples() {
+        let s = antfs_metric::parse(
+            "store_server_disk_io_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"+Inf\"} 4\n\
+             store_server_disk_io_duration_seconds_bucket{disk_id=\"d1\",op=\"put\",le=\"0.1\"} 2\n\
+             store_server_disk_io_duration_seconds_bucket{disk_id=\"d1\",op=\"get\",le=\"0.1\"} 1\n\
+             store_server_disk_io_duration_seconds_bucket{disk_id=\"d2\",op=\"put\",le=\"0.1\"} 7\n\
+             store_server_disk_io_duration_seconds_bucket{disk_id=\"d1\",op=\"put\"} 5\n\
+             store_server_disk_io_duration_seconds_count{disk_id=\"d1\",op=\"put\"} 4\n",
+        );
+        // 按 `le` 升序、跨 op 求和、别的盘与"漏了 le 的畸形样本"都不许混进来。
+        // (d1 那条没 `le` 的样本 parse 得出来但**不算桶** —— 5 不该被加进任何桶。)
+        assert_eq!(
+            disk_buckets(&s, "store_server_disk_io_duration_seconds", "d1"),
+            vec![(0.1, 3.0), (f64::INFINITY, 4.0)]
+        );
+        assert_eq!(
+            disk_buckets(&s, "store_server_disk_io_duration_seconds", "d2"),
+            vec![(0.1, 7.0)]
+        );
+        assert!(disk_buckets(&s, "store_server_disk_io_duration_seconds", "d9").is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_metrics_store_scrape_failure_keeps_same_key_set() {
+        // 一个抓得到 + 一个抓不到的节点:同一响应里两种形状的**键集必须逐项一致**
+        // (失败分支此前是另一份手写 JSON,漏字段只会在前端静默显示 "—")。
+        let ok_addr = spawn_fake_store("store_server_put_total 1\n", false).await;
+        let dead_addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let router = app_with(
+            Arc::new(
+                FakeMaster::default()
+                    .with_node(101, &ok_addr)
+                    .with_node(102, &dead_addr),
+            ),
+            AuthConfig::default(),
+        );
+
+        let req = Request::get("/api/metrics").body(Body::empty()).unwrap();
+        let v = body_json(&router, req).await;
+        let stores = v["stores"].as_array().unwrap();
+        assert_eq!(stores.len(), 2);
+        let ok = stores.iter().find(|x| x["node_id"] == 101).unwrap();
+        let bad = stores.iter().find(|x| x["node_id"] == 102).unwrap();
+        assert_eq!(ok["scrape_ok"], true);
+        assert_eq!(bad["scrape_ok"], false, "连不上: {v}");
+        assert_eq!(bad["up"], true, "node.up 照抄 master,不因抓取失败改判");
+        assert!(
+            bad["disks"].as_array().unwrap().is_empty(),
+            "抓不到 → 空盘清单: {bad}"
+        );
+        assert_eq!(bad["put_total"], 0);
+        assert_eq!(bad["blob_get_large_count"], 0);
+
+        let keys = |o: &serde_json::Value| {
+            let mut k: Vec<String> = o.as_object().unwrap().keys().cloned().collect();
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(keys(ok), keys(bad), "成功/失败两分支键集必须一致");
     }
 
     #[tokio::test]

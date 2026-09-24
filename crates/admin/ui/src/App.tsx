@@ -17,14 +17,15 @@ import { CapacityTab } from "./tabs/CapacityTab";
 import { NodesTab } from "./tabs/NodesTab";
 import { PartitionsTab } from "./tabs/PartitionsTab";
 import { MetricsTab } from "./tabs/MetricsTab";
+import { HostDisksTab } from "./tabs/HostDisksTab";
 import { BalanceTab } from "./tabs/BalanceTab";
 import { OpsTab } from "./tabs/OpsTab";
 import { AuditTab } from "./tabs/AuditTab";
 
 const REFRESH_MS = 5000;
 
-type Tab = "overview" | "capacity" | "nodes" | "partitions" | "metrics" | "balance" | "ops" | "audit";
-const ALL_TABS: Tab[] = ["overview", "capacity", "nodes", "partitions", "metrics", "balance", "ops", "audit"];
+type Tab = "overview" | "capacity" | "nodes" | "partitions" | "metrics" | "hostdisks" | "balance" | "ops" | "audit";
+const ALL_TABS: Tab[] = ["overview", "capacity", "nodes", "partitions", "metrics", "hostdisks", "balance", "ops", "audit"];
 
 /** 仅 operator 可见的 tab(viewer 即使手改 hash 也回落到概览)。 */
 const OPERATOR_TABS: Tab[] = ["ops", "audit"];
@@ -164,6 +165,7 @@ export function App() {
         />
       )}
       {active === "metrics" && <MetricsTab t={t} cluster={cluster} />}
+      {active === "hostdisks" && <HostDisksTab t={t} nodes={nodes} />}
       {active === "balance" && <BalanceTab t={t} isOperator={isOperator} />}
       {active === "ops" && isOperator && (
         <OpsTab t={t} nodes={nodes} cluster={cluster} onDone={refresh} setError={setError} />

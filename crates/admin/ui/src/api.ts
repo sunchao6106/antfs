@@ -194,11 +194,75 @@ export interface AdminMetrics {
   master_rpc_errors_total: number;
 }
 
+/**
+ * 单盘明细(`/api/metrics` stores 段的 `disks` 元素;盘从样本的 `disk_id` label 枚举,按 id 升序)。
+ *
+ * 数值**跨 `op` 求和**;口径是**请求级**(数据面请求),引擎内部 IO(flush / compact / 入向复制)尚未归盘。
+ */
+export interface StoreDiskMetrics {
+  disk_id: string;
+  /** 落在该盘的请求数(差分即该盘 IOPS)。 */
+  requests_total: number;
+  /** 该盘**成功**请求的字节数(差分即该盘带宽)。 */
+  bytes_total: number;
+  /** 端到端耗时超过 `disk_health_timeout_secs` 的请求数(差分即超时速率)。 */
+  slow_requests_total: number;
+  /** 该盘在途请求数(**含正在执行**的) —— 注意它**不是**队列深度,真队列深度看 `pool_queued`。 */
+  in_flight: number;
+  /** 延迟直方图的 `_sum`(秒)/ `_count`:平均 RT = sum / count(跨进程生命周期累计,重启清零)。 */
+  rt_sum_seconds: number;
+  rt_count: number;
+  /**
+   * **端到端**口径的分位点(秒,p50 / p99):由同一份直方图的 `le` 桶**跨 op 求和后线性插值**得到
+   * (口径照抄 Prometheus `histogram_quantile`),与 `rt_sum_seconds`/`rt_count` 是**同一批观测** ——
+   * 平均会把长尾平均掉,分位点才看得出长尾(`3ms / 900ms` 与 `3ms / 5ms` 的平均可以一模一样)。
+   *
+   * `null` = 取不到桶样本(老版本 store / 该盘零请求):UI 必须显示「—」,**不许当成 0 ms**。
+   * 目标秩落在最高桶(`+Inf`)时**只能给下界**:返回值 = 最高有限 `le`,即"真实分位点 ≥ 这个数"
+   * (绝不声称超出最高桶的精度)。见 cluster.md §11 / store.md §12.12。
+   */
+  rt_p50_seconds: number | null;
+  rt_p99_seconds: number | null;
+  /** 1 = 该盘有健康探测线程卡在设备里。 */
+  probe_stuck: number;
+  /** 因上一轮探测未返回而跳过的探测轮次。 */
+  probe_skipped_total: number;
+  // ── 每盘有界池(真队列深度)────────────────────────────────────────────────
+  /** 该盘池的 worker 线程数(启动时定死)。 */
+  pool_workers: number;
+  /** **真队列深度**:已准入但**还没被 worker 取走**的任务数。 */
+  pool_queued: number;
+  /** 已准入未完成(运行中 + 排队中)的任务数;逼近 `pool_workers` 即该盘正在被压满。 */
+  pool_in_flight: number;
+  /** 被该盘池拒掉的提交数(池满超时 / 未知盘 / 池已关)。**持续增长 = 该加池或查盘**。 */
+  pool_rejected_total: number;
+  // ── 健康与看门狗 ──────────────────────────────────────────────────────────
+  /** 该盘当前状态:`HEALTHY` / `UNAVAILABLE`(已被隔离,请求会 503)/ `UNKNOWN`(从未观测)/ 具体故障枚举。 */
+  health_state: string;
+  /** 看门狗判定的单次 IO 超期次数(闭包内 syscall 口径)。 */
+  io_watchdog_trips_total: number;
+  /** 因盘不可服务而被跳过的后台工作数(flush / compaction / replication)。 */
+  worker_skipped_total: number;
+  /**
+   * **syscall 口径**的 IO 直方图 `_sum`/`_count`:平均 = sum/count。
+   *
+   * 与 `rt_sum_seconds`(端到端,**含池排队**)**刻意区分**:这个回答"这盘自己快不快",
+   * 那个回答"用户看到多慢"。盘忙但健康时,两者会明显分叉。
+   */
+  io_sum_seconds: number;
+  io_count: number;
+  /** **syscall 口径**的分位点(秒,p50 / p99):同上,但取的是闭包内那套 `le` 桶,不含池排队。 */
+  io_p50_seconds: number | null;
+  io_p99_seconds: number | null;
+}
+
 export interface StoreMetrics {
   node_id: number;
   addr: string;
   up: boolean;
   scrape_ok: boolean;
+  /** 逐盘明细(抓取失败 → 空数组)。 */
+  disks: StoreDiskMetrics[];
   put_total: number;
   get_total: number;
   put_bytes: number;
