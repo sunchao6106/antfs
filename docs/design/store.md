@@ -153,7 +153,7 @@ key(`StoreKey`,**8B** = 64bit blobId:高 32bit partitionId + 低 32bit objectId,
 - 单机崩溃(掉电/panic):最近一次 flush 之后、未 fsync 的数据可能丢——由**多副本**兜底(未来在复制层)。
 - 本层保证:**flush 之前的数据崩溃后可完整恢复**(崩溃一致性属性测试)。因 buffered,测试直接断言恢复出的 data_end == 最后 flush 边界。
 - 恢复:加载已落盘索引 + 按**持久化水位**回放 log 尾部(增量,对齐 Ambry `recover()`);索引损坏时自动回退全量扫 log 重建(数据 fsync 是持久边界,索引可重建)。
-- compaction 崩溃:`COMPACT_COMMIT` 标记 + open 时收敛 + 清理残留 `.tmp` 新段。
+- compaction 崩溃:`COMPACT_COMMIT` 标记 + open 时收敛 + 清理残留 `.tmp` 新段。进程内 COPY 失败(如 ENOSPC / 读到坏记录):哨兵就地删掉半成品(`log.new` / `.tmp` 段)并撤掉标记——都还没 rename,无副作用,不留到重启。
 
 ## 7. 测试策略(学 ShardStore)
 

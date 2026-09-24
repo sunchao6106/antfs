@@ -1723,6 +1723,8 @@ impl BlobStore {
     ///
     /// 崩溃安全:先建 `log.new` 并 fsync → 写提交标记 → 目录 rename 换入(log→log.old,log.new→log)
     /// → 重建索引 → 删标记与 log.old。任一步崩溃,`open()` 依据标记修复(见 `recover_compaction`)。
+    /// 进程内 COPY 失败(如 ENOSPC / 读到坏记录):哨兵就地删掉半成品 `log.new`
+    /// (标记尚未写下,无副作用),不会把预分配的半成品留在盘上直到重启。
     pub fn compact(&self, policy: &CompactPolicy) -> Result<CompactionStats> {
         let _t = self.metrics.compaction_duration.start_timer();
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
@@ -1741,6 +1743,8 @@ impl BlobStore {
         // **段代次接着旧 log 往后取**(位置从 0 重来):于是新目录里的段身份与旧目录**绝不重复**,
         // 旧游标必然"认不出自己的段"(见 `docs/design/store.md` 的"复制游标重定位")。
         let next_generation = old.log.max_generation() + 1;
+        // COPY 失败(进程内)就地清掉半成品 `log.new`:标记尚未写下,旧 log 完好,删了无副作用。
+        let partial_new = PartialLogNew(log_new.clone());
         let new_log = Log::create(
             &log_new,
             self.total_capacity,
@@ -1783,6 +1787,8 @@ impl BlobStore {
         // Unix 下 rename 目录不受内部已打开 fd 影响,直接换入即可。
         let marker = self.dir.join("COMPACT_COMMIT");
         write_marker(&marker)?;
+        // 标记已写:此后任何中断都按"提交进行中"处理,半成品由 `recover_compaction` 收敛。
+        partial_new.defuse();
         std::fs::rename(&log_dir, &log_old)?;
         std::fs::rename(&log_new, &log_dir)?;
 
@@ -1936,8 +1942,9 @@ impl BlobStore {
 
     /// 压缩给定**非活跃段**集合 `selected`(调用方须已持 `write_lock`,`old` 为其快照):
     /// 存活记录写入位置更高的新段(temp→fsync→rename),删旧段,重建索引后原子换入新 Inner。
-    /// 存活赢家搬到更高位置仍是其 key 最新记录,newest-wins 不变。崩溃安全:复用 `COMPACT_COMMIT`
-    /// 标记 + open 重建索引;残留 `.tmp`/重复记录在重建时被忽略/收敛。
+    /// 存活赢家搬到更高位置仍是其 key 最新记录,newest-wins 不变。崩溃安全:`COMPACT_COMMIT`
+    /// 标记 + `recover_compaction` 收敛。进程内 COPY 失败:哨兵就地删 `.tmp` 半成品并撤掉标记
+    /// (都还没 rename,无副作用),不会把预分配的半成品留在盘上直到重启。
     ///
     /// 「存活」按 `policy` 判定:过期对象与过保留期墓碑**不搬**(回收),保留期内的墓碑照搬。
     fn compact_segments(
@@ -1965,7 +1972,9 @@ impl BlobStore {
         let mut dead_bytes = 0u64;
         let mut tombstone_bytes = 0u64;
         let mut expired_bytes = 0u64;
-        let mut tmp_paths: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, final)
+        // COPY 阶段失败的半成品清理由哨兵兜底:就地删本次创建的 `.tmp` 并撤掉标记
+        // (都还没 rename,无副作用);成功进入 rename 前 `defuse`。
+        let mut guard = PartialSegments::new(marker.clone());
         let mut cur: Option<LogSegment> = None;
 
         for &pos in selected {
@@ -2014,13 +2023,14 @@ impl BlobStore {
                     let tmp = PathBuf::from(tmp);
                     next_pos += 1;
                     next_gen += 1;
+                    // 先登记再建:`create` 失败留下的半成品文件也在清理范围内。
+                    guard.track(tmp.clone(), final_path);
                     cur = Some(LogSegment::create(
                         &tmp,
                         self.segment_capacity,
                         self.key_prefix,
                         u32::try_from(next_gen - 1).expect("generation must fit u32"),
                     )?);
-                    tmp_paths.push((tmp, final_path));
                 }
                 cur.as_ref().unwrap().append(raw)?;
                 Ok(())
@@ -2031,6 +2041,8 @@ impl BlobStore {
             c.close()?;
         }
 
+        // 进入 rename(提交段):`.tmp` 即将转正,哨兵失效;此后中断由 `recover_compaction` 收敛。
+        let tmp_paths = guard.defuse();
         // temp 新段 → 正式名(atomic rename)。
         for (tmp, final_path) in &tmp_paths {
             std::fs::rename(tmp, final_path)?;
@@ -2613,6 +2625,67 @@ fn rm_rf(path: &Path) -> Result<()> {
     }
 }
 
+/// 全量 compaction 的 `log.new` 半成品哨兵:COPY 阶段失败/提前返回时就地删掉整个半成品目录。
+///
+/// 此时 `COMPACT_COMMIT` 标记**尚未写下**、旧 log 完好,删半成品无副作用 —— 否则半成品会一直占盘,
+/// 直到下一次 `compact()`(开头 `rm_rf`)或进程重启(`recover_compaction`)才清。标记一旦写下,
+/// 残留收敛责任移交 `recover_compaction`(崩溃语义),哨兵必须 [`defuse`](Self::defuse)。
+struct PartialLogNew(PathBuf);
+
+impl PartialLogNew {
+    /// 标记已写:此后任何中断都按"提交进行中"处理,哨兵失效。
+    fn defuse(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PartialLogNew {
+    fn drop(&mut self) {
+        let _ = rm_rf(&self.0);
+    }
+}
+
+/// 增量 compaction 的 `.tmp` 新段哨兵:COPY 阶段失败/提前返回时,就地删掉本次创建的 `.tmp`
+/// 文件并撤掉 `COMPACT_COMMIT` 标记。
+///
+/// `.tmp` 都还没 rename 成正式段名,删除无副作用 —— 否则每个预分配 `.tmp` 会把数 GiB 半成品
+/// 留在盘上直到重启(`clean_tmp_segments` 只在 open 路径被调);标记同理要撤:此阶段还没
+/// rename 任何段,旧 log 完好,留着标记只会让 open 白做一次全库索引重建。
+struct PartialSegments {
+    tmps: Vec<(PathBuf, PathBuf)>,
+    marker: PathBuf,
+}
+
+impl PartialSegments {
+    fn new(marker: PathBuf) -> Self {
+        PartialSegments {
+            tmps: Vec::new(),
+            marker,
+        }
+    }
+
+    /// 登记一个待建的 `.tmp`(在 `LogSegment::create` **之前**登记:建失败的半成品文件也要清)。
+    fn track(&mut self, tmp: PathBuf, final_path: PathBuf) {
+        self.tmps.push((tmp, final_path));
+    }
+
+    /// COPY 完成、进入 rename:`.tmp` 即将转正,清理责任结束(此后崩溃由 `recover_compaction` 收敛)。
+    fn defuse(mut self) -> Vec<(PathBuf, PathBuf)> {
+        let tmps = std::mem::take(&mut self.tmps);
+        std::mem::forget(self);
+        tmps
+    }
+}
+
+impl Drop for PartialSegments {
+    fn drop(&mut self) {
+        for (tmp, _) in &self.tmps {
+            let _ = std::fs::remove_file(tmp);
+        }
+        let _ = std::fs::remove_file(&self.marker);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3000,6 +3073,98 @@ mod tests {
             .compact_if_needed(&legacy_policy(0.5))
             .unwrap()
             .is_none());
+    }
+
+    /// 两条失败路径共用的夹具:段 0 = PUT k0、PUT k1、TOMB k0(恰好写满,死字节占比 1/3),
+    /// 段 1 = PUT k2(活跃段)。返回 `(store, 段0的 data_end)`;载荷固定 600B/条。
+    fn three_record_sealed_segment_fixture() -> (BlobStore, tempfile::TempDir, u64) {
+        const PL: usize = 600;
+        let rec = (RECORD_OVERHEAD + PL) as u64; // 624B/条
+        let seg = 64 + 3 * rec; // 段 0 恰好装 3 条
+        let dir = temp_dir("compact_fail");
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 100).unwrap();
+        let data = |n: u64| vec![(n % 251) as u8; PL];
+        store.put(key(0), &data(0)).unwrap();
+        store.put(key(1), &data(1)).unwrap();
+        store.delete(key(0)).unwrap();
+        // 段 0 写满,下一条触发滚动 → 段 0 封存、段 1 成为活跃段。
+        store.put(key(2), &data(2)).unwrap();
+        let (_, data_end) = store
+            .sealed_segments()
+            .into_iter()
+            .next()
+            .expect("one sealed segment");
+        (store, dir, data_end)
+    }
+
+    /// 把段 0 最后一条记录的 crc 字节翻坏:copy 已建出半成品后才撞上它(错误注入点)。
+    fn corrupt_last_record_byte(dir: &tempfile::TempDir, data_end: u64) {
+        use std::os::unix::fs::FileExt;
+        let name = LogSegmentName::new(0, 1).filename();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("log").join(name))
+            .unwrap();
+        f.write_all_at(&[0xFF], 64 + data_end - 1).unwrap();
+    }
+
+    /// 增量 compact 在 COPY 中途失败:`.tmp` 半成品与 `COMPACT_COMMIT` 标记必须就地清掉
+    /// (都没 rename,无副作用;否则预分配的半成品占盘到重启,标记还会让下次 open 白重建索引),
+    /// 且旧 Inner 未动 —— 读写不受影响。
+    #[test]
+    fn failed_incremental_compaction_cleans_tmp_segments_and_marker() {
+        const PL: usize = 600;
+        let data = |n: u64| vec![(n % 251) as u8; PL];
+        let (store, dir, data_end) = three_record_sealed_segment_fixture();
+        corrupt_last_record_byte(&dir, data_end);
+
+        let r = store.compact_incremental(&legacy_policy(0.3));
+        assert!(r.is_err(), "corrupted record must fail the copy: {r:?}");
+
+        let tmps: Vec<_> = std::fs::read_dir(dir.path().join("log"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(tmps.is_empty(), "failed copy must clean .tmp: {tmps:?}");
+        assert!(
+            !dir.path().join("COMPACT_COMMIT").exists(),
+            "marker must be retracted on copy failure"
+        );
+
+        assert_eq!(store.get(&key(1)).unwrap(), data(1));
+        assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
+        store.put(key(3), &data(3)).unwrap();
+        store.close().unwrap();
+    }
+
+    /// 全量 compact 在 COPY 中途失败:半成品 `log.new` 就地删掉(标记尚未写下),旧 log 完好。
+    #[test]
+    fn failed_full_compaction_removes_partial_log_new() {
+        const PL: usize = 600;
+        let data = |n: u64| vec![(n % 251) as u8; PL];
+        let (store, dir, data_end) = three_record_sealed_segment_fixture();
+        corrupt_last_record_byte(&dir, data_end);
+
+        let r = store.compact(&legacy_policy(0.3));
+        assert!(r.is_err(), "corrupted record must fail the copy: {r:?}");
+
+        assert!(
+            !dir.path().join("log.new").exists(),
+            "failed full compaction must remove partial log.new"
+        );
+        assert!(
+            !dir.path().join("COMPACT_COMMIT").exists(),
+            "copy failure happens before the commit marker is written"
+        );
+        assert!(dir.path().join("log").exists(), "old log intact");
+
+        assert_eq!(store.get(&key(1)).unwrap(), data(1));
+        assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
+        store.put(key(3), &data(3)).unwrap();
+        store.close().unwrap();
     }
 
     /// 判定用的"现在":远在未来,确保短 TTL 对象都已过期,且不会与真实时钟打架。
