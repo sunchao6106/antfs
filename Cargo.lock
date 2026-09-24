@@ -172,6 +172,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

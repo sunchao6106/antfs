@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use antfs_config::Validate;
 use antfs_master::pb::master_client::MasterClient;
-use antfs_master::pb::CreatePartitionsRequest;
+use antfs_master::pb::{CreatePartitionsRequest, ListPartitionsRequest};
 use antfs_master::{MasterConfig, MasterNode};
 use antfs_store::{StoreServer, StoreServerConfig};
 use config::DevClusterConfig;
@@ -102,7 +102,7 @@ fn print_help() {
          \n\
          --config PATH          配置文件路径 (default:当前目录的 ./devcluster.toml,存在才读)\n\
          --dir PATH             数据/日志根目录 (default ./.localcluster,退出不删)\n\
-         --partitions N         启动后创建的分区数 (default 3)\n\
+         --partitions N         目标分区总数 (default 3;幂等 —— 已有不少于它就不再建,复跑不会叠加)\n\
          --rf N                 每分区副本数 (default 3;不得大于 store 节点数)\n\
          --master-grpc-port P   master 控制面 gRPC 端口 (default 7101)\n\
          --master-raft-port P   master Raft 内部 RPC 端口 (default 7100)\n\
@@ -233,17 +233,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })
     .await;
 
-    // ---- 建分区(重试到选盘成功:心跳需先把盘余量报上来)----
+    // ---- 建分区:**补到** `partitions` 个(幂等)----
+    // 数据目录是保留的,而 `--partitions` 的语义是"最终至少有这么多分区":直接按 count 建会在**复跑**时
+    // 每次再叠 N 个(本地 3 → 6 → 9 …,与"把本地分区数调低"正好相反)。故先问已有多少,只补差额;
+    // 补完再问一次,横幅与"应有副本数"都按**总数**算(复跑时本次没建、但总数并不为 0)。
     let mut mc = MasterClient::connect(format!("http://{grpc_addr}")).await?;
+    let existing = list_partition_ids(&mut mc).await?;
+    let missing = args.partitions.saturating_sub(existing.len() as u32);
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut created = Vec::new();
     let mut last_err = String::new();
-    while Instant::now() < deadline {
+    while missing > 0 && Instant::now() < deadline {
         let resp = mc
             .create_partitions(CreatePartitionsRequest {
                 version: 1,
                 cluster_secret: SECRET.into(),
-                count: args.partitions,
+                count: missing,
                 replication_factor: args.replication_factor,
             })
             .await?
@@ -257,19 +262,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     // 建不出来不能只留一句 `count=0`:master 拒的原因(选盘没有候选 / 非 leader / 盘都判不可用)
     // 必须看得见 —— 否则集群照样打印"已就绪",直到第一个 PUT 才暴露"一个可写分区都没有"。
-    if created.is_empty() && !last_err.is_empty() {
+    if created.len() < missing as usize && !last_err.is_empty() {
         tracing::error!(
-            partitions = args.partitions,
+            missing,
             error = %last_err,
             "create partitions failed"
         );
     }
-    tracing::info!(count = created.len(), "partitions created: {created:?}");
+    let all = list_partition_ids(&mut mc).await?;
+    tracing::info!(
+        existing = existing.len(),
+        created = created.len(),
+        total = all.len(),
+        "partitions ensured: {all:?}"
+    );
 
     // ---- 等副本真的建出来再报"就绪" ----
     // master 经心跳下发 transition、store 才 `ensure_replica`;不等就会出现"客户端首个 PUT 404"的假故障。
-    // 判据:各 store 的本地副本总数 ≥ 分区数 × RF(放置已确定的应有总数)。
-    let expected: usize = created.len() * args.replication_factor as usize;
+    // 判据:各 store 的本地副本总数 ≥ 分区总数 × RF(放置已确定的应有总数)。
+    let expected: usize = all.len() * args.replication_factor as usize;
     let ready = wait_until(Duration::from_secs(30), || {
         store_replicas.iter().map(|r| r.count()).sum::<usize>() >= expected
     })
@@ -332,7 +343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             store_addrs: &store_addrs,
             admin_addr: &admin_addr,
             frontend_addr: frontend_addr.as_deref(),
-            partitions: &created,
+            partitions: &all,
             config_file: config_file.as_deref(),
         },
     );
@@ -430,6 +441,28 @@ async fn start_frontend(args: &DevClusterConfig, grpc_addr: &str) -> Option<Stri
     });
     tracing::info!(addr = %addr, "frontend listening");
     Some(addr)
+}
+
+/// 问 master 要**全量**分区 id(按 pid 升序;`limit = 0` = 不分页)。
+///
+/// 建分区前用它算差额、建完用它出"总数" —— 这样复跑不叠加(理由见调用处注释)。
+async fn list_partition_ids(
+    mc: &mut MasterClient<tonic::transport::Channel>,
+) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    let resp = mc
+        .list_partitions(ListPartitionsRequest {
+            version: 1,
+            offset: 0,
+            limit: 0,
+            state: String::new(),
+        })
+        .await?
+        .into_inner();
+    Ok(resp
+        .partitions
+        .into_iter()
+        .map(|p| p.partition_id)
+        .collect())
 }
 
 async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {

@@ -877,3 +877,21 @@
   "只能在真机上做的那些见 §9.5"。
 - **说明**:本节只列**待执行动作**,不含新代码/新配置;执行过程中拿到的数字按 §9.4 末尾的三步收口
   (改 `impl Default` → 改文档表并写标定日期与机型 → 改钉住默认值的单测)。
+
+## 步骤 32:devcluster 建分区改幂等(补到目标数,复跑不叠加)(2026-09-24)
+
+- **踩到的坑**:步骤 30 把本地默认分区数降到 3 之后,复跑同一个数据目录会发现分区**又变成 6 个** ——
+  `CreatePartitions(count)` 每次都会**新建** `count` 个,而 devcluster 的数据目录是保留的(退出不删)。
+  于是"把本地分区数调低"被"每跑一次 +N"抵消掉了,越跑越多。
+- **改法**(`crates/devcluster/src/main.rs`):
+  - 建分区前先 `ListPartitions(limit=0)` 问已有多少,`missing = partitions - existing`,只补差额;
+    建完**再问一次**,横幅与"应有副本数"(`expected = 分区总数 × RF`)都按**总数**算(复跑时本次没建、
+    但总数并不为 0,否则会打印 `expected=0` 这种假就绪)。
+  - 日志改成 `partitions ensured: [..] existing=N created=M total=K`,三件事一眼看清。
+  - `--partitions` 的语义从"启动后创建的分区数"订正为"**目标分区总数(幂等)**",help 与
+    `devcluster.toml.example` 同步改。
+- **实测**(同一临时目录连跑两次):第 1 次 `existing=0 created=3 total=3`;第 2 次
+  `existing=3 created=0 total=3`,0 ERROR,盘上仍是 3 个 `partition_*` 目录 —— 不再叠加。
+- **注意**:幂等只保证"不少于目标",**不会替谁删分区**。本地若已经跑出 6 个分区,想回到 3 个得删掉
+  数据目录重来(或把 `partitions` 提到 6)。
+- **验证**:`cargo test -p antfs-devcluster`(8 条配置用例)仍全绿;`cargo fmt` 干净。
