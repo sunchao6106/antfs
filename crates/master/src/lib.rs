@@ -11,6 +11,7 @@
 pub mod autogrow;
 pub mod balance;
 pub mod config;
+pub mod digest;
 pub mod idalloc;
 pub mod metrics;
 pub mod network;

@@ -219,6 +219,8 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
             }],
             full_report: true,
             replicas: vec![],
+            replica_digest: 0,
+            removed_replicas: vec![],
         })
         .collect();
     let mut hb = client

@@ -63,16 +63,23 @@ pub struct Transition {
     pub target_state: String,
 }
 
-/// 为某节点算出待下发的转移:该节点承载的副本里,上报 current 与 placement target 不一致的。
+/// 为某节点算出待下发的转移:该节点在 placement 中承载的副本里,上报 current 与 target 不一致的。
 ///
-/// `reported`:该节点上报的 `partition_id -> current_state`;缺失(未上报)视为需要转移。
+/// `node_pids`:placement 侧该节点涉及的分区集(派生索引 —— 心跳每拍 O(本节点副本数) 的关键,
+/// 不扫全集群 partitions;索引的重建与保鲜见 server 侧 `PlacementIndex`)。
+/// `reported`:该节点软状态视图 `partition_id -> current_state`;缺失(未上报)视为需要转移 ——
+/// "placement 有、节点没上报"(如本地数据丢失)必须仍下发重建指令。
 pub fn plan_transitions(
     node_id: NodeId,
+    node_pids: &BTreeSet<PartitionId>,
     partitions: &BTreeMap<PartitionId, PartitionInfo>,
     reported: &BTreeMap<PartitionId, String>,
 ) -> Vec<Transition> {
     let mut out = Vec::new();
-    for (pid, info) in partitions {
+    for pid in node_pids {
+        let Some(info) = partitions.get(pid) else {
+            continue;
+        };
         for r in &info.replicas {
             if r.node_id != node_id {
                 continue;
@@ -593,12 +600,24 @@ mod tests {
         }
     }
 
+    /// placement 派生索引的测试版:从 parts 现算 node -> pids(server 侧是 epoch 懒重建的缓存)。
+    fn pids_of(
+        parts: &BTreeMap<PartitionId, PartitionInfo>,
+        node: NodeId,
+    ) -> BTreeSet<PartitionId> {
+        parts
+            .iter()
+            .filter(|(_, info)| info.replicas.iter().any(|r| r.node_id == node))
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
     #[test]
     fn transition_when_current_differs_or_missing() {
         let parts = BTreeMap::from([(0, part(2, &[(1, "d0", "ACTIVE"), (2, "d0", "ACTIVE")]))]);
         // node1 上报 BOOTSTRAP(≠ACTIVE)→ 需转移;node1 无 pid1 上报(缺失)→ 也需转移(但无此分区)。
         let reported = BTreeMap::from([(0u32, "BOOTSTRAP".to_string())]);
-        let t = plan_transitions(1, &parts, &reported);
+        let t = plan_transitions(1, &pids_of(&parts, 1), &parts, &reported);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].target_state, "ACTIVE");
         assert_eq!(t[0].partition_id, 0);
@@ -608,7 +627,7 @@ mod tests {
     fn no_transition_when_current_matches() {
         let parts = BTreeMap::from([(0, part(1, &[(1, "d0", "ACTIVE")]))]);
         let reported = BTreeMap::from([(0u32, "ACTIVE".to_string())]);
-        assert!(plan_transitions(1, &parts, &reported).is_empty());
+        assert!(plan_transitions(1, &pids_of(&parts, 1), &parts, &reported).is_empty());
     }
 
     /// 分区状态下发:只报本节点上报过的分区,状态取状态机权威值(`SEALED`/`RO` 不得被吞掉)。
@@ -686,7 +705,10 @@ mod tests {
     fn missing_report_needs_transition() {
         let parts = BTreeMap::from([(0, part(1, &[(1, "d0", "ACTIVE")]))]);
         let reported = BTreeMap::new();
-        assert_eq!(plan_transitions(1, &parts, &reported).len(), 1);
+        assert_eq!(
+            plan_transitions(1, &pids_of(&parts, 1), &parts, &reported).len(),
+            1
+        );
     }
 
     #[test]

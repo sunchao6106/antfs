@@ -7,6 +7,7 @@
 //! `spawn_blocking` offload。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -149,6 +150,32 @@ fn spawn_refresh(slots: &mut RefreshSlots, disks: &[Disk]) {
     }
 }
 
+/// M7 差分计算(纯函数):对比"当前持有"与"已上报快照",返回 `(变化项, 摘除项)`。
+///
+/// `full` 时变化项 = 全集、摘除为空(全量替换语义自带清理);增量时只含与快照不同者,
+/// 摘除 = 快照有而当前无 —— 增量合并语义下"缺项不代表没有",删除必须显式上报。
+/// 冷分区值逐拍恒定,稳态下两者都是空。
+fn diff_report(
+    sent: &HashMap<PartitionId, ReplicaBeat>,
+    current: &HashMap<PartitionId, ReplicaBeat>,
+    full: bool,
+) -> (Vec<ReplicaBeat>, Vec<PartitionId>) {
+    if full {
+        return (current.values().cloned().collect(), Vec::new());
+    }
+    let removed = sent
+        .keys()
+        .filter(|pid| !current.contains_key(*pid))
+        .copied()
+        .collect();
+    let changed = current
+        .values()
+        .filter(|b| sent.get(&b.partition_id) != Some(b))
+        .cloned()
+        .collect();
+    (changed, removed)
+}
+
 /// 启动后台任务:注册 + 心跳(仅当配置了 `master_addr`)。
 pub fn spawn_cluster_client(
     config: StoreServerConfig,
@@ -193,6 +220,13 @@ async fn run(
         .await?
         .into_inner();
 
+    // M7 增量上报的跨任务开关(receiver → sender):
+    // - `delta_enabled`:见到 `delta_report_supported` 握手才开 —— 旧 master 会把增量 beat 当全集
+    //   规划(transition 风暴),见到握手前必须恒全量;
+    // - `need_full`:master 摘要校验不符(`resend_full_report`)→ 下一拍全量重发,一拍内自愈。
+    let delta_enabled = Arc::new(AtomicBool::new(false));
+    let need_full = Arc::new(AtomicBool::new(false));
+
     {
         let (config, disks, replicas, health, metrics) = (
             config.clone(),
@@ -201,10 +235,17 @@ async fn run(
             health.clone(),
             metrics.clone(),
         );
+        let delta_enabled = delta_enabled.clone();
+        let need_full = need_full.clone();
         tokio::spawn(async move {
             let mut tick =
                 tokio::time::interval(Duration::from_secs(config.heartbeat_interval_secs));
             let mut refresh_slots: RefreshSlots = HashMap::new();
+            // M7 已上报快照(差分基准):首拍/全量拍整体重建,增量拍只更新变化与摘除。
+            // 首拍恒全量:master 软状态里可能有本节点的陈旧条目(进程重启前残留的),
+            // 只有全量替换能清掉它们。
+            let mut sent: HashMap<PartitionId, ReplicaBeat> = HashMap::new();
+            let mut first_beat = true;
             loop {
                 tick.tick().await;
                 let mut dm = disks.clone();
@@ -217,35 +258,68 @@ async fn run(
                 let states = replicas.replica_states();
                 // 每拍顺带刷新副本相关 gauge(实然态会随拉复制转正而变,见 `replication::sync_round`)。
                 metrics.set_replica_gauges(&states);
+                // 摘要覆盖**全部持有**副本(含本拍不随增量上报的)—— 口径与 master 按软状态重算
+                // 一致(同一 `digest` 模块),不符时 master 回 `resend_full_report`。
+                let digest = antfs_master::digest::digest_of(states.iter().map(|s| {
+                    (
+                        s.partition_id,
+                        s.disk_id.as_str(),
+                        s.current_state.as_str(),
+                        s.lag_bytes,
+                        s.used_bytes,
+                    )
+                }));
+                let full = first_beat
+                    || !delta_enabled.load(Ordering::SeqCst)
+                    || need_full.swap(false, Ordering::SeqCst);
+                first_beat = false;
+                let current: HashMap<PartitionId, ReplicaBeat> = states
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            s.partition_id,
+                            ReplicaBeat {
+                                partition_id: s.partition_id,
+                                disk_id: s.disk_id,
+                                current_state: s.current_state,
+                                // 滞后字节为**估算**(口径与误差见 `replication::lag_bytes`):
+                                // 每轮复制开始时 peer 游标与本地已 apply 游标之差,按段容量线性化。
+                                lag_bytes: s.lag_bytes,
+                                // 实际占用 = blob 活数据(墓碑不计),供 master 汇总可写容量与均衡判据。
+                                used_bytes: s.used_bytes,
+                            },
+                        )
+                    })
+                    .collect();
+                // 增量拍:只发与快照不同者;摘除(本地不再持有)必须显式上报 —— 增量合并语义下
+                // "缺项不代表没有"。冷分区值逐拍恒定,稳态下 changed/removed 都是空。
+                let (changed, removed_pids) = diff_report(&sent, &current, full);
                 let beat = NodeBeat {
                     version: 1,
                     cluster_secret: config.cluster_secret.clone(),
                     node_id: config.node_id,
                     disks: disk_beats(&dm, &health),
-                    full_report: true,
-                    replicas: states
-                        .into_iter()
-                        .map(|s| ReplicaBeat {
-                            partition_id: s.partition_id,
-                            disk_id: s.disk_id,
-                            current_state: s.current_state,
-                            // 滞后字节为**估算**(口径与误差见 `replication::lag_bytes`):
-                            // 每轮复制开始时 peer 游标与本地已 apply 游标之差,按段容量线性化。
-                            lag_bytes: s.lag_bytes,
-                            // 实际占用 = blob 活数据(墓碑不计),供 master 汇总可写容量与均衡判据。
-                            used_bytes: s.used_bytes,
-                        })
-                        .collect(),
+                    full_report: full,
+                    replicas: changed,
+                    replica_digest: digest,
+                    removed_replicas: removed_pids,
                 };
                 if tx.send(beat).await.is_err() {
                     break;
                 }
+                sent = current;
             }
         });
     }
 
     while let Some(directive) = inbound.message().await? {
         metrics.heartbeats.inc();
+        if directive.delta_report_supported {
+            delta_enabled.store(true, Ordering::SeqCst);
+        }
+        if directive.resend_full_report {
+            need_full.store(true, Ordering::SeqCst);
+        }
         // 分区可写态(master 权威,每拍全量):本地维护(定时 compaction)按它挑候选集。
         // 先吸收再处理转移 —— 转移会让副本增删,状态记在"当时存在的副本"上更有意义。
         for st in &directive.partition_states {
@@ -479,5 +553,66 @@ mod tests {
             capacity_before,
             "没有结果就不改容量(不猜测、不清零)"
         );
+    }
+
+    fn beat_entry(pid: PartitionId, state: &str, used: u64) -> ReplicaBeat {
+        ReplicaBeat {
+            partition_id: pid,
+            disk_id: "d1".to_string(),
+            current_state: state.to_string(),
+            lag_bytes: 0,
+            used_bytes: used,
+        }
+    }
+
+    /// 全量拍:变化项 = 全集、无摘除(全量替换语义自带清理)。
+    #[test]
+    fn diff_full_returns_everything_and_no_removals() {
+        let sent = HashMap::from([(9, beat_entry(9, "ACTIVE", 1))]);
+        let current = HashMap::from([
+            (1, beat_entry(1, "ACTIVE", 100)),
+            (2, beat_entry(2, "ACTIVE", 200)),
+        ]);
+        let (changed, removed) = diff_report(&sent, &current, true);
+        assert_eq!(changed.len(), 2);
+        assert!(removed.is_empty(), "全量拍不带摘除项");
+    }
+
+    /// 增量拍:值不变的条目不重发(稳态冷分区 → 空差分);变化/新增才上报。
+    #[test]
+    fn diff_delta_only_changes() {
+        let sent = HashMap::from([
+            (1, beat_entry(1, "ACTIVE", 100)),
+            (2, beat_entry(2, "ACTIVE", 200)),
+        ]);
+        // 稳态:逐拍相同 → 空差分。
+        let (changed, removed) = diff_report(&sent, &sent.clone(), false);
+        assert!(changed.is_empty() && removed.is_empty(), "稳态差分必须为空");
+
+        // pid1 占用变化(热分区)、pid3 新增、pid2 摘除。
+        let current = HashMap::from([
+            (1, beat_entry(1, "ACTIVE", 150)),
+            (3, beat_entry(3, "BOOTSTRAP", 0)),
+        ]);
+        let (changed, removed) = diff_report(&sent, &current, false);
+        let mut changed_pids: Vec<_> = changed.iter().map(|b| b.partition_id).collect();
+        changed_pids.sort_unstable();
+        assert_eq!(changed_pids, vec![1, 3]);
+        assert_eq!(removed, vec![2], "快照有而当前无 = 显式摘除");
+    }
+
+    /// 状态/滞后任一字段变化都构成差分(lag 精确性是墓碑闸门判据,不得量化吞掉)。
+    #[test]
+    fn diff_detects_state_and_lag_changes() {
+        let mut lagged = beat_entry(1, "ACTIVE", 100);
+        lagged.lag_bytes = 5;
+        let sent = HashMap::from([(1, beat_entry(1, "ACTIVE", 100))]);
+        let current = HashMap::from([(1, lagged)]);
+        let (changed, _) = diff_report(&sent, &current, false);
+        assert_eq!(changed.len(), 1, "lag 变化必须上报");
+
+        let current = HashMap::from([(1, beat_entry(1, "ERROR", 100))]);
+        let (changed, _) = diff_report(&sent, &current, false);
+        assert_eq!(changed.len(), 1, "状态变化必须上报");
     }
 }

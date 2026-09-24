@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::metrics::MasterMetrics;
-use crate::types::{MasterResponse, MasterState, NodeId, TypeConfig};
+use crate::types::{MasterCommand, MasterResponse, MasterState, NodeId, TypeConfig};
 
 /// log 表:log index → 序列化的 [`Entry`]。
 const LOGS: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_logs");
@@ -112,6 +112,12 @@ pub struct RedbStateMachine {
     data: Arc<RwLock<StateMachineData>>,
     /// 快照 id 单调计数(保证同一 last_log_id 下快照 id 仍唯一)。
     snapshot_seq: Arc<AtomicU64>,
+    /// placement 变更纪元(M7):改动 `partitions` 成员(建分区/增删副本/迁移)或装快照时 bump。
+    ///
+    /// 用途:心跳 handler 的 `node -> partitions` 派生索引按它做**懒重建** —— 稳态(无 placement
+    /// 变更)零重建,每拍 O(节点);变更后第一拍摊还一次 O(集群) 重建。发号(`AllocateObjectId`)
+    /// 等高频命令**不** bump,否则索引会被迫反复重建。
+    placement_epoch: Arc<AtomicU64>,
     metrics: MasterMetrics,
 }
 
@@ -147,6 +153,7 @@ pub fn open(
         db: db.clone(),
         data: Arc::new(RwLock::new(data)),
         snapshot_seq: Arc::new(AtomicU64::new(0)),
+        placement_epoch: Arc::new(AtomicU64::new(0)),
         metrics,
     };
     Ok((RedbLogStore { db }, sm))
@@ -156,6 +163,11 @@ impl RedbStateMachine {
     /// 共享的内存状态机句柄,供 gRPC server 只读查询(ListNodes / GetClusterState)。
     pub fn shared_data(&self) -> Arc<RwLock<StateMachineData>> {
         self.data.clone()
+    }
+
+    /// placement 变更纪元句柄(见字段注释):心跳 handler 的派生索引按它懒重建。
+    pub fn placement_epoch(&self) -> Arc<AtomicU64> {
+        self.placement_epoch.clone()
     }
 
     // result_large_err:错误是 openraft 契约的 `StorageError`,尺寸由外部固定,box 会破坏 trait 签名一致性。
@@ -416,6 +428,16 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     EntryPayload::Normal(ref cmd) => {
                         let r = d.state.apply_command(cmd);
                         self.metrics.applied_commands.inc();
+                        // placement 成员变更 → bump 纪元,心跳侧派生索引下一拍懒重建(见字段注释)。
+                        if matches!(
+                            cmd,
+                            MasterCommand::CreatePartition { .. }
+                                | MasterCommand::AddReplica { .. }
+                                | MasterCommand::RemoveReplica { .. }
+                                | MasterCommand::MoveReplica { .. }
+                        ) {
+                            self.placement_epoch.fetch_add(1, Ordering::SeqCst);
+                        }
                         r
                     }
                     EntryPayload::Membership(ref mem) => {
@@ -469,6 +491,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 .registered_nodes
                 .set(d.state.nodes.len() as i64);
         }
+        // 快照可能带来任意 placement 变化 → bump 纪元,派生索引下一拍重建。
+        self.placement_epoch.fetch_add(1, Ordering::SeqCst);
         self.persist_data(&data)?;
         let stored = StoredSnapshot {
             meta: meta.clone(),

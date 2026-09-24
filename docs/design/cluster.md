@@ -172,7 +172,9 @@ DiskUsage      map<(NodeId,DiskId), { capacity_bytes, free_bytes, health }>     
 ReplicaCurrent map<(PartitionId,NodeId), { disk_id, current_state, lag_bytes, used_bytes }>  // ← 实然
 RoutingIndex   map<PartitionId, [ 存活副本位置 ]>                                 // 供 LookupPartition
 ```
-> `ReplicaCurrent` 按节点**整体替换**(心跳是全量上报 `full_report=true`):本轮没列出的 `(pid, node)` 即"该节点已不再持有该副本"(DROPPED 后删除的场景),据此清理软状态。
+> `ReplicaCurrent` 支持两种上报口径(proto `NodeBeat.full_report`,M7 起默认增量):**全量**上报按节点**整体替换**(经 `node → partitions` 反查索引,O(本节点副本数);不做全集群 retain 扫描)——没列出的 `(pid, node)` 即"该节点已不再持有该副本",据此清理软状态;**增量**上报只插入合并,删除走显式的 `removed_replicas`。
+>
+> **增量心跳(M7,对齐 SeaweedFS digest 心跳)**:稳态下 store 每拍只带**变化项 + 摘除项 + `replica_digest`**(覆盖全部持有副本的 XOR 摘要,`master::digest` FNV-1a 口径,store/master 同一函数);master 按软状态重算比对,不符回 `resend_full_report` 要求下一拍全量(一拍内自愈);首拍/重连恒全量(覆盖 leader 切换后软状态重建);store 见到 `delta_report_supported` 握手才切增量(旧 master 会把增量当全集规划 → transition 风暴)。master 每拍处理随之降为 O(本节点副本数):软状态节点索引(上)+ placement 派生 `node → pids` 索引(`placement_epoch` 懒重建,稳态零重建)喂 `plan_transitions`,下行 `partition_states` 按连接级 last_sent 只发变化(store 端本就是逐条合并语义;闸门值仍每拍重算,不缓存)。
 
 ### 7.2 副本状态机(忠实照搬 Ambry `ReplicaState`)
 
@@ -411,6 +413,8 @@ message MasterDirective {
 | `master_applied_commands_total` | counter | — | 条 | 状态机 apply 的命令数 |
 | `master_registered_nodes` | gauge | — | 个 | 已注册节点数(hard state) |
 | `master_heartbeats_total` | counter | — | 次 | 收到的心跳数 |
+| `master_heartbeat_full_reports_total` | counter | — | 次 | 心跳中的全量副本上报数(M7;稳态应远低于 `master_heartbeats_total`) |
+| `master_heartbeat_resend_requests_total` | counter | — | 次 | 摘要校验不符要求全量重发的次数(M7;持续增长说明哈希口径或增量逻辑有 bug) |
 | `master_admission_rejected_total` | counter | — | 次 | 被准入校验拒绝的请求数 |
 | `master_partitions_created_total` | counter | — | 个 | 成功创建的分区数(M2) |
 | `master_partition_create_failed_total` | counter | — | 次 | 建分区失败数(M2) |

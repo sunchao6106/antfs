@@ -74,6 +74,8 @@ fn beat(node_id: u64, replicas: Vec<ReplicaBeat>) -> NodeBeat {
         }],
         full_report: true,
         replicas,
+        replica_digest: 0,
+        removed_replicas: vec![],
     }
 }
 

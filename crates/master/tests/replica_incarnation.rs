@@ -145,6 +145,7 @@ fn beat(node: &MasterNode, node_id: NodeId, replicas: &[PartitionId]) {
                 },
             )
         }),
+        &[],
         true,
     );
 }

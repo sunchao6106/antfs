@@ -46,6 +46,8 @@ async fn partition_states_from_master_reach_the_replica_handle() {
                 tombstones_reclaim_allowed: false,
             },
         ],
+        resend_full_report: false,
+        delta_report_supported: false,
     });
 
     let registry = antfs_metric::Registry::new();

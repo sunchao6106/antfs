@@ -2,7 +2,7 @@
 //!
 //! 用 `RwLock`(读多写少:心跳周期写,查询读)。共享可变状态必须同步(CLAUDE.md §2 并发)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,12 @@ pub struct ReplicaState {
 struct Inner {
     nodes: HashMap<NodeId, Liveness>,
     replicas: HashMap<(PartitionId, NodeId), ReplicaState>,
+    /// 节点 → 持有副本 反查索引(M7):与 `replicas` 严格同步维护。
+    ///
+    /// 为什么需要它:心跳每拍都要按节点增删/枚举副本,没有索引时"全量替换"只能 `retain` 扫
+    /// **全集群**副本表(O(集群副本数)/拍),节点数上去后心跳处理平方增长。有索引后全量替换、
+    /// 增量合并、摘除都只做 O(本节点副本数) 的工作。
+    node_index: HashMap<NodeId, HashSet<PartitionId>>,
 }
 
 /// 集群软状态句柄(可克隆,内部共享)。
@@ -92,24 +98,89 @@ impl SoftState {
         out
     }
 
-    /// 记录某节点上报的各副本实然态(M3)。
+    /// 记录某节点上报的各副本实然态(M3/M7)。
     ///
     /// `full_report` = 心跳声明的上报口径(proto `NodeBeat.full_report`):**全量**上报时按节点整体替换
     /// —— 本轮没列出的 `(pid, node)` 表示该节点已**不再持有**该副本(如收到 DROPPED 后删除),必须一并
-    /// 清掉,否则软状态永久残留;**增量**上报时只做插入合并(缺项不代表"没有")。
+    /// 清掉,否则软状态永久残留;**增量**上报时只做插入合并(缺项不代表"没有"),删除走显式的
+    /// `removed`(proto `NodeBeat.removed_replicas`)。
+    ///
+    /// 复杂度:三种路径都只做 O(本节点副本数) 的工作 —— 全量替换经 `node_index` 反查删旧,
+    /// 不做"扫全集群副本表 retain"(那是 O(集群副本数)/拍,规模上去后心跳处理平方增长)。
     pub fn record_replicas(
         &self,
         node_id: NodeId,
         replicas: impl IntoIterator<Item = (PartitionId, ReplicaState)>,
+        removed: &[PartitionId],
         full_report: bool,
     ) {
         let mut g = self.inner.write().expect("soft state lock poisoned");
+        let Inner {
+            replicas: table,
+            node_index,
+            ..
+        } = &mut *g;
         if full_report {
-            g.replicas.retain(|(_, n), _| *n != node_id);
+            // 经反查索引删该节点旧条目:O(节点旧副本数)。
+            if let Some(old) = node_index.remove(&node_id) {
+                for pid in old {
+                    table.remove(&(pid, node_id));
+                }
+            }
+        } else {
+            for pid in removed {
+                table.remove(&(*pid, node_id));
+                if let Some(set) = node_index.get_mut(&node_id) {
+                    set.remove(pid);
+                }
+            }
         }
+        let index = node_index.entry(node_id).or_default();
         for (pid, st) in replicas {
-            g.replicas.insert((pid, node_id), st);
+            table.insert((pid, node_id), st);
+            index.insert(pid);
         }
+    }
+
+    /// 某节点当前持有(最近上报口径)的副本视图:O(本节点副本数),心跳每拍规划的数据源。
+    pub fn node_replicas(&self, node_id: NodeId) -> Vec<(PartitionId, ReplicaState)> {
+        let g = self.inner.read().expect("soft state lock poisoned");
+        let Some(index) = g.node_index.get(&node_id) else {
+            return Vec::new();
+        };
+        index
+            .iter()
+            .filter_map(|pid| {
+                g.replicas
+                    .get(&(*pid, node_id))
+                    .cloned()
+                    .map(|st| (*pid, st))
+            })
+            .collect()
+    }
+
+    /// 按本节点软状态全集重算上报摘要(与 store 侧同一口径,见 [`crate::digest`]):
+    /// 与心跳携带的 `replica_digest` 比对,不符 → 要求下一拍全量重发。
+    pub fn node_digest(&self, node_id: NodeId) -> u64 {
+        let g = self.inner.read().expect("soft state lock poisoned");
+        let mut acc = 0u64;
+        if let Some(index) = g.node_index.get(&node_id) {
+            for pid in index {
+                if let Some(st) = g.replicas.get(&(*pid, node_id)) {
+                    acc = crate::digest::combine_digest(
+                        acc,
+                        crate::digest::replica_beat_hash(
+                            *pid,
+                            &st.disk_id,
+                            &st.current_state,
+                            st.lag_bytes,
+                            st.used_bytes,
+                        ),
+                    );
+                }
+            }
+        }
+        acc
     }
 
     /// 查某 (partition, node) 副本的实然态。
@@ -210,5 +281,116 @@ impl SoftState {
         pids.into_iter().fold(0u64, |acc, pid| {
             acc.saturating_add(by_pid.get(&pid).copied().unwrap_or(0))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(state: &str, lag: u64, used: u64) -> ReplicaState {
+        ReplicaState {
+            disk_id: "d1".to_string(),
+            current_state: state.to_string(),
+            lag_bytes: lag,
+            used_bytes: used,
+        }
+    }
+
+    /// 全量替换:经索引删旧,不再持有的条目被清掉(原 retain 全表扫的等价语义)。
+    #[test]
+    fn full_report_replaces_node_entries_via_index() {
+        let soft = SoftState::default();
+        soft.record_replicas(
+            1,
+            [(1, st("ACTIVE", 0, 100)), (2, st("ACTIVE", 0, 200))],
+            &[],
+            true,
+        );
+        soft.record_replicas(2, [(1, st("ACTIVE", 0, 100))], &[], true);
+
+        // 节点 1 全量重报:pid 2 不再持有 → 必须清掉;节点 2 的条目不受影响。
+        soft.record_replicas(1, [(1, st("ACTIVE", 0, 150))], &[], true);
+
+        assert!(soft.holds(1, 1));
+        assert!(!soft.holds(2, 1), "全量替换后不再上报的副本必须摘除");
+        assert!(soft.holds(1, 2), "别的节点的条目不受波及");
+        let view = soft.node_replicas(1);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].1.used_bytes, 150);
+    }
+
+    /// 增量合并:缺项不代表没有;显式 removed 才删除;索引与主表同步。
+    #[test]
+    fn delta_report_merges_and_removes_via_index() {
+        let soft = SoftState::default();
+        soft.record_replicas(
+            1,
+            [(1, st("ACTIVE", 0, 100)), (2, st("ACTIVE", 0, 200))],
+            &[],
+            true,
+        );
+
+        // 增量:pid 1 值变化,pid 2 未提 → 保留。
+        soft.record_replicas(1, [(1, st("ACTIVE", 0, 150))], &[], false);
+        assert!(soft.holds(1, 1) && soft.holds(2, 1), "增量缺项不得误删");
+        assert_eq!(soft.replica_state(1, 1).unwrap().used_bytes, 150);
+
+        // 显式摘除 pid 2。
+        soft.record_replicas(1, [], &[2], false);
+        assert!(!soft.holds(2, 1), "removed 必须生效");
+        assert!(soft.holds(1, 1));
+        assert_eq!(soft.node_replicas(1).len(), 1);
+
+        // 索引不得残留:再全量重报只含 pid 1 时,删旧不该碰别的节点。
+        soft.record_replicas(1, [(1, st("ACTIVE", 0, 160))], &[], true);
+        assert_eq!(soft.node_replicas(1).len(), 1);
+    }
+
+    /// `node_replicas` 视图只含该节点、且与主表内容一致。
+    #[test]
+    fn node_replicas_scoped_to_node() {
+        let soft = SoftState::default();
+        soft.record_replicas(1, [(1, st("ACTIVE", 0, 100))], &[], true);
+        soft.record_replicas(
+            2,
+            [(1, st("BOOTSTRAP", 5, 100)), (3, st("ACTIVE", 0, 1))],
+            &[],
+            true,
+        );
+
+        let n1 = soft.node_replicas(1);
+        assert_eq!(n1.len(), 1);
+        assert_eq!(n1[0].0, 1);
+        let mut n2: Vec<_> = soft.node_replicas(2);
+        n2.sort_by_key(|(pid, _)| *pid);
+        assert_eq!(n2.len(), 2);
+        assert_eq!(n2[0].1.current_state, "BOOTSTRAP");
+        assert!(soft.node_replicas(99).is_empty(), "未知节点空视图");
+    }
+
+    /// `node_digest` 与 `crate::digest::digest_of` 同口径;值变化/摘除都反映到摘要。
+    #[test]
+    fn node_digest_matches_shared_digest_over_full_set() {
+        let soft = SoftState::default();
+        soft.record_replicas(
+            1,
+            [(1, st("ACTIVE", 0, 100)), (2, st("ACTIVE", 0, 200))],
+            &[],
+            true,
+        );
+        let expect = crate::digest::digest_of([
+            (1u32, "d1", "ACTIVE", 0u64, 100u64),
+            (2u32, "d1", "ACTIVE", 0u64, 200u64),
+        ]);
+        assert_eq!(soft.node_digest(1), expect);
+
+        soft.record_replicas(1, [(1, st("ACTIVE", 0, 101))], &[], false);
+        assert_ne!(soft.node_digest(1), expect, "值变化必须改摘要");
+
+        soft.record_replicas(1, [], &[2], false);
+        let after_remove = crate::digest::digest_of([(1u32, "d1", "ACTIVE", 0u64, 101u64)]);
+        assert_eq!(soft.node_digest(1), after_remove);
+        assert_eq!(soft.node_digest(99), 0, "未知节点摘要为 0");
     }
 }

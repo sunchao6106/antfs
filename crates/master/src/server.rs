@@ -4,7 +4,7 @@
 //! - `Master`:数据节点接入(自注册 Q1 + 准入校验)、心跳(软状态重建)、只读查询。
 //! - 只有 leader 能提交写(RegisterNode);follower 回 leader 地址供 client 重定向。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -124,6 +124,43 @@ fn pseudo_random() -> u64 {
     x
 }
 
+/// placement 派生索引(M7):`node -> placement 中该节点涉及的分区集`,epoch 懒重建。
+///
+/// 心跳每拍的 `plan_transitions` 需要"该节点在 placement 里承载哪些分区";从 `MasterState.partitions`
+/// 现算是 O(全集群)/拍。这里缓存一份反查索引,只在 `placement_epoch`(见
+/// [`crate::store::RedbStateMachine`])变化后第一拍重建一次:稳态零重建、每拍 O(节点),
+/// 变更后摊还一次 O(集群) 重建。**不进 Raft 状态**(纯派生,可从 partitions 重建)。
+/// 索引本体:(重建时纪元, node -> 分区集)。
+type IndexInner = Arc<RwLock<(u64, HashMap<NodeId, BTreeSet<PartitionId>>)>>;
+
+#[derive(Clone, Default)]
+pub struct PlacementIndex {
+    inner: IndexInner,
+}
+
+impl PlacementIndex {
+    /// 取某节点的 placement 分区集;`epoch` 与缓存不一致时按 `state` 重建(调用方持 sm_data 读锁)。
+    fn node_pids(&self, node: NodeId, epoch: u64, state: &MasterState) -> BTreeSet<PartitionId> {
+        {
+            let g = self.inner.read().expect("placement index lock poisoned");
+            if g.0 == epoch {
+                return g.1.get(&node).cloned().unwrap_or_default();
+            }
+        }
+        let mut g = self.inner.write().expect("placement index lock poisoned");
+        if g.0 != epoch {
+            let mut by_node: HashMap<NodeId, BTreeSet<PartitionId>> = HashMap::new();
+            for (pid, info) in &state.partitions {
+                for r in &info.replicas {
+                    by_node.entry(r.node_id).or_default().insert(*pid);
+                }
+            }
+            *g = (epoch, by_node);
+        }
+        g.1.get(&node).cloned().unwrap_or_default()
+    }
+}
+
 /// 装配好的 master 节点:持有 Raft 句柄、共享状态机内存态、软状态、指标、配置。
 #[derive(Clone)]
 pub struct MasterNode {
@@ -134,6 +171,10 @@ pub struct MasterNode {
     pub config: MasterConfig,
     /// 指标注册表(GetMetrics 导出用;与 `metrics` 接入的同一 `Registry`)。
     pub registry: antfs_metric::Registry,
+    /// placement 变更纪元(状态机 apply 侧 bump;派生索引按它懒重建)。
+    pub placement_epoch: Arc<AtomicU64>,
+    /// placement 派生索引(心跳侧 `node -> pids`;见 [`PlacementIndex`])。
+    pub placement_index: PlacementIndex,
 }
 
 impl MasterNode {
@@ -147,6 +188,7 @@ impl MasterNode {
         let path = std::path::Path::new(&config.data_dir).join("master.redb");
         let (log_store, sm) = open(&path, metrics.clone())?;
         let sm_data = sm.shared_data();
+        let placement_epoch = sm.placement_epoch();
 
         let raft_config = Arc::new(
             Config {
@@ -174,6 +216,8 @@ impl MasterNode {
             metrics,
             config,
             registry: registry.clone(),
+            placement_epoch,
+            placement_index: PlacementIndex::default(),
         })
     }
 
@@ -202,6 +246,8 @@ impl MasterNode {
             config: self.config.clone(),
             registry: self.registry.clone(),
             id_alloc: IdAllocator::default(),
+            placement_epoch: self.placement_epoch.clone(),
+            placement_index: self.placement_index.clone(),
         });
 
         tokio::spawn(async move {
@@ -1010,13 +1056,13 @@ fn plan_drops(
     soft: &SoftState,
     state: &MasterState,
     node_id: NodeId,
-    reported: &BTreeMap<PartitionId, String>,
 ) -> Vec<crate::pb::Transition> {
+    // 源是否仍持有该副本:查软状态(增量心跳下 beat 内容不代表全集,不能用当拍上报列表判断)。
     let mine: Vec<(PartitionId, NodeId)> = state
         .pending_drop
         .iter()
         .copied()
-        .filter(|(pid, node)| *node == node_id && reported.contains_key(pid))
+        .filter(|(pid, node)| *node == node_id && soft.holds(*pid, node_id))
         .collect();
     if mine.is_empty() {
         return Vec::new(); // 常态:该节点没有待删项 → 不碰软状态
@@ -1181,6 +1227,9 @@ struct MasterService {
     registry: antfs_metric::Registry,
     /// objectId 号段发号器(leader 内存池 + Raft 水位;见 [`crate::idalloc`])。
     id_alloc: IdAllocator,
+    /// placement 变更纪元 + 派生索引(心跳每拍 O(节点) 的关键,见 [`PlacementIndex`])。
+    placement_epoch: Arc<AtomicU64>,
+    placement_index: PlacementIndex,
 }
 
 impl MasterService {
@@ -1356,9 +1405,14 @@ impl Master for MasterService {
         let metrics = self.metrics.clone();
         let secret = self.config.cluster_secret.clone();
         let up_timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+        let placement_epoch = self.placement_epoch.clone();
+        let placement_index = self.placement_index.clone();
         let (tx, rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
+            // 连接级下发现场(M7 增量下行):pid -> 上次已下发的 (分区状态, 墓碑闸门)。
+            // 重连 = 新流 = 新场 → 首拍自然全量下发;store 端按 pid 合并应用,无删除语义。
+            let mut last_sent: HashMap<PartitionId, (String, bool)> = HashMap::new();
             while let Ok(Some(beat)) = in_stream.message().await {
                 if !secret.is_empty() && beat.cluster_secret != secret {
                     let _ = tx
@@ -1367,6 +1421,10 @@ impl Master for MasterService {
                     break;
                 }
                 metrics.heartbeats.inc();
+                let node_id = beat.node_id;
+                let full_report = beat.full_report;
+                let reported_digest = beat.replica_digest;
+                let removed = beat.removed_replicas;
                 let disks: HashMap<String, DiskUsage> = beat
                     .disks
                     .into_iter()
@@ -1381,16 +1439,14 @@ impl Master for MasterService {
                         )
                     })
                     .collect();
-                soft.record_beat(beat.node_id, disks);
+                soft.record_beat(node_id, disks);
 
-                // M3:记录副本实然态,算出该节点待下发的转移(current != target)。
-                let reported: BTreeMap<PartitionId, String> = beat
-                    .replicas
-                    .iter()
-                    .map(|r| (r.partition_id, r.current_state.clone()))
-                    .collect();
+                // M3/M7:记录副本实然态(全量替换 / 增量合并 + 显式摘除)。
+                if full_report {
+                    metrics.heartbeat_full_reports.inc();
+                }
                 soft.record_replicas(
-                    beat.node_id,
+                    node_id,
                     beat.replicas.into_iter().map(|r| {
                         (
                             r.partition_id,
@@ -1402,15 +1458,35 @@ impl Master for MasterService {
                             },
                         )
                     }),
-                    beat.full_report,
+                    &removed,
+                    full_report,
                 );
+
+                // 节点视图取**软状态**(刚合并完这一拍):增量 beat 的内容不代表全集,规划一律以此为准。
+                let reported: BTreeMap<PartitionId, String> = soft
+                    .node_replicas(node_id)
+                    .into_iter()
+                    .map(|(pid, st)| (pid, st.current_state))
+                    .collect();
+
+                // 摘要校验(M7):不符 → 本拍响应要求下一拍全量重发(增量丢项/错项一拍内自愈)。
+                // digest==0 跳过:旧版 store 恒不报摘要(字段缺省 0),不对它误报;新版 store 持有副本时
+                // 摘要为 0 的概率 2^-64(XOR 恰好抵消),放过一拍无妨。
+                let resend_full_report =
+                    reported_digest != 0 && soft.node_digest(node_id) != reported_digest;
+                if resend_full_report {
+                    metrics.heartbeat_resend_requests.inc();
+                }
+
                 let (transitions, partition_states) = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => break,
                     };
+                    let epoch = placement_epoch.load(Ordering::SeqCst);
+                    let node_pids = placement_index.node_pids(node_id, epoch, &g.state);
                     let mut out: Vec<crate::pb::Transition> =
-                        plan_transitions(beat.node_id, &g.state.partitions, &reported)
+                        plan_transitions(node_id, &node_pids, &g.state.partitions, &reported)
                             .into_iter()
                             .map(|t| crate::pb::Transition {
                                 partition_id: t.partition_id,
@@ -1418,27 +1494,32 @@ impl Master for MasterService {
                                 target_state: t.target_state,
                             })
                             .collect();
-                    out.extend(plan_drops(&soft, &g.state, beat.node_id, &reported));
-                    // 分区状态每拍全量随指令下行:store 端据此挑本地 compaction 候选集,
-                    // 不必自己从"能不能写"反推可写态。
+                    out.extend(plan_drops(&soft, &g.state, node_id));
+                    // 下发现场按当前持有集收敛:副本摘除后旧条目作废(将来重建句柄要重新收到状态)。
+                    last_sent.retain(|pid, _| reported.contains_key(pid));
+                    // 分区状态与墓碑闸门**每拍重算**(闸门依赖其它节点追平态,不能缓存),但只下发
+                    // 与上拍不同的条目(M7 增量下行);store 端按 pid 合并应用。
                     let states = plan_partition_states(&g.state.partitions, &reported)
                         .into_iter()
-                        .map(|(partition_id, state)| crate::pb::PartitionStateInfo {
-                            partition_id,
-                            state: pstate(state).to_string(),
+                        .filter_map(|(partition_id, state)| {
                             // 墓碑回收闸门:该分区**所有副本**都已追平才放行(见
                             // [`tombstones_reclaim_allowed`]) —— 还有副本没追平时回收墓碑,它
                             // 就永远学不到那条删除,已删对象会以"活数据"永久留在它上面。
-                            // 每拍重算(软状态刚 `record_replicas` 过),追平的下一拍自然翻 true。
-                            tombstones_reclaim_allowed: g
-                                .state
-                                .partitions
-                                .get(&partition_id)
-                                .is_some_and(|info| {
-                                    tombstones_reclaim_allowed(info, |n| {
-                                        replica_caught_up(&soft, partition_id, n, up_timeout)
-                                    })
-                                }),
+                            let flag = g.state.partitions.get(&partition_id).is_some_and(|info| {
+                                tombstones_reclaim_allowed(info, |n| {
+                                    replica_caught_up(&soft, partition_id, n, up_timeout)
+                                })
+                            });
+                            let entry = (pstate(state).to_string(), flag);
+                            if last_sent.get(&partition_id) == Some(&entry) {
+                                return None;
+                            }
+                            last_sent.insert(partition_id, entry.clone());
+                            Some(crate::pb::PartitionStateInfo {
+                                partition_id,
+                                state: entry.0,
+                                tombstones_reclaim_allowed: entry.1,
+                            })
                         })
                         .collect();
                     (out, states)
@@ -1459,6 +1540,8 @@ impl Master for MasterService {
                         transitions,
                         tasks: vec![],
                         partition_states,
+                        resend_full_report,
+                        delta_report_supported: true,
                     }))
                     .await
                     .is_err()

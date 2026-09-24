@@ -465,6 +465,7 @@ fn report_used(node: &MasterNode, replicas: &[(u32, u64)]) {
                 },
             )
         }),
+        &[],
         true,
     );
 }

@@ -59,6 +59,8 @@ fn gate_directive(pid: u32, allowed: bool) -> MasterDirective {
             state: "RW".to_string(),
             tombstones_reclaim_allowed: allowed,
         }],
+        resend_full_report: false,
+        delta_report_supported: false,
     }
 }
 

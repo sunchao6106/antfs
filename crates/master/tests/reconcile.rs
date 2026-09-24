@@ -89,6 +89,8 @@ fn beat_disk(
         }],
         full_report: true,
         replicas,
+        replica_digest: 0,
+        removed_replicas: vec![],
     }
 }
 

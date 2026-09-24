@@ -128,6 +128,7 @@ fn beat_used(node: &MasterNode, node_id: u64, replicas: &[(PartitionId, u64)]) {
                 },
             )
         }),
+        &[],
         true,
     );
 }

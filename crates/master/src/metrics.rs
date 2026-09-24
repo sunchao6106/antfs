@@ -23,6 +23,10 @@ pub struct MasterMetrics {
     pub registered_nodes: IntGauge,
     /// 收到的心跳数(counter)。
     pub heartbeats: IntCounter,
+    /// 心跳中的全量副本上报数(counter,M7;稳态应远低于 heartbeats)。
+    pub heartbeat_full_reports: IntCounter,
+    /// 摘要校验不符要求节点全量重发的次数(counter,M7;恒 >0 说明哈希口径或增量逻辑有 bug)。
+    pub heartbeat_resend_requests: IntCounter,
     /// 被准入校验拒绝的请求数(counter)。
     pub admission_rejected: IntCounter,
     /// 成功创建的分区数(counter)。
@@ -135,6 +139,16 @@ impl MasterMetrics {
                 "number of nodes registered in hard state",
             )?,
             heartbeats: counter(registry, "master_heartbeats_total", "heartbeats received")?,
+            heartbeat_full_reports: counter(
+                registry,
+                "master_heartbeat_full_reports_total",
+                "full replica reports within heartbeats (M7)",
+            )?,
+            heartbeat_resend_requests: counter(
+                registry,
+                "master_heartbeat_resend_requests_total",
+                "digest mismatches answered with resend_full_report (M7)",
+            )?,
             admission_rejected: counter(
                 registry,
                 "master_admission_rejected_total",

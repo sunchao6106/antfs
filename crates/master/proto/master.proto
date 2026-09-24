@@ -68,7 +68,13 @@ message NodeBeat {
   uint64 node_id = 3;
   repeated DiskBeat disks = 4; // 各盘实时余量(软状态)
   bool full_report = 5;
-  repeated ReplicaBeat replicas = 6; // 本节点承载副本的 current_state(M3)
+  repeated ReplicaBeat replicas = 6; // 副本实然态(M3);full_report=false 时为增量(只含变化项)
+  // 副本上报摘要(增量心跳,M7):覆盖本节点**全部持有**副本(含本拍未随增量上报的)的 XOR 哈希。
+  // master 按自己的软状态重算比对,不符则回 `resend_full_report` 要求下一拍全量重发(自愈)。
+  uint64 replica_digest = 7;
+  // 增量模式下本拍**摘除**的副本(本地已删,如消费 DROPPED/OFFLINE 后):增量合并语义下
+  // "缺项不代表没有",删除必须显式上报,否则 master 软状态永久残留。
+  repeated uint32 removed_replicas = 8;
 }
 
 // 一个副本的实然态上报(M3)。
@@ -108,9 +114,15 @@ message MasterDirective {
   uint32 version = 1;
   repeated Transition transitions = 2; // current!=target 的副本转移指令
   repeated Task tasks = 3;             // 再复制等任务提示
-  // 本节点承载副本的分区状态(每拍全量、只含本节点有副本的分区):store 侧据此选 compaction
-  // 候选集(SEALED 永不入选,RW 是否入选由 store 配置决定)。
+  // 本节点承载副本的分区状态(**增量**:只含与上次下发相比变化的条目):store 侧据此选 compaction
+  // 候选集(SEALED 永不入选,RW 是否入选由 store 配置决定)。store 端按 pid 合并,无删除语义
+  // (副本摘除后残留的状态条目无害:本地无该副本时会被忽略)。
   repeated PartitionStateInfo partition_states = 4;
+  // 摘要校验不符(master 软状态与节点上报摘要不一致)→ 要求下一拍全量重发(自愈,M7)。
+  bool resend_full_report = 5;
+  // 版本握手(§3.4):master 每拍置 true,表示它理解增量心跳(`full_report=false` + digest)。
+  // store 见到它之前必须保持全量上报 —— 旧 master 会把增量 beat 当全集规划,导致 transition 风暴。
+  bool delta_report_supported = 6;
 }
 
 message ListNodesRequest { uint32 version = 1; }

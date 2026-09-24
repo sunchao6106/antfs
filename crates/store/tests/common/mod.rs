@@ -103,6 +103,8 @@ impl FakeMaster {
             }],
             tasks: Vec::new(),
             partition_states: Vec::new(),
+            resend_full_report: false,
+            delta_report_supported: false,
         });
     }
 

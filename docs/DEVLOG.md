@@ -939,3 +939,22 @@
   `Rustfmt` / `Clippy` 四项全部 success —— 那条把两个平台都弄红的时序用例确认修好(旧 run `35961897363` 是 failure)。
 - 顺手订正 openspec 8.6 的过期话("Linux 待 CI" → 已由 CI 双平台验证)。
 - 至此:**代码与文档待办清零**,只剩 §9.4 标定 / §9.5 真机核对清单(按决策本轮不做,见步骤 34)。
+
+## 步骤 35:心跳增量上报 + master 每拍 O(节点) 化(M7)(2026-09-24)
+
+- **动机**:store 每 3s 全量心跳,master 每拍处理是 O(全集群) —— `record_replicas` retain 扫全集群
+  副本表、`plan_transitions` 扫全集群 partitions、下行 `partition_states` 每拍全量重发;规模上去后
+  心跳处理在 master 上平方增长。而稳态(冷分区)上报值逐拍恒定,信息熵趋近于零。
+- **方案**(对齐 SeaweedFS digest 心跳,见 `openspec/changes/heartbeat-incremental-report/`):
+  周期 tick 保留(保活 + 下行通道),每拍只带**增量 + 全量摘要**;proto 增 `NodeBeat.replica_digest` /
+  `removed_replicas`、`MasterDirective.resend_full_report` / `delta_report_supported`(纯增量字段,§3.4)。
+  - `master::digest`:FNV-1a 逐条哈希 XOR 合成(手写不引依赖,store/master 同一函数);摘要覆盖全部
+    持有副本,master 按软状态重算,不符回 `resend_full_report` 一拍自愈。
+  - 软状态加 `node → partitions` 反查索引,全量替换/增量/removal 都 O(本节点副本数)。
+  - placement 派生 `node → pids` 索引(`placement_epoch`:apply 侧 placement 变更命令才 bump,
+    发号不 bump;懒重建,稳态零重建),`plan_transitions` 不再扫全集群;"应建未建仍下发"语义保留。
+  - 下行 `partition_states` 按连接级 last_sent 增量下发(闸门值仍每拍重算);store 端本就逐条合并。
+  - store 见到 `delta_report_supported` 握手才切增量(旧 master 兼容);首拍/重连恒全量。
+  - `used_bytes`/`lag_bytes` **不量化**(冷分区值恒定;`lag==0` 是墓碑闸门判据,不能模糊)。
+- **验证**:master 全量测试(含新增 `tests/heartbeat_delta.rs`:增量合并/显式摘除/摘要造假自愈/
+  增量下行/重连全量下行)、store lib 测试(新增 `diff_report` 三例)、`cargo test --workspace` 全绿。
