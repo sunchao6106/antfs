@@ -10,13 +10,19 @@
 //! GET   (HTTP)     ─▶ store   第一个成功即返回(R=1)
 //! ```
 //!
-//! **发号 = 多分区轮转**:补段时先拉 master 的当前可写(RW)分区列表,对**每个**分区各申请一小批号
-//! (显式点名 `partition_id`),之后写请求在这些分区之间轮转取号 —— 相邻写落在不同分区、不同盘上,
-//! 写 IOPS 摊开,而不是把一段号连续耗尽在一个分区上。**分区分派仍由 master 定**,router 不自选(D10)。
+//! **发号 = 多分区按写权重分配**:补段时先拉 master 的当前可写(RW)分区列表(**带写权重**),把号段总预算
+//! 按权重切给各分区(显式点名 `partition_id` 各申请一批),之后写请求在这些分区之间**按权重**轮转取号
+//! (平滑加权轮转)—— 越空的分区拿到越多号,相邻写落在不同分区、不同盘上,写 IOPS 摊开,
+//! 而不是把一段号连续耗尽在一个分区上。
+//!
+//! 权重由 **master 下发**(`PartitionEntry.write_weight`,千分比 = 剩余容量占比;口径与算法只在 master 一处):
+//! 分区分派仍由 master 定,router 不自选分区、**不自算容量**(D10)。未下发(旧 master / 容量未配)时行为
+//! 与**均权轮转逐位一致**;权重生效粒度 = 补齐/刷新的那一拍。
 //!
 //! **可写分区列表由后台任务保鲜**:`connect` 起一个后台任务,按 `partition_refresh_secs` 周期向 master 拉一次
-//! 可写分区列表,把已不可写分区的号段丢掉、给新出现的可写分区补一段(号段耗尽的写路径自己也会同步一次;
-//! 周期配 0 = 不起后台任务)。任务持号段池的 `Weak` 引用,最后一个 `Router` 析构后自行退出。
+//! 可写分区列表,**按新权重收敛各分区已有号段的段尾**、丢掉已不可写分区的号段、给新出现的可写分区补一段
+//! (号段耗尽的写路径自己也会同步一次;周期配 0 = 不起后台任务)。任务持号段池的 `Weak` 引用,
+//! 最后一个 `Router` 析构后自行退出。
 //!
 //! **两条正确性约束(不做成可配)**:
 //! - 写:W = 该分区**实际副本数 / 2 + 1**(多数派)。RF=3 → 2(对齐 Ambry `routerPutSuccessTarget`)、
@@ -81,46 +87,121 @@ struct Segment {
     end: u32,
 }
 
-/// 号段池:**每个可写分区各持一段**,取号时在它们之间轮转。
+/// 号段池:**每个可写分区各持一段**(段大小按写权重配比),取号时在它们之间**按写权重**轮转。
 #[derive(Default)]
 struct IdCache {
     /// 未发完的段(`pid → 段`);取完即移除。
     segments: HashMap<PartitionId, Segment>,
-    /// 轮转顺序(补段时刷新的可写分区列表,pid 升序)。
-    order: Vec<PartitionId>,
-    /// 轮转游标:`order` 里下一个待取的分区位置。
-    cursor: usize,
+    /// 可写分区 + **写权重**(补段时刷新,master 给的顺序 = pid 升序)。
+    order: Vec<PartitionWeight>,
+    /// 平滑加权轮转(SWRR)的**当前信用**(`pid → credit`)。只为**手上还有号段**的分区维护:
+    /// 段取完即清、补段从 0 起 —— 否则空转期攒下的信用会在补段后变成一串突发。
+    ///
+    /// 它同时顶替了早期实现里"保持轮转相位"的 `cursor`:一次什么都没补的空刷新之后,
+    /// "下一个该轮到谁"由信用高低决定,不会被清空重来。
+    credit: HashMap<PartitionId, i64>,
+}
+
+/// 一个可写分区的**写权重**(来自 master `PartitionEntry.write_weight`,千分比 `1..=1000`)。
+///
+/// **已归一**:`0`(未下发 / 未配容量上限)在 [`list_writable`] 里就变成 `1`,故这里的值恒 `≥1`。
+/// "0 = 均权"这条映射是兼容性的落点:master 还不下发权重(或容量未配)时,行为与纯轮转**完全一致**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartitionWeight {
+    pid: PartitionId,
+    weight: u32,
 }
 
 impl IdCache {
-    /// 轮转取一个号:游标所指分区的段没取完就用它,取完就丢掉并转到下一个分区。
+    /// 按写权重取一个号(**平滑加权轮转**,SWRR):每拍给在册(手上有号段)的分区各加 `weight` 信用,
+    /// 取信用最大的那个,再把它的信用减去在册权重总和。
     ///
-    /// 走完一轮都没号 → `None`(调用方去补段)。**顺序轮转**保证相邻写落在不同分区
-    /// (进而是不同副本、不同盘),写 IOPS 摊开而不是把一段号连续耗尽在一个分区上。
-    fn take_rr(&mut self) -> Option<StoreKey> {
-        for _ in 0..self.order.len() {
-            if self.cursor >= self.order.len() {
-                self.cursor = 0;
-            }
-            let pid = self.order[self.cursor];
-            self.cursor += 1;
-            let Some(seg) = self.segments.get_mut(&pid) else {
-                continue;
-            };
-            if seg.next >= seg.end {
-                self.segments.remove(&pid);
+    /// 于是**任意窗口**内的取号比例都趋近权重之比 —— 这是"只按权重切段大小、取号仍顺序轮转"做不到的:
+    /// 顺序轮转每轮给每个分区各 1 个号,任何中途窗口内各分区计数都**相等**,权重只能决定最满的那个
+    /// 何时停止发号(取舍论证见 `openspec/changes/router-weighted-partition-alloc`)。
+    ///
+    /// - 手上没号段的分区**不参与、也不攒信用**(它此刻不该被发号);
+    /// - 同分取 `order` 里靠前的(pid 小的)⇒ 结果**确定**,可被单测钉住;
+    /// - **均权时逐位退化为顺序轮转**:相邻写仍落在不同分区(进而是不同副本、不同盘),写 IOPS 摊开。
+    fn take_weighted(&mut self) -> Option<StoreKey> {
+        let mut best: Option<(PartitionId, i64)> = None;
+        let mut total: i64 = 0;
+        for slot in &self.order {
+            if !self.segments.contains_key(&slot.pid) {
                 continue;
             }
-            let key = StoreKey::from_parts(pid, seg.next);
-            seg.next += 1;
-            let exhausted = seg.next >= seg.end;
-            if exhausted {
-                self.segments.remove(&pid);
+            // `.max(1)`:0 = "未下发"(见 [`PartitionWeight`]),此处再兜一道,防将来有人直接构造 0 权重。
+            let w = i64::from(slot.weight.max(1));
+            total = total.saturating_add(w);
+            let credit = self.credit.entry(slot.pid).or_insert(0);
+            *credit = credit.saturating_add(w);
+            if best.is_none_or(|(_, best_credit)| *credit > best_credit) {
+                best = Some((slot.pid, *credit));
             }
-            return Some(key);
         }
-        None
+        let (pid, _) = best?;
+        if let Some(credit) = self.credit.get_mut(&pid) {
+            *credit = credit.saturating_sub(total);
+        }
+        self.take_from(pid)
     }
+
+    /// 从该分区取一个号;段取完即丢掉段**与信用**(下次补段从 0 起,不留突发)。
+    fn take_from(&mut self, pid: PartitionId) -> Option<StoreKey> {
+        let seg = self.segments.get_mut(&pid)?;
+        let key = StoreKey::from_parts(pid, seg.next);
+        seg.next += 1;
+        if seg.next >= seg.end {
+            self.segments.remove(&pid);
+            self.credit.remove(&pid);
+        }
+        Some(key)
+    }
+}
+
+/// 按写权重把号段总预算切成各分区的**份额**(个数,每个 `≥1`)。
+///
+/// - `pool = id_segment_size × 分区数`:总预留口径与均权时**不变**(空洞上界、换段频率都不变)。
+/// - `share_i = max(1, pool × w_i / Σw)`:`≥1` 保证一个分区(哪怕上报已满、权重落到下限)也不会被
+///   完全饿死,同时保证**不存在 0 长度的段**(0 长度的段等于"这个分区不发号",那该由 master 把它转 RO 表达)。
+/// - 余数按 **(小数部分降序, pid 升序)** 分配 ⇒ 结果确定、可单测;但下界 `1` 可能让总量略超 `pool`
+///   (最多超 `分区数` 个号),此时不再分配余数 —— 总预留只多出可忽略的一小截。
+/// - **均权时 `share_i == id_segment_size`**,与改动前逐位一致。
+fn segment_shares(pool: u64, weights: &[PartitionWeight]) -> Vec<u64> {
+    let total: u64 = weights.iter().map(|w| u64::from(w.weight)).sum();
+    if weights.is_empty() || total == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(weights.len());
+    let mut rem = Vec::with_capacity(weights.len());
+    let mut assigned = 0u64;
+    for w in weights {
+        let numer = pool.saturating_mul(u64::from(w.weight));
+        let share = (numer / total).max(1);
+        out.push(share);
+        rem.push((numer % total, out.len() - 1));
+        assigned = assigned.saturating_add(share);
+    }
+    rem.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut extra = pool.saturating_sub(assigned);
+    for (_, i) in rem {
+        if extra == 0 {
+            break;
+        }
+        out[i] += 1;
+        extra -= 1;
+    }
+    out
+}
+
+/// 按本次份额**收敛**已有号段的段尾(只减不增 —— 增大段尾等于替 master 多要号,而号只能由 master 发);
+/// 返回 `false` 表示收敛后已无号可发(调用方丢掉该段)。
+///
+/// 收敛掉的余号成为**空洞**(D3 无害)。这一步是"权重变化何时生效"的关键:有了它,分区快满而降权
+/// 不必等整池号段自然轮完,在一个刷新周期内就收紧。
+fn trim_segment(seg: &mut Segment, share: u32) -> bool {
+    seg.end = seg.end.min(seg.next.saturating_add(share));
+    seg.next < seg.end
 }
 
 /// antfs router(客户端 SDK)。可 `Arc` 共享给多任务并发使用。
@@ -134,7 +215,12 @@ pub struct Router {
     /// `Arc` 是为了让后台刷新任务持 `Weak` 引用 —— 最后一个 `Router` 析构后任务自己退出,不留常驻任务。
     ids: Arc<Mutex<IdCache>>,
     /// `partitionId → 副本位置` 读路由缓存(读路径用;写路径优先用发号响应带回的副本)。
+    ///
+    /// 缓存里存的是 **master 顺序 + `up` 优先**;延迟排序在**每次读**时另做(见
+    /// [`Router::ordered_for_read`])—— 否则测量值变了、缓存里的顺序却一直是旧的。
     topology: Arc<RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>>,
+    /// 每副本的观测延迟(读路由按它"先试快的")。
+    latency: Arc<LatencyTable>,
     metrics: Arc<RouterMetrics>,
 }
 
@@ -198,8 +284,27 @@ impl Router {
             http,
             ids,
             topology,
+            latency: Arc::new(LatencyTable::new()),
             metrics,
         })
+    }
+
+    /// 记一次数据面请求的耗时(毫秒)。**成功与失败都记** —— 超时才是最该被记住的那种"慢"。
+    fn note_latency(&self, addr: &str, elapsed: Duration) {
+        if !self.cfg.latency_aware_routing {
+            return; // 关掉时连表都不维护(零开销)
+        }
+        self.latency.note(addr, elapsed.as_secs_f64() * 1000.0);
+    }
+
+    /// 读路径的副本顺序:**`up` 优先 → 观测延迟升序 → master 原序**。
+    ///
+    /// - `up == false` 的副本仍排在最后(它们大概率不可达,先试活的);
+    /// - 延迟未知的副本按 **已测副本的均值**参与排序(先验:不奖励也不惩罚新人;全都没测时所有键相等,
+    ///   排序退化成 master 顺序 —— 即与关闭本特性时**完全一致**);
+    /// - 排序**稳定**,故延迟相同(或全无数据)时保持 master 给的顺序,行为可预期。
+    fn ordered_for_read(&self, replicas: &[ReplicaLoc]) -> Vec<ReplicaLoc> {
+        order_by_latency(replicas, &self.latency, self.cfg.latency_aware_routing)
     }
 
     /// 本客户端的配置(供 CLI 打印/转发)。
@@ -214,10 +319,10 @@ impl Router {
 
     // ── 发号 ────────────────────────────────────────────────────────────────────────────────
 
-    /// 申请一个 blobId:本地号段里轮转取(零 RPC);所有分区的号段都取完才对齐一次可写分区列表。
+    /// 申请一个 blobId:本地号段里**按写权重**取(零 RPC);所有分区的号段都取完才对齐一次可写分区列表。
     pub async fn allocate_one(&self) -> Result<StoreKey> {
         let mut cache = self.ids.lock().await;
-        if let Some(key) = cache.take_rr() {
+        if let Some(key) = cache.take_weighted() {
             return Ok(key);
         }
         sync_segments(
@@ -228,16 +333,29 @@ impl Router {
             &self.topology,
         )
         .await?;
-        cache.take_rr().ok_or(Error::NoWritablePartition)
+        cache.take_weighted().ok_or(Error::NoWritablePartition)
     }
 
-    /// 申请 `count` 个 blobId(按分区轮转取,可能跨多个分区)。
+    /// 申请 `count` 个 blobId(按分区**写权重**取,可能跨多个分区)。
     pub async fn allocate_batch(&self, count: u32) -> Result<Vec<StoreKey>> {
         let mut out = Vec::with_capacity(count as usize);
         while (out.len() as u32) < count {
             out.push(self.allocate_one().await?);
         }
         Ok(out)
+    }
+
+    /// 当前生效的**写权重**(pid 升序;master 的 `write_weight` 千分比,未下发已归一成 `1`)。
+    ///
+    /// 只读快照,供压测/排障对照"**期望比例 vs 实际分布**" —— 权重是否真的生效,一眼可核。
+    pub async fn write_weights(&self) -> Vec<(PartitionId, u32)> {
+        self.ids
+            .lock()
+            .await
+            .order
+            .iter()
+            .map(|w| (w.pid, w.weight))
+            .collect()
     }
 
     // ── 读路由 ──────────────────────────────────────────────────────────────────────────────
@@ -415,16 +533,21 @@ impl Router {
         expiration_ms: i64,
         addr: &str,
     ) -> Result<()> {
+        let t0 = Instant::now();
         let resp = self
             .http
             .put(put_url(addr, pid, key, expiration_ms))
             .body(data)
             .send()
             .await
-            .map_err(|source| Error::Http {
-                addr: addr.to_string(),
-                source,
+            .map_err(|source| {
+                self.note_latency(addr, t0.elapsed());
+                Error::Http {
+                    addr: addr.to_string(),
+                    source,
+                }
             })?;
+        self.note_latency(addr, t0.elapsed());
         classify_put(addr, pid, resp).await
     }
 
@@ -458,7 +581,7 @@ impl Router {
     /// (不能把"读不到"当成"不存在")。
     pub async fn get(&self, key: &StoreKey) -> Result<Bytes> {
         let pid = key.partition_id();
-        let replicas = self.replicas_for(pid).await?;
+        let replicas = self.ordered_for_read(&self.replicas_for(pid).await?);
         let mut last: Option<Error> = None;
         let mut missing = 0usize;
         for r in &replicas {
@@ -490,7 +613,7 @@ impl Router {
     /// 下载到本地文件(流式,内存 = 单块)。
     pub async fn get_file(&self, key: &StoreKey, path: impl AsRef<Path>) -> Result<u64> {
         let pid = key.partition_id();
-        let replicas = self.replicas_for(pid).await?;
+        let replicas = self.ordered_for_read(&self.replicas_for(pid).await?);
         let mut last: Option<Error> = None;
         let mut missing = 0usize;
         for r in &replicas {
@@ -522,15 +645,20 @@ impl Router {
         key: &StoreKey,
         addr: &str,
     ) -> Result<reqwest::Response> {
+        let t0 = Instant::now();
         let resp = self
             .http
             .get(blob_url(addr, pid, key))
             .send()
             .await
-            .map_err(|source| Error::Http {
-                addr: addr.to_string(),
-                source,
+            .map_err(|source| {
+                self.note_latency(addr, t0.elapsed());
+                Error::Http {
+                    addr: addr.to_string(),
+                    source,
+                }
             })?;
+        self.note_latency(addr, t0.elapsed());
         match resp.status().as_u16() {
             200 => Ok(resp),
             _ => Err(classify_err_status(addr, pid, resp).await),
@@ -548,7 +676,7 @@ impl Router {
     /// 读元数据(`HEAD` 语义:不读数据体):第一个成功即返回(R=1)。
     pub async fn stat(&self, key: &StoreKey) -> Result<BlobStat> {
         let pid = key.partition_id();
-        let replicas = self.replicas_for(pid).await?;
+        let replicas = self.ordered_for_read(&self.replicas_for(pid).await?);
         let mut last: Option<Error> = None;
         let mut missing = 0usize;
         for r in &replicas {
@@ -585,15 +713,15 @@ impl Router {
             "http://{addr}/partitions/{pid}/blobs/{}/metadata",
             hex_key(key)
         );
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|source| Error::Http {
+        let t0 = Instant::now();
+        let resp = self.http.get(url).send().await.map_err(|source| {
+            self.note_latency(addr, t0.elapsed());
+            Error::Http {
                 addr: addr.to_string(),
                 source,
-            })?;
+            }
+        })?;
+        self.note_latency(addr, t0.elapsed());
         if resp.status().as_u16() == 200 {
             return resp.json::<BlobStat>().await.map_err(|source| Error::Http {
                 addr: addr.to_string(),
@@ -715,12 +843,15 @@ fn spawn_refresher(
 }
 
 /// 一次「可写分区列表 ↔ 本地号段」对齐:
-/// 拉列表 → **丢掉**已不在列表里的分区的号段(余号成空洞,无害,D3)→ 给缺号段的分区**各申请一小批**
-/// (显式点名 `partition_id`,每批 `id_segment_size` 个)→ 按 pid 升序重建轮转顺序。
+/// 拉列表(+ **写权重**)→ **丢掉**已不在列表里的分区的号段(余号成空洞,无害,D3)→ 按权重把号段总预算
+/// 切成各分区的份额 → 已有段按份额**收敛段尾**、缺段的分区**各申请一批**(显式点名 `partition_id`,
+/// `count` = 该分区份额)。
 ///
-/// - 分区集合与合法性由 master 给:router 只从权威 RW 列表里取分区、**不自造 id**、不缓存容量判断,
-///   且每个分区在发号时被 master 复核(RW + 至少一个副本)。代价:负载由 D10 的"按剩余容量加权随机"
-///   变为"可写分区上的**均匀轮转**"(取舍见 `openspec/changes/router-partition-round-robin`)。
+/// - 分区集合与合法性由 master 给:router 只从权威 RW 列表里取分区、**不自造 id**、**不自算容量权重**
+///   (权重照抄 master 的 `PartitionEntry.write_weight`,只当相对值用),且每个分区在发号时被 master
+///   复核(RW + 至少一个副本)。这补回了 D10"按剩余容量加权"的容量感知,粒度 = 补齐/刷新的这一拍。
+/// - **已有段也要收敛**:权重下降(分区快满)要在一个刷新周期内生效,而不是等整池号轮完;收敛掉的
+///   余号成空洞(D3 无害)。
 /// - 单个分区取号失败(期间被改成 RO/封存、号耗尽、已下线)只跳过它,**不影响其余分区**。
 /// - 取段并发(`master` client 克隆后各自调用);整轮在号段锁里跑 —— 热路径借它单飞,后台任务借它
 ///   与取号互斥。缓存补齐后仍一个号段都没有才算失败。
@@ -732,32 +863,44 @@ async fn sync_segments(
     topology: &RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>,
 ) -> Result<()> {
     let order = list_writable(master).await?;
-    // 重建轮转顺序时**保持相位**:记下"下一个本该轮到谁",在新顺序里找回它的位置。
-    // 否则一次什么都没补的空刷新(后台任务常走到这条)会把游标打回起点,让同一分区连出两个号。
-    let anchor = if cache.order.is_empty() {
-        None
-    } else {
-        Some(cache.order[cache.cursor % cache.order.len()])
-    };
-    let writable: HashSet<PartitionId> = order.iter().copied().collect();
+    let writable: HashSet<PartitionId> = order.iter().map(|w| w.pid).collect();
     cache.segments.retain(|pid, _| writable.contains(pid));
-    let want: Vec<PartitionId> = order
-        .iter()
-        .copied()
-        .filter(|pid| !cache.segments.contains_key(pid))
-        .collect();
+
+    // 总预算(分区数 × id_segment_size)按写权重切给各分区 —— 逐个分区"本轮该发多少个号"。
+    let n = u64::try_from(order.len()).unwrap_or(u64::MAX);
+    let shares = segment_shares(u64::from(cfg.id_segment_size).saturating_mul(n), &order);
+
+    let mut want: Vec<(PartitionId, u32)> = Vec::new();
+    let mut exhausted: Vec<PartitionId> = Vec::new();
+    for (slot, share) in order.iter().zip(&shares) {
+        let share = u32::try_from(*share).unwrap_or(u32::MAX);
+        match cache.segments.get_mut(&slot.pid) {
+            // 已有段:按本次份额收敛段尾(见 [`trim_segment`])。
+            Some(seg) => {
+                if !trim_segment(seg, share) {
+                    exhausted.push(slot.pid);
+                }
+            }
+            None => want.push((slot.pid, share)),
+        }
+    }
+    // 收敛到没号的段直接丢掉(取号本就会跳过它;留着只会让 `writable_partitions` 虚高)。
+    for pid in exhausted {
+        cache.segments.remove(&pid);
+    }
     cache.order = order;
-    cache.cursor = anchor
-        .and_then(|pid| cache.order.iter().position(|p| *p == pid))
-        .unwrap_or(0);
+    // 信用只留给"手上有号段"的分区:补段/收敛后的分区从 0 起,不留空转期攒下的信用变成突发。
+    cache
+        .credit
+        .retain(|pid, _| cache.segments.contains_key(pid));
 
     let mut pending = FuturesUnordered::new();
-    for pid in want {
+    for (pid, size) in want {
         let mut client = master.lock().await.clone();
         let req = GetBlobIdsRequest {
             version: PROTO_VERSION,
             cluster_secret: cfg.cluster_secret.clone(),
-            count: cfg.id_segment_size,
+            count: size,
             partition_id: Some(pid),
         };
         pending.push(async move { client.get_blob_ids(req).await });
@@ -782,8 +925,13 @@ async fn sync_segments(
     Ok(())
 }
 
-/// master 当前可写(RW)分区列表(pid 升序)。跳过没有副本的分区 —— 挑了它只会拿到一个必然写不进去的号段。
-async fn list_writable(master: &Mutex<MasterClient<Channel>>) -> Result<Vec<PartitionId>> {
+/// master 当前可写(RW)分区列表 + **写权重**(pid 升序)。跳过没有副本的分区 —— 挑了它只会拿到一个
+/// 必然写不进去的号段。
+///
+/// 权重**照抄** master 的 `PartitionEntry.write_weight`(千分比 `1..=1000`);`0` = 未下发 / 容量未配
+/// → 归一成 `1`(均权),于是"master 还不下发权重"时行为与纯轮转**逐位一致**(§3.4 兼容)。
+/// router **不解释容量语义**:权重怎么算(master 按剩余占比现算,将来 admin 手动设置)与客户端无关。
+async fn list_writable(master: &Mutex<MasterClient<Channel>>) -> Result<Vec<PartitionWeight>> {
     let resp = master
         .lock()
         .await
@@ -800,7 +948,10 @@ async fn list_writable(master: &Mutex<MasterClient<Channel>>) -> Result<Vec<Part
         .partitions
         .into_iter()
         .filter(|p| !p.replicas.is_empty())
-        .map(|p| p.partition_id)
+        .map(|p| PartitionWeight {
+            pid: p.partition_id,
+            weight: p.write_weight.max(1),
+        })
         .collect())
 }
 
@@ -869,6 +1020,101 @@ async fn collect_majority<T>(
 fn sorted_replicas(mut replicas: Vec<ReplicaLoc>) -> Vec<ReplicaLoc> {
     replicas.sort_by_key(|r| !r.up);
     replicas
+}
+
+/// 读路径的副本排序(抽成自由函数,便于单测 —— [`Router::ordered_for_read`] 只是它的薄封装):
+/// **`up` 优先 → 观测延迟升序 → 原序**。
+///
+/// - `enabled == false` ⇒ 原样返回(恒等变换);
+/// - `up == false` 的副本仍排最后(它们大概率不可达,先试活的);
+/// - 延迟未知的副本按**已测副本的均值**参与排序(先验:不奖励也不惩罚新人;全都没测时所有键相等,
+///   排序退化成原序 —— 即与关闭本特性时**完全一致**);
+/// - 排序**稳定**,故延迟相同(或全无数据)时保持 master 给的顺序,行为可预期。
+fn order_by_latency(
+    replicas: &[ReplicaLoc],
+    latency: &LatencyTable,
+    enabled: bool,
+) -> Vec<ReplicaLoc> {
+    if !enabled {
+        return replicas.to_vec();
+    }
+    let prior = latency.mean_ms();
+    let key = |r: &ReplicaLoc| -> (bool, f64) {
+        let ms = latency.get(&r.addr).or(prior).unwrap_or(0.0);
+        (!r.up, ms)
+    };
+    let mut out = replicas.to_vec();
+    out.sort_by(|a, b| {
+        let (ua, ma) = key(a);
+        let (ub, mb) = key(b);
+        ua.cmp(&ub).then(ma.total_cmp(&mb))
+    });
+    out
+}
+
+/// **每副本的观测延迟**(毫秒,指数移动平均)—— 读路径据此"先试快的"。
+///
+/// ## 为什么只做这一件事
+///
+/// 读恒为 R=1(第一个成功即返回),故**试副本的顺序直接决定读延迟**;而慢副本恰恰是最该被绕开的东西。
+/// 这里**只改顺序、不改候选集** ⇒ 读的候选、写的 W 多数派、冲突解决全都不变,**不可能引入新的正确性问题**
+/// (慢副本本来就可能是任一被试到的副本;一致性模型早已允许"试到任意副本")。
+///
+/// 诚实边界:顺序变化会改变"你**先**看到哪个副本的状态"。而对象不可变 + 删除是墓碑,滞后副本可能
+/// 暂时读不到(→ 404 → 试下一个)或暂时看到已删对象仍活着 —— **这个风险在任意顺序下都存在**,
+/// 本节只改变"先撞上哪一个",不引入新的语义。
+///
+/// ## 平滑系数的取舍
+///
+/// `ALPHA = 0.2`(写死,不做配置):≈ 最近 5 次请求的等效窗口。太小则跟不上盘的变化,太大则一次抖动
+/// 就把好副本排到后面。**它不需要按部署标定** —— 这个排序是"尽力而为的启发",错了的代价只是
+/// "这次读多花一点"(而不是像 `disk_watchdog_ms` 那样错了就摘盘),所以不值得为它加旋钮。
+struct LatencyTable {
+    /// `addr -> EWMA(毫秒)`。用 `addr` 而不是 `node_id`:它直接对应 HTTP 目标,与 master 的 id 无关。
+    ///
+    /// **标准库 `Mutex`**(不是 `tokio::sync::Mutex`):临界区里没有任何 `await`(只做几次浮点运算),
+    /// 用异步锁反而要求调用方 `await`,还会把"排序"这件事变成一次跨 yield 的操作。
+    ewma_ms: std::sync::Mutex<HashMap<String, f64>>,
+}
+
+/// EWMA 平滑系数(见 [`LatencyTable`] 的说明:刻意不做配置项)。
+const LATENCY_ALPHA: f64 = 0.2;
+
+impl LatencyTable {
+    fn new() -> Self {
+        LatencyTable {
+            ewma_ms: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 记一次观测(成功或失败都记 —— **超时才是最该被记住的那种"慢"**)。
+    fn note(&self, addr: &str, ms: f64) {
+        let mut g = self.ewma_ms.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get_mut(addr) {
+            Some(v) => *v = LATENCY_ALPHA * ms + (1.0 - LATENCY_ALPHA) * *v,
+            None => {
+                g.insert(addr.to_string(), ms);
+            }
+        }
+    }
+
+    /// 已测副本的均值(没有任何测量 → `None`)。**未测副本用它当先验**:
+    /// 既不奖励也不惩罚一个刚出现的副本,而"全都没测"时所有键相等 ⇒ 排序退化为 master 顺序。
+    fn mean_ms(&self) -> Option<f64> {
+        let g = self.ewma_ms.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            return None;
+        }
+        Some(g.values().sum::<f64>() / g.len() as f64)
+    }
+
+    fn get(&self, addr: &str) -> Option<f64> {
+        self.ewma_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(addr)
+            .copied()
+    }
 }
 
 fn hex_key(key: &StoreKey) -> String {
@@ -982,6 +1228,110 @@ fn map_master_error(error: &str, pid: PartitionId) -> Error {
 mod tests {
     use super::*;
 
+    fn loc(node_id: u64, addr: &str, up: bool) -> ReplicaLoc {
+        ReplicaLoc {
+            node_id,
+            addr: addr.to_string(),
+            disk_id: "d0".to_string(),
+            target_state: "ACTIVE".to_string(),
+            up,
+            incarnation: 1,
+        }
+    }
+
+    /// **延迟感知排序的直接收益**:快的副本被先试。
+    ///
+    /// 读恒为 R=1(第一个成功即返回),故"先试谁"直接决定读延迟 —— 这是这一整块改动存在的理由。
+    #[test]
+    fn latency_order_prefers_the_faster_replica() {
+        let t = LatencyTable::new();
+        t.note("slow:1", 200.0);
+        t.note("fast:1", 5.0);
+        let rs = vec![
+            loc(1, "slow:1", true), // master 把它排第一
+            loc(2, "fast:1", true),
+        ];
+        let out = order_by_latency(&rs, &t, true);
+        assert_eq!(out[0].addr, "fast:1", "实测快的那份要被先试");
+        assert_eq!(out[1].addr, "slow:1");
+        assert_eq!(out.len(), 2, "候选集不变(只改顺序)");
+    }
+
+    /// **没有任何测量 ⇒ 恒等变换**:新增特性在"还没数据"时不能改变任何行为。
+    #[test]
+    fn latency_order_is_identity_without_measurements() {
+        let t = LatencyTable::new();
+        let rs = vec![
+            loc(3, "c:1", true),
+            loc(1, "a:1", true),
+            loc(2, "b:1", true),
+        ];
+        let out = order_by_latency(&rs, &t, true);
+        let addrs: Vec<&str> = out.iter().map(|r| r.addr.as_str()).collect();
+        assert_eq!(addrs, vec!["c:1", "a:1", "b:1"], "保持 master 原序");
+    }
+
+    /// **关掉时也是恒等变换**(留出对照/排查用的确定性顺序)。
+    #[test]
+    fn latency_order_disabled_is_identity() {
+        let t = LatencyTable::new();
+        t.note("a:1", 500.0);
+        t.note("b:1", 1.0);
+        let rs = vec![loc(1, "a:1", true), loc(2, "b:1", true)];
+        let out = order_by_latency(&rs, &t, false);
+        let addrs: Vec<&str> = out.iter().map(|r| r.addr.as_str()).collect();
+        assert_eq!(addrs, vec!["a:1", "b:1"], "关掉后顺序完全由 master 决定");
+    }
+
+    /// **`up = false` 的副本永远排最后** —— 哪怕它历史延迟最低。
+    ///
+    /// master 已经告诉我们它不健康;把一次读先拿去撞它,只会白白等一次超时。
+    #[test]
+    fn latency_order_keeps_down_replicas_last() {
+        let t = LatencyTable::new();
+        t.note("down:1", 1.0); // 历史很快,但自己是 down
+        t.note("up:1", 300.0);
+        let rs = vec![loc(1, "down:1", false), loc(2, "up:1", true)];
+        let out = order_by_latency(&rs, &t, true);
+        assert_eq!(out[0].addr, "up:1", "活的优先,与延迟无关");
+        assert_eq!(out[1].addr, "down:1");
+    }
+
+    /// **未测副本用"已测均值"当先验**:既不奖励也不惩罚新副本 ——
+    /// 比已测**慢**的那份靠前,比已测**快**的那份靠后。
+    #[test]
+    fn unmeasured_replica_uses_the_mean_as_prior() {
+        let t = LatencyTable::new();
+        t.note("fast:1", 5.0);
+        t.note("slow:1", 100.0);
+        // 均值 = 52.5 ⇒ 期望顺序:fast(5) < new(52.5) < slow(100)
+        let rs = vec![
+            loc(1, "slow:1", true),
+            loc(2, "fast:1", true),
+            loc(3, "new:1", true),
+        ];
+        let out = order_by_latency(&rs, &t, true);
+        let addrs: Vec<&str> = out.iter().map(|r| r.addr.as_str()).collect();
+        assert_eq!(addrs, vec!["fast:1", "new:1", "slow:1"]);
+    }
+
+    /// EWMA 朝最近观测移动,且量级正确(第一次观测即初始值)。
+    #[test]
+    fn latency_ewma_moves_toward_recent_observations() {
+        let t = LatencyTable::new();
+        t.note("a:1", 100.0);
+        assert_eq!(t.get("a:1"), Some(100.0), "第一次观测即初值");
+        t.note("a:1", 200.0);
+        // 0.2*200 + 0.8*100 = 120
+        let v = t.get("a:1").expect("有值");
+        assert!(
+            (v - 120.0).abs() < 1e-9,
+            "EWMA 应按 alpha=0.2 平滑,实际 {v}"
+        );
+        assert_eq!(t.get("never:1"), None, "没测过的副本没有值");
+        assert_eq!(LatencyTable::new().mean_ms(), None, "空表没有均值");
+    }
+
     /// 段 [start, start+count) —— 与发号响应同构(`next` 含、`end` 不含)。
     fn seg(pid: PartitionId, start: u32, count: u32) -> Segment {
         Segment {
@@ -992,58 +1342,145 @@ mod tests {
     }
 
     /// 缓存里装上各分区的一段号,轮转顺序 = `pids`。
-    fn cache_with(pids: &[PartitionId], count: u32) -> IdCache {
+    /// 缓存里装上各分区的一段号 + 写权重,取号顺序 = `weights` 的顺序。
+    fn cache_with(weights: &[(PartitionId, u32)], count: u32) -> IdCache {
         let mut c = IdCache {
-            order: pids.to_vec(),
+            order: weights
+                .iter()
+                .map(|(pid, weight)| PartitionWeight {
+                    pid: *pid,
+                    weight: *weight,
+                })
+                .collect(),
             ..Default::default()
         };
-        for (i, pid) in pids.iter().enumerate() {
+        for (i, (pid, _)) in weights.iter().enumerate() {
             c.segments
                 .insert(*pid, seg(*pid, 100 * (i as u32 + 1), count));
         }
         c
     }
 
-    /// 核心行为:取号在持有号段的分区之间**交替**,而不是把一个分区的一段连续耗尽。
+    /// 均权时:取号在持有号段的分区之间**交替** —— 与加权之前的顺序轮转逐位一致,是兼容性基线。
     #[test]
-    fn take_rr_rotates_across_partitions() {
-        let mut c = cache_with(&[1, 2, 3], 2);
+    fn uniform_weights_rotate_across_partitions() {
+        let mut c = cache_with(&[(1, 1), (2, 1), (3, 1)], 2);
         let pids: Vec<PartitionId> = (0..6)
-            .map(|_| c.take_rr().expect("有号可取").partition_id())
+            .map(|_| c.take_weighted().expect("有号可取").partition_id())
             .collect();
-        assert_eq!(pids, vec![1, 2, 3, 1, 2, 3], "必须按分区轮转");
-        assert!(c.take_rr().is_none(), "号取完 → 交给调用方补段");
+        assert_eq!(pids, vec![1, 2, 3, 1, 2, 3], "均权必须按分区交替");
+        assert!(c.take_weighted().is_none(), "号取完 → 交给调用方补段");
         assert!(c.segments.is_empty(), "取完的段必须被丢掉");
+    }
+
+    /// **核心行为**:权重决定取号比例,且**在短窗口内就生效** —— 这正是"只按权重切段大小、取号仍顺序
+    /// 轮转"做不到的(那种做法在整池轮完之前,各分区的计数一直相等)。
+    #[test]
+    fn weights_steer_allocation_within_a_short_window() {
+        let mut c = cache_with(&[(1, 1000), (2, 500), (3, 500)], 100);
+        let mut by_pid: HashMap<PartitionId, u32> = HashMap::new();
+        for _ in 0..20 {
+            *by_pid
+                .entry(c.take_weighted().expect("有号可取").partition_id())
+                .or_default() += 1;
+        }
+        assert_eq!(
+            (
+                by_pid.get(&1).copied().unwrap_or(0),
+                by_pid.get(&2).copied().unwrap_or(0),
+                by_pid.get(&3).copied().unwrap_or(0)
+            ),
+            (10, 5, 5),
+            "20 个号必须按 1000:500:500 分配(不是轮完一整池才均等)"
+        );
+    }
+
+    /// 权重 `0`(旧 master 未下发 / 容量未配)按**均权**处理 —— 不能解释成"零分配"。
+    #[test]
+    fn zero_weight_means_uniform_not_zero() {
+        let mut c = cache_with(&[(1, 0), (2, 1)], 4);
+        let pids: Vec<PartitionId> = (0..4)
+            .map(|_| c.take_weighted().expect("有号").partition_id())
+            .collect();
+        assert_eq!(pids, vec![1, 2, 1, 2], "0 权重 = 均权,不能被饿死");
     }
 
     /// 一段只有一个号(count=1)也必须发得出去 —— `next` 含 / `end` 不含 的边界。
     #[test]
-    fn take_rr_handles_single_id_segment() {
-        let mut c = cache_with(&[7], 1);
-        let key = c.take_rr().expect("单号段仍可发一个号");
+    fn take_weighted_handles_single_id_segment() {
+        let mut c = cache_with(&[(7, 1)], 1);
+        let key = c.take_weighted().expect("单号段仍可发一个号");
         assert_eq!((key.partition_id(), key.object_id()), (7, 100));
-        assert!(c.take_rr().is_none());
+        assert!(c.take_weighted().is_none());
     }
 
-    /// 某分区的段取完后跳过它,其余分区继续轮转;空缓存返回 None。
+    /// 某分区的段取完后跳过它,其余分区继续取;空缓存返回 None。
     #[test]
-    fn take_rr_skips_exhausted_and_empty_cache_returns_none() {
-        assert!(IdCache::default().take_rr().is_none());
-        let mut c = cache_with(&[1, 2], 1);
+    fn take_weighted_skips_exhausted_and_empty_cache_returns_none() {
+        assert!(IdCache::default().take_weighted().is_none());
+        let mut c = cache_with(&[(1, 1), (2, 1)], 1);
         let pids: Vec<PartitionId> = (0..2)
-            .map(|_| c.take_rr().expect("有号可取").partition_id())
+            .map(|_| c.take_weighted().expect("有号可取").partition_id())
             .collect();
         assert_eq!(pids, vec![1, 2]);
-        assert!(c.take_rr().is_none());
+        assert!(c.take_weighted().is_none());
     }
 
-    /// 分区不在了(转 RO/封存后从 `order` 里消失)不 panic、不卡死:游标越过 `order` 长度要回绕。
+    /// 分区不在了(转 RO/封存后从 `order` 里消失)不 panic、不卡死:取号只看 `order` 里的分区
+    /// (它剩下的段由 `sync_segments` 连同段一起丢掉)。
     #[test]
-    fn take_rr_wraps_cursor_when_order_shrinks() {
-        let mut c = cache_with(&[1, 2], 4);
-        assert_eq!(c.take_rr().expect("号").partition_id(), 1);
-        c.order = vec![2]; // 分区 1 转 RO:从轮转顺序里摘掉
-        assert_eq!(c.take_rr().expect("号").partition_id(), 2);
-        assert_eq!(c.take_rr().expect("号").partition_id(), 2);
+    fn take_weighted_wraps_when_order_shrinks() {
+        let mut c = cache_with(&[(1, 1), (2, 1)], 4);
+        assert_eq!(c.take_weighted().expect("号").partition_id(), 1);
+        c.order.retain(|w| w.pid == 2); // 分区 1 转 RO:从取号顺序里摘掉
+        assert_eq!(c.take_weighted().expect("号").partition_id(), 2);
+        assert_eq!(c.take_weighted().expect("号").partition_id(), 2);
+    }
+
+    /// 份额:按权重配比、每段 `≥1`、结果确定(余数给小数部分最大的,同分 pid 小的优先)。
+    #[test]
+    fn segment_shares_are_proportional_with_a_floor_of_one() {
+        let w = |pid: PartitionId, weight: u32| PartitionWeight { pid, weight };
+        // 均权:每段恰好 = 均分时的大小(总预留口径不变)。
+        assert_eq!(
+            segment_shares(12, &[w(1, 1), w(2, 1), w(3, 1)]),
+            vec![4, 4, 4]
+        );
+        // 加权且整除:12 个号按 1000:500:500 → 6:3:3。
+        assert_eq!(
+            segment_shares(12, &[w(1, 1000), w(2, 500), w(3, 500)]),
+            vec![6, 3, 3]
+        );
+        // 有余数:7 个号按 1000:500:500 → 取整 3:1:1,余 2 个给小数部分最大的两个。
+        assert_eq!(
+            segment_shares(7, &[w(1, 1000), w(2, 500), w(3, 500)]),
+            vec![3, 2, 2]
+        );
+        // e2e 里那组:池 128(2 分区 × 段 64)按 1000:500 → 85:43(余数给小数部分大的那一个)。
+        assert_eq!(segment_shares(128, &[w(1, 1000), w(2, 500)]), vec![85, 43]);
+        // 极端偏斜也不产生 0 长度的段(0 长度 = 该分区永远发不出号)。
+        assert_eq!(segment_shares(2048, &[w(1, 1000), w(2, 1)]), vec![2046, 2]);
+        assert_eq!(segment_shares(2, &[w(1, 1000), w(2, 1)]), vec![1, 1]);
+        // 空输入 / 全 0 权重(防御):不 panic、不分配。
+        assert!(segment_shares(1024, &[]).is_empty());
+        assert!(segment_shares(1024, &[w(1, 0)]).is_empty());
+    }
+
+    /// 段尾收敛:按份额**只减不增**;无号可发时明确告诉调用方丢掉它(而不是留一个空段)。
+    #[test]
+    fn trim_segment_only_shrinks_and_reports_exhaustion() {
+        // 手上还剩 [10, 100),份额 20 → 收紧到 [10, 30)(丢掉的 70 个号成空洞,不再发给任何人)。
+        let mut s = seg(1, 10, 90);
+        assert!(trim_segment(&mut s, 20), "收敛后仍有号可发");
+        assert_eq!((s.next, s.end), (10, 30));
+
+        // 份额比手上剩的还多 → **不增长**(号只能由 master 发,不能替它多要)。
+        let mut s = seg(1, 10, 90);
+        assert!(trim_segment(&mut s, 1000));
+        assert_eq!((s.next, s.end), (10, 100), "段尾只减不增");
+
+        // objectId 空间见底(saturating 后等于 next)→ 没号可发,调用方该丢掉它。
+        let mut s = seg(1, u32::MAX, 0);
+        assert!(!trim_segment(&mut s, 5), "无号可发必须报 false");
     }
 }

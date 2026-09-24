@@ -7,14 +7,19 @@
 //!   3. **R = 1**:第一个副本不可达时自动换副本读成功;
 //!   4. 号段:一次申请多个 id,互不重复、都落在 master 发的 partition 上,**且在可写分区之间轮转**;
 //!   5. 元数据/删除/复活;不存在的对象报 `NotFound`(而不是笼统的传输错误);
-//!   6. 后台刷新任务:可写分区增减(转 RO / 新建)后本地号段池跟着调账。
+//!   6. 后台刷新任务:可写分区增减(转 RO / 新建)后本地号段池跟着调账;
+//!   7. **写权重**:master 下发的 `write_weight`(剩余容量占比)决定发号怎么在分区之间分 —— 越空的分区
+//!      拿到的号越多,占用对调后分布跟着翻转(软状态直注,不依赖心跳周期)。
 //!
 //! 测试夹具刻意**不依赖心跳周期**:节点注册与分区建立直接经 master 的 Raft 提交,副本在 store 上
 //! 经 admin 端点同步创建 —— 全部同步等待,不用 `sleep`(CLAUDE.md §5.6)。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use antfs_master::pb::master_client::MasterClient;
+use antfs_master::pb::ListPartitionsRequest;
+use antfs_master::soft::{DiskUsage, ReplicaState};
 use antfs_master::types::{
     DiskSpec, MasterCommand, MasterResponse, NodeInfo, PartitionState, ReplicaPlacement,
 };
@@ -22,6 +27,7 @@ use antfs_master::{MasterConfig, MasterNode};
 use antfs_router::{Error, Router, RouterConfig, StoreKey};
 use antfs_store::{StoreServer, StoreServerConfig};
 use openraft::BasicNode;
+use tonic::transport::Channel;
 
 const SECRET: &str = "test-secret";
 
@@ -163,6 +169,8 @@ fn client_cfg(master_addr: &str) -> RouterConfig {
         id_segment_size: 4,
         // 1s:让后台刷新在测试里可观测(生产默认 30s)。
         partition_refresh_secs: 1,
+        // 其余走默认值:新增配置项不该让每个构造 `RouterConfig` 的地方都跟着改一遍。
+        ..Default::default()
     }
 }
 
@@ -348,6 +356,142 @@ async fn allocated_ids_are_unique_and_partitioned() {
             .await
             .unwrap_or_else(|e| panic!("put {id:?}: {e}"));
     }
+}
+
+/// **写权重生效**:master 下发的 `write_weight` 真的决定发号怎么在分区之间分 —— 越空的分区拿到的号越多。
+///
+/// 软状态**直注**(与 master 侧加权用例同款注入),故不依赖心跳周期、不用 `sleep`:分布的改变由
+/// 「池子耗尽 → 按新权重补段」确定性地体现。号段 `id_segment_size = 64` × 2 分区 = 池 128,
+/// 权重 1000:500 → 份额 85:43(余数按小数部分给 p1),两轮 256 个号即 170:86。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partition_write_weight_steers_allocation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let dir_a = tmp.path().join("store-a");
+    let (_sa, addr_a) = start_store(&dir_a, 101).await;
+    register_node(&node, 101, &addr_a).await;
+
+    let p0 = create_partition(&node, vec![placement(101)]).await;
+    let p1 = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, p0).await;
+    ensure_replica(&addr_a, p1).await;
+
+    // p1 的副本报"用掉一半容量" → 权重 500;p0 没有上报 → 视为全空 → 1000。
+    let cap = node.config.partition_capacity_bytes;
+    report_used(&node, &[(p0, 0), (p1, cap / 2)]);
+
+    // ① master 侧:权重真的**下发到 `ListPartitions`**(不是只在自动挑分区那一条路径里用)。
+    let weights = list_write_weights(&grpc).await;
+    assert_eq!(
+        weights.get(&p1).copied(),
+        Some(500),
+        "半满 → 权重 500;实际 {weights:?}"
+    );
+    assert_eq!(
+        weights.get(&p0).copied(),
+        Some(1000),
+        "全空 → 权重满值;实际 {weights:?}"
+    );
+
+    // ② client 侧:发号分布跟着权重走(p0 : p1 ≈ 2 : 1,而不是均权的 1 : 1)。
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(
+        RouterConfig {
+            id_segment_size: 64, // 池子大一点,权重配比才不被量化吃掉
+            ..client_cfg(&grpc)
+        },
+        &registry,
+    )
+    .await
+    .expect("connect");
+    let (p0_n, p1_n) = spread_by_partition(&client, p0, p1, 256).await;
+    assert!(
+        p0_n * 100 / 256 >= 60,
+        "越空的分区应拿到大部分号:p0={p0_n}, p1={p1_n}"
+    );
+    assert!(
+        p1_n * 100 / 256 <= 40,
+        "半满的分区必须被降权:p0={p0_n}, p1={p1_n}"
+    );
+
+    // ③ 反向验证:把占用对调(现在 p0 半满)→ 分布跟着翻转 —— 证明它由**权重**驱动,与 pid 顺序无关。
+    report_used(&node, &[(p0, cap / 2), (p1, 0)]);
+    let (p0_n, p1_n) = spread_by_partition(&client, p0, p1, 256).await;
+    assert!(
+        p1_n * 100 / 256 >= 60,
+        "占用对调后应轮到 p1 拿大头:p0={p0_n}, p1={p1_n}"
+    );
+    let snapshot: BTreeMap<u32, u32> = client.write_weights().await.into_iter().collect();
+    assert_eq!(
+        (snapshot.get(&p0).copied(), snapshot.get(&p1).copied()),
+        (Some(500), Some(1000)),
+        "client 侧权重快照必须跟着 master 更新"
+    );
+}
+
+/// 申请 `n` 个号,返回它们落在两个分区上的个数(顺带断言"号只能来自这两个可写分区")。
+async fn spread_by_partition(client: &Router, p0: u32, p1: u32, n: u32) -> (u64, u64) {
+    let ids = client.allocate_batch(n).await.expect("allocate_batch");
+    let p0_n = ids.iter().filter(|k| k.partition_id() == p0).count() as u64;
+    let p1_n = ids.iter().filter(|k| k.partition_id() == p1).count() as u64;
+    assert_eq!(p0_n + p1_n, u64::from(n), "号只能来自这两个可写分区");
+    (p0_n, p1_n)
+}
+
+/// 直注软状态:节点 101 判活 + 各分区副本的实然态(占用)。心跳是**全量**上报,故一次给全该节点的副本
+/// (分次调用会整体替换掉上一次的)。
+fn report_used(node: &MasterNode, replicas: &[(u32, u64)]) {
+    node.soft.record_beat(
+        101,
+        HashMap::from([(
+            "d0".to_string(),
+            DiskUsage {
+                capacity_bytes: 1 << 40,
+                free_bytes: 1 << 39,
+                health: String::new(),
+            },
+        )]),
+    );
+    node.soft.record_replicas(
+        101,
+        replicas.iter().map(|(pid, used)| {
+            (
+                *pid,
+                ReplicaState {
+                    disk_id: "d0".to_string(),
+                    current_state: "ACTIVE".to_string(),
+                    lag_bytes: 0,
+                    used_bytes: *used,
+                },
+            )
+        }),
+        true,
+    );
+}
+
+/// 读 master 的 `ListPartitions`(RW)→ `pid → write_weight`。
+async fn list_write_weights(grpc_addr: &str) -> BTreeMap<u32, u32> {
+    let mut client = MasterClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("connect master gRPC");
+    list_write_weights_from(&mut client).await
+}
+
+async fn list_write_weights_from(client: &mut MasterClient<Channel>) -> BTreeMap<u32, u32> {
+    client
+        .list_partitions(ListPartitionsRequest {
+            version: 1,
+            offset: 0,
+            limit: 0,
+            state: "RW".to_string(),
+        })
+        .await
+        .expect("list_partitions")
+        .into_inner()
+        .partitions
+        .into_iter()
+        .map(|p| (p.partition_id, p.write_weight))
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -22,10 +22,23 @@ pub struct RouterConfig {
     pub cluster_secret: String,
     /// 单次数据面 HTTP 请求超时(秒)。
     pub request_timeout_secs: u64,
-    /// **每个可写分区**一次向 master 申请的 blobId 个数(号段大小 N)。router 稳态下同时持有
-    /// 「可写分区数 × N」个号:越大越省 RPC、router 崩溃留下的空洞越大
+    /// **每个可写分区均分时**一次向 master 申请的 blobId 个数(号段大小 N)。router 稳态下同时持有
+    /// 「可写分区数 × N」个号(**总预留口径与写权重无关**;每个分区实际拿到多少按 master 下发的写权重
+    /// 配比,见 `docs/design/router.md` §2):越大越省 RPC、router 崩溃留下的空洞越大
     /// (空洞无害,见 `blobid-master-assign` D3/D9)。
     pub id_segment_size: u32,
+    /// **读路由是否按观测延迟排序副本**(默认 `true`)。
+    ///
+    /// 读恒为 R=1(第一个成功即返回),故**试副本的顺序直接决定读延迟**。开着时,router 会记录每个副本
+    /// 最近若干次请求的耗时(指数移动平均),读时**先试快的**;没有测量数据的副本按"已知值的均值"参与排序,
+    /// 全都无数据时保持 master 给的顺序(即与关闭时完全一致)。
+    ///
+    /// **为什么默认开着**(与"不擅改默认值"不冲突):它**只改试副本的顺序,不改副本集合** ——
+    /// 读的候选集、写的 W 多数派语义、冲突解决全都不变,故不可能引入新的正确性问题;
+    /// 而无数据时它是**恒等变换**。慢副本本该被绕开 —— 这正是客户端侧最便宜的一块收益。
+    ///
+    /// 关掉它的场景:排查"为什么读打到了某个副本"(定位问题时想要确定性顺序),或对照压测。
+    pub latency_aware_routing: bool,
     /// 后台刷新**可写分区列表**的周期(秒)。router 起一个后台任务,按此周期向 master 拉一次可写(RW)分区列表:
     /// 已不可写的分区,其本地号段被丢掉;新出现的可写分区,补一段加进缓存。
     /// **0 = 关闭**刷新(退回"只在号段耗尽时拉一次列表")。
@@ -39,6 +52,7 @@ impl Default for RouterConfig {
             cluster_secret: String::new(),
             request_timeout_secs: 10,
             id_segment_size: 1024,
+            latency_aware_routing: true,
             partition_refresh_secs: 30,
         }
     }

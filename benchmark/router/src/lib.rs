@@ -68,6 +68,8 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
             request_timeout_secs: cfg.request_timeout_secs,
             id_segment_size: cfg.id_segment_size,
             partition_refresh_secs: 30,
+            // 其余走默认值(含读路由的延迟感知)。
+            ..Default::default()
         },
         &registry,
     )
@@ -123,7 +125,7 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
 
     let written = Arc::new(written.lock().expect("written poisoned").clone());
     if !written.is_empty() {
-        report_partition_spread(&written);
+        report_partition_spread(&written, &router.write_weights().await);
     }
     if !written.is_empty() && cfg.read_ratio > 0 {
         let reads = (written.len() as u64 * cfg.read_ratio / 100).max(1);
@@ -183,21 +185,35 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
     Ok(())
 }
 
-/// 打印写成功的 blobId 在**各分区**上的分布 —— 轮转发号是否真的把写摊到多个分区上的直接证据。
+/// 打印写成功的 blobId 在**各分区**上的分布 + 当前生效的**写权重** —— 把"期望比例 vs 实际分布"并列,
+/// 是"按 partition 写权重发号"是否真的生效的直接证据(权重全 1 时即均权,分布应大体均匀)。
 ///
 /// 注意:分区摊开 ≠ 盘摊开。盘级是否摊开还要看这些分区的副本落在哪些盘上(master 的放置决定;
 /// 用 `store-*/partition_*` 目录或 admin `ListPartitions` 对照)。
-fn report_partition_spread(keys: &[StoreKey]) {
+fn report_partition_spread(keys: &[StoreKey], weights: &[(u32, u32)]) {
     let mut by_pid: BTreeMap<u32, u64> = BTreeMap::new();
     for k in keys {
         *by_pid.entry(k.partition_id()).or_default() += 1;
     }
+    let weight_of: BTreeMap<u32, u32> = weights.iter().copied().collect();
+    let sum_w: u64 = weights.iter().map(|(_, w)| u64::from(*w)).sum();
     let total = keys.len() as u64;
-    println!("分配分布: {total} 个号落在 {} 个分区", by_pid.len());
+    println!(
+        "分配分布: {total} 个号落在 {} 个分区(本地可写分区 {} 个,权重合计 {sum_w})",
+        by_pid.len(),
+        weights.len()
+    );
     for (pid, n) in &by_pid {
-        println!(
-            "  partition {pid:<6} {n:>8} 个 ({:.1}%)",
-            *n as f64 * 100.0 / total as f64
-        );
+        let pct = *n as f64 * 100.0 / total as f64;
+        match weight_of.get(pid).filter(|_| sum_w > 0) {
+            Some(w) => println!(
+                "  partition {pid:<6} {n:>8} 个 ({pct:>5.1}%)  权重 {w:>4} → 期望 {:>5.1}%",
+                f64::from(*w) * 100.0 / sum_w as f64
+            ),
+            // 写过的分区此刻不在本地可写集合里(转 RO/封存后被丢掉):不猜权重,直说。
+            None => println!(
+                "  partition {pid:<6} {n:>8} 个 ({pct:>5.1}%)  权重未知(已不在本地可写集合)"
+            ),
+        }
     }
 }

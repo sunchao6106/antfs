@@ -61,6 +61,39 @@ pub struct MasterConfig {
     /// 计划式均衡:单条在途搬迁的超时(秒);超时未摘源 → 判败(`FailBalanceMove`),释放并发预算,
     /// 不再重试该条(重试同样的落点大概率再卡,留给运维重新 eval)。
     pub balance_move_timeout_secs: u64,
+    /// **判活迟滞**(D5):节点被判 down 需要**连续 K 个 reconcile tick** 都观察到心跳过期。
+    ///
+    /// 有效判死窗口 ≈ `heartbeat_timeout_secs + K × reconcile_interval_secs`(默认 15 + 3×5 = 30s)。
+    /// 为什么需要它:判活原先只看单窗口(`elapsed() <= heartbeat_timeout_secs`,15s),而 store 每 3s
+    /// 一拍 —— 一次 GC/调度停顿、一次 `statvfs` 卡顿就能跨过阈值,于是**一次抖动 = 判死 = 全节点再复制**。
+    /// 3s 心跳在这段窗口里本应有 10 拍,少一两拍不该等于死亡。
+    ///
+    /// **0 = 保持改造前行为**(单窗口无迟滞),便于回退对比。
+    pub node_down_debounce_ticks: u64,
+    /// **再复制每 tick 预算**(D6):每 tick 最多**新发起**这么多个欠副本分区的补副本。
+    ///
+    /// 按 `PartitionId` 排序取前 K(确定性,便于复现),其余下 tick 继续;被压下的数量暴露成
+    /// `master_rereplication_deferred`。为什么必须有它:原先 `add_targets` 一 tick 全量发起,
+    /// 一个节点判死 ⇒ 它承载的**所有**分区同时开始搬数据(可能是几万个),把网络与盘写瞬间打满。
+    ///
+    /// 注意:它限的是"每 tick 的**数量**",不是 `balance_max_in_flight` 那种并发信号量 ——
+    /// 两者名字相近但意义不同,别照抄。
+    pub rereplication_max_per_tick: u64,
+    /// **坏盘撤离总开关**(D4)。**默认 false**:这是新写的**自动搬迁动作**,与该类动作的保守惯例一致
+    /// (同 `auto_grow_enabled`)。关闭时坏盘只被"不再接新副本"避开(既有行为),**不会有任何自动搬迁**。
+    pub disk_evac_enabled: bool,
+    /// **持续证据门槛**(秒,仅 `disk_evac_enabled` 时生效):某盘为 `UNAVAILABLE` 需**持续**这么久才允许
+    /// 撤离它上面的副本。
+    ///
+    /// 为什么单轮故障枚举不够:一次抖动就搬 GB 级数据,代价不对称 —— 多留一份副本几乎免费,一次不必要的
+    /// 迁移是真金白银(还可能让新副本与源副本一起进入追平)。故门槛取得比"判坏"宽松得多
+    /// (判坏:3 轮/30s;撤离:默认 300s)。
+    pub disk_evac_min_bad_secs: u64,
+    /// **在途撤离预算**(个,仅 `disk_evac_enabled` 时生效):同时在途的撤离分区数上限。
+    ///
+    /// "在途" = 该分区在硬放置里**还带着坏盘上的那个副本**(搬迁未完成)。撤离是真搬 GB 数据,
+    /// 风格对齐 `balance_max_in_flight = 1`:宁可慢,也别把网络与盘写一次打满。
+    pub disk_evac_max_in_flight: u64,
 }
 
 impl Default for MasterConfig {
@@ -89,6 +122,13 @@ impl Default for MasterConfig {
             balance_max_moves: 100,
             balance_skew_threshold: 1.0,
             balance_move_timeout_secs: 300,
+            // 经验初值(见字段注释;标定前先按"宁可迟,不可早"取值)。
+            node_down_debounce_ticks: 3,
+            rereplication_max_per_tick: 4,
+            // 自动搬迁动作:保守默认关(同 `auto_grow_enabled`)。
+            disk_evac_enabled: false,
+            disk_evac_min_bad_secs: 300,
+            disk_evac_max_in_flight: 1,
         }
     }
 }
@@ -150,6 +190,25 @@ impl Validate for MasterConfig {
             self.balance_move_timeout_secs,
             1,
         )?;
+        // D5/D6:迟滞轮数允许 0(= 关迟滞,保持改造前行为);再复制预算是**必须 ≥1** 的护栏
+        // (0 会让欠副本永远补不上,那是静默停摆,不是"保守")。
+        at_least(
+            "master.rereplication_max_per_tick",
+            self.rereplication_max_per_tick,
+            1,
+        )?;
+        // D4:持续证据门槛必须 ≥1(0 等于"一看到 UNAVAILABLE 就搬",那正是门槛要防的事);
+        // 在途预算 ≥1(0 会让撤离永远不动,那是静默停摆,不是"保守")。
+        at_least(
+            "master.disk_evac_min_bad_secs",
+            self.disk_evac_min_bad_secs,
+            1,
+        )?;
+        at_least(
+            "master.disk_evac_max_in_flight",
+            self.disk_evac_max_in_flight,
+            1,
+        )?;
         if self.raft_addr.is_empty() {
             return Err(antfs_config::ConfigError::invalid(
                 "master.raft_addr",
@@ -169,5 +228,86 @@ impl Validate for MasterConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 本批(盘故障处置 D4/D5/D6)新增配置项的**默认值闸门**:改任何一个都必须显式改本测试。
+    ///
+    /// 为什么逐个断言而不是只测 `Default`:`Default` 变了但没人注意,是"经验初值被误当成标定过的值"
+    /// 最常见的路径。这些数字在**压测标定**(见 `docs/design/cluster.md` §9.3)之前都是经验值。
+    #[test]
+    fn disk_fault_defaults_are_pinned_pending_calibration() {
+        let c = MasterConfig::default();
+        assert_eq!(
+            c.node_down_debounce_ticks, 3,
+            "判活迟滞拍数(有效判死窗口 ≈ heartbeat_timeout + K × reconcile_interval)"
+        );
+        assert_eq!(
+            c.rereplication_max_per_tick, 4,
+            "每 tick 新发起的再复制分区上限"
+        );
+        assert!(
+            !c.disk_evac_enabled,
+            "自动搬迁动作默认关(与 auto_grow_enabled 同风格)"
+        );
+        assert_eq!(
+            c.disk_evac_min_bad_secs, 300,
+            "坏盘撤离的持续证据门槛(应远大于判坏门槛)"
+        );
+        assert_eq!(
+            c.disk_evac_max_in_flight, 1,
+            "在途撤离分区数上限(风格对齐 balance_max_in_flight)"
+        );
+    }
+
+    /// 本批配置的校验:危险的取值必须**当场起不来**,而不是悄悄退化成"静默停摆"或"每拍刷屏"。
+    ///
+    /// - `rereplication_max_per_tick = 0` ⇒ 欠副本永远补不上(静默停摆),不是"保守";
+    /// - `disk_evac_min_bad_secs = 0` ⇒ 一看到 `UNAVAILABLE` 就搬数据(正是门槛要防的事);
+    /// - `disk_evac_max_in_flight = 0` ⇒ 撤离永远不动,同样是静默停摆;
+    /// - `node_down_debounce_ticks = 0` ⇒ **合法**(保持改造前行为,便于回退对比)。
+    #[test]
+    fn disk_fault_validation_rejects_silent_stalls() {
+        let base = MasterConfig::default();
+        assert!(base.validate().is_ok(), "默认配置应合法");
+
+        for (field, cfg) in [
+            (
+                "master.rereplication_max_per_tick",
+                MasterConfig {
+                    rereplication_max_per_tick: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "master.disk_evac_min_bad_secs",
+                MasterConfig {
+                    disk_evac_min_bad_secs: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "master.disk_evac_max_in_flight",
+                MasterConfig {
+                    disk_evac_max_in_flight: 0,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert!(cfg.validate().is_err(), "{field} 的危险取值必须被拒");
+        }
+
+        let no_debounce = MasterConfig {
+            node_down_debounce_ticks: 0,
+            ..base
+        };
+        assert!(
+            no_debounce.validate().is_ok(),
+            "0 = 关迟滞(保持改造前行为),必须合法以便回退对比"
+        );
     }
 }

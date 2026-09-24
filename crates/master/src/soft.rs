@@ -154,6 +154,15 @@ impl SoftState {
             .collect()
     }
 
+    /// **在册**节点集(不管心跳是否超时)。
+    ///
+    /// 判活迟滞需要它:迟滞的语义是"**在册**节点的连击",而不是"过期集合的连击" ——
+    /// 一个从没上报过的节点不该被算成"连续 N 拍过期",一个刚注册的节点也不该继承别人的连击。
+    pub fn known_nodes(&self) -> std::collections::HashSet<NodeId> {
+        let g = self.inner.read().expect("soft state lock poisoned");
+        g.nodes.keys().copied().collect()
+    }
+
     /// 全集群磁盘 (Σcapacity_bytes, Σfree_bytes) 汇总(心跳上报,reconciler 观测用)。
     pub fn capacity_totals(&self) -> (u64, u64) {
         let g = self.inner.read().expect("soft state lock poisoned");

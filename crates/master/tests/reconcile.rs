@@ -46,6 +46,8 @@ fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
         balance_max_moves: 100,
         balance_skew_threshold: 1.0,
         balance_move_timeout_secs: 300,
+        // 其余配置项走默认值:本用例只关心上面那几项,新增配置项不该让每个测试文件都跟着改一遍。
+        ..Default::default()
     }
 }
 
@@ -317,17 +319,44 @@ async fn decommission_evacuates_replicas_add_before_remove() {
         .await
         .expect("connect");
 
-    // 全部 4 个数据节点心跳保持存活(含被下线的 103)。
-    for id in [101u64, 102, 103, 104] {
-        let mut hb = client
-            .heartbeat(tokio_stream::iter(vec![beat(id, vec![])]))
+    // 全部 4 个数据节点心跳保持存活(含被下线的 103),并**各自如实上报自己的副本为 `ACTIVE`**。
+    //
+    // 为什么必须报 ACTIVE:删源闸门已统一 —— 两条 evacuation 路径都要求"数得上的每一份**已追平**"
+    // 才允许删源(否则会把还在 `BOOTSTRAP` 的那份算成已有数据,可能删掉盘上唯一一份可用数据)。
+    // 上线的 `DecommissionNode` 在真实集群里也是这么工作的:store 会持续上报 `current_state`。
+    let grpc = leader.config.grpc_addr.clone();
+    let keepalive = tokio::spawn(async move {
+        let mut c = MasterClient::connect(format!("http://{grpc}"))
             .await
-            .expect("hb")
-            .into_inner();
-        hb.message().await.expect("recv").expect("directive");
-    }
+            .expect("connect");
+        for _ in 0..40 {
+            for id in [101u64, 102, 104] {
+                let replicas = vec![antfs_master::pb::ReplicaBeat {
+                    partition_id: pid,
+                    disk_id: "d0".into(),
+                    current_state: "ACTIVE".into(),
+                    lag_bytes: 0,
+                    used_bytes: 100,
+                }];
+                if let Ok(resp) = c
+                    .heartbeat(tokio_stream::iter(vec![beat(id, replicas)]))
+                    .await
+                {
+                    let _ = resp.into_inner().message().await;
+                }
+            }
+            // 103 也要保持"存活"(它在下线中,不应因为心跳缺失而被判 down —— 那会让测试偏离主题)。
+            if let Ok(resp) = c
+                .heartbeat(tokio_stream::iter(vec![beat(103, vec![])]))
+                .await
+            {
+                let _ = resp.into_inner().message().await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
 
-    // 下线 103:evacuation 应先在 104 补副本,再移除 103。
+    // 下线 103:evacuation 应先在 104 补副本,再移除 103(等 104 报 ACTIVE 之后)。
     let d = client
         .decommission_node(antfs_master::pb::DecommissionRequest {
             version: 1,
@@ -369,6 +398,7 @@ async fn decommission_evacuates_replicas_add_before_remove() {
         vec![101, 102, 104],
         "final placement excludes decommissioned 103, includes 104"
     );
+    keepalive.abort();
 }
 
 /// 宽限期内 reconciler 不动作(用于确定性地观察 move 的中间态,不被"后删"竞态干扰)。
@@ -1990,4 +2020,532 @@ async fn heartbeat_directive_carries_partition_states() {
         d.partition_states.is_empty(),
         "无副本上报时不应下发任何分区状态"
     );
+}
+
+// ── D5 判活迟滞 / D6 再复制每 tick 预算(端到端:真 3 节点 master + 真心跳流)─────────────
+//
+// 这两条都是"防误判引发风暴"的护栏,而它们的**价值只在真链路里能看出来**:单元测试证明函数算得对,
+// 这里证明**它被接上了**(配置 → reconcile loop → 实际不再一 tick 全量搬数据)。
+
+/// D5 的配置:心跳超时与调谐周期都压到 1s、迟滞 3 拍、免稳定期 —— 让"过期 → 计数 → 判死"在几秒内可观测。
+fn cfg_fast_liveness(id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
+    MasterConfig {
+        node_id: id,
+        raft_addr: format!("127.0.0.1:{raft}"),
+        grpc_addr: format!("127.0.0.1:{grpc}"),
+        data_dir: dir.to_string_lossy().into_owned(),
+        initial_members: vec![1, 2, 3],
+        cluster_secret: SECRET.to_string(),
+        heartbeat_timeout_secs: 1,
+        reconcile_interval_secs: 1,
+        reconcile_startup_grace_secs: 0,
+        node_down_debounce_ticks: 3,
+        ..Default::default()
+    }
+}
+
+/// 起 3 节点 master、选出 leader、注册 4 个数据节点(n1..n3 + 一个备用 104),返回 (nodes, leader_id)。
+async fn cluster_with_spare(tmp: &std::path::Path) -> Vec<MasterNode> {
+    let mut nodes = Vec::new();
+    let mut members = BTreeMap::new();
+    for id in 1u64..=3 {
+        let dir = tmp.join(format!("n{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = cfg_fast_liveness(id, &dir, free_port(), free_port());
+        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let registry = antfs_metric::Registry::new();
+        let node = MasterNode::start(c, &registry).await.expect("start");
+        node.serve().expect("serve");
+        nodes.push(node);
+    }
+    nodes[0].initialize(members).await.expect("initialize");
+    for n in &nodes {
+        n.raft
+            .wait(Some(Duration::from_secs(15)))
+            .metrics(|m| m.current_leader.is_some(), "leader")
+            .await
+            .expect("leader elected");
+    }
+    let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
+    for (id, rack) in [(101u64, "rA"), (102, "rB"), (103, "rC"), (104, "rD")] {
+        leader
+            .raft
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: data_node(rack),
+            })
+            .await
+            .expect("register data node");
+    }
+    nodes
+}
+
+/// 建一个副本落在 `on` 上的 RF=1 分区,返回 pid。
+async fn create_partition_on(leader: &MasterNode, on: &[u64]) -> u32 {
+    let replicas = on
+        .iter()
+        .map(|n| ReplicaPlacement {
+            node_id: *n,
+            disk_id: "d0".into(),
+            target_state: "ACTIVE".into(),
+            incarnation: 0,
+        })
+        .collect();
+    let resp = leader
+        .raft
+        .client_write(MasterCommand::CreatePartition {
+            replication_factor: on.len() as u8,
+            replicas,
+        })
+        .await
+        .expect("create partition");
+    match resp.data {
+        antfs_master::MasterResponse::PartitionId(id) => id,
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// **D5:一次心跳抖动不该判节点死**(而持续静默**仍要**判死)。
+///
+/// 场景:RF=1 分区在 103 上;103 上报一次心跳之后**停止上报**(模拟一次 GC/调度停顿 / `statvfs` 卡顿);
+/// 101、102 照常心跳(保证集群里有别的存活节点可作备选)。
+///
+/// 断言分两半,缺一不可:
+/// 1. **早段**(节拍不到 3):`master_node_down_total == 0` 且分区**没有**被补到 104 ——
+///    单窗口判活这时候早就判死了,迟滞必须挡住它;
+/// 2. **晚段**(20s 内):连击达标 ⇒ 判死**确实发生**(`node_down == 1`)且副本补到 104 ——
+///    "不再把抖动当死亡"不等于"永远不判死",真死了照样 30s 内被发现。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn liveness_debounce_absorbs_a_single_missed_beat_but_still_detects_real_death() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = cluster_with_spare(tmp.path()).await;
+    let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
+    // RF=3 落在 101/102/103 ⇒ 103 一死,`try_add_replica` 的 exclude 就是 {101,102,103},
+    // 唯一备选只剩 104 —— 断言因此是**确定**的(不用猜 placement 在平票时选谁)。
+    let pid = create_partition_on(leader, &[101, 102, 103]).await;
+
+    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
+        .await
+        .expect("connect");
+
+    // 三个节点各上报一次(让它们在软状态里"在册",并如实报出各自的副本);此后只有 101/102 继续上报。
+    for id in [101u64, 102, 103] {
+        let replicas = vec![antfs_master::pb::ReplicaBeat {
+            partition_id: pid,
+            disk_id: "d0".into(),
+            current_state: "ACTIVE".into(),
+            lag_bytes: 0,
+            used_bytes: 100,
+        }];
+        let mut hb = client
+            .heartbeat(tokio_stream::iter(vec![beat(id, replicas)]))
+            .await
+            .expect("hb")
+            .into_inner();
+        hb.message().await.expect("recv").expect("directive");
+    }
+    // 104 也必须上报一次:选盘只看**软状态**里的盘余量,一次没报过的节点是"未上报 ⇒ 不可用"。
+    // (这不是测试技巧,而是真实约束:备选节点得先活着报到,才有资格被补副本。)
+    {
+        let mut hb = client
+            .heartbeat(tokio_stream::iter(vec![beat(104, vec![])]))
+            .await
+            .expect("hb104")
+            .into_inner();
+        hb.message().await.expect("recv").expect("directive");
+    }
+    let last_103_beat = Instant::now();
+
+    // 101/102 持续心跳(在后台跑,保证它们不会跟着一起过期)。
+    // 先把地址拷成 owned String —— `spawn` 要求 `'static`,不能借住 `nodes`。
+    let grpc_addr = leader.config.grpc_addr.clone();
+    let keepalive = tokio::spawn(async move {
+        let mut c = MasterClient::connect(format!("http://{grpc_addr}"))
+            .await
+            .expect("connect");
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            // 104 必须**持续**心跳:它既要做备选,就要一直是"存活健康盘",
+            // 否则 1s 超时一到它自己就被排除出候选(与要修的"节点判死"是同一把尺子)。
+            for id in [101u64, 102, 104] {
+                if let Ok(resp) = c
+                    .heartbeat(tokio_stream::iter(vec![beat(id, vec![])]))
+                    .await
+                {
+                    let _ = resp.into_inner().message().await;
+                }
+            }
+        }
+    });
+
+    // ① 早段:等到"103 已过期但连击还没到 3 拍"的时刻。心跳超时 1s + 调谐周期 1s ⇒
+    //    最坏连击进度 = floor((elapsed - 1s) / 1s);在 2.5s 时最多 1 拍,**远不到 3**。
+    while last_103_beat.elapsed() < Duration::from_millis(2_500) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        gauge(leader, "master_node_down_total").unwrap_or(0),
+        0,
+        "抖一拍就被判死 = 迟滞没接上(单窗口判活这时候早就判死了)"
+    );
+    assert!(
+        !placement(leader, pid).contains(&104),
+        "还没判死就不该开始搬数据;placement={:?}",
+        placement(leader, pid)
+    );
+
+    // ② 晚段:连击达标 ⇒ 判死发生 + 副本补到 104(证明"迟滞只是延后,不是永不")。
+    let sm = leader.sm_data.clone();
+    let grown = wait_until(Duration::from_secs(25), || {
+        let g = sm.read().unwrap();
+        g.state
+            .partitions
+            .get(&pid)
+            .map(|p| p.replicas.iter().any(|r| r.node_id == 104))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        grown,
+        "持续静默最终必须被发现并补副本;placement={:?}",
+        placement(leader, pid)
+    );
+    assert_eq!(
+        gauge(leader, "master_node_down_total").unwrap_or(0),
+        1,
+        "判死应恰好计一次(持续 down 不每拍重复计)"
+    );
+
+    keepalive.abort();
+}
+
+/// **D6:一个节点判死不能让它的全部分区在同一拍开始搬数据** —— 每 tick 只放行 K 个,
+/// 但**最终**全部补齐(限速,不是停摆)。
+///
+/// 这条的失败形态正是"集群动荡":几万个分区同时开始搬 GB 级数据,把网络与盘写瞬间打满。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rereplication_budget_throttles_a_node_death_but_never_stalls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = cluster_with_spare(tmp.path()).await;
+    let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
+
+    // 6 个 RF=3 分区,副本统一落 101/102/103 ⇒ 103 一死,6 个分区都欠 1 个副本,
+    // 而**唯一**备选是 104(确定),且 6 > 默认每 tick 预算 4 ⇒ 必然触发限速。
+    let pids: Vec<u32> = {
+        let mut v = Vec::new();
+        for _ in 0..6 {
+            v.push(create_partition_on(leader, &[101, 102, 103]).await);
+        }
+        v
+    };
+
+    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
+        .await
+        .expect("connect");
+    // 三个节点各上报一次(在册 + 如实报副本);此后 103 静止,101/102 保持心跳。
+    for id in [101u64, 102, 103] {
+        let replicas = pids
+            .iter()
+            .map(|pid| antfs_master::pb::ReplicaBeat {
+                partition_id: *pid,
+                disk_id: "d0".into(),
+                current_state: "ACTIVE".into(),
+                lag_bytes: 0,
+                used_bytes: 10,
+            })
+            .collect();
+        let mut hb = client
+            .heartbeat(tokio_stream::iter(vec![beat(id, replicas)]))
+            .await
+            .expect("hb")
+            .into_inner();
+        hb.message().await.expect("recv").expect("directive");
+    }
+    // 同上:104 先报一次盘余量,否则它不在候选里。
+    {
+        let mut hb = client
+            .heartbeat(tokio_stream::iter(vec![beat(104, vec![])]))
+            .await
+            .expect("hb104")
+            .into_inner();
+        hb.message().await.expect("recv").expect("directive");
+    }
+    let grpc_addr = leader.config.grpc_addr.clone();
+    let keepalive = tokio::spawn(async move {
+        let mut c = MasterClient::connect(format!("http://{grpc_addr}"))
+            .await
+            .expect("connect");
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            // 104 必须**持续**心跳:它既要做备选,就要一直是"存活健康盘",
+            // 否则 1s 超时一到它自己就被排除出候选(与要修的"节点判死"是同一把尺子)。
+            for id in [101u64, 102, 104] {
+                if let Ok(resp) = c
+                    .heartbeat(tokio_stream::iter(vec![beat(id, vec![])]))
+                    .await
+                {
+                    let _ = resp.into_inner().message().await;
+                }
+            }
+        }
+    });
+
+    let sm = leader.sm_data.clone();
+    // ① 限速可见:迟早会观测到"有分区被顺延到下一拍"。
+    let throttled = wait_until(Duration::from_secs(25), || {
+        gauge(leader, "master_rereplication_deferred").unwrap_or(0) > 0
+    })
+    .await;
+    assert!(
+        throttled,
+        "6 个欠副本分区 > 每 tick 预算 4 ⇒ 限速必须可观测(否则运维看到的是'系统不动了')"
+    );
+
+    // ② 但绝不停摆:最终 6 个分区**全部**补齐到 104。
+    let all_grown = wait_until(Duration::from_secs(30), || {
+        let g = sm.read().unwrap();
+        pids.iter().all(|pid| {
+            g.state
+                .partitions
+                .get(pid)
+                .map(|p| p.replicas.iter().any(|r| r.node_id == 104))
+                .unwrap_or(false)
+        })
+    })
+    .await;
+    let g = sm.read().unwrap();
+    let pending: Vec<u32> = pids
+        .iter()
+        .copied()
+        .filter(|pid| {
+            !g.state.partitions[pid]
+                .replicas
+                .iter()
+                .any(|r| r.node_id == 104)
+        })
+        .collect();
+    assert!(
+        all_grown,
+        "被顺延的分区必须在下几拍补上(限速 ≠ 停摆);仍缺: {pending:?}"
+    );
+
+    keepalive.abort();
+}
+
+/// **D4 坏盘撤离全链路**(加固需求 8.3):坏盘 → 先补副本 → **继任者追平(ACTIVE)后**才删源;
+/// 断言两步之间**源副本一直还在**(任意时刻可用副本数不下降)。
+///
+/// ## 为什么这条断言最值钱
+///
+/// "先补后删"如果只按"存活副本数 ≥ RF"判,就会把**还在追平的那份**算成已有数据 ——
+/// 于是删掉源盘上唯一一份可用数据 ⇒ **丢数据**(CLAUDE.md §3.1)。故本用例在"新副本已就位、
+/// 但还没报 ACTIVE"的窗口里**反复断言源仍在**,把那道闸门钉死。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_active() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut nodes = Vec::new();
+    let mut members = BTreeMap::new();
+    for id in 1u64..=3 {
+        let dir = tmp.path().join(format!("n{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = MasterConfig {
+            node_id: id,
+            raft_addr: format!("127.0.0.1:{}", free_port()),
+            grpc_addr: format!("127.0.0.1:{}", free_port()),
+            data_dir: dir.to_string_lossy().into_owned(),
+            initial_members: vec![1, 2, 3],
+            cluster_secret: SECRET.to_string(),
+            heartbeat_timeout_secs: 5,
+            reconcile_interval_secs: 1,
+            reconcile_startup_grace_secs: 0,
+            node_down_debounce_ticks: 3,
+            // D4:显式打开自动撤离,并把"持续证据"压到 1s 便于观察。
+            disk_evac_enabled: true,
+            disk_evac_min_bad_secs: 1,
+            disk_evac_max_in_flight: 1,
+            ..Default::default()
+        };
+        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let registry = antfs_metric::Registry::new();
+        let node = MasterNode::start(c, &registry).await.expect("start");
+        node.serve().expect("serve");
+        nodes.push(node);
+    }
+    nodes[0].initialize(members).await.expect("initialize");
+    for n in &nodes {
+        n.raft
+            .wait(Some(Duration::from_secs(15)))
+            .metrics(|m| m.current_leader.is_some(), "leader")
+            .await
+            .expect("leader elected");
+    }
+    let leader_id = nodes[0].raft.metrics().borrow().current_leader.unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id)
+        .unwrap();
+    for (id, rack) in [(101u64, "rA"), (102, "rB"), (103, "rC"), (104, "rD")] {
+        leader
+            .raft
+            .client_write(MasterCommand::RegisterNode {
+                node_id: id,
+                info: data_node(rack),
+            })
+            .await
+            .expect("register");
+    }
+    // RF=2 落在 (101,d0)/(102,d0):(101,d0) 判坏后,候选只有 103/104(平票取小 ⇒ 103)。
+    let pid = create_partition_on(leader, &[101, 102]).await;
+    let grpc = leader.config.grpc_addr.clone();
+
+    let sm = leader.sm_data.clone();
+
+    // 该分区当前硬放置的节点集(**直接从被测 leader 的状态机读**,不经 API 加工)。
+    let placement_now = |sm: &std::sync::Arc<
+        std::sync::RwLock<antfs_master::store::StateMachineData>,
+    >|
+     -> Vec<u64> {
+        let g = sm.read().expect("sm");
+        let mut ids: Vec<u64> = g.state.partitions[&pid]
+            .replicas
+            .iter()
+            .map(|r| r.node_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // 继任者是否已"追平"由测试控制:置位之后 103 才开始上报 ACTIVE。
+    let successor_active = Arc::new(AtomicBool::new(false));
+    let flag = successor_active.clone();
+    let keepalive = tokio::spawn(async move {
+        let mut c = MasterClient::connect(format!("http://{grpc}"))
+            .await
+            .expect("connect");
+        for _ in 0..40 {
+            for id in [101u64, 102, 103, 104] {
+                // 101 的盘**持续报 UNAVAILABLE**;其余节点盘健康。
+                let health = if id == 101 { "UNAVAILABLE" } else { "" };
+                let mut replicas = Vec::new();
+                if id == 101 || id == 102 {
+                    replicas.push(antfs_master::pb::ReplicaBeat {
+                        partition_id: pid,
+                        disk_id: "d0".into(),
+                        current_state: "ACTIVE".into(),
+                        lag_bytes: 0,
+                        used_bytes: 100,
+                    });
+                }
+                if id == 103 && flag.load(Ordering::Relaxed) {
+                    // 继任者补上来了:先报 BOOTSTRAP,等下面置位后才报 ACTIVE。
+                    replicas.push(antfs_master::pb::ReplicaBeat {
+                        partition_id: pid,
+                        disk_id: "d0".into(),
+                        current_state: "ACTIVE".into(),
+                        lag_bytes: 0,
+                        used_bytes: 100,
+                    });
+                }
+                if let Ok(resp) = c
+                    .heartbeat(tokio_stream::iter(vec![beat_disk(
+                        id, replicas, DISK_FREE, health,
+                    )]))
+                    .await
+                {
+                    let _ = resp.into_inner().message().await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    });
+
+    // ① 先补:坏盘撤离应把副本补到 103。
+    let sm1 = sm.clone();
+    let added = wait_until(Duration::from_secs(25), || {
+        placement_now(&sm1).contains(&103)
+    })
+    .await;
+    assert!(
+        added,
+        "坏盘上的副本应被补到健康盘;placement={:?}",
+        placement_now(&sm)
+    );
+
+    // ② **先补后删**:继任者还没报 ACTIVE 的这段时间里,源(101)必须**一直在**。
+    //    跑够 ≥3 个调谐周期,给 reconciler 充分的"犯错机会"。
+    for round in 0..4 {
+        assert!(
+            placement_now(&sm).contains(&101),
+            "第 {round} 轮:继任者尚未 ACTIVE,源副本绝不能被删(删了就丢数据);placement={:?}",
+            placement_now(&sm)
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    assert_eq!(
+        gauge(leader, "master_disk_evacuating").unwrap_or(0),
+        1,
+        "在途撤离数应如实暴露(受 disk_evac_max_in_flight 约束)"
+    );
+    let planned = antfs_metric::gather(&leader.registry)
+        .ok()
+        .and_then(|d| {
+            antfs_metric::parse(&d)
+                .into_iter()
+                .find(|s| {
+                    s.name == "master_disk_evac_planned_total"
+                        && s.labels
+                            .iter()
+                            .any(|(k, v)| k == "result" && *v == "planned")
+                })
+                .map(|s| s.value)
+        })
+        .unwrap_or(0.0);
+    assert!(planned >= 1.0, "撤离计划应计数(planned)");
+
+    // ③ 继任者追平 ⇒ 现在才允许删源。
+    successor_active.store(true, Ordering::Relaxed);
+    let sm2 = sm.clone();
+    let removed = wait_until(Duration::from_secs(25), || {
+        let ids = placement_now(&sm2);
+        ids.contains(&103) && !ids.contains(&101)
+    })
+    .await;
+    assert!(
+        removed,
+        "继任者 ACTIVE 之后才该删源;placement={:?}",
+        placement_now(&sm)
+    );
+    // ④ 最终仍保有 RF=2 份可用副本(先补后删的可观测保证)。
+    assert_eq!(
+        placement_now(&sm),
+        vec![102, 103],
+        "最终放置:坏盘上的副本已搬走,冗余仍是 2"
+    );
+    // 在途 gauge 比硬放置**晚一拍**收敛(它在本 tick 的动作之前刷新),故这里是**有界等待**而不是立即断言。
+    let drained = wait_until(Duration::from_secs(10), || {
+        gauge(leader, "master_disk_evacuating") == Some(0)
+    })
+    .await;
+    assert!(
+        drained,
+        "撤离走完后在途应归 0(实际 {:?})",
+        gauge(leader, "master_disk_evacuating")
+    );
+
+    keepalive.abort();
 }

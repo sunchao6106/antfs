@@ -65,6 +65,8 @@ fn cfg(
         balance_max_moves: 100,
         balance_skew_threshold: 1.0,
         balance_move_timeout_secs: move_timeout_secs,
+        // 其余配置项走默认值:本用例只关心上面那几项,新增配置项不该让每个测试文件都跟着改一遍。
+        ..Default::default()
     }
 }
 

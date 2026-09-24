@@ -78,6 +78,31 @@ fn used_ratio(u: &DiskUsage) -> Option<f64> {
     (u.capacity_bytes > 0).then(|| 1.0 - (u.free_bytes as f64 / u.capacity_bytes as f64))
 }
 
+/// 写权重的上界(千分比):1000 = 该分区完全空。下界固定 1(见 [`capacity_weight_permille`])。
+const WEIGHT_PERMILLE_MAX: u32 = 1000;
+
+/// 分区的**写权重**(千分比,`1..=1000`)= 剩余容量占分区容量上限的比例(1000 = 完全空,越接近 1 越满)。
+///
+/// 两处用途**共用这一个定义**(否则集群里会出现两套自相矛盾的"容量权重"):
+/// ① 发号时 `partition_id` 缺省 → [`MasterService::pick_writable_partition`] 按它加权随机挑分区;
+/// ② [`MasterService::list_partitions`] 把它下发给 client(`PartitionEntry.write_weight`)——
+///    client(router SDK)只当**相对**权重用,不解释容量语义。
+///
+/// - **下限 1**:上报为满/超卖(余量 0)的分区仍留一丝机会,不被永久饿死;正因如此 `0` 可以让给
+///   "未下发/无意见"(`cap == 0` 即未配容量上限时返回 1000 = 无意见),二者不冲突。
+/// - 口径:`used` 由调用方按"每分区取各副本最大值"给(见 `SoftState::used_bytes_by_partition`)。
+fn capacity_weight_permille(cap: u64, used: u64) -> u32 {
+    if cap == 0 {
+        return WEIGHT_PERMILLE_MAX;
+    }
+    // u128 做乘法:cap 取到 u64 上界时 remaining × 1000 会溢出 u64。
+    let ratio =
+        u128::from(cap.saturating_sub(used)) * u128::from(WEIGHT_PERMILLE_MAX) / u128::from(cap);
+    u32::try_from(ratio)
+        .unwrap_or(WEIGHT_PERMILLE_MAX)
+        .clamp(1, WEIGHT_PERMILLE_MAX)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -297,11 +322,26 @@ impl MasterNode {
             let mut balance_counted: std::collections::HashSet<(u64, PartitionId, NodeId)> =
                 std::collections::HashSet::new();
             let mut balance_plan_seen: Option<u64> = None;
+            // D5 判活迟滞的连击状态(`node -> 连续多少拍观察到心跳过期`)。leader 本地簿记:
+            // 切主后新 leader 从零重算(反正它也要先过稳定期),不需要进 Raft。
+            let mut liveness_misses: HashMap<NodeId, u64> = HashMap::new();
+            // 上一拍判定为 up 的集合:只用来算"本拍**新**判死了几个"(计数不重复刷)。
+            let mut prev_up: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            // D4 持续证据:`(node,disk) -> (最近健康值, 该值自何时起未变)`。值一变就重置计时。
+            let mut disk_health_since: std::collections::BTreeMap<
+                (NodeId, DiskId),
+                (String, Instant),
+            > = std::collections::BTreeMap::new();
+            // D4 在途撤离:`已为哪些分区开过撤离`(坏盘上那份副本还在 ⇒ 仍未走完)。leader 本地簿记。
+            let mut evac_started: std::collections::BTreeSet<PartitionId> =
+                std::collections::BTreeSet::new();
             loop {
                 tick.tick().await;
                 if raft.metrics().borrow().current_leader != Some(config.node_id) {
                     leader_since = None; // 卸任 leader:下次重新计稳定期
                     last_unsatisfiable.clear();
+                    liveness_misses.clear();
+                    prev_up.clear();
                     continue;
                 }
                 // 启动/切主稳定期:软状态靠心跳从零重建,期内不据"暂无心跳"误判失联(防再复制风暴)。
@@ -309,7 +349,34 @@ impl MasterNode {
                 if !crate::reconcile::reconcile_ready(since.elapsed(), grace) {
                     continue;
                 }
-                let up = soft.up_nodes(timeout);
+                // D5:先拿**原始**判活(单窗口)与"本拍谁过期",再过迟滞得到**决策用**的 up 集。
+                //
+                // 两者分工刻意不同:**观测/展示**口径(上面的 gauge、`ListNodes` 的 up 字段)用原始的 ——
+                // "最后一拍心跳什么时候来的"是事实;而**执行动作**(再复制/撤离/迁移后删)用迟滞后的 ——
+                // 判死的代价是几万个分区一起搬数据,一次抖动不该触发它。
+                let up_raw = soft.up_nodes(timeout);
+                let known: Vec<NodeId> = soft.known_nodes().into_iter().collect();
+                let expired: std::collections::HashSet<NodeId> = known
+                    .iter()
+                    .copied()
+                    .filter(|n| !up_raw.contains(n))
+                    .collect();
+                let up = crate::reconcile::up_nodes_debounced(
+                    known.iter().copied(),
+                    &expired,
+                    config.node_down_debounce_ticks,
+                    &mut liveness_misses,
+                );
+                // 只在"本拍新判死"时计数(持续 down 不每拍重复计)。
+                for n in prev_up.difference(&up) {
+                    metrics.node_down.inc();
+                    tracing::warn!(
+                        node = *n,
+                        debounce_ticks = config.node_down_debounce_ticks,
+                        "reconcile: node declared down after liveness debounce"
+                    );
+                }
+                prev_up = up.clone();
                 let (
                     partitions,
                     all_nodes,
@@ -336,10 +403,50 @@ impl MasterNode {
                     )
                 };
 
-                // 补副本目标:失联再复制(M3)∪ 下线 evacuation 的"先补"(M4)。动作相同,合并去重。
-                let evac = plan_evacuation(&partitions, &decom, &up);
+                // 补副本目标:失联再复制(M3)∪ 下线 evacuation 的"先补"(M4)∪ **坏盘撤离**的"先补"(D4)。
+                // 动作相同,合并去重。
+                let active = soft.active_replicas();
                 let errored = soft.errored_replicas();
                 let usage = soft.usage_snapshot();
+
+                // ---- D4:坏盘抖动集的**持续证据**维护 ----
+                //
+                // 逐 tick 记"每个 (node,disk) 的健康值**从什么时候起没变过**":值一变就重置计时。
+                // 于是 `pick_evicted_disks` 能回答"它保持 UNAVAILABLE 满 min_bad_secs 了吗" ——
+                // 抖动中的盘永远攒不满(这是刻意的,见 design §6/§8)。
+                {
+                    let now = Instant::now();
+                    let mut alive: std::collections::HashSet<(NodeId, DiskId)> =
+                        std::collections::HashSet::new();
+                    for ((node, disk), u) in &usage {
+                        let key = (*node, disk.clone());
+                        alive.insert(key.clone());
+                        match disk_health_since.get_mut(&key) {
+                            Some((h, since)) => {
+                                if *h != u.health {
+                                    *h = u.health.clone();
+                                    *since = now;
+                                }
+                            }
+                            None => {
+                                disk_health_since.insert(key, (u.health.clone(), now));
+                            }
+                        }
+                    }
+                    // 盘从软状态里消失(节点注销/换盘):记账一并清掉,免得留下陈旧计时。
+                    disk_health_since.retain(|k, _| alive.contains(k));
+                }
+                let evicted_disks: std::collections::BTreeSet<(NodeId, DiskId)> =
+                    if config.disk_evac_enabled {
+                        crate::reconcile::pick_evicted_disks(
+                            &disk_health_since,
+                            config.disk_evac_min_bad_secs,
+                            Instant::now(),
+                        )
+                    } else {
+                        std::collections::BTreeSet::new() // 关着 ⇒ 什么都不抖出(既有行为)
+                    };
+                let evac = plan_evacuation(&partitions, &decom, &evicted_disks, &up, &active);
 
                 // 集群级观测 gauge(周期刷新,仅 leader;对齐 under_replicated_partitions 的更新时机)。
                 {
@@ -430,10 +537,56 @@ impl MasterNode {
                     plan_rereplication(&partitions, &up, &errored)
                         .into_iter()
                         .collect();
-                for a in &evac {
-                    if let EvacAction::Add(pid) = a {
+                // D4 的"先补"受**在途预算**约束:在途 = 该分区在硬放置里**还带着坏盘上那个副本**
+                // (搬迁未完成)。预算满了就把本拍新腾出来的名额让给已在途的那些,不再开新的。
+                let evac_adds: std::collections::BTreeSet<PartitionId> = evac
+                    .iter()
+                    .filter_map(|a| match a {
+                        EvacAction::Add(pid) => Some(*pid),
+                        EvacAction::Remove(..) => None,
+                    })
+                    .collect();
+                // 在途 = **本 leader 已为它开过撤离**、且坏盘上那份副本还在 placement 里(搬迁没走完)。
+                // 用显式的 `evac_started` 而不是"包含被抖出盘的分区" —— 后者在**开出第一发之前**就已经成立,
+                // 会把预算一开始就占满,导致永远开不出第一发(实测踩到)。
+                evac_started.retain(|pid| {
+                    partitions.get(pid).is_some_and(|info| {
+                        info.replicas
+                            .iter()
+                            .any(|r| evicted_disks.contains(&(r.node_id, r.disk_id.clone())))
+                    })
+                });
+                metrics.disk_evacuating.set(evac_started.len() as i64);
+                let budget =
+                    (config.disk_evac_max_in_flight as usize).saturating_sub(evac_started.len());
+                let mut opened = 0usize;
+                let mut newly_opened = 0usize;
+                for pid in &evac_adds {
+                    // 已经开过的**照旧重发**:上一发可能因为"当时没有健康盘可落"而失败,重发才能自愈;
+                    // 它不占新名额(名额是"同时在途多少条",不是"发了多少次")。重发不会造成重复副本 —
+                    // 一旦补上来的那份进了 placement,这个 pid 就不再出现在 `evac_adds` 里了。
+                    if evac_started.contains(pid) {
+                        add_targets.insert(*pid);
+                        continue;
+                    }
+                    if opened < budget {
+                        opened += 1;
+                        newly_opened += 1;
+                        evac_started.insert(*pid);
                         add_targets.insert(*pid);
                     }
+                }
+                if config.disk_evac_enabled && !evac_adds.is_empty() {
+                    // `unsatisfiable`:本拍该补的比"还没开过的名额"多 —— 说明被预算挡住了(不是没盘可落),
+                    // 持续为 `unsatisfiable` 就是"该把 disk_evac_max_in_flight 调大"的信号。
+                    let result = if newly_opened + evac_started.len().min(evac_adds.len())
+                        >= evac_adds.len()
+                    {
+                        "planned"
+                    } else {
+                        "unsatisfiable"
+                    };
+                    metrics.disk_evac_planned.with_label_values(&[result]).inc();
                 }
                 metrics
                     .under_replicated_partitions
@@ -485,7 +638,22 @@ impl MasterNode {
                 }
                 let mut unsatisfiable: std::collections::BTreeSet<PartitionId> =
                     std::collections::BTreeSet::new();
-                for pid in add_targets {
+                // D6:每 tick 只发起前 K 个(按 `PartitionId` 确定性排序),其余下 tick 继续 ——
+                // 否则"一个节点判死"会让它承载的所有分区**同时**开始搬 GB 级数据。
+                // 被压下的数量暴露成 gauge:让"我们正在限速"可见,而不是表现为"系统不动了"。
+                let (this_tick, deferred) = crate::reconcile::take_rereplication_budget(
+                    &add_targets,
+                    config.rereplication_max_per_tick,
+                );
+                metrics.rereplication_deferred.set(deferred as i64);
+                if deferred > 0 {
+                    tracing::info!(
+                        deferred,
+                        max_per_tick = config.rereplication_max_per_tick,
+                        "reconcile: 再复制按每 tick 预算限速,其余顺延到下一拍"
+                    );
+                }
+                for pid in this_tick {
                     // 排除该分区已有节点 + 所有下线节点(故障域打散,只落存活健康盘)。
                     let mut exclude: std::collections::HashSet<NodeId> = partitions[&pid]
                         .replicas
@@ -535,7 +703,7 @@ impl MasterNode {
 
                 // 副本迁移(MoveReplica)的"后删":新副本补上、继任者已 ACTIVE、且非迁出源的存活副本
                 // 数 ≥ RF,才移除迁出源(真正的"先补后删",见 `plan_move`)。
-                let active = soft.active_replicas();
+                // (`active` 已在前面取过 —— 撤离判定也要用它,不重复取。)
                 let successor_active: std::collections::HashSet<(PartitionId, NodeId)> = moving
                     .iter()
                     .filter(|(pid, from)| {
@@ -1056,8 +1224,9 @@ impl MasterService {
     /// 按**剩余容量加权**随机挑一个可写(RW)分区(blobid-master-assign D10:写路由由 master 选,
     /// 换来全局容量感知均衡 + 不撞陈旧的满/RO 分区 + 薄 client)。
     ///
-    /// - 权重 = `partition_capacity_bytes − used_bytes[pid]`,下界 1(留一丝机会,不让"上报为满"的分区
-    ///   被永久饿死)。`used_bytes` 取自心跳软状态,缺上报按 0 计(即视为"还没写过")。
+    /// - 权重 = [`capacity_weight_permille`](千分比;与下发给 client 的 `write_weight` 同一口径与同一函数),
+    ///   下界 1(留一丝机会,不让"上报为满"的分区被永久饿死)。`used_bytes` 取自心跳软状态,缺上报按 0 计
+    ///   (即视为"还没写过")。
     /// - 候选**优先**取「至少一个副本所在节点存活」的分区;若一个都没有(典型是 master 刚重启、
     ///   软状态还没被心跳重建),退回全部 RW 分区 —— 否则会出现"心跳空窗期完全不可写"的假故障。
     /// - 随机只在 leader 侧发生(不进 `apply`,守状态机确定性铁律)。
@@ -1068,10 +1237,8 @@ impl MasterService {
         timeout: Duration,
     ) -> Option<PartitionId> {
         let cap = self.config.partition_capacity_bytes;
-        let weight = |pid: PartitionId| {
-            cap.saturating_sub(used.get(&pid).copied().unwrap_or(0))
-                .max(1)
-        };
+        let weight =
+            |pid: PartitionId| capacity_weight_permille(cap, used.get(&pid).copied().unwrap_or(0));
 
         let mut cands: Vec<PartitionId> = g
             .state
@@ -1102,10 +1269,10 @@ impl MasterService {
         // 稳定顺序:权重相同时结果可复现,便于测试与排障(随机只体现在落点上)。
         cands.sort_unstable();
 
-        let total: u64 = cands.iter().map(|pid| weight(*pid)).sum();
+        let total: u64 = cands.iter().map(|pid| u64::from(weight(*pid))).sum();
         let mut point = pseudo_random() % total;
         for pid in &cands {
-            let w = weight(*pid);
+            let w = u64::from(weight(*pid));
             if point < w {
                 return Some(*pid);
             }
@@ -1507,6 +1674,8 @@ impl Master for MasterService {
         } else {
             req.limit as usize
         };
+        // 写权重(千分比)按软状态现算:**派生视图,不进 hard state/apply**(切主后由心跳重建)。
+        let used = self.soft.used_bytes_by_partition();
         let partitions = g
             .state
             .partitions
@@ -1588,6 +1757,10 @@ impl Master for MasterService {
                         .filter(|(p, _)| p == pid)
                         .map(|&(_, n)| n)
                         .collect(),
+                    write_weight: capacity_weight_permille(
+                        self.config.partition_capacity_bytes,
+                        used.get(pid).copied().unwrap_or(0),
+                    ),
                 }
             })
             .collect();
@@ -2519,5 +2692,42 @@ async fn place_one_partition(
             metrics.partition_create_failed.inc();
             Err(format!("{e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写权重(千分比)的边界与单调性:空 = 1000、半满 = 500、满/超卖 = 下限 1、未配上限 = 1000。
+    #[test]
+    fn capacity_weight_is_remaining_ratio_with_floor_one() {
+        let cap = 64 << 20;
+        assert_eq!(capacity_weight_permille(cap, 0), 1000, "完全空 → 满权重");
+        assert_eq!(
+            capacity_weight_permille(cap, cap / 2),
+            500,
+            "用掉一半 → 500"
+        );
+        assert_eq!(
+            capacity_weight_permille(cap, cap),
+            1,
+            "写满 → 下限 1(不被饿死)"
+        );
+        assert_eq!(capacity_weight_permille(cap, cap * 2), 1, "超卖 → 仍 1");
+        assert_eq!(
+            capacity_weight_permille(cap, cap - 1),
+            1,
+            "只剩 1 字节 → 量化后落到下限,不能是 0(0 表示'未下发')"
+        );
+        assert_eq!(
+            capacity_weight_permille(0, 0),
+            1000,
+            "未配容量上限 → 无意见(均权)"
+        );
+        assert_eq!(capacity_weight_permille(0, 123), 1000);
+        // cap 取到 u64 上界也不许溢出/panic(u128 内部算)。
+        assert_eq!(capacity_weight_permille(u64::MAX, 0), 1000);
+        assert_eq!(capacity_weight_permille(u64::MAX, u64::MAX / 2), 500);
     }
 }

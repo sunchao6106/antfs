@@ -6,7 +6,8 @@
 //! 的这个 `Registry` 上(CLAUDE.md §6)。
 
 use antfs_metric::{
-    counter, gauge, gauge_vec, IntCounter, IntGauge, IntGaugeVec, Registry, Result,
+    counter, counter_vec, gauge, gauge_vec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Registry, Result,
 };
 
 /// master 指标集,构造时注册进传入的 `Registry`。
@@ -101,6 +102,21 @@ pub struct MasterMetrics {
     pub balance_moves: IntCounter,
     /// 均衡计划内判败的搬迁数(counter,口径同上)。
     pub balance_failed: IntCounter,
+    /// 判定节点 down 的次数(counter;**迟滞后**才计 —— 便于确认判活没被一次心跳抖动污染)。
+    ///
+    /// `master.node_down_debounce_ticks = 0`(关迟滞)时它就是"每拍超时即计一次",会持续增长;
+    /// 开了迟滞后只在**连击达标那一刻**计一次(持续 down 不会每拍重复计)。
+    pub node_down: IntCounter,
+    /// 因每 tick 预算(`master.rereplication_max_per_tick`)被推后到下轮的欠副本分区数(gauge)。
+    ///
+    /// 它让"我们正在限速"**可见** —— 否则运维看到的现象是"系统不动了",而不是"在按预算补齐"。
+    pub rereplication_deferred: IntGauge,
+    /// 坏盘撤离计划生成/无法满足的次数,按 `result`(`planned` / `unsatisfiable`)分(D4)。
+    ///
+    /// `unsatisfiable` 持续增长 = "有坏盘要搬,但没地方搬"(需加节点/盘),这是必须让运维看见的状态。
+    pub disk_evac_planned: IntCounterVec,
+    /// 在途撤离分区数(gauge;受 `master.disk_evac_max_in_flight` 约束)(D4)。
+    pub disk_evacuating: IntGauge,
 }
 
 impl MasterMetrics {
@@ -314,6 +330,27 @@ impl MasterMetrics {
                 registry,
                 "master_balance_failed_total",
                 "balance plan moves observed reaching failed",
+            )?,
+            node_down: counter(
+                registry,
+                "master_node_down_total",
+                "nodes declared down (after liveness debounce; a node staying down is counted once)",
+            )?,
+            rereplication_deferred: gauge(
+                registry,
+                "master_rereplication_deferred",
+                "under-replicated partitions deferred to the next tick by rereplication_max_per_tick",
+            )?,
+            disk_evac_planned: counter_vec(
+                registry,
+                "master_disk_evac_planned_total",
+                "bad-disk evacuation plans generated (result: planned/unsatisfiable)",
+                &["result"],
+            )?,
+            disk_evacuating: gauge(
+                registry,
+                "master_disk_evacuating",
+                "partitions currently being evacuated off a bad disk (bounded by disk_evac_max_in_flight)",
             )?,
         })
     }

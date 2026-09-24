@@ -264,6 +264,10 @@ message PartitionEntry {
   bool healable = 7;                     // 欠副本时:是否有空闲健康节点可补(false=卡住,需加容量)
   string under_replicated_reason = 8;    // 欠副本原因码(healthy 时为空):node_down/replica_error/decommissioning/bootstrapping/no_spare
   repeated uint64 moving_out_nodes = 9;  // 迁移中的"待迁出"源节点(add-before-remove,新副本健康后移除)
+  // 写权重(千分比,0..=1000)= floor(剩余容量 / partition_capacity_bytes × 1000),下限 1:1000 = 完全空,越接近 1 越满。
+  // 0 = 未下发/无意见 → 客户端按均权处理(旧 master 兼容,§3.4);故 0 永不表示"零分配"。
+  // 客户端只用**相对**权重(段大小比 = 取号比),容量口径(policy)只活在 master 侧。
+  uint32 write_weight = 10;
 }
 
 message ListPartitionsResponse {
