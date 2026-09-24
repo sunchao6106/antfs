@@ -101,6 +101,39 @@ pub fn partition_of_path(path: &str) -> Option<PartitionId> {
         .ok()
 }
 
+/// 数据面请求的 **op 名**(打点标签用)。返回值域跨两条闸门:
+///
+/// - 可被静默的三类,用 [`DataOp::as_str`] 的真值(`put`/`get`/`delete`);
+/// - 其余 `/partitions/**` 数据面端点**虽然豁免静默**,却**照样受盘健康闸门管**(从坏盘上拉复制、
+///   拉段本来就拉不动),故它们也需要一个稳定的 op 名。
+///
+/// 与 [`classify`] 的分工:`classify` 答"这个请求**能不能被静默**"(默认豁免,失败方向是"禁不掉");
+/// `path_op` 答"这个请求**叫什么**"(只用于指标标签,不认识的一律 `"other"`)。
+/// 新增数据面端点时两条都要过 [`tests::path_op_names_every_data_plane_route`]。
+pub fn path_op(method: &Method, path: &str, query: Option<&str>) -> &'static str {
+    if let Some(op) = classify(method, path, query) {
+        return op.as_str();
+    }
+    let Some(tail) = path.strip_prefix("/partitions/") else {
+        return "other";
+    };
+    // 跳过 `{pid}`,按**剩余段**精确分类(不能用"第 2 段是 blobs 就完事"—— 那样
+    // `/blobs/{key}/metadata` 会被误判成复制读)。
+    let rest: Vec<&str> = tail.split('/').skip(1).collect();
+    match (method, rest.as_slice()) {
+        // 走到这里说明 `classify` 判了豁免:同一 method + 同一 path 下只剩"复制读"这一种可能
+        // (`?replication=` 非 0),口径与 `classify` 的豁免理由一致。
+        (&Method::GET, ["blobs", _key]) => "replication_get",
+        (&Method::GET, ["blobs", _key, "metadata"]) => "metadata",
+        (&Method::GET, ["replica-metadata"]) => "replica_metadata",
+        (&Method::GET, ["segments"]) => "segments",
+        (&Method::GET, ["segments", _name]) => "segment",
+        (&Method::GET, ["scrub-report"]) => "scrub_report",
+        (&Method::GET, ["verify"]) => "verify",
+        _ => "other",
+    }
+}
+
 /// 判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
@@ -427,6 +460,72 @@ mod tests {
         assert_eq!(partition_of_path("/partitions/7/blobs/00"), Some(7));
         assert_eq!(partition_of_path("/metrics"), None);
         assert_eq!(partition_of_path("/partitions/x/blobs/00"), None);
+    }
+
+    /// `path_op` 必须覆盖**每一条**数据面路由:盘健康闸门适用全部 `/partitions/**`,而它的拒绝打点
+    /// 靠这个 op 名 —— 新增端点若不在这里归类,看板上的拒绝会全挤进 `other`(故障归错地方)。
+    #[test]
+    fn path_op_names_every_data_plane_route() {
+        // 可静默的三类:op 名与 `DataOp::as_str` 完全一致(同一个真值,不另抄一遍)。
+        for (method, path, op) in [
+            ("PUT", "/partitions/0/blobs/0011223344556677", "put"),
+            ("DELETE", "/partitions/0/blobs/0011223344556677", "delete"),
+            ("GET", "/partitions/0/blobs/0011223344556677", "get"),
+            (
+                "GET",
+                "/partitions/0/blobs/0011223344556677/nosuchop",
+                "other",
+            ),
+            // 豁免但**照样受盘闸门管**的那些:各给一个稳定名字。
+            (
+                "GET",
+                "/partitions/0/blobs/0011223344556677?replication=1",
+                "replication_get",
+            ),
+            (
+                "GET",
+                "/partitions/0/blobs/0011223344556677/metadata",
+                "metadata",
+            ),
+            ("GET", "/partitions/0/replica-metadata", "replica_metadata"),
+            ("GET", "/partitions/0/segments", "segments"),
+            ("GET", "/partitions/0/segments/3_7", "segment"),
+            ("GET", "/partitions/0/scrub-report", "scrub_report"),
+            ("GET", "/partitions/0/verify", "verify"),
+            // 非数据面:永不经过盘闸门(只作为兜底,值本身无意义)。
+            ("GET", "/metrics", "other"),
+            ("POST", "/admin/request-control", "other"),
+            ("GET", "/", "other"),
+        ] {
+            assert_eq!(
+                path_op(&m(method), path, query_of(path)),
+                op,
+                "{method} {path} 的 op 名不对"
+            );
+        }
+    }
+
+    /// 从路径里取 query 部分(测试用;真实调用由 `req.uri().query()` 提供)。
+    fn query_of(path: &str) -> Option<&str> {
+        path.split_once('?').map(|(_, q)| q)
+    }
+
+    /// 读 op 与写/删同名路径必须分得开(`/blobs/{key}/metadata` 不能因为前缀是 `blobs` 被误判成
+    /// "复制读")—— 这条是 `path_op` 第一版真踩过的坑。
+    #[test]
+    fn path_op_does_not_confuse_blob_metadata_with_a_replication_read() {
+        let key = "/partitions/0/blobs/0011223344556677";
+        assert_eq!(path_op(&m("GET"), key, None), DataOp::Get.as_str());
+        assert_eq!(
+            path_op(&m("GET"), &format!("{key}/metadata"), None),
+            "metadata",
+            "带 /metadata 后缀的是元数据端点,不是复制读"
+        );
+        assert_eq!(
+            path_op(&m("GET"), key, Some("replication=1")),
+            "replication_get",
+            "复制读只能按 query 认"
+        );
     }
 
     #[test]

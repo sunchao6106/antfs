@@ -75,7 +75,7 @@ async fn start_store(node_id: u64, dir: &std::path::Path) -> (StoreServer, Strin
     let http_addr = addr(free_port());
     let cfg = StoreServerConfig {
         node_id,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: http_addr.clone(),
         master_addr: String::new(),
         partition_capacity_bytes: 64 << 20,
@@ -231,6 +231,8 @@ impl Fixture {
                 request_timeout_secs: 10,
                 id_segment_size: 4,
                 partition_refresh_secs: 30,
+                // 其余走默认值(含读路由的延迟感知)。
+                ..Default::default()
             },
         };
         cfg.validate().expect("frontend config");

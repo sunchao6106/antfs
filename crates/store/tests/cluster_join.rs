@@ -76,6 +76,8 @@ async fn store_server_joins_master_and_serves_directed_replica() {
         balance_max_moves: 100,
         balance_skew_threshold: 1.0,
         balance_move_timeout_secs: 300,
+        // 其余配置项走默认值:新增配置项不该让每个用到 master 的测试文件都跟着改一遍。
+        ..Default::default()
     };
     let mreg = antfs_metric::Registry::new();
     let master = MasterNode::start(mcfg.clone(), &mreg)
@@ -101,7 +103,7 @@ async fn store_server_joins_master_and_serves_directed_replica() {
     std::fs::create_dir_all(&ss_dir).unwrap();
     let sscfg = StoreServerConfig {
         node_id: 101,
-        data_dirs: vec![ss_dir.to_string_lossy().into_owned()],
+        data_dirs: vec![ss_dir.to_string_lossy().into_owned().into()],
         http_addr: format!("127.0.0.1:{}", free_port()),
         partition_capacity_bytes: 4 << 20,
         master_addr: mcfg.grpc_addr.clone(),

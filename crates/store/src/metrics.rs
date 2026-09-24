@@ -1,8 +1,8 @@
 //! `StoreServerMetrics`:数据节点打点(接 common/metric 的 `Registry`)。
 
 use antfs_metric::{
-    counter, counter_vec, gauge, gauge_vec, latency_seconds, latency_seconds_vec, Histogram,
-    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry, Result,
+    counter, counter_vec, gauge, gauge_vec, histogram_vec, latency_seconds, latency_seconds_vec,
+    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry, Result,
 };
 
 use crate::replica::{ReplicaState, STATE_BOOTSTRAP};
@@ -39,6 +39,71 @@ pub struct StoreServerMetrics {
     pub replicas_bootstrapping: IntGauge,
     /// 数据面错误,按 `kind` 分类(io / unavailable / join_error)。
     pub errors: IntCounterVec,
+    /// **每盘**在途数据面请求数,按 `disk_id` × `op` 分(与全局 `in_flight` 同口径,只是多了盘维度)。
+    ///
+    /// 引擎 IO 全是同步阻塞且共用同一个进程级阻塞池:一块盘开始堆积(或盘 hang 住),在它上面就
+    /// 只增不减 —— 这是"该盘出事了"最直接、也最不依赖任何超时判定的现网信号。
+    ///
+    /// **UI 上这一列就是"排队深度"的代偿**:真正的池排队深度要 `--cfg tokio_unstable`,而每盘有界池
+    /// (N4)落地后队列归我们自己管,届时换真值(见 `server.rs` 里那段取舍记录)。
+    pub disk_in_flight: IntGaugeVec,
+    /// 落在该盘上的**数据面请求数**,按 `disk_id` × `op` 分(`rate()` 即该盘 IOPS)。
+    ///
+    /// 口径 = 请求(不是磁盘扇区 IO),且只覆盖数据面;引擎内部 IO(flush / compaction / 入向复制
+    /// apply)不在此列 —— 它们随 N4 每盘池归口到同一条路径时再计入,见 `docs/design/store.md` §12.11。
+    pub disk_requests: IntCounterVec,
+    /// 该盘上**成功**请求的字节数,按 `disk_id` × `op` 分(`rate()` 即该盘带宽)。
+    ///
+    /// 与 `put_bytes_total` / `get_bytes_total` 同口径:只在成功路径计,失败/早退不计。
+    pub disk_bytes: IntCounterVec,
+    /// 落在该盘上的请求**端到端**延迟,按 `disk_id` × `op` 分(口径与 `request_duration` 一致,
+    /// 含阻塞池排队 —— 它是"用户看到的这块盘的 RT",不是纯 syscall 耗时)。
+    pub disk_request_duration: HistogramVec,
+    /// 该盘是否有一发探测**卡在盘里未归**(1 = 卡住)。
+    ///
+    /// 只为 `disk_health_enabled` 的部署服务(未开探测时恒 0)。为 1 说明探测线程收不回来,后续轮次
+    /// 已停止叠加(见 `health.rs` 模块注释)。
+    pub disk_probe_stuck: IntGaugeVec,
+    /// 因上一发探测未归而**跳过**探测的累计轮次数(× 探测周期 ≈ 该盘卡住的时长)。
+    pub disk_probe_skipped: IntCounterVec,
+    /// 端到端耗时超过 `disk_health_timeout_secs` 的数据面请求数,按 `disk_id` × `op` 分。
+    ///
+    /// 口径是**端到端**(handler 入口 → 引擎完成,**含阻塞池排队**),不是"盘自己慢":它回答"哪块盘
+    /// 在拖长尾、多久拖一次",用于标定每盘隔离/看门狗的强度。真正的"盘慢"(syscall 耗时)要看每盘
+    /// 看门狗落地时单独立的那组指标。
+    pub disk_slow_requests: IntCounterVec,
+    /// 每盘池的 **worker 线程数**(建池时定死;= `pool_size_by_dir` 或 `pool_shared_size` 均分的结果)。
+    pub disk_pool_workers: IntGaugeVec,
+    /// 每盘池**已准入未完成**的任务数(含排队中)。逼近 `workers + pool_queue_size` = 该盘正在被压满。
+    pub disk_pool_in_flight: IntGaugeVec,
+    /// 每盘池**已准入但还没被 worker 取走**的任务数 —— 这才是**真正的每盘排队深度**
+    /// (与 `disk_in_flight_requests` 那个代偿口径不同,后者含正在执行的)。
+    pub disk_pool_queued: IntGaugeVec,
+    /// 每盘池拒绝掉的提交数,按 `disk_id` × `op` × `reason`(`saturated` 池满超时 / `unknown_disk` /
+    /// `closed`)。**非零且持续 = 这块盘已经供不上,该加池或查盘**。
+    pub disk_pool_rejected: IntCounterVec,
+    /// 每盘**闭包内**测得的单次 IO 时长(syscall,**不含**池排队),按 `disk_id` × `op` 分。
+    ///
+    /// 与 `disk_request_duration`(端到端,含排队)**刻意分开**:后者回答"用户看到的这块盘多慢",
+    /// 前者回答"这盘自己快不快"。**只有后者能做隔离判据** —— 用端到端口径会把"池忙"判成"盘坏"
+    /// (design §5.1)。
+    pub disk_io_duration: HistogramVec,
+    /// 看门狗判定的单次 IO 超期次数,按 `disk_id` 分(超期只算**一次坏观测**,是否摘盘由迟滞决定)。
+    pub disk_io_watchdog_trips: IntCounterVec,
+    /// 该盘当前状态,按 `disk_id` × `state` 分(`state` ∈ [`crate::disk_health::REPORTED_STATES`])。
+    ///
+    /// **整族每次摆平**(当前值 1、其余 0):只置 1 不置 0 会让状态迁移后旧值永远留 1,看板上出现
+    /// "一块盘同时健康又坏掉"。
+    pub disk_health_state: IntGaugeVec,
+    /// 该盘可服务性的状态迁移次数,**按 `from` × `to` 分**。
+    ///
+    /// 非零是**正常**的(坏盘被隔离、恢复后复位);**频繁迁移**说明迟滞阈值定得太紧。
+    pub disk_health_transitions: IntCounterVec,
+    /// 因盘不可服务(或池满)而被跳过的后台工作,按 `disk_id` × `task`(`flush`/`compaction`/
+    /// `replication`)分。
+    ///
+    /// 它让"坏盘被跳过"这件事**可见** —— 否则表现为"这块盘上的副本悄悄不推进了"。
+    pub disk_worker_skipped: IntCounterVec,
     /// 数据面请求延迟(handler 入口 → spawn_blocking 完成,含排队),按 `op` 分。
     pub request_duration: HistogramVec,
     /// 成功 blob 请求的延迟,按 `op`(put/get)× `size`(small/medium/large)分桶
@@ -102,6 +167,107 @@ impl StoreServerMetrics {
                 "store_server_errors_total",
                 "data-plane errors",
                 &["kind"],
+            )?,
+            disk_in_flight: gauge_vec(
+                registry,
+                "store_server_disk_in_flight_requests",
+                "in-flight data-plane requests per disk (engine IO shares one process-wide blocking pool)",
+                &["disk_id", "op"],
+            )?,
+            disk_requests: counter_vec(
+                registry,
+                "store_server_disk_requests_total",
+                "data-plane requests landed on each disk (rate = per-disk IOPS)",
+                &["disk_id", "op"],
+            )?,
+            disk_bytes: counter_vec(
+                registry,
+                "store_server_disk_bytes_total",
+                "bytes of successful requests per disk (rate = per-disk bandwidth)",
+                &["disk_id", "op"],
+            )?,
+            disk_request_duration: latency_seconds_vec(
+                registry,
+                "store_server_disk_request_duration_seconds",
+                "end-to-end latency of requests per disk (incl. blocking-pool queueing)",
+                &["disk_id", "op"],
+            )?,
+            disk_probe_stuck: gauge_vec(
+                registry,
+                "store_server_disk_probe_stuck",
+                "disk has a probe thread stuck inside the device (1 = stuck)",
+                &["disk_id"],
+            )?,
+            disk_probe_skipped: counter_vec(
+                registry,
+                "store_server_disk_probe_skipped_total",
+                "probe rounds skipped because the previous probe has not returned",
+                &["disk_id"],
+            )?,
+            disk_slow_requests: counter_vec(
+                registry,
+                "store_server_disk_slow_requests_total",
+                "data-plane requests slower than disk_health_timeout_secs (end-to-end, incl. blocking-pool queueing)",
+                &["disk_id", "op"],
+            )?,
+            disk_pool_workers: gauge_vec(
+                registry,
+                "store_server_disk_pool_workers",
+                "per-disk pool worker threads (fixed at startup)",
+                &["disk_id"],
+            )?,
+            disk_pool_in_flight: gauge_vec(
+                registry,
+                "store_server_disk_pool_in_flight",
+                "per-disk pool admitted-but-unfinished tasks (running + queued)",
+                &["disk_id"],
+            )?,
+            disk_pool_queued: gauge_vec(
+                registry,
+                "store_server_disk_pool_queued",
+                "per-disk pool tasks admitted but not yet picked up by a worker (true queue depth)",
+                &["disk_id"],
+            )?,
+            disk_pool_rejected: counter_vec(
+                registry,
+                "store_server_disk_pool_rejected_total",
+                "submissions rejected by a per-disk pool (reason: saturated/unknown_disk/closed)",
+                &["disk_id", "op", "reason"],
+            )?,
+            // 桶刻意铺到 120s:看门狗 deadline(默认 30s)就是要看的长尾,而 Prometheus 默认桶在 10s
+            // 就封顶了 —— 那样"盘慢到什么程度"正好看不见。
+            disk_io_duration: histogram_vec(
+                registry,
+                "store_server_disk_io_duration_seconds",
+                "single engine IO duration measured INSIDE the blocking closure (syscall only, excl. pool queueing)",
+                &["disk_id", "op"],
+                vec![
+                    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+                ],
+            )?,
+            disk_io_watchdog_trips: counter_vec(
+                registry,
+                "store_server_disk_io_watchdog_trips_total",
+                "per-disk IO watchdog deadline breaches (one breach = one bad observation, hysteresis decides)",
+                &["disk_id"],
+            )?,
+            disk_health_state: gauge_vec(
+                registry,
+                "store_server_disk_health_state",
+                "per-disk serviceability state (1 = current, 0 = others; states: HEALTHY/UNAVAILABLE/UNKNOWN/failure)",
+                &["disk_id", "state"],
+            )?,
+            disk_health_transitions: counter_vec(
+                registry,
+                "store_server_disk_health_transitions_total",
+                "per-disk availability transitions by from/to (frequent transitions = hysteresis thresholds too tight)",
+                &["disk_id", "from", "to"],
+            )?,
+            disk_worker_skipped: counter_vec(
+                registry,
+                "store_server_disk_worker_skipped_total",
+                "background work skipped because the disk is unavailable or its pool is full",
+                &["disk_id", "task"],
             )?,
             request_duration: latency_seconds_vec(
                 registry,

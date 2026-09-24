@@ -71,7 +71,7 @@ async fn start_store(dir: &std::path::Path, node_id: u64) -> (StoreServer, Strin
     let http_addr = addr(free_port());
     let cfg = StoreServerConfig {
         node_id,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: http_addr.clone(),
         master_addr: String::new(),
         partition_capacity_bytes: 64 << 20,

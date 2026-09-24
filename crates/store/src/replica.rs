@@ -496,18 +496,16 @@ impl ReplicaManager {
             .collect()
     }
 
-    /// 某分区副本所在盘的**暂存目录**(流式 put 的中转文件落点;按需创建)。
+    /// 某分区副本的**暂存目录**(流式 put 的中转文件落点;按需创建)。
     ///
-    /// 落在该副本的数据盘上而不是系统临时目录:大文件暂存不该吃 tmpfs(RAM);崩溃遗留由
-    /// [`crate::disk::DiskManager::mount`] 的 `clean_tmp_dir` 清理。
+    /// 默认落在该副本的数据盘上而不是系统临时目录:大文件暂存不该吃 tmpfs(RAM);崩溃遗留由
+    /// [`crate::disk::DiskManager::mount`] 的 `clean_tmp_dir` 清理。配了 `store_server.staging_dir`
+    /// 则所有分区都用那一个目录(此时它已在 mount 期建好,这里的 `create_dir_all` 只是幂等兜底)。
     pub fn tmp_dir_for(&self, pid: PartitionId) -> Result<std::path::PathBuf> {
         let disk_id = self.get(pid).map(|h| h.disk_id).ok_or(Error::NoReplica)?;
         let dir = self
             .disks
-            .disks()
-            .iter()
-            .find(|d| d.id == disk_id)
-            .map(|d| d.tmp_dir())
+            .tmp_dir_for_disk(&disk_id)
             .ok_or(Error::NoReplica)?;
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
@@ -519,7 +517,7 @@ mod tests {
     use super::*;
 
     fn manager(dir: &std::path::Path) -> ReplicaManager {
-        let dm = DiskManager::mount(&[dir.to_string_lossy().into_owned()]).unwrap();
+        let dm = DiskManager::mount(&[dir.to_string_lossy().into_owned().into()]).unwrap();
         let registry = antfs_metric::Registry::new();
         let sc = StoreConfig {
             segment_size_bytes: 1 << 20,
@@ -558,7 +556,7 @@ mod tests {
     #[test]
     fn replica_accepts_keys_of_its_own_partition_after_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned()]).unwrap();
+        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned().into()]).unwrap();
         let registry = antfs_metric::Registry::new();
         let sc = StoreConfig {
             segment_size_bytes: 1 << 20,
@@ -591,7 +589,7 @@ mod tests {
     #[test]
     fn ensure_replica_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned()]).unwrap();
+        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned().into()]).unwrap();
         let registry = antfs_metric::Registry::new();
         let sc = StoreConfig {
             segment_size_bytes: 1 << 20,

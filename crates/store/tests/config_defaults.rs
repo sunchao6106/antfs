@@ -7,11 +7,12 @@ use antfs_blob::StoreConfig;
 use antfs_store::StoreServerConfig;
 
 /// **非整数倍的总容量现在是合法的**:最后一段是"残段"(容量 = `total − k × segment`)。
-/// 这条盯的是"配置项之间已解耦" —— 例如 100 GiB 分区 + 8 GiB 段 = 12 个整段 + 1 个 4 GiB 残段。
+/// 这条盯的是"配置项之间已解耦" —— 例如 100 GiB 分区 + 3 GiB 段 = 33 个整段 + 1 个 1 GiB 残段。
+/// (段大小本身仍有 4 GiB 硬上界,故例子里的段不能大于 4 GiB。)
 ///
-/// 历史:`blob::log::validate_capacities` 曾硬校验 `total % segment == 0`,导致默认组合
-/// (100 GiB + 8 GiB)直接 `BadArgument`、建不出 replica;现由 `crates/blob/tests/segment_tail.rs`
-/// 覆盖残段的几何与"写不下"语义。
+/// 历史:`blob::log::validate_capacities` 曾硬校验 `total % segment == 0`,导致**当时的默认组合**
+/// (100 GiB 分区 + 8 GiB 段,那时还没有 4 GiB 段上限)直接 `BadArgument`、建不出 replica;现由
+/// `crates/blob/tests/segment_tail.rs` 覆盖残段的几何与"写不下"语义。
 #[test]
 fn non_multiple_partition_and_segment_sizes_are_legal() {
     let part = StoreServerConfig::default().partition_capacity_bytes;
@@ -20,13 +21,13 @@ fn non_multiple_partition_and_segment_sizes_are_legal() {
     let tail = part - (segments - 1) * seg;
     assert_eq!(segments, 25, "默认组合 100 GiB / 4 GiB = 25 段");
     assert_eq!(tail, seg, "整倍时末段就是整段");
-    // 8 GiB 段:12 整段 + 4 GiB 残段 —— 过去这是"非法配置",现在完全可用。
-    let s8 = 8 * 1024 * 1024 * 1024u64;
-    assert_eq!(part.div_ceil(s8), 13);
+    // 3 GiB 段:33 整段 + 1 GiB 残段 —— 过去这是"非法配置",现在完全可用。
+    let s3 = 3 * 1024 * 1024 * 1024u64;
+    assert_eq!(part.div_ceil(s3), 34);
     assert_eq!(
-        part - 12 * s8,
-        4 * 1024 * 1024 * 1024,
-        "多出一个 4 GiB 残段,不再浪费/报错"
+        part - 33 * s3,
+        1024 * 1024 * 1024,
+        "多出一个 1 GiB 残段,不再浪费/报错"
     );
 }
 

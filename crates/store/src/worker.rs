@@ -8,7 +8,8 @@
 //! - **compaction**:按「首跑钟点 + 周期」调度(默认每天本地 01:00 一次),跑在低峰;
 //!   候选集与触发条件见 [`compact_all`]。
 //!
-//! 引擎调用是同步阻塞(路线乙),故在 [`tokio::task::spawn_blocking`] 里执行,不阻塞 reactor。
+//! 引擎调用是同步阻塞(路线乙),故按盘提交到 [`DiskPools`] 的**每盘池**执行:不阻塞 reactor,
+//! 且一块盘挂死只占它自己的 worker 线程(见 `disk_pool` 与 store.md §12.11)。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +17,8 @@ use std::time::Duration;
 use antfs_blob::CompactPolicy;
 
 use crate::config::{parse_hhmm, StoreServerConfig};
+use crate::disk_health::DiskHealthMap;
+use crate::disk_pool::DiskPools;
 use crate::metrics::StoreServerMetrics;
 use crate::replica::{ReplicaHandle, ReplicaManager};
 
@@ -23,12 +26,59 @@ use crate::replica::{ReplicaHandle, ReplicaManager};
 ///
 /// flush 是持久化边界(§3.1):把已入 page-cache 的记录推进到 fsync,只增强持久性。
 /// 单个 replica 失败只记 warn 并继续(维护尽力而为,不因一盘拖垮全局)。
-pub fn flush_all(replicas: &ReplicaManager) -> usize {
-    let mut n = 0;
+///
+/// **每个 replica 各自并发提交到它那块盘的池**(而不是顺序跑一遍):一块盘挂死只卡住它自己的任务,
+/// 其余盘该 flush 的照 flush —— 顺序版本会让一块坏盘把全节点的持久化边界一起冻住。
+///
+/// **盘不可服务 ⇒ 整块跳过**(D2):往一块已知卡死的盘上再塞任务,只是白占一条收不回来的线程,
+/// 而且下一轮还会再塞一个。跳过计数落 `disk_worker_skipped{task="flush"}`,让"这块盘没在推进"
+/// 这件事**可见**(否则表现为"副本悄悄不 flush 了")。
+pub async fn flush_all(
+    pool: &Arc<DiskPools>,
+    replicas: &ReplicaManager,
+    health: &DiskHealthMap,
+    metrics: &StoreServerMetrics,
+) -> usize {
+    let mut tasks = Vec::new();
     for (pid, h) in replicas.handles() {
-        match h.store.flush() {
-            Ok(()) => n += 1,
-            Err(e) => tracing::warn!(partition = pid, error = %e, "local-worker flush failed"),
+        if !crate::disk_health::is_available(health, &h.disk_id) {
+            metrics
+                .disk_worker_skipped
+                .with_label_values(&[h.disk_id.as_str(), "flush"])
+                .inc();
+            tracing::debug!(
+                partition = pid,
+                disk = %h.disk_id,
+                "local-worker flush skipped: disk unavailable"
+            );
+            continue;
+        }
+        let store = h.store.clone();
+        let disk = h.disk_id.clone();
+        let pool = pool.clone();
+        tasks.push(tokio::spawn(async move {
+            match pool.run(&disk, "flush", move || store.flush()).await {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    tracing::warn!(partition = pid, error = %e, "local-worker flush failed");
+                    false
+                }
+                Err(reject) => {
+                    tracing::warn!(
+                        partition = pid,
+                        disk = %disk,
+                        reason = reject.as_str(),
+                        "local-worker flush skipped by disk pool"
+                    );
+                    false
+                }
+            }
+        }));
+    }
+    let mut n = 0;
+    for t in tasks {
+        if let Ok(true) = t.await {
+            n += 1;
         }
     }
     n
@@ -48,13 +98,30 @@ pub fn flush_all(replicas: &ReplicaManager) -> usize {
 ///
 /// **触发条件**在引擎内:partition 整体可回收占比 ≥ `policy.dead_ratio` 才动手(回收口径 = 被取代的
 /// 旧记录 + TTL 已过期对象 + 墓碑已过保留期**且过了墓碑回收闸门**)。
-pub fn compact_all(
+pub async fn compact_all(
+    pool: &Arc<DiskPools>,
     replicas: &ReplicaManager,
+    health: &DiskHealthMap,
+    metrics: &StoreServerMetrics,
     config: &StoreServerConfig,
     include_rw: bool,
 ) -> usize {
     let mut n = 0;
     for (pid, h) in replicas.handles() {
+        // 盘不可服务 ⇒ 跳过(D2)。**放在最前面**:下面那些判据(候选集/追平)都要先读副本状态,
+        // 而对一块已知坏盘的副本,任何判据都没有意义 —— 早退一条,少一轮白干。
+        if !crate::disk_health::is_available(health, &h.disk_id) {
+            metrics
+                .disk_worker_skipped
+                .with_label_values(&[h.disk_id.as_str(), "compaction"])
+                .inc();
+            tracing::debug!(
+                partition = pid,
+                disk = %h.disk_id,
+                "local-worker compaction skipped: disk unavailable"
+            );
+            continue;
+        }
         let state = h.partition_state_now();
         if !compaction_candidate(&state, include_rw) {
             continue;
@@ -72,10 +139,25 @@ pub fn compact_all(
             config,
             tombstones_allowed(config.master_addr.is_empty(), &h),
         );
-        match h.store.compact_if_needed(&policy) {
-            Ok(Some(_)) => n += 1,
-            Ok(None) => {}
-            Err(e) => tracing::warn!(partition = pid, error = %e, "local-worker compaction failed"),
+        let store = h.store.clone();
+        match pool
+            .run(&h.disk_id, "compaction", move || {
+                store.compact_if_needed(&policy)
+            })
+            .await
+        {
+            Ok(Ok(Some(_))) => n += 1,
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(partition = pid, error = %e, "local-worker compaction failed")
+            }
+            // 池拒(盘被压满/未知盘):本轮跳过,下一轮再来(压缩是尽力而为)。
+            Err(reject) => tracing::warn!(
+                partition = pid,
+                disk = %h.disk_id,
+                reason = reject.as_str(),
+                "local-worker compaction skipped by disk pool"
+            ),
         }
     }
     n
@@ -108,14 +190,21 @@ pub fn spawn_local_worker(
     config: StoreServerConfig,
     replicas: Arc<ReplicaManager>,
     metrics: Arc<StoreServerMetrics>,
+    pool: Arc<DiskPools>,
+    health: DiskHealthMap,
 ) {
     spawn_loop(
         Duration::from_secs(config.flush_interval_secs),
         replicas.clone(),
         metrics.clone(),
-        |r, m| m.flushes.inc_by(flush_all(&r) as u64),
+        pool.clone(),
+        health.clone(),
+        |r, m, p, h| async move {
+            let n = flush_all(&p, &r, &h, &m).await;
+            m.flushes.inc_by(n as u64);
+        },
     );
-    spawn_compaction_loop(config, replicas, metrics);
+    spawn_compaction_loop(config, replicas, metrics, pool, health);
 }
 
 /// compaction loop:首跑对齐本地 `compaction_start_time`,之后每 `compaction_interval_secs` 一次。
@@ -126,6 +215,8 @@ fn spawn_compaction_loop(
     config: StoreServerConfig,
     replicas: Arc<ReplicaManager>,
     metrics: Arc<StoreServerMetrics>,
+    pool: Arc<DiskPools>,
+    health: DiskHealthMap,
 ) {
     // 配置已过 `Validate`,这里的解析失败只可能是"运行时改坏了字符串",退回默认钟点继续跑。
     let start_secs_of_day = match parse_hhmm(&config.compaction_start_time) {
@@ -152,11 +243,9 @@ fn spawn_compaction_loop(
             let cfg = config.clone();
             let r = replicas.clone();
             let m = metrics.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                m.compactions
-                    .inc_by(compact_all(&r, &cfg, cfg.compaction_include_rw) as u64);
-            })
-            .await;
+            let h = health.clone();
+            let n = compact_all(&pool, &r, &h, &m, &cfg, cfg.compaction_include_rw).await;
+            m.compactions.inc_by(n as u64);
             last_fire = Some(now_epoch_secs());
         }
     });
@@ -275,23 +364,33 @@ impl LocalClock for SystemLocalClock {
 }
 
 /// 通用维护 loop:按 `period` 节拍,把同步维护动作 offload 到阻塞线程池执行。
-fn spawn_loop<F>(
+fn spawn_loop<F, Fut>(
     period: Duration,
     replicas: Arc<ReplicaManager>,
     metrics: Arc<StoreServerMetrics>,
+    pool: Arc<DiskPools>,
+    health: DiskHealthMap,
     action: F,
 ) where
-    F: Fn(Arc<ReplicaManager>, &StoreServerMetrics) + Send + Sync + 'static,
+    F: Fn(Arc<ReplicaManager>, Arc<StoreServerMetrics>, Arc<DiskPools>, DiskHealthMap) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
         let action = Arc::new(action);
         let mut tick = tokio::time::interval(period);
         loop {
             tick.tick().await;
-            let r = replicas.clone();
-            let m = metrics.clone();
+            let (r, m, p, h) = (
+                replicas.clone(),
+                metrics.clone(),
+                pool.clone(),
+                health.clone(),
+            );
             let action = action.clone();
-            let _ = tokio::task::spawn_blocking(move || action(r, &m)).await;
+            action(r, m, p, h).await;
         }
     });
 }
@@ -308,8 +407,100 @@ mod tests {
         StoreKey::from_parts(1, n as u32)
     }
 
+    /// 同一目录上再建一份每盘池(盘 id 与 [`manager`] 建出来的副本一致,都取目录 basename);
+    /// 池参数全用**默认值**。
+    fn pool_for(dir: &std::path::Path) -> Arc<DiskPools> {
+        let declared: crate::config::DataDir = dir.to_string_lossy().into_owned().into();
+        let dm = DiskManager::mount(std::slice::from_ref(&declared)).unwrap();
+        let registry = antfs_metric::Registry::new();
+        let metrics = StoreServerMetrics::new(&registry).unwrap();
+        let cfg = StoreServerConfig {
+            data_dirs: vec![declared],
+            ..Default::default()
+        };
+        Arc::new(DiskPools::new(&dm, &cfg, &metrics, crate::disk_health::new_map()).unwrap())
+    }
+
+    /// 同上,但**显式**指定三个池参数(`0` 就是 0:不排队 / 不等 —— 没有"0 = 用默认值"的隐式约定,
+    /// 那种约定会让"想造一个满池"的用例其实造出一个带队列的池)。返回池与该盘 id。
+    fn pool_with(
+        dir: &std::path::Path,
+        workers: u32,
+        queue: u32,
+        timeout_ms: u64,
+    ) -> (Arc<DiskPools>, String) {
+        let declared: crate::config::DataDir = dir.to_string_lossy().into_owned().into();
+        let dm = DiskManager::mount(std::slice::from_ref(&declared)).unwrap();
+        let registry = antfs_metric::Registry::new();
+        let metrics = StoreServerMetrics::new(&registry).unwrap();
+        let cfg = StoreServerConfig {
+            data_dirs: vec![declared],
+            pool_default_size: workers,
+            pool_queue_size: queue,
+            pool_acquire_timeout_ms: timeout_ms,
+            ..Default::default()
+        };
+        let id = dm.disks()[0].id.clone();
+        (
+            Arc::new(DiskPools::new(&dm, &cfg, &metrics, crate::disk_health::new_map()).unwrap()),
+            id,
+        )
+    }
+
+    /// 池被压满时,flush / compaction **跳过该盘而不是卡死整轮** —— 一块坏盘不该冻住全节点的本地维护;
+    /// 放行之后同一块盘照常维护(拒绝没留下副作用)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_disk_pool_makes_worker_skip_not_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rm = manager(tmp.path());
+        let (pool, disk) = pool_with(tmp.path(), 1, 0, 0);
+        let (health, metrics) = health_and_metrics();
+        let _h = handle_with_dead_data(&rm);
+
+        // 占住该盘唯一的 worker(等测试放行)。
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let p = pool.clone();
+        let d = disk.clone();
+        let hold = tokio::spawn(async move {
+            p.run(&d, "test_hold", move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.blocking_recv();
+            })
+            .await
+        });
+        started_rx.await.expect("占住 worker");
+
+        // 两条维护路径都必须**返回**(而不是等满准入超时后还挂在那里):池满 ⇒ 本轮跳过该盘。
+        let flushed = tokio::time::timeout(
+            Duration::from_secs(10),
+            flush_all(&pool, &rm, &health, &metrics),
+        )
+        .await
+        .expect("池满时 flush 不该卡住");
+        assert_eq!(flushed, 0, "池满 ⇒ 该盘本轮 flush 跳过");
+        let compacted = tokio::time::timeout(
+            Duration::from_secs(10),
+            compact_all(&pool, &rm, &health, &metrics, &config(), true),
+        )
+        .await
+        .expect("池满时 compaction 不该卡住");
+        assert_eq!(compacted, 0, "池满 ⇒ 该盘本轮 compaction 跳过");
+
+        // 放行 ⇒ 同一块盘恢复正常维护(许可没漏、也没有状态残留)。
+        release_tx.send(()).unwrap();
+        hold.await.expect("join").expect("hold 应完成");
+        let flushed = tokio::time::timeout(
+            Duration::from_secs(10),
+            flush_all(&pool, &rm, &health, &metrics),
+        )
+        .await
+        .expect("放行后 flush 不该卡住");
+        assert_eq!(flushed, 1, "放行后该盘 flush 应正常完成");
+    }
+
     fn manager(dir: &std::path::Path) -> ReplicaManager {
-        let dm = DiskManager::mount(&[dir.to_string_lossy().into_owned()]).unwrap();
+        let dm = DiskManager::mount(&[dir.to_string_lossy().into_owned().into()]).unwrap();
         let registry = antfs_metric::Registry::new();
         let sc = StoreConfig {
             segment_size_bytes: 1 << 20,
@@ -324,6 +515,15 @@ mod tests {
     /// 墓碑闸门由 [`tombstone_reclamation_needs_the_master_gate`] 单独覆盖。
     fn config() -> StoreServerConfig {
         StoreServerConfig::default()
+    }
+
+    /// 测试用的**健康表 + 指标**:空表 = 每块盘都"从未观测 ⇒ 可服务",故后台维护**一块都不跳过**。
+    /// 要造"某盘不可服务"的场景,用 [`crate::disk_health::observe_disk`] 把它喂成 `UNAVAILABLE`
+    /// (经 `bad_rounds` 次坏观测,与生产同一条路径)。
+    fn health_and_metrics() -> (DiskHealthMap, StoreServerMetrics) {
+        let registry = antfs_metric::Registry::new();
+        let metrics = StoreServerMetrics::new(&registry).expect("metrics");
+        (crate::disk_health::new_map(), metrics)
     }
 
     /// 造一份"够压"的副本:写满一段以上再全删,产生达阈的封存段死数据。
@@ -341,14 +541,20 @@ mod tests {
         h
     }
 
-    #[test]
-    fn flush_all_persists_and_reopen_reads_back() {
+    #[tokio::test]
+    async fn flush_all_persists_and_reopen_reads_back() {
         let tmp = tempfile::tempdir().unwrap();
         let rm = manager(tmp.path());
+        let pool = pool_for(tmp.path());
+        let (health, metrics) = health_and_metrics();
         let h = rm.ensure_replica(1).unwrap();
         h.store.put(key(1), b"durable payload").unwrap();
 
-        assert_eq!(flush_all(&rm), 1, "one replica flushed");
+        assert_eq!(
+            flush_all(&pool, &rm, &health, &metrics).await,
+            1,
+            "one replica flushed"
+        );
 
         rm.remove_replica(1);
         let h2 = rm.ensure_replica(1).unwrap();
@@ -358,14 +564,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_all_reclaims_dead_data() {
+    #[tokio::test]
+    async fn compact_all_reclaims_dead_data() {
         let tmp = tempfile::tempdir().unwrap();
         let rm = manager(tmp.path());
+        let pool = pool_for(tmp.path());
+        let (health, metrics) = health_and_metrics();
         let h = handle_with_dead_data(&rm);
         let before = h.store.stats().unwrap().dead_bytes;
 
-        compact_all(&rm, &config(), true);
+        compact_all(&pool, &rm, &health, &metrics, &config(), true).await;
 
         let after = h.store.stats().unwrap().dead_bytes;
         assert!(
@@ -443,8 +651,8 @@ mod tests {
     }
 
     /// 候选集闸门矩阵:SEALED 永不入选;RW 由 `include_rw` 决定;RO 与"未知"总是入选。
-    #[test]
-    fn candidate_gate_by_partition_state() {
+    #[tokio::test]
+    async fn candidate_gate_by_partition_state() {
         let cases = [
             ("RO", false, 1usize),
             ("RO", true, 1),
@@ -457,12 +665,14 @@ mod tests {
         for (state, include_rw, want) in cases {
             let tmp = tempfile::tempdir().unwrap();
             let rm = manager(tmp.path());
+            let pool = pool_for(tmp.path());
+            let (health, metrics) = health_and_metrics();
             let h = handle_with_dead_data(&rm);
             let before = h.store.stats().unwrap().dead_bytes;
             if !state.is_empty() {
                 assert!(rm.set_partition_state(1, state), "状态应写入句柄");
             }
-            let got = compact_all(&rm, &config(), include_rw);
+            let got = compact_all(&pool, &rm, &health, &metrics, &config(), include_rw).await;
             assert_eq!(got, want, "state={state:?} include_rw={include_rw}");
             let after = h.store.stats().unwrap().dead_bytes;
             if want == 1 {
@@ -475,24 +685,34 @@ mod tests {
 
     /// 未追平的副本(`BOOTSTRAP`)在**集群模式**下不压:盘上还在追赶,回收了也要从 peer 拉回来。
     /// 单机模式(状态为空 = 没接 master)不受此限,由 `compact_all` 里的判据区分。
-    #[test]
-    fn bootstrap_replica_is_skipped_in_cluster_mode() {
+    #[tokio::test]
+    async fn bootstrap_replica_is_skipped_in_cluster_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let rm = manager(tmp.path());
+        let pool = pool_for(tmp.path());
+        let (health, metrics) = health_and_metrics();
         let _h = handle_with_dead_data(&rm);
         rm.set_partition_state(1, "RO"); // 状态放行,卡在实然态上
         *rm.get(1).unwrap().current_state.write().unwrap() =
             crate::replica::STATE_BOOTSTRAP.to_string();
-        assert_eq!(compact_all(&rm, &config(), true), 0);
+        assert_eq!(
+            compact_all(&pool, &rm, &health, &metrics, &config(), true).await,
+            0
+        );
 
         // 单机模式(从未收到状态下发):没有"追平"语义,本地维护照跑。
         let tmp2 = tempfile::tempdir().unwrap();
         let rm2 = manager(tmp2.path());
+        let pool2 = pool_for(tmp2.path());
+        let (health2, metrics2) = health_and_metrics();
         let h2 = handle_with_dead_data(&rm2);
         // handle_with_dead_data 已置 ACTIVE;这里退回 BOOTSTRAP 并清掉状态,模拟单机副本。
         *h2.current_state.write().unwrap() = crate::replica::STATE_BOOTSTRAP.to_string();
         assert!(!rm2.set_partition_state(1, ""), "状态本来就是空的");
-        assert_eq!(compact_all(&rm2, &config(), true), 1);
+        assert_eq!(
+            compact_all(&pool2, &rm2, &health2, &metrics2, &config(), true).await,
+            1
+        );
     }
 
     /// 固定偏移(UTC)假时钟:让调度逻辑与机器时区无关地可测。

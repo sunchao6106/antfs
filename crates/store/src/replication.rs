@@ -841,9 +841,11 @@ pub fn spawn_replicator(
     replicas: Arc<ReplicaManager>,
     metrics: Arc<StoreServerMetrics>,
     paused: Arc<AtomicBool>,
+    pool: Arc<crate::disk_pool::DiskPools>,
+    health: crate::disk_health::DiskHealthMap,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = run(config, replicas, metrics, paused).await {
+        if let Err(e) = run(config, replicas, metrics, paused, pool, health).await {
             tracing::warn!(error = %e, "store-server replicator stopped");
         }
     });
@@ -854,6 +856,8 @@ async fn run(
     replicas: Arc<ReplicaManager>,
     metrics: Arc<StoreServerMetrics>,
     paused: Arc<AtomicBool>,
+    pool: Arc<crate::disk_pool::DiskPools>,
+    health: crate::disk_health::DiskHealthMap,
 ) -> Result<()> {
     let mut client = MasterClient::connect(format!("http://{}", config.master_addr))
         .await
@@ -874,6 +878,21 @@ async fn run(
             .map(|s| s.partition_id)
             .collect();
         for pid in pids {
+            // **盘不可服务 ⇒ 跳过该 pid**(既不做源也不做目标),但**绝不动游标** —— 恢复后从原游标
+            // 续拉,与 `/admin/replication-control` 的暂停语义一致(`sessions` 里的 prior 状态原样留着)。
+            // 往一块已知卡死的盘上再塞一轮拉取,除了再漏一条线程之外毫无收益。
+            let disk_id = match replicas.get(pid) {
+                Some(h) => h.disk_id,
+                None => continue,
+            };
+            if !crate::disk_health::is_available(&health, &disk_id) {
+                metrics
+                    .disk_worker_skipped
+                    .with_label_values(&[disk_id.as_str(), "replication"])
+                    .inc();
+                tracing::debug!(partition = pid, disk = %disk_id, "replication skipped: disk unavailable");
+                continue;
+            }
             let locs = match client
                 .lookup_partition(LookupRequest {
                     version: 1,
@@ -905,20 +924,24 @@ async fn run(
                     let base = format!("http://{}", loc.addr);
                     let max_bytes = config.replication_max_batch_bytes;
                     let bootstrap = config.bootstrap_copy_enabled;
-                    let res = tokio::task::spawn_blocking(move || {
-                        let peer =
-                            HttpPeer::new(base, pid, timeout)?.with_incarnation(prior_incarnation);
-                        sync_round(
-                            &store,
-                            pid,
-                            &peer,
-                            prior,
-                            prior_incarnation,
-                            max_bytes,
-                            bootstrap,
-                        )
-                    })
-                    .await;
+                    // 本地盘的写/读按盘归口到该盘的池(网络侧仍有自己的超时):一块盘挂死时,
+                    // 占住的是**它自己**的 worker,而不是全节点共用的阻塞池。
+                    // (`disk_id` 已在本 pid 的入口处取好并做过健康判定 —— 不再取第二次。)
+                    let res = pool
+                        .run(&disk_id, "replication", move || {
+                            let peer = HttpPeer::new(base, pid, timeout)?
+                                .with_incarnation(prior_incarnation);
+                            sync_round(
+                                &store,
+                                pid,
+                                &peer,
+                                prior,
+                                prior_incarnation,
+                                max_bytes,
+                                bootstrap,
+                            )
+                        })
+                        .await;
                     match res {
                         Ok(Ok(out)) => {
                             metrics.replication_rounds.inc();
@@ -952,7 +975,15 @@ async fn run(
                                     .inc();
                             }
                         }
-                        Ok(Err(_)) | Err(_) => metrics.replication_errors.inc(),
+                        Ok(Err(_)) => metrics.replication_errors.inc(),
+                        // 池拒(本盘被压满/未知盘):本轮跳过这个 pid,游标保持不动,下一轮再来。
+                        // 不算复制的错(它没出错),只记日志 —— 池指标上已经有一次 rejected。
+                        Err(reject) => tracing::debug!(
+                            partition = pid,
+                            disk = %disk_id,
+                            reason = reject.as_str(),
+                            "replication round skipped by disk pool"
+                        ),
                     }
                 }
             }

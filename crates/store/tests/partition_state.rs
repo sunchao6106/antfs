@@ -51,7 +51,7 @@ async fn partition_states_from_master_reach_the_replica_handle() {
     let registry = antfs_metric::Registry::new();
     let cfg = StoreServerConfig {
         node_id: 1,
-        data_dirs: vec![tmp.path().to_string_lossy().into_owned()],
+        data_dirs: vec![tmp.path().to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 8 << 20,
         master_addr: fake.addr(),

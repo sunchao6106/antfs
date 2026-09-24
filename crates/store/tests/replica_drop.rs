@@ -55,7 +55,7 @@ async fn dropped_directive_deletes_replica_data_and_is_idempotent() {
     // 正是"删目录 vs 在飞持有者"那条竞态的真实来源(见 `ReplicaManager::drop_replica` 的等待逻辑)。
     let cfg = StoreServerConfig {
         node_id: 101,
-        data_dirs: vec![data_dir.to_string_lossy().into_owned()],
+        data_dirs: vec![data_dir.to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 4 << 20,
         master_addr: fake.addr(),

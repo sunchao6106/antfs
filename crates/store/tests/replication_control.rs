@@ -34,7 +34,7 @@ fn key(n: u8) -> StoreKey {
 async fn spawn_standalone(dir: &std::path::Path) -> (String, StoreServer) {
     let cfg = StoreServerConfig {
         node_id: 1,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 8 << 20,
         ..Default::default()
@@ -92,7 +92,7 @@ async fn spawn_replicating(
     let registry = antfs_metric::Registry::new();
     let cfg = StoreServerConfig {
         node_id,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 8 << 20,
         master_addr,
@@ -233,7 +233,7 @@ async fn paused_pull_replication_stops_converging_then_resumes() {
     let registry_b = antfs_metric::Registry::new();
     let cfg_b = StoreServerConfig {
         node_id: 2,
-        data_dirs: vec![dir_b.path().to_string_lossy().into_owned()],
+        data_dirs: vec![dir_b.path().to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 8 << 20,
         master_addr: fake.addr(),

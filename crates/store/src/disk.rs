@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config::DataDir;
+
 /// 一块盘的运行时视图。
 #[derive(Clone, Debug)]
 pub struct Disk {
@@ -61,14 +63,25 @@ pub fn statfs(dir: &Path) -> std::io::Result<(u64, u64)> {
 #[derive(Clone, Debug, Default)]
 pub struct DiskManager {
     disks: Vec<Disk>,
+    /// 全节点共用的暂存目录(配置 `store_server.staging_dir`):`None` = 用各盘自己的 `tmp/` 子目录。
+    ///
+    /// 为什么要留一个"共用"选项:把流式 put 的中转写入从数据盘上挪开(单独一块本地 SSD / scratch 盘),
+    /// 代价见 [`StoreServerConfig::staging_dir`](crate::config::StoreServerConfig::staging_dir) 与 store.md §12.11。
+    staging_dir: Option<PathBuf>,
 }
 
 impl DiskManager {
-    /// 从盘目录列表构建:创建目录(不存在则建)并 `statfs` 探容量。
-    pub fn mount(dirs: &[String]) -> std::io::Result<Self> {
+    /// 从盘声明构建:创建目录(不存在则建)并 `statfs` 探容量。暂存目录走默认(各盘的 `tmp/`)。
+    pub fn mount(dirs: &[DataDir]) -> std::io::Result<Self> {
+        Self::mount_with(dirs, None)
+    }
+
+    /// 同 [`mount`](Self::mount),但可指定**全节点共用的暂存目录**;`Some` 时该目录会被创建并清掉
+    /// 遗留的 `*.tmp`(与各盘 `tmp/` 同样的收尾口径)。
+    pub fn mount_with(dirs: &[DataDir], staging_dir: Option<PathBuf>) -> std::io::Result<Self> {
         let mut disks = Vec::with_capacity(dirs.len());
         for (i, d) in dirs.iter().enumerate() {
-            let dir = PathBuf::from(d);
+            let dir = PathBuf::from(d.dir());
             std::fs::create_dir_all(&dir)?;
             let (capacity_bytes, free_bytes) = statfs(&dir)?;
             // 清掉上次崩溃/中断遗留的流式 put 暂存文件(未提交,见 clean_tmp_dir)。
@@ -85,21 +98,41 @@ impl DiskManager {
                 free_bytes,
             });
         }
-        Ok(DiskManager { disks })
-    }
-
-    /// 重新 `statfs` 刷新各盘余量(心跳前调,S2 用;S1 也可调)。
-    pub fn refresh(&mut self) {
-        for d in &mut self.disks {
-            if let Ok((cap, free)) = statfs(&d.dir) {
-                d.capacity_bytes = cap;
-                d.free_bytes = free;
-            }
+        if let Some(dir) = &staging_dir {
+            // 起不来比"悄悄退回默认目录"好:配了专用暂存盘却不可用,属于运维必须立刻知道的错配。
+            std::fs::create_dir_all(dir)?;
+            clean_tmp_dir(dir);
         }
+        Ok(DiskManager { disks, staging_dir })
     }
 
     pub fn disks(&self) -> &[Disk] {
         &self.disks
+    }
+
+    /// 配了共用暂存目录则返回它(供 mount 时打日志/自省用)。
+    pub fn staging_dir(&self) -> Option<&Path> {
+        self.staging_dir.as_deref()
+    }
+
+    /// 某盘的**暂存目录**:配了共用目录就所有盘都用它,否则用该盘自己的 `tmp/` 子目录。
+    /// 盘 id 未知 → `None`(调用方据此报"无此副本/盘";配了共用目录也不放宽这条,免得调用方把
+    /// "盘不在本节点"当成"盘在但没暂存目录")。
+    pub fn tmp_dir_for_disk(&self, disk_id: &str) -> Option<PathBuf> {
+        let disk = self.disks.iter().find(|d| d.id == disk_id)?;
+        Some(match &self.staging_dir {
+            Some(dir) => dir.clone(),
+            None => disk.tmp_dir(),
+        })
+    }
+
+    /// 把一次 `statvfs` 的结果写回某盘(单飞刷新路径用:探测在阻塞池里跑,结果回来再落到这里)。
+    /// 盘 id 不存在 = 无操作(盘列表在运行期不变,只可能是调用方传错)。
+    pub fn apply_statfs(&mut self, disk_id: &str, capacity_bytes: u64, free_bytes: u64) {
+        if let Some(d) = self.disks.iter_mut().find(|d| d.id == disk_id) {
+            d.capacity_bytes = capacity_bytes;
+            d.free_bytes = free_bytes;
+        }
     }
 
     /// 选第一块可用容量 ≥ `need` 的盘(S1 简单选盘;S2 用 master 指令里的 disk_id)。
@@ -120,10 +153,80 @@ mod tests {
         assert!(free > 0, "free must be > 0");
     }
 
+    /// 默认(未配 `staging_dir`):每块盘各用自己的 `tmp/` 子目录 —— 这是**既有默认落点**,不许悄悄改。
+    #[test]
+    fn default_staging_dir_is_per_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned().into()]).unwrap();
+        let id = dm.disks()[0].id.clone();
+        assert!(dm.staging_dir().is_none());
+        assert_eq!(dm.tmp_dir_for_disk(&id), Some(dm.disks()[0].tmp_dir()));
+    }
+
+    /// 配了共用暂存目录:所有盘都指向它、嵌套路径由 mount 自己建出来、遗留 `*.tmp` 被清掉,
+    /// 且各盘不再被建 `tmp/`;未知盘 id 仍然报 `None`。
+    #[test]
+    fn staging_override_is_shared_swept_and_created() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("nested")
+            .join("staging");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("put_1_1.tmp"), b"leftover").unwrap();
+
+        let dm = DiskManager::mount_with(
+            &[
+                a.path().to_string_lossy().into_owned().into(),
+                b.path().to_string_lossy().into_owned().into(),
+            ],
+            Some(scratch.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(dm.staging_dir(), Some(scratch.as_path()));
+        for d in dm.disks() {
+            assert_eq!(
+                dm.tmp_dir_for_disk(&d.id).as_deref(),
+                Some(scratch.as_path()),
+                "两块盘都该用同一个暂存目录"
+            );
+            assert!(
+                !d.dir.join("tmp").exists(),
+                "配了共用暂存目录就不该再建各盘的 tmp/"
+            );
+        }
+        assert!(
+            dm.tmp_dir_for_disk("no-such-disk").is_none(),
+            "未知盘仍报 None(不因为配了共用目录就放宽)"
+        );
+        assert!(
+            std::fs::read_dir(&scratch).unwrap().next().is_none(),
+            "遗留 .tmp 应被 mount 清掉"
+        );
+    }
+
+    /// 暂存目录不存在时由 mount 创建(嵌套路径也要能建),失败则整个挂载失败(宁可起不来)。
+    #[test]
+    fn staging_override_is_created_by_mount() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("x").join("y");
+        assert!(!scratch.exists());
+        let dm = DiskManager::mount_with(
+            &[tmp.path().to_string_lossy().into_owned().into()],
+            Some(scratch.clone()),
+        )
+        .unwrap();
+        assert!(scratch.is_dir(), "mount 应把暂存目录建出来");
+        assert_eq!(dm.staging_dir(), Some(scratch.as_path()));
+    }
+
     #[test]
     fn mount_probes_each_disk() {
         let tmp = tempfile::tempdir().unwrap();
-        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned()]).unwrap();
+        let dm = DiskManager::mount(&[tmp.path().to_string_lossy().into_owned().into()]).unwrap();
         assert_eq!(dm.disks().len(), 1);
         assert!(dm.disks()[0].capacity_bytes > 0);
     }

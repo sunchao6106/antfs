@@ -212,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(&data_dir)?;
         let scfg = StoreServerConfig {
             node_id: *node_id,
-            data_dirs: vec![data_dir.to_string_lossy().into_owned()],
+            data_dirs: vec![data_dir.to_string_lossy().into_owned().into()],
             http_addr: http_addr.clone(),
             partition_capacity_bytes: 64 << 20,
             master_addr: grpc_addr.clone(),

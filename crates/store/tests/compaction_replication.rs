@@ -58,7 +58,7 @@ fn compact_now() -> CompactPolicy {
 async fn spawn_standalone(dir: &std::path::Path, node_id: u64) -> (String, StoreServer) {
     let cfg = StoreServerConfig {
         node_id,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 16 << 20,
         local_worker_enabled: false, // 本文件手动触发 compaction,别让 worker 掺进来
@@ -390,7 +390,7 @@ async fn background_replicator_recovers_after_peer_compact() {
     let registry_b = antfs_metric::Registry::new();
     let cfg_b = StoreServerConfig {
         node_id: 2,
-        data_dirs: vec![dir_b.path().to_string_lossy().into_owned()],
+        data_dirs: vec![dir_b.path().to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 16 << 20,
         master_addr: fake.addr(),

@@ -36,7 +36,7 @@ async fn spawn_with(
 ) -> (String, StoreServer) {
     let cfg = StoreServerConfig {
         node_id: 1,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes,
         ..Default::default()

@@ -35,7 +35,7 @@ fn key(n: u8) -> StoreKey {
 fn config(dir: &std::path::Path, node_id: u64) -> StoreServerConfig {
     StoreServerConfig {
         node_id,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes: 8 << 20,
         // 本地维护 worker 关掉:用例只关心副本实然态,别让后台 flush/compaction 掺进来。

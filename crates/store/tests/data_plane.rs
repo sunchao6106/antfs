@@ -22,7 +22,7 @@ fn server_with(
 ) -> StoreServer {
     let cfg = StoreServerConfig {
         node_id: 1,
-        data_dirs: vec![dir.to_string_lossy().into_owned()],
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: "127.0.0.1:0".into(),
         partition_capacity_bytes,
         max_body_bytes,
@@ -33,7 +33,7 @@ fn server_with(
 }
 
 fn server(dir: &std::path::Path) -> StoreServer {
-    // 小段:避免测试预分配 8GiB 默认段;body 上限用默认 2 MiB。
+    // 小段:避免测试预分配默认 4 GiB 段;body 上限用默认 2 MiB。
     server_with(dir, store_config(1 << 20), 4 << 20, 2 * 1024 * 1024)
 }
 
@@ -74,6 +74,278 @@ async fn create_replica(router: &axum::Router) {
         .body(Body::empty())
         .unwrap();
     assert_eq!(status_of(router, req).await, StatusCode::CREATED);
+}
+
+/// 盘维度指标要在**真数据面**上闭环:该盘的请求数/字节数/延迟计数对得上,且在途计数回到 0
+/// (任何出口漏一次 dec,"某盘在堆积"的告警就会变噪声)。断言取自被测服务自己的 `/metrics`。
+#[tokio::test]
+async fn per_disk_metrics_close_the_loop_after_put_and_get() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 单目录部署 ⇒ 这块盘的 disk_id 就是该目录的 basename(`DiskManager::mount` 的口径)。
+    let disk = tmp
+        .path()
+        .file_name()
+        .expect("tempdir has a name")
+        .to_string_lossy()
+        .into_owned();
+    let srv = server(tmp.path());
+    let router = srv.router();
+    create_replica(&router).await;
+
+    let key = data_key(0x21);
+    let data = b"disk metrics payload".to_vec();
+    let len = data.len();
+    let put = Request::put(format!("/partitions/0/blobs/{key}"))
+        .body(Body::from(data))
+        .unwrap();
+    assert_eq!(status_of(&router, put).await, StatusCode::CREATED);
+    let get = Request::get(format!("/partitions/0/blobs/{key}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(status_of(&router, get).await, StatusCode::OK);
+
+    let text = metrics_text(&router).await;
+    for op in ["put", "get"] {
+        assert!(
+            text.contains(&format!(
+                r#"store_server_disk_requests_total{{disk_id="{disk}",op="{op}"}} 1"#
+            )),
+            "该盘 {op} 应计 1 次请求:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                r#"store_server_disk_bytes_total{{disk_id="{disk}",op="{op}"}} {len}"#
+            )),
+            "该盘 {op} 的字节数应等于数据体长度:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                r#"store_server_disk_request_duration_seconds_count{{disk_id="{disk}",op="{op}"}} 1"#
+            )),
+            "该盘 {op} 应 observe 一次延迟:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                r#"store_server_disk_in_flight_requests{{disk_id="{disk}",op="{op}"}} 0"#
+            )),
+            "该盘 {op} 的在途计数必须配平回 0:\n{text}"
+        );
+    }
+}
+
+/// 目录里剩下的文件名(不存在 → 空)。给"某个具体目录有没有残渣"用(与 `staging_leftovers` 的
+/// "数据盘 tmp/" 口径互补)。
+fn leftovers_in(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 配了 `store_server.staging_dir` ⇒ 流式 put 的中转文件全落那**一个**目录(含嵌套路径也会被建出来),
+/// 各数据盘的 `tmp/` 一个都不建;成功与被拒的上传都不留残渣。
+#[tokio::test]
+async fn staging_dir_override_takes_all_streamed_puts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    // 故意用嵌套路径:必须由 mount 自己建出来(而不是要求运维先建好)。
+    let scratch = tmp.path().join("scratch").join("staging");
+    let cfg = StoreServerConfig {
+        node_id: 1,
+        data_dirs: vec![data.to_string_lossy().into_owned().into()],
+        http_addr: "127.0.0.1:0".into(),
+        partition_capacity_bytes: 64 << 20,
+        max_body_bytes: 8 << 20,
+        staging_dir: scratch.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let registry = antfs_metric::Registry::new();
+    let srv = StoreServer::start_with(cfg, store_config(4 << 20), &registry).expect("start");
+    let router = srv.router();
+    assert!(scratch.is_dir(), "配了暂存目录 ⇒ 启动时就该建出来");
+    create_replica(&router).await;
+
+    // 2 MiB > 1 MiB 内存上界 ⇒ 走流式暂存路径;段 4 MiB 装得下 ⇒ 成功。
+    let body = vec![9u8; 2 << 20];
+    let key = data_key(0x31);
+    let put = Request::put(format!("/partitions/0/blobs/{key}"))
+        .header("content-length", body.len().to_string())
+        .body(Body::from(body))
+        .unwrap();
+    assert_eq!(status_of(&router, put).await, StatusCode::CREATED);
+    assert!(
+        leftovers_in(&scratch).is_empty(),
+        "成功路径不得留残渣:{:?}",
+        leftovers_in(&scratch)
+    );
+
+    // 5 MiB 记录装不进 4 MiB 段 ⇒ 400;这一次 body 已落到暂存文件之后才被拒,同样不得留残渣。
+    let too_big = vec![7u8; 5 << 20];
+    let key2 = data_key(0x32);
+    let rejected = Request::put(format!("/partitions/0/blobs/{key2}"))
+        .header("content-length", too_big.len().to_string())
+        .body(Body::from(too_big))
+        .unwrap();
+    assert_eq!(status_of(&router, rejected).await, StatusCode::BAD_REQUEST);
+    assert!(
+        leftovers_in(&scratch).is_empty(),
+        "被拒的上传不得留残渣:{:?}",
+        leftovers_in(&scratch)
+    );
+
+    // 关键判据:配了共用暂存目录 ⇒ 各数据盘的 `tmp/` **从不被创建**(一旦落回旧路径,这里会存在)。
+    assert!(
+        !data.join("tmp").exists(),
+        "共用暂存目录生效时不该再给数据盘建 tmp/"
+    );
+}
+
+/// 配置 → 每盘池 → 指标这条链在**真装配**里闭环:某盘显式指定的 worker 数生效、没给的盘走每盘默认,
+/// 且池确实在服务数据面(put/get 走的就是各自盘的池)。
+#[tokio::test]
+async fn disk_pool_sizing_from_config_is_wired_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("d0");
+    let scratch = tmp.path().join("d1");
+    let cfg = StoreServerConfig {
+        node_id: 1,
+        // 每盘参数写法:d0 单独给 7;d1 不给 ⇒ 走 pool_default_size = 3。
+        data_dirs: vec![
+            antfs_store::StoreDataDir::spec(data.to_string_lossy().into_owned(), Some(7)),
+            antfs_store::StoreDataDir::plain(scratch.to_string_lossy().into_owned()),
+        ],
+        http_addr: "127.0.0.1:0".into(),
+        partition_capacity_bytes: 64 << 20,
+        max_body_bytes: 1 << 20,
+        pool_default_size: 3,
+        pool_queue_size: 3,
+        pool_acquire_timeout_ms: 50,
+        ..Default::default()
+    };
+    let registry = antfs_metric::Registry::new();
+    let srv = StoreServer::start_with(cfg, store_config(1 << 20), &registry).expect("start");
+    let router = srv.router();
+    create_replica(&router).await;
+
+    let key = data_key(0x41);
+    let put = Request::put(format!("/partitions/0/blobs/{key}"))
+        .body(Body::from(b"pooled".to_vec()))
+        .unwrap();
+    assert_eq!(status_of(&router, put).await, StatusCode::CREATED);
+    let get = Request::get(format!("/partitions/0/blobs/{key}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(status_of(&router, get).await, StatusCode::OK);
+
+    let text = metrics_text(&router).await;
+    assert!(
+        text.contains(r#"store_server_disk_pool_workers{disk_id="d0"} 7"#),
+        "该盘显式指定的 worker 数应生效:\n{text}"
+    );
+    assert!(
+        text.contains(r#"store_server_disk_pool_workers{disk_id="d1"} 3"#),
+        "没给的盘走每盘默认大小:\n{text}"
+    );
+    assert!(
+        text.contains(r#"store_server_disk_pool_in_flight{disk_id="d0"} 0"#),
+        "在飞计数应配平:\n{text}"
+    );
+}
+
+/// 池满 ⇒ **503 + `Retry-After`**(让 router 立刻改用别的副本),而不是拖到客户端超时。
+///
+/// 这是整条"每盘有界池"在**用户可见面**上的失败语义,必须有端到端用例:占住该盘唯一的 worker,
+/// 再打一发请求,断言 503 + 头 + 指标;放行后同一块盘又能正常服务(证明拒绝没留下副作用)。
+#[tokio::test]
+async fn saturated_disk_pool_returns_503_with_retry_after() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = StoreServerConfig {
+        node_id: 1,
+        data_dirs: vec![antfs_store::StoreDataDir::plain(
+            tmp.path().to_string_lossy().into_owned(),
+        )],
+        http_addr: "127.0.0.1:0".into(),
+        partition_capacity_bytes: 64 << 20,
+        max_body_bytes: 1 << 20,
+        // 1 个 worker、不排队、不等 ⇒ 被占住后下一发立刻可判。
+        pool_default_size: 1,
+        pool_queue_size: 0,
+        pool_acquire_timeout_ms: 0,
+        ..Default::default()
+    };
+    let registry = antfs_metric::Registry::new();
+    let srv = StoreServer::start_with(cfg, store_config(1 << 20), &registry).expect("start");
+    let router = srv.router();
+    create_replica(&router).await;
+
+    // 找到该盘的池,占住它唯一的 worker(等测试放行)。
+    let disk = tmp
+        .path()
+        .file_name()
+        .expect("tempdir has a name")
+        .to_string_lossy()
+        .into_owned();
+    let pool = srv.disk_pools();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let disk_hold = disk.clone();
+    let hold = tokio::spawn(async move {
+        pool.run(&disk_hold, "test_hold", move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+        })
+        .await
+    });
+    started_rx.await.expect("占住该盘唯一 worker");
+
+    // 数据面请求:同盘的 put 与 get 都应**立刻** 503(带 Retry-After),不是挂到超时。
+    let key = data_key(0x51);
+    let put = Request::put(format!("/partitions/0/blobs/{key}"))
+        .body(Body::from(b"backpressure".to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(put).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "池满应回 503"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("1"),
+        "503 应带 Retry-After"
+    );
+    let get = Request::get(format!("/partitions/0/blobs/{key}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        status_of(&router, get).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let text = metrics_text(&router).await;
+    assert!(
+        text.contains(&format!(
+            r#"store_server_disk_pool_rejected_total{{disk_id="{disk}",op="put",reason="saturated"}} 1"#
+        )),
+        "拒绝应如实计数:\n{text}"
+    );
+
+    // 放行 ⇒ 同一块盘恢复正常(拒绝没有留下副作用:许可没漏、计数没漂)。
+    release_tx.send(()).unwrap();
+    hold.await.expect("join").expect("hold 应完成");
+    let ok = Request::put(format!("/partitions/0/blobs/{key}"))
+        .body(Body::from(b"after release".to_vec()))
+        .unwrap();
+    assert_eq!(
+        status_of(&router, ok).await,
+        StatusCode::CREATED,
+        "放行后应恢复正常"
+    );
 }
 
 #[tokio::test]
