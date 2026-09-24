@@ -20,9 +20,10 @@ pub const MAX_SEGMENT_SIZE_BYTES: u64 = crate::log_segment::MAX_CAPACITY;
 pub struct StoreConfig {
     /// 单个 log 段大小(字节)。对齐 Ambry `store.segment.size.in.bytes`。
     ///
-    /// **默认 4 GiB**:记录内 `data_len` 是 u32,段 ≤ 4 GiB 时单条记录必然 ≤ `段 − 102 < u32::MAX`,
-    /// "长度回绕写坏记录"这件事在**结构上**不可能发生(`record_data_len` 的显式校验是第二道保险,
-    /// 供把段配大时兜底)。同时容量粒度比 8 GiB 更细,`is_full()`(剩余 < 一个段)不会过早触发。
+    /// **默认 4 GiB**(即格式硬上界 [`MAX_SEGMENT_SIZE_BYTES`]):记录内 `data_len` 是 u32,段 ≤ 4 GiB 时
+    /// 单条记录必然 ≤ `段 − 102 < u32::MAX`,"长度回绕写坏记录"这件事在**结构上**不可能发生
+    /// (`record_data_len` 的显式校验是第二道保险,供把段配大时兜底)。取到上界的代价:
+    /// `is_full()`(剩余 < 一个段,见 `BlobStore::is_full`)最多把 4 GiB 判为不可写。
     pub segment_size_bytes: u64,
     /// 活跃索引常驻内存的最大条目数,达阈值即封存。对齐 Ambry `store.index.max.number.of.inmem.elements`。
     pub index_max_inmem_elements: usize,

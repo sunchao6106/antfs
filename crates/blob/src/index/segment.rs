@@ -249,12 +249,14 @@ mod tests {
     use super::*;
     use crate::types::LogOffset;
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::path::PathBuf::from(format!("/var/tmp/ambry_idxseg_{tag}_{ns}.idx"))
+    /// 单个测试段文件:落在 RAII 临时目录里(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+    fn tmp(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("ambry_idxseg_{tag}_"))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join(format!("{tag}.idx"));
+        (dir, path)
     }
 
     /// 磁盘布局的手指印:条目 = 8B blobId + 21B 值 = 29B。
@@ -267,7 +269,7 @@ mod tests {
 
     #[test]
     fn segment_file_roundtrips_and_rejects_layout_mismatch() {
-        let path = tmp("rt");
+        let (_dir, path) = tmp("rt");
         let entries = vec![
             (
                 StoreKey::from_parts(3, 1),
@@ -295,6 +297,5 @@ mod tests {
             ),
             "旧布局(59B 值)必须被判 Corrupt"
         );
-        let _ = std::fs::remove_file(&path);
     }
 }

@@ -138,6 +138,7 @@ dependencies = [
  "memmap2",
  "proptest",
  "serde",
+ "tempfile",
  "thiserror",
  "tracing",
  "xorf",

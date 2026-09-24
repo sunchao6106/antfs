@@ -10,8 +10,6 @@
 //! **上一次 flush 的状态**——故本测试直接校验:恢复出的 data_end 严格等于最后
 //! 一次 flush 的 data_end,未 flush 尾部不进入恢复视图。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use antfs_blob::LogSegment;
 use proptest::prelude::*;
 
@@ -29,20 +27,18 @@ fn ops_strategy() -> impl Strategy<Value = Vec<Op>> {
     proptest::collection::vec(op, 0..50)
 }
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_path() -> std::path::PathBuf {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    std::path::PathBuf::from(format!("/var/tmp/ambry_prop_{pid}_{ns}_{seq}.seg"))
+/// 单个测试段文件:落在 RAII 临时目录里(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+fn unique_path() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("ambry_prop_")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("crash.seg");
+    (dir, path)
 }
 
 fn run_case(ops: Vec<Op>) {
-    let path = unique_path();
+    let (_dir, path) = unique_path();
     let data_capacity = 512u64 * 1024;
     let capacity = 64 + data_capacity;
     let seg = LogSegment::create(&path, capacity, 0, 1).unwrap();
@@ -90,7 +86,6 @@ fn run_case(ops: Vec<Op>) {
     }
 
     seg.close().unwrap();
-    let _ = std::fs::remove_file(&path);
 }
 
 proptest! {

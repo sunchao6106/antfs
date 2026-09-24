@@ -2620,12 +2620,12 @@ mod tests {
     const HEADER: u64 = 64;
     const BLOCK: u64 = 1024;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+    /// RAII 临时目录(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("ambry_blob_{tag}_"))
+            .tempdir()
             .unwrap()
-            .as_nanos();
-        PathBuf::from(format!("/var/tmp/ambry_blob_{tag}_{ns}"))
     }
 
     fn seg_cap(blocks: u64) -> u64 {
@@ -2646,7 +2646,7 @@ mod tests {
     fn io_error_threshold_trips_shutdown_and_hook() {
         let dir = temp_dir("ioerr");
         let seg = seg_cap(64);
-        let store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
         store.io_error_threshold.store(3, Ordering::Relaxed);
 
         let fired = Arc::new(AtomicBool::new(false));
@@ -2682,7 +2682,7 @@ mod tests {
     fn threshold_zero_never_trips() {
         let dir = temp_dir("ioerr0");
         let seg = seg_cap(64);
-        let store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
         for _ in 0..100 {
             store.record_io_error();
         }
@@ -2696,7 +2696,7 @@ mod tests {
     fn put_get_roundtrip() {
         let dir = temp_dir("rt");
         let seg = seg_cap(64);
-        let store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
 
         let data = b"hello ambry blob".to_vec();
         store.put(key(1), &data).unwrap();
@@ -2710,25 +2710,23 @@ mod tests {
 
         assert!(matches!(store.get(&key(999)), Err(Error::NotFound)));
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn put_existing_rejected() {
         let dir = temp_dir("dup");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
         store.put(key(1), b"a").unwrap();
         assert!(matches!(store.put(key(1), b"b"), Err(Error::AlreadyExists)));
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn delete_then_reput_rejected() {
         let dir = temp_dir("del");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
         store.put(key(1), b"v1").unwrap();
         store.delete(key(1)).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
@@ -2743,7 +2741,6 @@ mod tests {
         ));
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2751,14 +2748,14 @@ mod tests {
         let dir = temp_dir("reopen");
         let seg = seg_cap(16);
         {
-            let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 8, seg, 4).unwrap();
             for i in 0..20u64 {
                 store.put(key(i), format!("blob-{i}").as_bytes()).unwrap();
             }
             store.delete(key(3)).unwrap();
             store.close().unwrap();
         }
-        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 8, seg, 4).unwrap();
         for i in 0..20u64 {
             if i == 3 {
                 assert!(matches!(store.get(&key(i)), Err(Error::Deleted)));
@@ -2770,7 +2767,6 @@ mod tests {
                 );
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2778,7 +2774,7 @@ mod tests {
         let dir = temp_dir("rebuild");
         let seg = seg_cap(16);
         {
-            let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 8, seg, 4).unwrap();
             for i in 0..25u64 {
                 store.put(key(i), format!("v-{i}").as_bytes()).unwrap();
             }
@@ -2786,7 +2782,7 @@ mod tests {
             store.close().unwrap();
         }
 
-        let index_dir = dir.join("index");
+        let index_dir = dir.path().join("index");
         for ent in std::fs::read_dir(&index_dir).unwrap() {
             let p = ent.unwrap().path();
             if p.extension().is_some_and(|e| e == "idx") {
@@ -2794,7 +2790,7 @@ mod tests {
             }
         }
 
-        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::open_rebuild_index(dir.path(), seg * 8, seg, 4).unwrap();
         for i in 0..25u64 {
             if i == 7 {
                 assert!(
@@ -2812,10 +2808,9 @@ mod tests {
         assert!(matches!(store.get(&key(999)), Err(Error::NotFound)));
 
         drop(store);
-        let store2 = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        let store2 = BlobStore::open(dir.path(), seg * 8, seg, 4).unwrap();
         assert!(matches!(store2.get(&key(7)), Err(Error::Deleted)));
         drop(store2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2823,7 +2818,7 @@ mod tests {
         let dir = temp_dir("corrupt_idx");
         let seg = seg_cap(16);
         {
-            let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 8, seg, 4).unwrap();
             for i in 0..20u64 {
                 store.put(key(i), format!("v-{i}").as_bytes()).unwrap();
             }
@@ -2832,7 +2827,7 @@ mod tests {
         }
 
         // 损坏活跃索引段(`{seq}.idx` 且无配套 `{seq}.fuse`,open 时走 crc 校验的整段载入)。
-        let index_dir = dir.join("index");
+        let index_dir = dir.path().join("index");
         let mut active_idx = None;
         for ent in std::fs::read_dir(&index_dir).unwrap() {
             let p = ent.unwrap().path();
@@ -2846,7 +2841,7 @@ mod tests {
         std::fs::write(active_idx.expect("active idx exists"), b"garbage").unwrap();
 
         // open 检测到 Corrupt → 自动扫 log 重建;逻辑状态仍正确。
-        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 8, seg, 4).unwrap();
         for i in 0..20u64 {
             if i == 3 {
                 assert!(
@@ -2862,7 +2857,6 @@ mod tests {
             );
         }
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2913,36 +2907,35 @@ mod tests {
         let seg = seg_cap(16);
         let exp = now_ms() as i64 + 3_600_000; // 1h 后过期
         {
-            let store = BlobStore::create(&dir, seg * 4, seg, 100).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 4, seg, 100).unwrap();
             store.put_ttl(key(1), b"has-ttl", exp).unwrap();
             store.put(key(2), b"no-ttl").unwrap();
             store.close().unwrap();
         }
         // 抹掉索引,从 log 重建:expiration 应被保留。
-        let index_dir = dir.join("index");
+        let index_dir = dir.path().join("index");
         for ent in std::fs::read_dir(&index_dir).unwrap() {
             let p = ent.unwrap().path();
             let _ = std::fs::remove_file(p);
         }
-        let store = BlobStore::open_rebuild_index(&dir, seg * 4, seg, 100).unwrap();
+        let store = BlobStore::open_rebuild_index(dir.path(), seg * 4, seg, 100).unwrap();
         assert_eq!(store.get(&key(1)).unwrap(), b"has-ttl".to_vec());
         assert_eq!(store.get(&key(2)).unwrap(), b"no-ttl".to_vec());
         // 用一个已过期的 TTL 再验证过期路径。
         drop(store);
         {
-            let s2 = BlobStore::open(&dir, seg * 4, seg, 100).unwrap();
+            let s2 = BlobStore::open(dir.path(), seg * 4, seg, 100).unwrap();
             s2.put_ttl(key(3), b"expired", 1).unwrap(); // expiration=1ms,早已过期
             assert!(matches!(s2.get(&key(3)), Err(Error::Expired)));
             s2.close().unwrap();
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn compact_reclaims_dead_space_and_preserves_state() {
         let dir = temp_dir("compact");
         let seg = seg_cap(8);
-        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
 
         // 死数据来源(Ambry 语义下无覆盖/无删后重写):delete 使原 PUT 变死,墓碑成为新赢家。
         for i in 0..10u64 {
@@ -2984,7 +2977,7 @@ mod tests {
 
         // 重开(会经过 recover_compaction 无标记路径)仍一致。
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 16, seg, 4).unwrap();
         for i in 5..10u64 {
             assert_eq!(
                 store.get(&key(i)).unwrap(),
@@ -2992,14 +2985,13 @@ mod tests {
             );
         }
         assert!(matches!(store.get(&key(0)), Err(Error::Deleted)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn compact_if_needed_respects_threshold() {
         let dir = temp_dir("compact_thr");
         let seg = seg_cap(8);
-        let store = BlobStore::create(&dir, seg * 16, seg, 100).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 16, seg, 100).unwrap();
         for i in 0..5u64 {
             store.put(key(i), b"v").unwrap();
         }
@@ -3008,7 +3000,6 @@ mod tests {
             .compact_if_needed(&legacy_policy(0.5))
             .unwrap()
             .is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 判定用的"现在":远在未来,确保短 TTL 对象都已过期,且不会与真实时钟打架。
@@ -3018,7 +3009,7 @@ mod tests {
     fn compaction_reclaims_expired_objects() {
         let dir = temp_dir("compact_ttl");
         let seg = seg_cap(4);
-        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
         // 三条短 TTL(1ms,出生即过期)+ 两条不过期。载荷 ~2KB、段容量 ~4KB ⇒ 过期数据必然
         // 落在**封存段**里(活跃段不参与增量压缩,闸门放行也不代表有段可选)。
         let expired = vec![0xE1u8; 2000];
@@ -3058,16 +3049,15 @@ mod tests {
         assert_eq!(store.stats().unwrap(), store.stats_by_scan());
 
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 16, seg, 4).unwrap();
         assert!(matches!(store.get(&key(0)), Err(Error::NotFound)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn tombstones_are_reclaimed_only_after_retention() {
         let dir = temp_dir("compact_tomb");
         let seg = seg_cap(8);
-        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
         for i in 0..6u64 {
             store.put(key(i), b"payload-to-be-deleted").unwrap();
         }
@@ -3117,9 +3107,8 @@ mod tests {
         assert_eq!(store.stats().unwrap(), store.stats_by_scan());
 
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 16, seg, 4).unwrap();
         assert!(matches!(store.get(&key(0)), Err(Error::NotFound)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 墓碑的删除时刻随记录落盘:重开后保留期判定不变(否则重启就会提前回收墓碑)。
@@ -3129,20 +3118,19 @@ mod tests {
         let seg = seg_cap(8);
         let deleted_at;
         {
-            let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
             store.put(key(1), b"v").unwrap();
             store.delete(key(1)).unwrap();
             deleted_at = store.expiration_of(&key(1)).unwrap();
             store.close().unwrap();
         }
-        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 16, seg, 4).unwrap();
         assert_eq!(store.expiration_of(&key(1)), Some(deleted_at));
         // 元数据口径:墓碑的 TTL 仍是 -1,不当成过期时刻对外汇报。
         let stat = store.stat(&key(1)).unwrap();
         assert!(stat.deleted);
         assert_eq!(stat.expiration_ms, NO_EXPIRATION);
         assert!(!stat.expired);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// partition 级闸门用「可回收占比」(含 TTL/墓碑空间),不是只看死字节计数。
@@ -3150,7 +3138,7 @@ mod tests {
     fn compact_if_needed_gate_counts_expired_bytes() {
         let dir = temp_dir("compact_gate");
         let seg = seg_cap(4);
-        let store = BlobStore::create(&dir, seg * 32, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 32, seg, 4).unwrap();
         let payload = vec![0xABu8; 512];
         for i in 0..4u64 {
             store.put_ttl(key(i), &payload, 1).unwrap(); // 过期
@@ -3169,7 +3157,6 @@ mod tests {
             .unwrap()
             .expect("0.3 的闸门应放行");
         assert!(st.expired_reclaimed_bytes > 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3178,7 +3165,7 @@ mod tests {
         let dir = temp_dir("compact_crash");
         let seg = seg_cap(8);
         {
-            let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
             for i in 0..8u64 {
                 store.put(key(i), format!("v-{i}").as_bytes()).unwrap();
             }
@@ -3189,23 +3176,22 @@ mod tests {
             store.close().unwrap();
         }
         // 人为伪造"提交中崩溃":放一个标记 + 残留 log.old / log.new,open 必须收敛。
-        let marker = dir.join("COMPACT_COMMIT");
+        let marker = dir.path().join("COMPACT_COMMIT");
         std::fs::write(&marker, b"COMPACTING").unwrap();
         // 残留一个空 log.new(无标记语义下会被丢弃;有标记时若 log 存在则清理)。
-        std::fs::create_dir_all(dir.join("log.new")).unwrap();
-        std::fs::create_dir_all(dir.join("log.old")).unwrap();
+        std::fs::create_dir_all(dir.path().join("log.new")).unwrap();
+        std::fs::create_dir_all(dir.path().join("log.old")).unwrap();
 
-        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 16, seg, 4).unwrap();
         assert!(!marker.exists(), "marker cleared after recovery");
-        assert!(!dir.join("log.new").exists(), "log.new cleaned");
-        assert!(!dir.join("log.old").exists(), "log.old cleaned");
+        assert!(!dir.path().join("log.new").exists(), "log.new cleaned");
+        assert!(!dir.path().join("log.old").exists(), "log.old cleaned");
         for i in 4..8u64 {
             assert_eq!(store.get(&key(i)).unwrap(), format!("v-{i}").into_bytes());
         }
         for i in 0..4u64 {
             assert!(matches!(store.get(&key(i)), Err(Error::Deleted)));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **磁盘格式前后兼容**(CLAUDE.md §3.4):改造前的墓碑 `expiration = -1`(删除时间未知),
@@ -3216,7 +3202,7 @@ mod tests {
         let dir = temp_dir("legacy_tomb");
         let seg = seg_cap(8);
         {
-            let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
             store.put(key(7), b"v").unwrap();
             // 手工造一条"旧格式"墓碑:记录头与索引条目的 expiration 都是 -1。
             let record = encode_record(&key(7), FLAG_DELETED, NO_EXPIRATION, &[]).unwrap();
@@ -3230,7 +3216,7 @@ mod tests {
         }
 
         // 重开走"由 log 重建索引"的路径:删除时间从记录头还原,仍是 -1。
-        let store = BlobStore::open(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 16, seg, 4).unwrap();
         assert_eq!(store.expiration_of(&key(7)), Some(NO_EXPIRATION));
         assert!(matches!(store.get(&key(7)), Err(Error::Deleted)));
 
@@ -3243,7 +3229,6 @@ mod tests {
             "旧格式墓碑(删除时间未知)永不自动回收"
         );
         assert!(matches!(store.get(&key(7)), Err(Error::Deleted)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3253,7 +3238,7 @@ mod tests {
         let dir = temp_dir("wm");
         let seg = seg_cap(64);
         {
-            let store = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+            let store = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
             store.put(key(1), b"a").unwrap();
             store.flush().unwrap(); // 索引 + 水位落到含 key(1)
                                     // 之后再写 key(2)/key(3),只 flush 数据日志(不落索引、不推进水位),模拟崩溃前状态。
@@ -3264,7 +3249,7 @@ mod tests {
             std::mem::forget(store);
         }
         // 重开:水位=含 key(1) 处,回放 log 尾部应补回 key(2)/key(3)。
-        let store = BlobStore::open(&dir, seg * 4, seg, 1000).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 4, seg, 1000).unwrap();
         assert_eq!(store.get(&key(1)).unwrap(), b"a".to_vec());
         assert_eq!(
             store.get(&key(2)).unwrap(),
@@ -3276,14 +3261,13 @@ mod tests {
             b"c".to_vec(),
             "tail key(3) recovered via replay"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn incremental_compaction_reclaims_only_dead_segments() {
         let dir = temp_dir("incr");
         let seg = seg_cap(1); // 每段数据容量 ~1KiB → 大记录会跨多段
-        let store = BlobStore::create(&dir, seg * 128, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 128, seg, 1000).unwrap();
 
         let big = |tag: &str| -> Vec<u8> {
             let mut v = vec![b'x'; 400];
@@ -3328,19 +3312,18 @@ mod tests {
 
         // 重开一致。
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 128, seg, 1000).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 128, seg, 1000).unwrap();
         for i in 30..40u64 {
             assert_eq!(store.get(&key(i)).unwrap(), big(&format!("v{i}")));
         }
         assert!(matches!(store.get(&key(5)), Err(Error::Deleted)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn cost_benefit_compaction_reclaims_and_preserves_state() {
         let dir = temp_dir("costben");
         let seg = seg_cap(1); // ~1KiB 数据容量,400B 记录 → 每段约 2 条,跨很多段
-        let store = BlobStore::create(&dir, seg * 128, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 128, seg, 1000).unwrap();
         let big = |tag: &str| -> Vec<u8> {
             let mut v = vec![b'y'; 400];
             v[..tag.len()].copy_from_slice(tag.as_bytes());
@@ -3385,7 +3368,7 @@ mod tests {
 
         // 全存活库无可回收区间 → None。
         let dir2 = temp_dir("costben2");
-        let fresh = BlobStore::create(&dir2, seg * 128, seg, 1000).unwrap();
+        let fresh = BlobStore::create(dir2.path(), seg * 128, seg, 1000).unwrap();
         for i in 0..6u64 {
             fresh.put(key(i), &big(&format!("v{i}"))).unwrap();
         }
@@ -3397,21 +3380,19 @@ mod tests {
             "no dead data → no candidate"
         );
         fresh.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir2);
 
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 128, seg, 1000).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 128, seg, 1000).unwrap();
         for i in 35..40u64 {
             assert_eq!(store.get(&key(i)).unwrap(), big(&format!("v{i}")));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn incremental_stats_match_full_scan() {
         let dir = temp_dir("stats_incr");
         let seg = seg_cap(2);
-        let store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 64, seg, 8).unwrap();
         for i in 0..40u64 {
             store.put(key(i), format!("value-{i}").as_bytes()).unwrap();
         }
@@ -3439,20 +3420,19 @@ mod tests {
         );
 
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 64, seg, 8).unwrap();
         assert_eq!(
             store.stats().unwrap(),
             store.stats_by_scan(),
             "after reopen recompute"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn delete_is_irreversible_and_key_stays_occupied() {
         let dir = temp_dir("irreversible");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 4).unwrap();
         store.put(key(1), b"hello").unwrap();
 
         store.delete(key(1)).unwrap();
@@ -3488,20 +3468,19 @@ mod tests {
 
         // 墓碑跨重开与扫 log 重建仍是终态。
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 8, seg, 4).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
         store.close().unwrap();
-        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::open_rebuild_index(dir.path(), seg * 8, seg, 4).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Deleted)));
         assert!(store.stat(&key(1)).unwrap().deleted);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn ttl_is_fixed_at_write_time() {
         let dir = temp_dir("ttl_write_only");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 4).unwrap();
         // 过期时刻设在过去 → 立即过期。
         store.put_ttl(key(1), b"payload", 1).unwrap();
         assert!(matches!(store.get(&key(1)), Err(Error::Expired)));
@@ -3518,17 +3497,16 @@ mod tests {
         );
         // TTL 落记录体内,故扫 log 全量重建后仍过期(不只活在索引里)。
         store.close().unwrap();
-        let store = BlobStore::open_rebuild_index(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::open_rebuild_index(dir.path(), seg * 8, seg, 4).unwrap();
         assert_eq!(store.expiration_of(&key(1)), Some(1));
         assert!(matches!(store.get(&key(1)), Err(Error::Expired)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn foreign_partition_key_is_rejected() {
         let dir = temp_dir("prefix_reject");
         let seg = seg_cap(16);
-        let store = BlobStore::create_for_partition(&dir, seg * 8, seg, 4, 7).unwrap();
+        let store = BlobStore::create_for_partition(dir.path(), seg * 8, seg, 4, 7).unwrap();
         assert_eq!(store.key_prefix(), 7);
         let mine = StoreKey::from_parts(7, 1);
         let other = StoreKey::from_parts(8, 1);
@@ -3555,7 +3533,7 @@ mod tests {
 
         // 前缀从段头读回(重开后仍知道自己是 partition 7)。
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 8, seg, 4).unwrap();
         assert_eq!(store.key_prefix(), 7);
         assert_eq!(store.get(&mine).unwrap(), b"ok".to_vec());
         store.close().unwrap();
@@ -3564,19 +3542,19 @@ mod tests {
         let registry = crate::metrics::StoreMetrics::new(&antfs_metric::Registry::new()).unwrap();
         let cfg = crate::config::StoreConfig::default();
         assert!(matches!(
-            BlobStore::open_with_partition(&dir, seg * 8, &cfg, &registry, "p7", 8),
+            BlobStore::open_with_partition(dir.path(), seg * 8, &cfg, &registry, "p7", 8),
             Err(Error::Corrupt(_))
         ));
-        let ok = BlobStore::open_with_partition(&dir, seg * 8, &cfg, &registry, "p7", 7).unwrap();
+        let ok =
+            BlobStore::open_with_partition(dir.path(), seg * 8, &cfg, &registry, "p7", 7).unwrap();
         assert_eq!(ok.key_prefix(), 7);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn stat_get_options_and_introspection() {
         let dir = temp_dir("stat");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 4).unwrap();
         assert!(store.is_empty());
         assert!(matches!(store.stat(&key(1)), Err(Error::NotFound)));
 
@@ -3607,7 +3585,6 @@ mod tests {
             b"temp".to_vec()
         );
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 差分对拍:纯内存模型记录每个 key 的期望状态,随机穿插 put/delete 与
@@ -3679,7 +3656,7 @@ mod tests {
 
         for &seed in &[0x1234_5678u64, 0xdead_beefu64, 0x0BAD_F00Du64] {
             let dir = temp_dir(&format!("model_{seed:x}"));
-            let mut store = BlobStore::create(&dir, total, seg, max_idx).unwrap();
+            let mut store = BlobStore::create(dir.path(), total, seg, max_idx).unwrap();
             let mut model = vec![ModelState::Absent; KEYS];
             let mut rng = Rng(seed);
             let mut ver = 0u64;
@@ -3729,7 +3706,7 @@ mod tests {
                     65..=76 => store.flush().unwrap(),
                     77..=86 => {
                         store.close().unwrap();
-                        store = BlobStore::open(&dir, total, seg, max_idx).unwrap();
+                        store = BlobStore::open(dir.path(), total, seg, max_idx).unwrap();
                         verify_all(&store, &model, &format!("step {step} after reopen"));
                     }
                     87..=92 => {
@@ -3756,15 +3733,13 @@ mod tests {
             );
             store.close().unwrap();
 
-            let reopened = BlobStore::open(&dir, total, seg, max_idx).unwrap();
+            let reopened = BlobStore::open(dir.path(), total, seg, max_idx).unwrap();
             verify_all(&reopened, &model, "final reopen");
             reopened.close().unwrap();
 
-            let rebuilt = BlobStore::open_rebuild_index(&dir, total, seg, max_idx).unwrap();
+            let rebuilt = BlobStore::open_rebuild_index(dir.path(), total, seg, max_idx).unwrap();
             verify_all(&rebuilt, &model, "final rebuild-from-log");
             rebuilt.close().unwrap();
-
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -3778,7 +3753,7 @@ mod tests {
 
         let dir = temp_dir("concurrent");
         let seg = seg_cap(8);
-        let store = Arc::new(BlobStore::create(&dir, seg * 256, seg, 1000).unwrap());
+        let store = Arc::new(BlobStore::create(dir.path(), seg * 256, seg, 1000).unwrap());
 
         const KEPT: u64 = 200;
         const VICTIMS: u64 = 200;
@@ -3868,7 +3843,6 @@ mod tests {
         }
 
         Arc::into_inner(store).unwrap().close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // 汇总分批拉取的全部条目到「key → 最新 MessageInfo」(find 恒返回最新态,跨批同 key 合并)。
@@ -3896,7 +3870,7 @@ mod tests {
     fn find_entries_since_covers_all_and_catches_up() {
         let dir = temp_dir("fes_basic");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 1000).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 1000).unwrap();
         for k in 0..20u64 {
             store.put(key(k), &data_for(k, 0)).unwrap();
         }
@@ -3911,7 +3885,6 @@ mod tests {
         assert!(next.entries.is_empty(), "caught up → empty");
         assert_eq!(next.token, info.token, "token unchanged when caught up");
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3919,7 +3892,7 @@ mod tests {
         let dir = temp_dir("fes_page");
         let seg = seg_cap(16);
         // 小段 → 小 journal(4*2=8),配合从头分批拉取,强制走扫 log 慢路径。
-        let store = BlobStore::create(&dir, seg * 32, seg, 2).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 32, seg, 2).unwrap();
         for k in 0..15u64 {
             store.put(key(k), &data_for(k, 0)).unwrap();
         }
@@ -3946,14 +3919,13 @@ mod tests {
             "journal fast-path returns new key"
         );
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn find_missing_keys_and_is_key_deleted() {
         let dir = temp_dir("fmk");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 100).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 100).unwrap();
         store.put(key(1), b"a").unwrap();
         store.put(key(2), b"b").unwrap();
         store.delete(key(2)).unwrap();
@@ -3972,14 +3944,13 @@ mod tests {
             "absent"
         );
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn valid_data_size_excludes_deleted_but_counts_unexpired_and_expired() {
         let dir = temp_dir("valid");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 100).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 100).unwrap();
         // 永久 blob。
         store.put(key(1), b"keep-1").unwrap();
         let live1 = store.stat(&key(1)).unwrap();
@@ -3996,14 +3967,13 @@ mod tests {
         assert_eq!(store.valid_data_size(), rec1 + rec2);
         assert_eq!(store.valid_data_size_by_scan(), rec1 + rec2, "scan agrees");
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn valid_data_size_incremental_matches_scan_under_mixed_ops() {
         let dir = temp_dir("valid_diff");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 64, seg, 8).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 64, seg, 8).unwrap();
         let mut rng = Rng(0x51ED_C0DE);
 
         // 混合 put(部分带 TTL)/delete,穿插 compaction,每步后增量计数须与全扫基准相等。
@@ -4035,21 +4005,20 @@ mod tests {
         }
         // 重开后(全量重算)仍一致。
         store.close().unwrap();
-        let store = BlobStore::open(&dir, seg * 64, seg, 8).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 64, seg, 8).unwrap();
         assert_eq!(
             store.valid_data_size(),
             store.valid_data_size_by_scan(),
             "reopen"
         );
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn put_ttl_records_arbitrary_expiration() {
         let dir = temp_dir("ttl_set");
         let seg = seg_cap(16);
-        let store = BlobStore::create(&dir, seg * 8, seg, 100).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 100).unwrap();
         // 未来的过期时刻(非永久)—— 写入时一次定下,没有后续"改期"。
         let future = now_ms() as i64 + 1_000_000;
         store.put_ttl(key(1), b"payload", future).unwrap();
@@ -4058,14 +4027,13 @@ mod tests {
         assert!(!m.expired, "not yet expired");
         assert!(!m.deleted);
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn store_full_when_capacity_exhausted() {
         let dir = temp_dir("store_full");
         let seg = seg_cap(2); // 小段:数据区约 2KiB
-        let store = BlobStore::create(&dir, seg * 2, seg, 1000).unwrap(); // 仅 2 段
+        let store = BlobStore::create(dir.path(), seg * 2, seg, 1000).unwrap(); // 仅 2 段
         assert_eq!(store.total_capacity(), seg * 2);
 
         let value = vec![0u8; 500];
@@ -4084,7 +4052,6 @@ mod tests {
         // 已写入的对象仍可读。
         assert_eq!(store.get(&key(0)).unwrap(), value);
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 拉复制收敛驱动:把 `peer` 的全部记录按 log 序忠实 apply 到 `local`(镜像 store-server 复制器)。
@@ -4119,8 +4086,8 @@ mod tests {
     fn apply_replicated_propagates_put_and_is_idempotent() {
         let (dp, dl) = (temp_dir("repl_put_peer"), temp_dir("repl_put_local"));
         let seg = seg_cap(64);
-        let peer = BlobStore::create(&dp, seg * 4, seg, 1000).unwrap();
-        let local = BlobStore::create(&dl, seg * 4, seg, 1000).unwrap();
+        let peer = BlobStore::create(dp.path(), seg * 4, seg, 1000).unwrap();
+        let local = BlobStore::create(dl.path(), seg * 4, seg, 1000).unwrap();
         let payload = vec![9u8; 128];
         peer.put(key(1), &payload).unwrap();
 
@@ -4134,8 +4101,6 @@ mod tests {
 
         peer.close().unwrap();
         local.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dp);
-        let _ = std::fs::remove_dir_all(&dl);
     }
 
     /// 墓碑恒胜:对象不可变 + 删除不可逆 ⇒ 每个 key 的状态单调向前。
@@ -4144,8 +4109,8 @@ mod tests {
     fn apply_replicated_is_tombstone_wins_and_never_regresses() {
         let (dp, dl) = (temp_dir("repl_tw_peer"), temp_dir("repl_tw_local"));
         let seg = seg_cap(64);
-        let peer = BlobStore::create(&dp, seg * 4, seg, 1000).unwrap();
-        let local = BlobStore::create(&dl, seg * 4, seg, 1000).unwrap();
+        let peer = BlobStore::create(dp.path(), seg * 4, seg, 1000).unwrap();
+        let local = BlobStore::create(dl.path(), seg * 4, seg, 1000).unwrap();
 
         // 1) peer 的 PUT 进本地(PUT + 本地不存在 → Applied)。
         peer.put(key(1), &[1, 2, 3]).unwrap();
@@ -4198,8 +4163,6 @@ mod tests {
 
         peer.close().unwrap();
         local.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dp);
-        let _ = std::fs::remove_dir_all(&dl);
     }
 
     /// 存活记录缺数据体且本地也缺该 key → `Corrupt`(不能凭空造一条没有数据的活记录)。
@@ -4207,7 +4170,7 @@ mod tests {
     fn apply_replicated_alive_without_data_is_corrupt() {
         let dir = temp_dir("repl_no_data");
         let seg = seg_cap(64);
-        let local = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let local = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
         let r = local.apply_replicated(ReplicatedRecord {
             key: key(1),
             flags: 0,
@@ -4225,15 +4188,14 @@ mod tests {
         assert_eq!(ok.unwrap(), ApplyOutcome::Applied);
         assert!(matches!(local.get(&key(1)), Err(Error::Deleted)));
         local.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn apply_replicated_propagates_tombstone() {
         let (dp, dl) = (temp_dir("repl_del_peer"), temp_dir("repl_del_local"));
         let seg = seg_cap(64);
-        let peer = BlobStore::create(&dp, seg * 4, seg, 1000).unwrap();
-        let local = BlobStore::create(&dl, seg * 4, seg, 1000).unwrap();
+        let peer = BlobStore::create(dp.path(), seg * 4, seg, 1000).unwrap();
+        let local = BlobStore::create(dl.path(), seg * 4, seg, 1000).unwrap();
         peer.put(key(3), &[7u8; 32]).unwrap();
         replicate_all(&peer, &local);
         assert!(local.get(&key(3)).is_ok(), "先收到 PUT");
@@ -4247,15 +4209,13 @@ mod tests {
 
         peer.close().unwrap();
         local.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dp);
-        let _ = std::fs::remove_dir_all(&dl);
     }
 
     #[test]
     fn apply_replicated_rejected_when_unavailable() {
         let dir = temp_dir("repl_unavail");
         let seg = seg_cap(64);
-        let local = BlobStore::create(&dir, seg * 4, seg, 1000).unwrap();
+        let local = BlobStore::create(dir.path(), seg * 4, seg, 1000).unwrap();
         local.available.store(false, Ordering::Relaxed);
         let r = local.apply_replicated(ReplicatedRecord {
             key: key(4),
@@ -4265,7 +4225,6 @@ mod tests {
         });
         assert!(matches!(r, Err(Error::Unavailable)), "自关后 apply 拒绝");
         local.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4273,7 +4232,7 @@ mod tests {
         // 造多段:小段容量,写到滚动出封存段。
         let src = temp_dir("s3b_src");
         let seg = seg_cap(2); // 每段 2 块数据
-        let store = BlobStore::create(&src, seg * 8, seg, 1000).unwrap();
+        let store = BlobStore::create(src.path(), seg * 8, seg, 1000).unwrap();
         let rec = vec![7u8; (BLOCK + 100) as usize]; // 每条 > 1 块,2 条即滚动
         for n in 0..6u64 {
             store.put(key(n), &rec).unwrap();
@@ -4292,7 +4251,7 @@ mod tests {
 
         // 物理拷贝封存段到新目录 → open_rebuild_index_with → 封存段里的对象可读。
         let dst = temp_dir("s3b_dst");
-        let (log_dir, _) = sub_dirs(&dst);
+        let (log_dir, _) = sub_dirs(dst.path());
         std::fs::create_dir_all(&log_dir).unwrap();
         for (name, _) in &sealed {
             let bytes = store.read_segment_prefix(*name).unwrap();
@@ -4304,7 +4263,8 @@ mod tests {
             io_error_count_to_trigger_shutdown: 0,
         };
         let reg = crate::StoreMetrics::new(&antfs_metric::Registry::new()).unwrap();
-        let copied = BlobStore::open_rebuild_index_with(&dst, seg * 8, &cfg, &reg, "s3b").unwrap();
+        let copied =
+            BlobStore::open_rebuild_index_with(dst.path(), seg * 8, &cfg, &reg, "s3b").unwrap();
         // 封存段覆盖的 key(排除落在活跃段的)应可读。
         let mut readable = 0;
         for n in 0..6u64 {
@@ -4316,8 +4276,6 @@ mod tests {
 
         store.close().unwrap();
         copied.close().unwrap();
-        let _ = std::fs::remove_dir_all(&src);
-        let _ = std::fs::remove_dir_all(&dst);
     }
     // ── 段身份(代次)+ 副本 incarnation + 游标重定位(对齐 Ambry `revalidateStoreFindToken`)──────
 
@@ -4328,11 +4286,11 @@ mod tests {
         let seg = seg_cap(4);
         let created;
         {
-            let s = BlobStore::create(&dir, seg * 4, seg, 4).unwrap();
+            let s = BlobStore::create(dir.path(), seg * 4, seg, 4).unwrap();
             created = s.incarnation();
             assert!(created >= 1);
             assert_eq!(
-                std::fs::read_to_string(dir.join(LOG_INCARNATION_FILE))
+                std::fs::read_to_string(dir.path().join(LOG_INCARNATION_FILE))
                     .unwrap()
                     .trim()
                     .parse::<u64>()
@@ -4342,15 +4300,14 @@ mod tests {
             );
             s.close().unwrap();
         }
-        let again = BlobStore::open(&dir, seg * 4, seg, 4).unwrap();
+        let again = BlobStore::open(dir.path(), seg * 4, seg, 4).unwrap();
         assert_eq!(again.incarnation(), created, "重开必须读到同一号");
         again.adopt_incarnation(created + 100).unwrap();
         assert_eq!(again.incarnation(), created + 100);
         again.close().unwrap();
-        let third = BlobStore::open(&dir, seg * 4, seg, 4).unwrap();
+        let third = BlobStore::open(dir.path(), seg * 4, seg, 4).unwrap();
         assert_eq!(third.incarnation(), created + 100, "采纳后必须持久");
         third.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 副本目录被删后重建(等价 `DROPPED`,或**换盘后重来**):身份文件随之消失,重建时会写一个新号
@@ -4358,7 +4315,7 @@ mod tests {
     #[test]
     fn recreated_replica_gets_a_new_incarnation_file() {
         let root = temp_dir("incarnation_recreate");
-        let store_dir = root.join("partition_0");
+        let store_dir = root.path().join("partition_0");
         let seg = seg_cap(4);
         let first = BlobStore::create(&store_dir, seg * 4, seg, 4).unwrap();
         first.close().unwrap();
@@ -4369,7 +4326,6 @@ mod tests {
         assert!(second.incarnation() >= 1);
         assert_eq!(read_incarnation(&store_dir), Some(second.incarnation()));
         second.close().unwrap();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 身份文件缺失(物理 bootstrap 只拷段):`open` 用**本机当前时刻**兜底并落盘。
@@ -4378,17 +4334,16 @@ mod tests {
         let dir = temp_dir("incarnation_heal");
         let seg = seg_cap(4);
         {
-            let s = BlobStore::create(&dir, seg * 4, seg, 4).unwrap();
+            let s = BlobStore::create(dir.path(), seg * 4, seg, 4).unwrap();
             s.put(key(1), b"v").unwrap();
             s.close().unwrap();
         }
-        std::fs::remove_file(dir.join(LOG_INCARNATION_FILE)).unwrap();
-        let store = BlobStore::open(&dir, seg * 4, seg, 4).unwrap();
+        std::fs::remove_file(dir.path().join(LOG_INCARNATION_FILE)).unwrap();
+        let store = BlobStore::open(dir.path(), seg * 4, seg, 4).unwrap();
         assert!(store.incarnation() >= 1, "缺失 → 用本机时刻兜底补写");
-        assert_eq!(read_incarnation(&dir), Some(store.incarnation()));
+        assert_eq!(read_incarnation(dir.path()), Some(store.incarnation()));
         assert_eq!(store.get(&key(1)).unwrap(), b"v");
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **兜底值不得取自段头**:物理 bootstrap 拷来的段诞生在**对端**,其 `created_ns` 正是对端自己的
@@ -4402,7 +4357,7 @@ mod tests {
         let src = temp_dir("incarnation_peer_src");
         let dst = temp_dir("incarnation_peer_dst");
         let seg = seg_cap(2);
-        let peer = BlobStore::create(&src, seg * 4, seg, 4).unwrap();
+        let peer = BlobStore::create(src.path(), seg * 4, seg, 4).unwrap();
         for i in 0..3u64 {
             peer.put(key(i), &[9u8; 700]).unwrap();
         }
@@ -4412,14 +4367,17 @@ mod tests {
         let peer_incarnation = peer.incarnation();
 
         // 物理拷贝:段文件原样落盘(对端时刻原封不动带过来),不带 LOG_INCARNATION。
-        let (log_dir, _) = sub_dirs(&dst);
+        let (log_dir, _) = sub_dirs(dst.path());
         std::fs::create_dir_all(&log_dir).unwrap();
         for (name, _) in &sealed {
             let bytes = peer.read_segment_prefix(*name).unwrap();
             std::fs::write(log_dir.join(name.filename()), &bytes).unwrap();
         }
-        assert!(read_incarnation(&dst).is_none(), "bootstrap 不带身份文件");
-        let local = BlobStore::open_rebuild_index(&dst, seg * 8, seg, 4).unwrap();
+        assert!(
+            read_incarnation(dst.path()).is_none(),
+            "bootstrap 不带身份文件"
+        );
+        let local = BlobStore::open_rebuild_index(dst.path(), seg * 8, seg, 4).unwrap();
         assert!(
             local.incarnation() >= 1 && local.incarnation() != peer_incarnation,
             "本副本身份必须从本机取,绝不复用对端的:local={} peer={peer_incarnation}",
@@ -4433,7 +4391,7 @@ mod tests {
             let bytes = peer.read_segment_prefix(*name).unwrap();
             std::fs::write(log_dir.join(name.filename()), &bytes).unwrap();
         }
-        let again = BlobStore::open_rebuild_index(&dst, seg * 8, seg, 4).unwrap();
+        let again = BlobStore::open_rebuild_index(dst.path(), seg * 8, seg, 4).unwrap();
         assert_ne!(
             again.incarnation(),
             peer_incarnation,
@@ -4442,8 +4400,6 @@ mod tests {
 
         peer.close().unwrap();
         again.close().unwrap();
-        let _ = std::fs::remove_dir_all(&src);
-        let _ = std::fs::remove_dir_all(&dst);
     }
 
     /// 全库 compact 必须换身份,且旧游标被**重定位**(段已不存在)而不是"看似已追上"。
@@ -4451,7 +4407,7 @@ mod tests {
     fn full_compact_changes_identity_and_revalidates_old_cursor() {
         let dir = temp_dir("epoch_compact");
         let seg = seg_cap(2);
-        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
         let payload = vec![7u8; 600];
         for i in 0..15u64 {
             store.put(key(i), &payload).unwrap();
@@ -4498,7 +4454,6 @@ mod tests {
             assert!(got.contains(&key(i)), "重定位后从起点重扫必须覆盖活数据");
         }
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **代次正是用来识破"段号被复用"的**:全库 compact 后新 log 的段位置从 0 重来,但代次接着涨,
@@ -4509,7 +4464,7 @@ mod tests {
     fn reused_segment_positions_are_detected_by_generation() {
         let dir = temp_dir("gen_reuse");
         let seg = seg_cap(4);
-        let store = BlobStore::create(&dir, seg * 16, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 16, seg, 4).unwrap();
         let payload = vec![9u8; 900];
         for i in 0..8u64 {
             store.put(key(i), &payload).unwrap();
@@ -4539,7 +4494,6 @@ mod tests {
             "同位置、不同代次 ⇒ 段号被复用 ⇒ 游标作废"
         );
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 重定位的三种原因逐个盯死;合法游标**不得**被误重置(否则每次拉取都从头重扫)。
@@ -4547,7 +4501,7 @@ mod tests {
     fn revalidate_reports_reasons_and_keeps_valid_cursors() {
         let dir = temp_dir("revalidate");
         let seg = seg_cap(4);
-        let store = BlobStore::create(&dir, seg * 8, seg, 4).unwrap();
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 4).unwrap();
         for i in 0..8u64 {
             store.put(key(i), &data_for(i, 0)).unwrap();
         }
@@ -4604,7 +4558,6 @@ mod tests {
             "offset_out_of_range"
         );
         store.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

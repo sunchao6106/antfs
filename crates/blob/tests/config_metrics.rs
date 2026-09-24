@@ -4,24 +4,16 @@
 //! (对齐 CLAUDE.md §6:对被测对象实际接入的那个 Registry 断言);③ 多 store 共享一个
 //! Registry 靠 `store` label 区分(common.md §2.2)。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use antfs_blob::{BlobStore, StoreConfig, StoreKey, StoreMetrics};
 use antfs_config::{Loader, Validate};
 use antfs_metric::{gather, Registry};
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_dir() -> std::path::PathBuf {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+/// RAII 临时目录(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+fn unique_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("ambry_store_cm_")
+        .tempdir()
         .unwrap()
-        .as_nanos();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let p = std::path::PathBuf::from(format!("/var/tmp/ambry_store_cm_{pid}_{ns}_{seq}"));
-    std::fs::create_dir_all(&p).unwrap();
-    p
 }
 
 fn key(n: u8) -> StoreKey {
@@ -57,7 +49,7 @@ fn di_constructor_emits_metrics_on_injected_registry() {
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
     };
-    let store = BlobStore::create_with(&dir, 4096 * 8, &cfg, &metrics, "p1").unwrap();
+    let store = BlobStore::create_with(dir.path(), 4096 * 8, &cfg, &metrics, "p1").unwrap();
 
     store.put(key(1), b"hello").unwrap();
     store.put(key(2), b"world").unwrap();
@@ -93,8 +85,10 @@ fn two_stores_share_registry_distinguished_by_label() {
         io_error_count_to_trigger_shutdown: 0,
     };
 
-    let s1 = BlobStore::create_with(unique_dir(), 4096 * 8, &cfg, &metrics, "p1").unwrap();
-    let s2 = BlobStore::create_with(unique_dir(), 4096 * 8, &cfg, &metrics, "p2").unwrap();
+    let d1 = unique_dir();
+    let d2 = unique_dir();
+    let s1 = BlobStore::create_with(d1.path(), 4096 * 8, &cfg, &metrics, "p1").unwrap();
+    let s2 = BlobStore::create_with(d2.path(), 4096 * 8, &cfg, &metrics, "p2").unwrap();
     s1.put(key(1), b"a").unwrap();
     s1.put(key(2), b"b").unwrap();
     s2.put(key(1), b"c").unwrap();

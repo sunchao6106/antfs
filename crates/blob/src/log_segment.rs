@@ -381,9 +381,14 @@ impl LogSegment {
 mod tests {
     use super::*;
 
-    fn temp_path(tag: &str) -> std::path::PathBuf {
-        let ns = now_ns();
-        std::path::PathBuf::from(format!("/var/tmp/ambry_ls_{tag}_{ns}.seg"))
+    /// 单个测试段文件:落在 RAII 临时目录里(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+    fn temp_path(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("ambry_ls_{tag}_"))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join(format!("{tag}.seg"));
+        (dir, path)
     }
 
     fn cap(blocks: u64) -> u64 {
@@ -392,7 +397,7 @@ mod tests {
 
     #[test]
     fn roundtrip_before_and_after_flush() {
-        let path = temp_path("rt");
+        let (_dir, path) = temp_path("rt");
         let seg = LogSegment::create(&path, cap(64), 7, 1).unwrap();
 
         let a = b"hello".to_vec();
@@ -413,12 +418,11 @@ mod tests {
         seg.flush().unwrap();
         assert_eq!(seg.read(oa, a.len()).unwrap(), a);
         seg.close().unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn oversized_record_rejected() {
-        let path = temp_path("big");
+        let (_dir, path) = temp_path("big");
         let seg = LogSegment::create(&path, cap(2), 7, 1).unwrap();
         let big = vec![0u8; (cap(2) - HEADER_SIZE as u64) as usize + 1];
         match seg.append(&big) {
@@ -426,24 +430,22 @@ mod tests {
             other => panic!("expected SegmentFull, got {other:?}"),
         }
         seg.close().unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn read_out_of_range_rejected() {
-        let path = temp_path("oor");
+        let (_dir, path) = temp_path("oor");
         let seg = LogSegment::create(&path, cap(4), 7, 1).unwrap();
         match seg.read(0, 1000) {
             Err(Error::OutOfRange { .. }) => {}
             other => panic!("expected OutOfRange, got {other:?}"),
         }
         seg.close().unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn reopen_recovers_flushed_state() {
-        let path = temp_path("reopen");
+        let (_dir, path) = temp_path("reopen");
         let a = vec![3u8; 5000];
         let b = b"tail-record".to_vec();
         let (oa, ob, data_end);
@@ -460,12 +462,11 @@ mod tests {
         assert_eq!(seg.read(oa, a.len()).unwrap(), a);
         assert_eq!(seg.read(ob, b.len()).unwrap(), b);
         seg.close().unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn unflushed_data_not_in_header_after_reopen() {
-        let path = temp_path("unflush");
+        let (_dir, path) = temp_path("unflush");
         let flushed_end;
         {
             let seg = LogSegment::create(&path, cap(64), 7, 1).unwrap();
@@ -484,12 +485,11 @@ mod tests {
             "durability boundary == last flush"
         );
         seg.close().unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn create_rejects_capacity_above_ceiling() {
-        let path = temp_path("ceiling");
+        let (_dir, path) = temp_path("ceiling");
         match LogSegment::create(&path, MAX_CAPACITY + 1, 0, 1) {
             Err(Error::BadArgument(m)) => assert!(m.contains("ceiling"), "got: {m}"),
             other => panic!("expected BadArgument, got {other:?}"),
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn open_rejects_header_capacity_above_ceiling() {
         // 手写一个 capacity 超过上界的段头(CRC 自洽,只违反容量不变量)→ open 必须报 Corrupt。
-        let path = temp_path("ceiling_open");
+        let (_dir, path) = temp_path("ceiling_open");
         let mut hb = [0u8; HEADER_SIZE];
         hb[hdr::MAGIC..hdr::MAGIC + 4].copy_from_slice(&HEADER_MAGIC.to_le_bytes());
         hb[hdr::VERSION..hdr::VERSION + 2].copy_from_slice(&HEADER_VERSION.to_le_bytes());
@@ -512,12 +512,11 @@ mod tests {
             matches!(LogSegment::open(&path), Err(Error::Corrupt(ref m)) if m.contains("ceiling")),
             "超上界的段头必须判 Corrupt"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn key_prefix_survives_reopen_and_flush() {
-        let path = temp_path("prefix");
+        let (_dir, path) = temp_path("prefix");
         {
             let seg = LogSegment::create(&path, cap(4), 0xA1B2_C3D4, 1).unwrap();
             assert_eq!(seg.key_prefix(), 0xA1B2_C3D4);
@@ -530,12 +529,11 @@ mod tests {
         assert_eq!(seg.key_prefix(), 0xA1B2_C3D4);
         assert_eq!(seg.read(0, 1).unwrap(), b"x");
         seg.close().unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn corrupt_key_prefix_trips_header_crc() {
-        let path = temp_path("prefix_crc");
+        let (_dir, path) = temp_path("prefix_crc");
         LogSegment::create(&path, cap(4), 7, 1)
             .unwrap()
             .close()
@@ -554,6 +552,5 @@ mod tests {
             Err(Error::Corrupt(_)) => {}
             other => panic!("expected Corrupt, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&path);
     }
 }

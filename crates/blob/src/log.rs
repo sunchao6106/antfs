@@ -6,7 +6,7 @@
 //! - **单条记录不得跨段**,且不得超过一个段的数据容量(对齐 Ambry "buffer 写进单个 log segment");
 //! - **`total` 允许不是 `segment` 的整数倍**:最后一段是"残段"(容量 = `total − k × segment`),
 //!   装不下任何记录时该部分空间视为写满(`SegmentFull` → `StoreFull`)。这样配置项之间解耦
-//!   (100 GiB 分区 + 8 GiB 段 = 12 整段 + 1 个 4 GiB 残段),`total < segment` 也退化为单段。
+//!   (100 GiB 分区 + 3 GiB 段 = 33 整段 + 1 个 1 GiB 残段),`total < segment` 也退化为单段。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -445,8 +445,9 @@ impl Log {
 ///
 /// **允许 `total` 不是 `segment` 的整数倍**:最后一段就是"残段",容量 = `total − k × segment`
 /// (`Log::roll_over` 按剩余声明容量算,段头自身的 CAPACITY 字段能表达任意大小)。
-/// 这样配置项之间不再互相耦合(例如 100 GiB 分区 + 8 GiB 段:12 个整段 + 1 个 4 GiB 残段),
-/// 也允许 `total < segment`(退化为单段,对齐 Ambry `segmentCapacity = min(capacity, segment)`)。
+/// 这样配置项之间不再互相耦合(例如 100 GiB 分区 + 3 GiB 段:33 个整段 + 1 个 1 GiB 残段 —— 段本身
+/// 仍受 4 GiB 硬上界约束,见 `LogSegment::MAX_CAPACITY`);也允许 `total < segment`
+/// (退化为单段,对齐 Ambry `segmentCapacity = min(capacity, segment)`)。
 ///
 /// 真正不可用的是"连数据区都装不下"的残段:那部分空间会被视为写满(`SegmentFull` → `StoreFull`),
 /// 而不是报一个误导性的"记录超过段容量"。
@@ -464,12 +465,12 @@ mod tests {
     const BLOCK: u64 = 1024;
     const HEADER: u64 = 64;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+    /// RAII 临时目录(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("ambry_log_{tag}_"))
+            .tempdir()
             .unwrap()
-            .as_nanos();
-        PathBuf::from(format!("/var/tmp/ambry_log_{tag}_{ns}"))
     }
 
     fn seg_cap(blocks: u64) -> u64 {
@@ -480,7 +481,7 @@ mod tests {
     fn rollover_across_segments() {
         let dir = temp_dir("roll");
         let seg = seg_cap(2);
-        let log = Log::create(&dir, seg * 3, seg, 0x1234, 1).unwrap();
+        let log = Log::create(dir.path(), seg * 3, seg, 0x1234, 1).unwrap();
 
         let rec = vec![9u8; BLOCK as usize + 100];
         let o1 = log.append(&rec).unwrap();
@@ -494,14 +495,13 @@ mod tests {
         assert_eq!(log.read(o2, rec.len()).unwrap(), rec);
 
         log.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn log_full_when_all_segments_exhausted() {
         let dir = temp_dir("full");
         let seg = seg_cap(1);
-        let log = Log::create(&dir, seg * 2, seg, 0x1234, 1).unwrap();
+        let log = Log::create(dir.path(), seg * 2, seg, 0x1234, 1).unwrap();
 
         let rec = vec![1u8; BLOCK as usize];
         log.append(&rec).unwrap();
@@ -511,21 +511,19 @@ mod tests {
             other => panic!("expected SegmentFull, got {other:?}"),
         }
         log.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn record_too_large_for_segment() {
         let dir = temp_dir("toobig");
         let seg = seg_cap(2);
-        let log = Log::create(&dir, seg * 2, seg, 0x1234, 1).unwrap();
+        let log = Log::create(dir.path(), seg * 2, seg, 0x1234, 1).unwrap();
         let rec = vec![0u8; (2 * BLOCK) as usize + 1];
         match log.append(&rec) {
             Err(Error::BadArgument(_)) => {}
             other => panic!("expected BadArgument, got {other:?}"),
         }
         log.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -535,14 +533,14 @@ mod tests {
         let rec = vec![5u8; BLOCK as usize + 50];
         let (o1, o2, end);
         {
-            let log = Log::create(&dir, seg * 4, seg, 0x1234, 1).unwrap();
+            let log = Log::create(dir.path(), seg * 4, seg, 0x1234, 1).unwrap();
             o1 = log.append(&rec).unwrap();
             o2 = log.append(&rec).unwrap();
             log.flush().unwrap();
             end = log.end_offset();
             log.close().unwrap();
         }
-        let log = Log::open(&dir, seg * 4, seg).unwrap();
+        let log = Log::open(dir.path(), seg * 4, seg).unwrap();
         assert_eq!(log.segment_count(), 2);
         assert_eq!(
             log.key_prefix(),
@@ -559,14 +557,13 @@ mod tests {
         assert_eq!(log.read(o1, rec.len()).unwrap(), rec);
         assert_eq!(log.read(o2, rec.len()).unwrap(), rec);
         log.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rollover_inherits_key_prefix() {
         let dir = temp_dir("prefix_roll");
         let seg = seg_cap(1);
-        let log = Log::create(&dir, seg * 2, seg, 0xABCD_EF01, 1).unwrap();
+        let log = Log::create(dir.path(), seg * 2, seg, 0xABCD_EF01, 1).unwrap();
         let rec = vec![1u8; BLOCK as usize];
         log.append(&rec).unwrap();
         log.append(&rec).unwrap();
@@ -577,11 +574,10 @@ mod tests {
         );
         // 两个段:位置 0/1,代次 1/2(每次滚动代次 +1)。
         for (pos, gen) in [(0u64, 1u64), (1, 2)] {
-            let path = dir.join(LogSegmentName::new(pos, gen).filename());
+            let path = dir.path().join(LogSegmentName::new(pos, gen).filename());
             assert_eq!(LogSegment::open(&path).unwrap().key_prefix(), 0xABCD_EF01);
         }
         log.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 各段前缀不一致 → `open` 报 `Corrupt`,不按某一个前缀去解释整库数据。
@@ -589,21 +585,20 @@ mod tests {
     fn open_rejects_segments_with_disagreeing_prefix() {
         let dir = temp_dir("prefix_mismatch");
         let seg = seg_cap(1);
-        Log::create(&dir, seg * 2, seg, 1, 1)
+        Log::create(dir.path(), seg * 2, seg, 1, 1)
             .unwrap()
             .close()
             .unwrap();
-        let p1 = dir.join(LogSegmentName::new(1, 1).filename());
+        let p1 = dir.path().join(LogSegmentName::new(1, 1).filename());
         LogSegment::create(&p1, seg, 2, 1).unwrap().close().unwrap();
 
         assert!(
             matches!(
-                Log::open(&dir, seg * 2, seg),
+                Log::open(dir.path(), seg * 2, seg),
                 Err(Error::Corrupt(ref m)) if m.contains("key prefix")
             ),
             "各段前缀不一致必须判 Corrupt"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **代次永不复用**:同一目录内每建一个新段代次 +1;跨全库 compact 由调用方接着取
@@ -612,7 +607,7 @@ mod tests {
     fn generation_is_monotonic_and_never_reused() {
         let dir = temp_dir("gen_monotonic");
         let seg = seg_cap(1);
-        let log = Log::create(&dir, seg * 4, seg, 0, 1).unwrap();
+        let log = Log::create(dir.path(), seg * 4, seg, 0, 1).unwrap();
         let rec = vec![7u8; BLOCK as usize];
         log.append(&rec).unwrap(); // 首段
         log.append(&rec).unwrap(); // 滚到第二段
@@ -629,15 +624,13 @@ mod tests {
 
         // 重写(模拟全库 compact):代次接着旧 log 的最大值往后,段位置从 0 重来。
         let rewritten_dir = temp_dir("gen_rewritten");
-        let rewritten = Log::create(&rewritten_dir, seg * 4, seg, 0, old_max + 1).unwrap();
+        let rewritten = Log::create(rewritten_dir.path(), seg * 4, seg, 0, old_max + 1).unwrap();
         assert_eq!(
             rewritten.generation_of(0),
             Some(old_max as u32 + 1),
             "(位置 0, 新代次) 与旧的 (位置 0, 旧代次) 不同"
         );
         rewritten.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&rewritten_dir);
     }
 
     /// 段头自述的代次与文件名不一致 → `open` 判 `Corrupt`(段文件被替换/名字被改过)。
@@ -645,12 +638,12 @@ mod tests {
     fn open_rejects_generation_mismatch_between_header_and_name() {
         let dir = temp_dir("gen_mismatch");
         let seg = seg_cap(1);
-        Log::create(&dir, seg * 2, seg, 0, 1)
+        Log::create(dir.path(), seg * 2, seg, 0, 1)
             .unwrap()
             .close()
             .unwrap();
         // 造一个"名字说代次 1、段头说代次 9"的段。
-        let bad = dir.join(LogSegmentName::new(1, 1).filename());
+        let bad = dir.path().join(LogSegmentName::new(1, 1).filename());
         LogSegment::create(&bad, seg, 0, 9)
             .unwrap()
             .close()
@@ -658,11 +651,10 @@ mod tests {
 
         assert!(
             matches!(
-                Log::open(&dir, seg * 2, seg),
+                Log::open(dir.path(), seg * 2, seg),
                 Err(Error::Corrupt(ref m)) if m.contains("generation")
             ),
             "段头与文件名代次不符必须判 Corrupt"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

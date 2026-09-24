@@ -3,24 +3,14 @@
 //! 覆盖:干净副本零坏记录、人为损坏可定位、`max_bytes` 限流截断、摘要口径(活记录/墓碑/活字节),
 //! 以及"坏记录也允许启动并大声报错"(`open_damage` + 指标 + 其余记录照常可读可写)。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use antfs_blob::{BlobStore, StoreConfig, StoreKey};
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_dir() -> std::path::PathBuf {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+/// RAII 临时目录(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+fn unique_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("ambry_verify_")
+        .tempdir()
         .unwrap()
-        .as_nanos();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let p = std::path::PathBuf::from(format!(
-        "/var/tmp/ambry_verify_{}_{ns}_{seq}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
 }
 
 fn small_config() -> StoreConfig {
@@ -40,7 +30,8 @@ fn clean_store_verifies_and_summarises() {
     let dir = unique_dir();
     let registry = antfs_metric::Registry::new();
     let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-    let store = BlobStore::create_with(&dir, 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    let store =
+        BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
 
     store.put(key(1), b"aaaa").unwrap();
     store.put(key(2), b"bbbbbb").unwrap();
@@ -70,13 +61,14 @@ fn verify_locates_corrupted_record() {
     let dir = unique_dir();
     let registry = antfs_metric::Registry::new();
     let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-    let store = BlobStore::create_with(&dir, 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    let store =
+        BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
     for n in 0..6u8 {
         store.put(key(n), &[n; 64]).unwrap();
     }
     store.flush().unwrap();
 
-    let log_dir = dir.join("log");
+    let log_dir = dir.path().join("log");
     let seg = std::fs::read_dir(&log_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -105,7 +97,8 @@ fn verify_respects_max_bytes_and_reports_truncated() {
     let dir = unique_dir();
     let registry = antfs_metric::Registry::new();
     let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-    let store = BlobStore::create_with(&dir, 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    let store =
+        BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
     for n in 0..5u8 {
         store.put(key(n), &[n; 128]).unwrap();
     }
@@ -123,7 +116,8 @@ fn index_stats_tracks_growth_after_readd_and_tombstone() {
     let dir = unique_dir();
     let registry = antfs_metric::Registry::new();
     let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-    let store = BlobStore::create_with(&dir, 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    let store =
+        BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
 
     store.put(key(9), b"hello").unwrap();
     assert_eq!(store.index_stats().live_records, 1);
@@ -153,7 +147,8 @@ fn open_tolerates_damaged_record_and_reports_damage() {
     {
         let registry = antfs_metric::Registry::new();
         let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-        let store = BlobStore::create_with(&dir, 1 << 30, &small_config(), &metrics, "p0").unwrap();
+        let store =
+            BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
         for n in 0..6u8 {
             store.put(key(n), &[n; 64]).unwrap();
         }
@@ -161,7 +156,7 @@ fn open_tolerates_damaged_record_and_reports_damage() {
     }
 
     // 破坏第一条记录的 magic(物理 64 = 数据 offset 0),data_len 保持完好 → 可重同步。
-    let seg = first_segment(&dir);
+    let seg = first_segment(dir.path());
     let mut bytes = std::fs::read(&seg).unwrap();
     bytes[64] ^= 0xff;
     std::fs::write(&seg, &bytes).unwrap();
@@ -169,7 +164,7 @@ fn open_tolerates_damaged_record_and_reports_damage() {
     // ① 打开成功(不再整体失败),损伤被如实记录。
     let registry = antfs_metric::Registry::new();
     let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-    let store = BlobStore::open_with(&dir, 1 << 30, &small_config(), &metrics, "p0")
+    let store = BlobStore::open_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0")
         .expect("坏记录不应让副本起不来");
     let d = store.open_damage();
     assert_eq!(d.bad_records, 1, "应记录 1 条被跳过的坏记录: {d:?}");
@@ -215,13 +210,13 @@ fn open_abandons_unresyncable_segment_but_recovers_later_segments() {
     {
         let registry = antfs_metric::Registry::new();
         let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-        let store = BlobStore::create_with(&dir, 1 << 30, &cfg, &metrics, "p0").unwrap();
+        let store = BlobStore::create_with(dir.path(), 1 << 30, &cfg, &metrics, "p0").unwrap();
         for n in 0..4u8 {
             store.put(key(n), &[n; 100]).unwrap();
         }
         store.flush().unwrap();
     }
-    let segs = segment_files(&dir);
+    let segs = segment_files(dir.path());
     assert!(segs.len() >= 2, "应滚出至少两个段: {segs:?}");
 
     // 破坏**第一段**的记录头(magic + data_len 一起改)→ 无法重同步。
@@ -238,7 +233,7 @@ fn open_abandons_unresyncable_segment_but_recovers_later_segments() {
 
     let registry = antfs_metric::Registry::new();
     let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
-    let store = BlobStore::open_with(&dir, 1 << 30, &cfg, &metrics, "p0")
+    let store = BlobStore::open_with(dir.path(), 1 << 30, &cfg, &metrics, "p0")
         .expect("不可重同步也不该让副本起不来");
     let d = store.open_damage();
     assert_eq!(d.bad_records, 1, "第一段那条算坏记录: {d:?}");
@@ -270,11 +265,12 @@ fn clean_open_reports_no_damage() {
     let registry = antfs_metric::Registry::new();
     let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
     {
-        let store = BlobStore::create_with(&dir, 1 << 30, &small_config(), &metrics, "p0").unwrap();
+        let store =
+            BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
         store.put(key(1), b"clean").unwrap();
         store.flush().unwrap();
     }
-    let store = BlobStore::open_with(&dir, 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    let store = BlobStore::open_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
     assert!(store.open_damage().is_clean(), "{:?}", store.open_damage());
     let text = antfs_metric::gather(&registry).unwrap();
     assert!(

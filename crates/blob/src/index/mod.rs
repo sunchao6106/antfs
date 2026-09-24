@@ -248,12 +248,12 @@ mod tests {
     use crate::index::value::FLAG_DELETED;
     use crate::types::LogOffset;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+    /// RAII 临时目录(测试结束整目录回收,`$TMPDIR` 下,带 ambry 前缀可辨认)。
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("ambry_idx_{tag}_"))
+            .tempdir()
             .unwrap()
-            .as_nanos();
-        PathBuf::from(format!("/var/tmp/ambry_idx_{tag}_{ns}"))
     }
 
     fn key(n: u64) -> StoreKey {
@@ -267,19 +267,18 @@ mod tests {
     #[test]
     fn add_and_find_active() {
         let dir = temp_dir("active");
-        let idx = PersistentIndex::create(&dir, 1000).unwrap();
+        let idx = PersistentIndex::create(dir.path(), 1000).unwrap();
         idx.add(key(1), put(0, 0)).unwrap();
         idx.add(key(2), put(0, 100)).unwrap();
         assert_eq!(idx.find(&key(1)).unwrap().offset, LogOffset::new(0, 0));
         assert_eq!(idx.find(&key(2)).unwrap().offset, LogOffset::new(0, 100));
         assert!(idx.find(&key(999)).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn seals_and_finds_across_segments() {
         let dir = temp_dir("seal");
-        let idx = PersistentIndex::create(&dir, 4).unwrap();
+        let idx = PersistentIndex::create(dir.path(), 4).unwrap();
         for i in 0..10u64 {
             idx.add(key(i), put(0, i * 100)).unwrap();
         }
@@ -294,13 +293,12 @@ mod tests {
             );
         }
         assert!(idx.find(&key(12345)).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn newest_wins_delete_after_put() {
         let dir = temp_dir("delete");
-        let idx = PersistentIndex::create(&dir, 4).unwrap();
+        let idx = PersistentIndex::create(dir.path(), 4).unwrap();
         idx.add(key(1), put(0, 0)).unwrap();
         for i in 2..6u64 {
             idx.add(key(i), put(0, i * 100)).unwrap(); // 触发封存,key(1) 进 sealed
@@ -312,20 +310,19 @@ mod tests {
         del.flags = FLAG_DELETED;
         idx.add(key(1), del).unwrap();
         assert!(idx.find(&key(1)).unwrap().is_deleted(), "delete must win");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reopen_recovers_sealed_and_active() {
         let dir = temp_dir("reopen");
         {
-            let idx = PersistentIndex::create(&dir, 4).unwrap();
+            let idx = PersistentIndex::create(dir.path(), 4).unwrap();
             for i in 0..10u64 {
                 idx.add(key(i), put(0, i * 100)).unwrap();
             }
             idx.flush().unwrap(); // 持久化活跃段
         }
-        let idx = PersistentIndex::open(&dir, 4).unwrap();
+        let idx = PersistentIndex::open(dir.path(), 4).unwrap();
         for i in 0..10u64 {
             assert_eq!(
                 idx.find(&key(i)).unwrap().offset,
@@ -333,6 +330,5 @@ mod tests {
                 "key {i} lost after reopen"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
