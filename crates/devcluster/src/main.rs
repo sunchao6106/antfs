@@ -251,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut mc = MasterClient::connect(format!("http://{grpc_addr}")).await?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut created = Vec::new();
+    let mut last_err = String::new();
     while Instant::now() < deadline {
         let resp = mc
             .create_partitions(CreatePartitionsRequest {
@@ -265,7 +266,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             created = resp.partition_ids;
             break;
         }
+        last_err = resp.error;
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // 建不出来不能只留一句 `count=0`:master 拒的原因(选盘没有候选 / 非 leader / 盘都判不可用)
+    // 必须看得见 —— 否则集群照样打印"已就绪",直到第一个 PUT 才暴露"一个可写分区都没有"。
+    if created.is_empty() && !last_err.is_empty() {
+        tracing::error!(
+            partitions = args.partitions,
+            error = %last_err,
+            "create partitions failed"
+        );
     }
     tracing::info!(count = created.len(), "partitions created: {created:?}");
 
