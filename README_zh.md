@@ -109,7 +109,8 @@ blob 引擎当前要点:
      见 [`docs/design/router.md`](docs/design/router.md) 与 `docs/design/cluster.md` §9.3。
 
   以上全部阈值的**标定步骤**(12 个数字,目前都还没压测过)连查询与判据都写好了:
-  `docs/design/cluster.md` §9.4。
+  `docs/design/cluster.md` §9.4;上线前**必须在真机上做**的事(设备级 fail-fast 配置、故障注入验收、
+  告警接线)另有一份逐条清单:同节 §9.5。
 - 索引:并发活跃段 + **mmap 封存段 + 持久化 Binary Fuse 过滤器**
 
 详细设计见 [`docs/design/`](docs/design/)(总览 + 各模块);决策档案见 [`openspec/changes/`](openspec/changes/)。

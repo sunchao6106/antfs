@@ -115,7 +115,9 @@ Storage engine highlights:
      identity. See [`docs/design/router.md`](docs/design/router.md) and `docs/design/cluster.md` §9.3.
 
   Threshold calibration for all of the above (12 numbers, none of them benchmarked yet) is a written
-  procedure with queries and decision rules: `docs/design/cluster.md` §9.4.
+  procedure with queries and decision rules: `docs/design/cluster.md` §9.4. What has to happen **on real
+  hardware** before a rollout — device-level fail-fast config, fault-injection acceptance, alert wiring —
+  is a checklist in §9.5.
 - **Index**: concurrent active segments + **mmap'd sealed segments + persistent Binary Fuse filters**.
 
 Design docs live in [`docs/design/`](docs/design/) (overview + per-module); decision archives live in [`openspec/changes/`](openspec/changes/).

@@ -690,6 +690,9 @@ store server(一个进程 / 一台数据节点)
 
 ### 9.2 部署前提:设备级 fail-fast(D7,**不是代码,是上线检查项**)
 
+> **本节与 §9.4 / §9.5 是同一批"上线前必须做"的动作**:本节是设备层前提,§9.4 是数字标定,§9.5 是逐条
+> 真机核对清单(含故障注入验收)。
+
 > **为什么单列一节**:上面 D2/D3 的进入判据来自"探测失败"与"IO 超期",而 D1/D3 的最终逃生舱是进程自杀。
 > **如果设备层永远 hang**,那么:引擎自关(`io_error_count_to_trigger_shutdown`)**永远等不到错误**
 > (被动链路全哑);看门狗**拿不到 errno**,只能超时隔离(而隔离的代价是该盘请求全部 503、线程**仍然泄漏**);
@@ -768,6 +771,72 @@ store server(一个进程 / 一台数据节点)
 1. 改代码 `impl Default`(store: `crates/store/src/config.rs`;master: `crates/master/src/config.rs`);
 2. 改**两张文档表**([`store.md` §12.12](./store.md) 八 与本节所属的 §9 / §7.7),并把"经验初值"的标注去掉、写上标定日期与机器/负载描述;
 3. 改**钉住默认值的单测**(见本节开头的清单),否则下一个人会以为默认值还是经验值。
+
+### 9.5 上线前真机核对清单(**待执行**)
+
+> ⚠️ **本节条目全部还没在真机上做过。** 代码侧验收用的是**合成故障注入**
+> (`StoreServer::force_disk_unavailable` 喂的是与生产**完全相同**的迟滞状态机),它**造不出真 `D` 状态**、
+> 也不经过内核 fail-fast —— 也就是说"盘故障处置这条链在真实硬件上长什么样"目前**只有合成证据**。
+> 上线前逐条做,做完在本节打勾并写明日期 / 机型 / 负载。
+
+#### A. 逐机部署前置(不是代码;不做则 §9.2 那条链是空响)
+
+- [ ] 按 §9.2 逐机落盘设备级超时:SCSI `timeout=30s`、NVMe `nvme_core.io_timeout=30` + `max_retries=5`、
+      dm-multipath `no_path_retry=N`(**禁用 `queue_if_no_path`**);`data_dir` 在网络盘时补 NFS `timeo`/`retrans`。
+- [ ] `[store] io_error_count_to_trigger_shutdown` 显式打开(建议 **3~10**;默认 0 = 关)。不开的话
+      "EIO → 引擎自关 → replica `ERROR` → 心跳上报 → master 再复制"这条闭环根本不启动。
+- [ ] 进程守护:`systemd Restart=always`(容器则 `restart: always`)—— 逃生舱 `abort()` 生效的前提。
+- [ ] `store_server.data_dirs` 逐机核对:每块盘一条;异构盘写 `pool_size`,其余盘按"留给未指定盘的预算"
+      均分(口径见 [`store.md` §12.11](./store.md))。
+- [ ] 线程预算:`store_server.pool_default_size`(默认 16)× 盘数 = 每节点线程数,按机型核。
+- [ ] `store_server.staging_dir` 决策(流式 put 暂存):不指定 = 各盘 `tmp/`;指定 = **单点**且**不进容量上报**,
+      **别指 tmpfs**(大文件暂存会吃内存)。
+- [ ] 观测通道可达:`/metrics` 与所有 `/admin/**` **不在健康闸门的拒绝名单里** —— 确认 LB / 防火墙也不挡,
+      这是坏盘期间唯一的远程手段。
+
+#### B. 真机故障注入验收
+
+| 注入 | 手段 | 通过判据 |
+|---|---|---|
+| **单盘 IO hang** | `dm-delay` 拉长单盘全路径延迟 / cgroup `io.latency` 限速 / 物理拔盘 | **本项就是最初那个问题的验收**:同进程内**其他盘的 P50/P99/IOPS 与无故障基线一致**(不是"略降") |
+| 单盘 EIO | `dm-error` / 写坏块 | 数据面当场 503 + `store_server_rejected_requests_total{reason="disk_unavailable"}`;`/metrics`、`/admin` 仍可达 |
+| 慢盘 | 单盘限速到 p99 的数倍 | `store_server_disk_io_watchdog_trips_total` 增长 → 迟滞判 `UNAVAILABLE`;恢复后 `store_server_disk_health_transitions_total{to="HEALTHY"}` 不来回抖 |
+| 池满 | 小池 + 高并发打单盘 | `store_server_disk_pool_queued` 贴顶、`store_server_disk_pool_rejected_total{reason="saturated"}` 与上游重试成功率的关系;503 带 `Retry-After`,客户端能退避 |
+| 逃生舱 | 打开 `store_server.disk_watchdog_escalate_secs` | 全池被超期 IO 占死到点后确实 `abort()`,并被守护拉起(**先只观察一个完整周期,取值 ≥ 600**) |
+| 坏盘撤离 | `master.disk_evac_enabled = true` | 副本确实从坏盘搬走;看 `master_disk_evacuating` 与**写入延迟**有没有被抬起 |
+| 节点抖动 | 掐心跳 / 短暂网络隔离 | 真实抖动分布下 `master_node_down_total` **只对真死计一次** |
+| 掉电 / 内核 panic | 硬断电 | 重启后数据面可用(崩溃恢复),不出现"某个分区打不开" |
+| 再复制预算 | 一次打掉多盘副本 | `master_rereplication_deferred` 的长期水位可接受(持续不降 = 预算太小) |
+
+#### C. 标定与观测接线
+
+- [ ] 按 §9.4 把 **12 个数字**在真机 + 真实负载上跑出来(含"跑一次全库 compaction 取峰值"那条),再按
+      §9.4 末尾的**三步收口**改代码、改文档表、改钉住默认值的单测。
+- [ ] 告警规则接线(全名见 §7.7 与 [`store.md` §12.12](./store.md)):
+      `store_server_rejected_requests_total{reason="disk_unavailable"}` > 0、
+      `store_server_disk_io_watchdog_trips_total` 增速、`store_server_disk_pool_queued` 贴顶、
+      `store_server_disk_pool_rejected_total`、`store_server_disk_health_state` /
+      `store_server_disk_health_transitions_total`、`store_server_disk_probe_skipped_total`(探测追尾)、
+      `master_rereplication_deferred` 持续不降、`master_disk_evacuating` 长期 > 0。
+- [ ] admin「主机磁盘」页逐盘数字与 `fio` / `iostat` **对账**(iops、rt、带宽、队列深度、p50/p99);
+      注意页面上的 **p99 只给下界**(只有分位点层,不上传 `le` 桶)。
+- [ ] 慢盘收益量化:按 §9.3 用 `router.latency_aware_routing = true / false` 做对照压测,把"读路由到底省了多少"
+      写回 §9.3(目前只有单测与构造性论证)。
+
+#### D. 上线前对齐的"不做"(别当成 bug 上报)
+
+- 引擎 IO 仍是**同步阻塞** `std::fs` + 页缓存(不迁 AIO / io_uring);**已经进 syscall 的那次 IO 无法取消** ——
+  "快速失败"只对排队与后续请求成立。
+- 盘恢复后**不自动回填副本**(只置状态,交均衡 / 运维);**不自动换硬件**。
+- 单进程多盘下 `abort()` 会**带走同进程的健康盘** —— 所以逃生舱默认关、门槛极高(见 §9.4 第 7 行)。
+- `ensure_replica` 建目录与流式 put 暂存的 `unlink` 仍走**进程级**池(D1 只覆盖数据面 IO);
+  `DROPPED` 副本的目录不回收 —— 完整清单见 [`store.md` §12.12](./store.md) 的"残留风险"。
+
+#### E. 仍缺端到端证据的三处(只有结构性论证)
+
+1. 盘恢复后不自动回填副本 —— 事实上成立,**没有专门用例守着**;
+2. 复制游标"段被换掉即失效" —— 只有结构性保证,无端到端断言;
+3. `UNKNOWN` 参与撤离判据的**可达性**(`master.disk_evac_*` 那条链)只在实现期核对过。
 
 ## 10. 数据面读写 + quorum(D4 展开)
 
