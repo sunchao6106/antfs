@@ -130,6 +130,9 @@ cargo run -p antfs-smoke        # 存储引擎冒烟测试
 cargo run -p antfs-devcluster
 ```
 
+本地参数(端口、分区数、`disk_near_full_ratio` 等)可写进当前目录的 `devcluster.toml` —— 存在就自动读,
+命令行 flag 覆盖它,全部键与样例见 `devcluster.toml.example`。
+
 ### 预编译二进制
 
 打 `v*` tag 会在 [Releases 页面](https://github.com/sunchao6106/antfs/releases)产出 Linux(x86_64 / aarch64)与 macOS(arm64 / x86_64)四个平台的包,每个包里含 `antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-admin`、`antfs-devcluster`:

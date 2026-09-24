@@ -169,6 +169,8 @@ dependencies = [
  "antfs-store",
  "axum",
  "openraft",
+ "serde",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

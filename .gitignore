@@ -16,6 +16,9 @@ target/
 # devcluster 本地集群数据(可重生)
 /.localcluster/
 
+# devcluster 的本地参数文件(样例见 devcluster.toml.example,各机不同故不入库)
+/devcluster.toml
+
 # release 打包产物(dist/ 在仓库根;crates/admin/ui/dist 需入库,故只忽略根目录)
 /dist/
 

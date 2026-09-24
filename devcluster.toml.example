@@ -1,0 +1,49 @@
+# devcluster 本地集群配置样例(字段名即 key;没写的键回落内置默认)。
+#
+# 用法:
+#   cp devcluster.toml.example devcluster.toml    # 当前目录下存在 devcluster.toml 就自动读
+#   antfs-devcluster --config /path/to/other.toml # 或显式指定别处的文件
+#   AMBRY_PARTITIONS=2 antfs-devcluster           # 环境变量优先级高于文件
+#   antfs-devcluster --partitions 2               # 命令行优先级最高
+#
+# 优先级(后覆盖前):内置默认 < 该文件 < 环境变量 AMBRY_* < 命令行 flag。
+# 改完启动时日志会打印 "loaded devcluster config file",底部横幅也会回显"参数来源"。
+
+# 数据/日志根目录(退出不删,便于复检)。
+dir = "./.localcluster"
+
+# 启动后创建的分区数。默认 3:本地联调够用(3 分区 × RF3 = 9 个副本),
+# 再多只是让每个 store 多开几份引擎、占内存与盘目录。
+partitions = 3
+
+# 每分区副本数;不得大于 store_count(解析期就会拒,不会等到选盘失败)。
+replication_factor = 3
+
+# store 节点数(≥4 才能在 RF=3 时真正执行 move/均衡与删源验证)。
+store_count = 3
+
+# 各服务端口(均只监听 host;集群内部互连恒为 127.0.0.1)。
+master_grpc_port = 7101
+master_raft_port = 7100
+store_base_port = 7200
+admin_port = 7300
+frontend_port = 7400
+
+# 对外服务的监听 host(容器里要传 "0.0.0.0" 才能被 -p 发布的端口访问)。
+host = "127.0.0.1"
+
+# master 的盘将满阈值。口径是**宿主机整盘**(statfs 的已用比例):
+# 一旦高于它,所有盘都不再参与放置 —— 表现为"一个分区都建不出来",且已有分区会被陆续转只读
+# (只置不回,恢复要显式 SetPartitionState 或删掉数据目录重来)。
+# 本地盘比较满时把它提到 0.95;想复现"盘将满 → 分区转 RO"就调小(例如 0.5)。
+disk_near_full_ratio = 0.8
+
+# 开启 store 主动盘探测(心跳带 HEALTHY/... 健康值;默认关,只靠 IO 看门狗判不可用)。
+disk_health = false
+
+# 起完集群(等就绪)后在同一进程内跑一轮压测并退出;不写就常驻等 Ctrl-C。
+# run_bench = "router"        # router | frontend
+# bench_ops = 20000
+# bench_concurrency = 32
+# bench_size = 4096
+# bench_read_ratio = 20

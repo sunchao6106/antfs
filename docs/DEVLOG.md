@@ -833,3 +833,26 @@
 - **验证**:`cargo test -p antfs-router`(单测 14 + e2e 8)、`cargo test -p antfs-master`(lib 85 + 各集成套件,
   含 `blob_ids` 里的容量加权用例)、`cargo test --workspace` 全绿;`cargo clippy --workspace --all-targets` 通过,
   本轮触及的三个 crate(`antfs-router` / `antfs-master` / `antfs-bench-router`)**无新增告警**。
+
+## 步骤 30:devcluster 支持配置文件 + 本地分区数下调(2026-09-24)
+
+- **为什么**:本地集群参数只能靠命令行,于是"本机盘偏满"这类**环境差异**每次都得重敲一遍
+  (`--disk-near-full-ratio 0.95`);而默认建 6 个分区、每个 store 都要多开几份引擎,对纯联调是浪费。
+- **做法**(`crates/devcluster/src/config.rs`,新):
+  - 参数来源统一成**内置默认 < 配置文件 < 环境变量 `AMBRY_*` < 命令行**,复用仓库同一条 loader
+    (`antfs_config::Loader`);键名即字段名,单层 flat。样例:仓库根 `devcluster.toml.example`(入库)。
+  - 文件来源:显式 `--config PATH`(不存在即报错),或**当前目录下的 `devcluster.toml`**(存在才读)。
+    用了哪个文件会打日志、并在启动横幅的"参数来源"里回显 —— 隐式读取必须看得见。
+  - `#[serde(deny_unknown_fields)]`:拼错的键当场拒(不静默回落默认值),报错列出全部合法键。
+  - 解析期校验:`rf > store_count`(放不下)、`partitions` / `bench_*` 非正、`disk_near_full_ratio` 不在 (0,1]、
+    `run_bench` 不在枚举内 —— 都在启动前报错,不再等 20s 选盘失败。
+  - 命令行解析改为**返回值**(不再 `expect` panic),错误带上 flag 名与给的值;`--run-bench` 的枚举校验
+    收敛到 `Validate`。`print_summary` 的 8 个位置参数收成一个 `Banner` 结构体(避开 clippy 参数上限)。
+- **默认值**:`partitions` **6 → 3**(3 分区 × RF3 = 9 个副本,本地联调足够)。顺带订正 help 里
+  `--disk-near-full-ratio` 的错标(此前写 default 0.95,与代码的 0.8 不符)。
+- **验证**:`cargo test -p antfs-devcluster` 8 条新用例(默认值自洽 / 文件只覆盖写了的键 / 显式路径缺失报错 /
+  错键被拒 / 校验拒 RF>节点数 / 命令行覆盖文件 / 坏值点名 flag / 未知 flag 不 panic)。
+  真机冒烟三连:① `--config /tmp/dc-e2e.toml` → `partitions created: [0,1,2]`、`replicas 9/9`、0 ERROR;
+  ② 无 `--config` → 自动读 `./devcluster.toml`,横幅回显 `devcluster.toml (+ 命令行覆盖)`;
+  ③ 错键配置 → `unknown field \`partitons\`, expected one of ...`,exit 2。
+- **边界**:`devcluster.toml` 进 `.gitignore`(各机不同);样例文件入库作为格式存档。

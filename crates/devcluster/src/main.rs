@@ -3,17 +3,26 @@
 //! 全部**进程内**跑在同一个 tokio runtime(单日志流、单 Ctrl-C 收尾),用于本地端到端联调 / 演示 /
 //! 给 `bench-cluster` 提供压测目标。数据落 `--dir`(默认 `./.localcluster`,退出不自动删,便于复检)。
 //!
-//! 流程:起 master → 单节点自举等 leader → 起 3 个 store 节点(开启拉复制)→ 等三节点注册 →
+//! 参数来源(`crates/devcluster/src/config.rs`):**内置默认 < `devcluster.toml` < 环境变量 < 命令行**。
+//! 当前目录下的 `devcluster.toml` 存在就自动读(`--config PATH` 可指定别处),于是本地环境差异
+//! (例如"宿主盘偏满,得把 `disk_near_full_ratio` 提到 0.95")可以钉在文件里,不必每次敲 flag。
+//!
+//! 流程:起 master → 单节点自举等 leader → 起 N 个 store 节点(开启拉复制)→ 等节点注册 →
 //! master 建 N 个 RF 分区(经心跳散布到各节点)→ 起 admin → 打印各服务地址 → 常驻等 Ctrl-C。
 
+mod config;
+
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use antfs_config::Validate;
 use antfs_master::pb::master_client::MasterClient;
 use antfs_master::pb::CreatePartitionsRequest;
 use antfs_master::{MasterConfig, MasterNode};
 use antfs_store::{StoreServer, StoreServerConfig};
+use config::DevClusterConfig;
 use openraft::BasicNode;
 
 const SECRET: &str = "local-dev-secret";
@@ -24,118 +33,84 @@ fn store_node_ids(count: u32) -> Vec<u64> {
     (0..count as u64).map(|i| 101 + i).collect()
 }
 
-struct Args {
-    dir: std::path::PathBuf,
-    partitions: u32,
-    replication_factor: u32,
-    master_grpc_port: u16,
-    master_raft_port: u16,
-    store_base_port: u16,
-    admin_port: u16,
-    /// store 节点数(默认 3;≥4 才能在 RF=3 时真正执行 move/均衡——devcluster 用于验证搬迁与删源)。
-    store_count: u32,
-    /// master 的 `disk_near_full_ratio`(默认 0.8;调小可在本地复现"盘将满 → 分区转 RO")。
-    disk_near_full_ratio: f64,
-    /// store 是否开启主动盘探测(`disk_health_enabled`,默认 false;开启后心跳会带 HEALTHY/... 健康值)。
-    disk_health: bool,
-    frontend_port: u16,
-    /// 对外服务的监听 host(`--host`,默认回环)。容器里传 `0.0.0.0` 才能被 `-p` 发布的端口访问。
-    /// 只影响**监听**地址:集群内部互连地址恒为 `127.0.0.1`(master/store/admin/frontend 同进程)。
-    host: String,
-    /// `--run-bench router|frontend`:起完集群(等就绪)后在**同一进程**内跑一轮压测并退出。
-    /// 客户端与被测服务共享同一份 CPU/盘 IO,数字只作冒烟参考 —— 正式压测请另起进程跑 bench 二进制。
-    run_bench: Option<String>,
-    bench_ops: u64,
-    bench_concurrency: u64,
-    bench_size: usize,
-    bench_read_ratio: u64,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Args {
-            dir: std::path::PathBuf::from("./.localcluster"),
-            partitions: 6,
-            replication_factor: 3,
-            master_grpc_port: 7101,
-            master_raft_port: 7100,
-            store_base_port: 7200,
-            admin_port: 7300,
-            store_count: 3,
-            disk_near_full_ratio: 0.8,
-            disk_health: false,
-            frontend_port: 7400,
-            host: "127.0.0.1".to_string(),
-            run_bench: None,
-            bench_ops: 20_000,
-            bench_concurrency: 32,
-            bench_size: 4096,
-            bench_read_ratio: 20,
+/// 解析命令行:`--config`(若有)先铺底,其余 flag 在其上覆盖,最后统一校验。
+fn parse_args(argv: &[String]) -> std::result::Result<(DevClusterConfig, Option<PathBuf>), String> {
+    // 先单独扫一遍 `--config`:它决定"铺底"读哪个文件,必须早于其它 flag 生效。
+    let mut explicit = None;
+    let mut scan = argv.iter();
+    while let Some(a) = scan.next() {
+        if a == "--config" {
+            explicit = Some(PathBuf::from(
+                scan.next().ok_or_else(|| "--config 缺参数".to_string())?,
+            ));
         }
     }
-}
+    let (mut a, file) =
+        config::load(explicit.as_deref()).map_err(|e| format!("读取配置失败: {e}"))?;
 
-fn parse_args() -> Args {
-    let mut a = Args::default();
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.iter();
     while let Some(flag) = it.next() {
-        let mut val = || it.next().expect("missing value for flag");
+        let mut val = || it.next().ok_or_else(|| format!("{flag} 缺参数"));
         match flag.as_str() {
-            "--dir" => a.dir = std::path::PathBuf::from(val()),
-            "--partitions" => a.partitions = val().parse().expect("partitions"),
-            "--rf" => a.replication_factor = val().parse().expect("rf"),
-            "--master-grpc-port" => a.master_grpc_port = val().parse().expect("port"),
-            "--master-raft-port" => a.master_raft_port = val().parse().expect("port"),
-            "--store-base-port" => a.store_base_port = val().parse().expect("port"),
-            "--admin-port" => a.admin_port = val().parse().expect("port"),
-            "--store-count" => a.store_count = val().parse::<u32>().expect("store-count").max(1),
-            "--disk-near-full-ratio" => {
-                a.disk_near_full_ratio = val().parse().expect("disk-near-full-ratio")
+            // 已在上面读过并铺底,这里只吃掉它的值。
+            "--config" => {
+                val()?;
             }
+            "--dir" => a.dir = PathBuf::from(val()?),
+            "--partitions" => a.partitions = num(flag, val()?)?,
+            "--rf" => a.replication_factor = num(flag, val()?)?,
+            "--master-grpc-port" => a.master_grpc_port = num(flag, val()?)?,
+            "--master-raft-port" => a.master_raft_port = num(flag, val()?)?,
+            "--store-base-port" => a.store_base_port = num(flag, val()?)?,
+            "--admin-port" => a.admin_port = num(flag, val()?)?,
+            "--store-count" => a.store_count = num(flag, val()?)?,
+            "--disk-near-full-ratio" => a.disk_near_full_ratio = num(flag, val()?)?,
             "--disk-health" => a.disk_health = true,
-            "--frontend-port" => a.frontend_port = val().parse().expect("port"),
-            "--host" => a.host = val(),
-            "--run-bench" => {
-                let mode = val();
-                if mode != "router" && mode != "frontend" {
-                    eprintln!("--run-bench expects `router` or `frontend`, got `{mode}`");
-                    std::process::exit(2);
-                }
-                a.run_bench = Some(mode);
-            }
-            "--bench-ops" => a.bench_ops = val().parse().expect("bench-ops"),
-            "--bench-concurrency" => {
-                a.bench_concurrency = val().parse::<u64>().expect("bench-concurrency").max(1)
-            }
-            "--bench-size" => a.bench_size = val().parse().expect("bench-size"),
-            "--bench-read-ratio" => a.bench_read_ratio = val().parse().expect("bench-read-ratio"),
+            "--frontend-port" => a.frontend_port = num(flag, val()?)?,
+            "--host" => a.host = val()?.clone(),
+            "--run-bench" => a.run_bench = Some(val()?.clone()),
+            "--bench-ops" => a.bench_ops = num(flag, val()?)?,
+            "--bench-concurrency" => a.bench_concurrency = num(flag, val()?)?,
+            "--bench-size" => a.bench_size = num(flag, val()?)?,
+            "--bench-read-ratio" => a.bench_read_ratio = num(flag, val()?)?,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
             }
             other => {
-                eprintln!("unknown flag: {other}");
                 print_help();
-                std::process::exit(2);
+                return Err(format!("unknown flag: {other}"));
             }
         }
     }
-    a
+    a.validate().map_err(|e| e.to_string())?;
+    Ok((a, file))
+}
+
+/// 数值解析:报错要指出哪个 flag、给的是什么值(配置文件与命令行走同一条报错口径)。
+fn num<T: std::str::FromStr>(flag: &str, raw: &str) -> std::result::Result<T, String> {
+    raw.parse()
+        .map_err(|_| format!("{flag} 的值 `{raw}` 不合法"))
 }
 
 fn print_help() {
     eprintln!(
         "devcluster — 本地 master + 3×store + admin 一键起集群\n\
          \n\
+         参数来源(后覆盖前):内置默认 < 配置文件 < 环境变量 AMBRY_* < 命令行。\n\
+         样例配置见仓库根 `devcluster.toml.example`。\n\
+         \n\
+         --config PATH          配置文件路径 (default:当前目录的 ./devcluster.toml,存在才读)\n\
          --dir PATH             数据/日志根目录 (default ./.localcluster,退出不删)\n\
-         --partitions N         启动后创建的分区数 (default 6)\n\
-         --rf N                 每分区副本数 (default 3)\n\
+         --partitions N         启动后创建的分区数 (default 3)\n\
+         --rf N                 每分区副本数 (default 3;不得大于 store 节点数)\n\
          --master-grpc-port P   master 控制面 gRPC 端口 (default 7101)\n\
          --master-raft-port P   master Raft 内部 RPC 端口 (default 7100)\n\
          --store-base-port P    store 节点 HTTP 起始端口,依次 +0/+1/+2 (default 7200)\n\
          --admin-port P         admin web 端口 (default 7300)\n\
          --store-count N        store 节点数 (default 3;≥4 才能验证 RF=3 下的 move/均衡与删源)\n\
-         --disk-near-full-ratio F  master 盘将满阈值 (default 0.95;调小可在本地复现「分区转 RO」)\n\
+         --disk-near-full-ratio F  master 盘将满阈值 (default 0.8;口径是宿主机整盘,调小可在本地复现\n\
+                                「分区转 RO」;本地盘偏满以致建不出分区时提到 0.95)\n\
          --disk-health          开启 store 主动盘探测(心跳带健康值,用于验证健康回填与避让)\n\
          --frontend-port P      frontend REST 端口 (default 7400)\n\
          --host ADDR            对外服务(master gRPC / admin / frontend)的监听 host\n\
@@ -161,7 +136,18 @@ fn dev_store_engine() -> antfs_blob::StoreConfig {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt().init();
-    let args = parse_args();
+    // 参数:配置文件(默认 ./devcluster.toml)铺底 + 命令行覆盖 —— 解析失败要看得见原因,不 panic。
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (args, config_file) = match parse_args(&argv) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("devcluster: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(f) = &config_file {
+        tracing::info!(file = %f.display(), "loaded devcluster config file");
+    }
     std::fs::create_dir_all(&args.dir)?;
 
     // `grpc_addr` = 集群内部互连地址(恒回环);`*_bind` = 实际监听地址(`--host`,容器里 0.0.0.0)。
@@ -340,12 +326,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     print_summary(
         &args,
-        &grpc_addr,
-        &store_ids,
-        &store_addrs,
-        &admin_addr,
-        frontend_addr.as_deref(),
-        &created,
+        &Banner {
+            grpc_addr: &grpc_addr,
+            store_ids: &store_ids,
+            store_addrs: &store_addrs,
+            admin_addr: &admin_addr,
+            frontend_addr: frontend_addr.as_deref(),
+            partitions: &created,
+            config_file: config_file.as_deref(),
+        },
     );
 
     // ---- 可选:起完就压一轮(--run-bench)----
@@ -407,7 +396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// 起 frontend(HTTP REST 入口):内嵌同一个 router SDK,把 REST 请求翻译成 SDK 调用。
 ///
 /// 失败只记 warn 并返回 `None` —— devcluster 的主职责是 master+store 起得来,REST 入口缺了不影响直连模式联调。
-async fn start_frontend(args: &Args, grpc_addr: &str) -> Option<String> {
+async fn start_frontend(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
     let cfg = antfs_frontend::config::FrontendConfig {
         listen_addr: format!("{}:{}", args.host, args.frontend_port),
         // dev 环境放宽(默认 2 MiB);与 store 侧同因、同值。
@@ -454,17 +443,39 @@ async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
     cond()
 }
 
-fn print_summary(
-    args: &Args,
-    grpc_addr: &str,
-    store_ids: &[u64],
-    store_addrs: &[String],
-    admin_addr: &str,
-    frontend_addr: Option<&str>,
-    partitions: &[u32],
-) {
+/// 启动横幅要打印的东西:起完集群后的**实际布局**(各服务地址 + 真建成的分区)与参数来源。
+///
+/// 收成一个结构体只为避开 clippy 的"参数过多"上限,同时让调用点读起来是"一份布局"而非一串位置参数。
+#[derive(Clone, Copy)]
+struct Banner<'a> {
+    grpc_addr: &'a str,
+    store_ids: &'a [u64],
+    store_addrs: &'a [String],
+    admin_addr: &'a str,
+    frontend_addr: Option<&'a str>,
+    partitions: &'a [u32],
+    config_file: Option<&'a std::path::Path>,
+}
+
+fn print_summary(args: &DevClusterConfig, banner: &Banner) {
+    let Banner {
+        grpc_addr,
+        store_ids,
+        store_addrs,
+        admin_addr,
+        frontend_addr,
+        partitions,
+        config_file,
+    } = *banner;
     println!("\n========================================================");
     println!("  antfs 本地集群已就绪 (数据目录 {})", args.dir.display());
+    println!(
+        "  参数来源      : {}",
+        match config_file {
+            Some(p) => format!("{} (+ 命令行覆盖)", p.display()),
+            None => "内置默认(无 devcluster.toml)".to_string(),
+        }
+    );
     println!("--------------------------------------------------------");
     println!("  admin web     : http://{admin_addr}");
     println!("                  operator token = {OPERATOR_TOKEN} (读写)");
@@ -519,4 +530,61 @@ fn print_summary(
     println!("    cargo run -p antfs-bench-blob --release -- --ops 100000 --value-size 4096");
     println!("========================================================");
     println!("  Ctrl-C 停止。\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn cli_flags_win_over_the_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("devcluster.toml");
+        std::fs::write(&path, "partitions = 2\nadmin_port = 7500\n").unwrap();
+
+        let (a, file) = parse_args(&argv(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--partitions",
+            "5",
+        ]))
+        .unwrap();
+        assert_eq!(
+            file.as_deref(),
+            Some(path.as_path()),
+            "要能回答用的是哪个文件"
+        );
+        assert_eq!(a.partitions, 5, "命令行覆盖文件");
+        assert_eq!(a.admin_port, 7500, "文件里没被命令行覆盖的键照样生效");
+    }
+
+    #[test]
+    fn a_bad_cli_value_names_the_flag_instead_of_panicking() {
+        let err = parse_args(&argv(&["--partitions", "many"])).unwrap_err();
+        assert!(
+            err.contains("--partitions") && err.contains("many"),
+            "{err}"
+        );
+
+        let err = parse_args(&argv(&["--config"])).unwrap_err();
+        assert!(err.contains("--config"), "{err}");
+
+        let err = parse_args(&argv(&["--nope"])).unwrap_err();
+        assert!(err.contains("--nope"), "{err}");
+    }
+
+    #[test]
+    fn validation_runs_after_the_cli_overrides() {
+        // 文件本身合法、命令行把它改成放不下 → 仍要在解析期拒掉,而不是等 20s 选盘失败。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("devcluster.toml");
+        std::fs::write(&path, "store_count = 3\n").unwrap();
+        let err =
+            parse_args(&argv(&["--config", path.to_str().unwrap(), "--rf", "5"])).unwrap_err();
+        assert!(err.contains("replication_factor"), "{err}");
+    }
 }

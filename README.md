@@ -136,6 +136,10 @@ Run a full local cluster — 1 Raft master + 3 store nodes + admin web, all in-p
 cargo run -p antfs-devcluster
 ```
 
+Local knobs (ports, partition count, `disk_near_full_ratio`, …) can live in a `devcluster.toml` in the
+current directory — it is read automatically when present, and CLI flags override it. See
+`devcluster.toml.example` for every key.
+
 ### Prebuilt binaries
 
 Every `v*` tag produces tarballs for Linux (x86_64 / aarch64) and macOS (arm64 / x86_64) on the [Releases page](https://github.com/sunchao6106/antfs/releases). Each tarball contains `antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-admin` and `antfs-devcluster`:

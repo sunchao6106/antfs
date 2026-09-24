@@ -19,8 +19,12 @@ antfs-bench-frontend = { path = "../../benchmark/frontend" }
 antfs-blob = { path = "../blob" }
 antfs-config = { path = "../common/config" }
 antfs-metric = { path = "../common/metric" }
+serde = { version = "1", features = ["derive"] }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
