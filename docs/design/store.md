@@ -399,7 +399,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.data_flush_delay_seconds` | u64 | 5 | ≥0 | 启动后首次 flush 延迟 | `store.data.flush.delay.seconds` |
 | `store.index_max_memory_size_bytes` | u64 | 20971520 | ≥1 | 活跃索引常驻内存上限(触发封存) | `store.index.max.memory.size.bytes` |
 | `store.index_max_inmem_elements` | u64 | 10000 | ≥1 | 活跃索引内存条目上限 | `store.index.max.number.of.inmem.elements` |
-| `store.io_error_count_to_trigger_shutdown` | u32 | 0(=禁用) | 任意(0 禁用,≥1 阈值) | **已接入**:连续 IO 错误达此值则 store 自关(被动磁盘检测)+ 触发回调;0=禁用,对齐 Ambry 默认 `MAX_VALUE` | `store.io.error.count.to.trigger.shutdown` |
+| `store.io_error_count_to_trigger_shutdown` | u32 | 0(=禁用) | 任意(0 禁用,≥1 阈值) | **已接入**:连续 IO 错误达此值则 store 自关(被动磁盘检测)+ 触发回调;0=禁用,对齐 Ambry 默认 `MAX_VALUE`。**上线建议显式打开(3–10)**:它是"设备层 EIO → 引擎自关 → replica `ERROR` → 心跳上报 → master 再复制"这条**被动**链路的唯一开关;默认关着时,盘 hang 只能靠主动探测与 IO 看门狗(见 §12.12 与 [cluster.md §9.2 部署前提](./cluster.md))观察 | `store.io.error.count.to.trigger.shutdown` |
 | `store.max_journal_entries_to_return` | u32 | 5000 | 1–10000 | journal 单次返回上限 | `store.max.number.of.entries.to.return.from.journal` |
 | `store.index_persisted_entry_min_bytes` | u32 | 115 | ≥1 | 索引条目持久化最小字节(注:Rust 索引条目为 8B key + `IndexValue` 21B = **29B**,值需按实际布局重定) | `store.index.persisted.entry.min.bytes` |
 | `store.segment_size_bytes` | u64 | **4 GiB** | ≥1 且 **≤ 4 GiB** | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;antfs 取段级定容)。**4 GiB 是格式不变量而非调优旋钮**:① 段内偏移要放进索引条目 u32 的偏移半区;② "单条记录 ≤ 段 − 64 < `u32::MAX`"使记录的 u32 `data_len` 结构性无法回绕(`record_data_len` 只是第二道保险)。上界由 `StoreConfig::validate`(`MAX_SEGMENT_SIZE_BYTES`)与 `log_segment::MAX_CAPACITY` 共同强制 | `store.segment.size.in.bytes` |
@@ -846,3 +846,432 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 `store_server_verify_duration_seconds`(histogram)、`store_server_scrub_reports_total`(counter)。
 
 **配置**(§12.4 同步登记):`store_server.scrub_max_batch_bytes`(u64,默认 64 MiB,≥1)= verify 缺省扫描读取上限。
+
+### 12.11 盘维度打点 + 探测单飞(盘 hang 隔离 Phase 0)
+
+> # ⚠️ 地基性变更:引擎 IO 的线程模型(每盘有界池)+ 磁盘探测守卫
+>
+> 本节记录一次**触及全节点数据面**的调整,不是普通优化:它改变了"谁在什么时候替我们执行磁盘 IO"。
+> 改动前,**所有盘的引擎 IO 挤在同一个进程级阻塞池**(tokio `spawn_blocking`,默认 512 线程,全仓无一处
+> 配置),且 `spawn_blocking` **不可取消**、卡在内核 D 态的线程**不可回收** —— 一块盘挂死就能把池吃满,
+> 于是**连健康盘上的请求也一起排队**(节点级不可用)。改动后,**每块盘拥有自己的 worker 线程 + 有界队列**,
+> 池满则短暂排队后快速失败(503),一块盘的损伤被限制在它自己的线程里。
+>
+> **一句话**:把"一块盘的故障"从**节点级**收敛到**盘级**;不改变任何持久化语义(引擎仍是同步阻塞 IO)。
+>
+> **必读**:配置项/监控项/测试证据/**残留风险**都在下面各节显式列出(残留风险那节请务必看完再上线)。
+
+单进程多盘部署里,一块盘 hang 住(内核 D 态)害的不只是自己:引擎 IO 全是同步阻塞且**共用同一个进程级
+阻塞池**(tokio `spawn_blocking`,默认 512 线程,本仓库不配置它),卡住的线程**收不回来**(D 态不可取消、
+`spawn_blocking` 不可取消),池满之后连健康盘上的请求也一起排队。本节落的是一批**不改行为**的前置改动
+(盘维度观测 + 探测自身的泄漏修复);每盘有界池 / 健康闸门 / IO 看门狗 / 坏盘撤离见
+[`openspec/changes/store-disk-isolation/`](../../../openspec/changes/store-disk-isolation/)。
+
+**一、每盘有界池(线程模型;⚠️ 本节的核心改动)**
+
+**改了什么**:引擎 IO 不再提交给进程级 `spawn_blocking`,而是提交给它所在的**那块盘自己的池**
+(`crates/store/src/disk_pool.rs`):每盘 `pool_size` 条专属 worker 线程(线程名 `antfs-disk-<盘id>-<i>`)
++ `pool_queue_size` 个排队位;准入 = "拿到一个空位",没空位就最多等 `pool_acquire_timeout_ms`,超时即
+调用方快速失败。
+
+| 维度 | 改动前 | 改动后 |
+|---|---|---|
+| 执行者 | 全节点共享的 tokio 阻塞池(默认 512,不可配置) | **每盘自己的** worker 线程(默认每盘 16,可按盘指定) |
+| 单盘 hang 的后果 | 线程被逐个占死 → **全节点**(含健康盘)请求一起排队 | 只占该盘的 `pool_size` 条线程;该盘后续请求 503,其它盘**无感** |
+| 池满时 | 无界排队(tokio 阻塞池没有拒绝语义)→ 请求吊到客户端超时 | **短暂排队**(默认 200ms)→ 超时 **503 + `Retry-After`** |
+| 线程能否回收 | 不能(卡在 D 态) | 仍不能,但**上限被限定在该盘内**(默认 16 条) |
+| 任务 panic | join 失败 → 500,且旧实现下**一条 worker 线程被带走**(永久减并发) | panic 被逐任务接住:worker 存活、计数不漂、许可不漏,调用方得 500 + `join_error` |
+| 线程生命周期 | —— | 池析构 ⇒ worker 自行退出(有测试守着) |
+
+**准入语义的边界(刻意如此)**:超时只约束"等空位";一次**已准入**的操作**不再设超时** —— 盘慢不慢该由
+健康闸门/看门狗(`store-disk-isolation` D2/D3)判定后让**新**请求快速失败,而不是把一次已经开始的写中途判死。
+
+**谁在池上、谁不在**(如实列出,别以为"全都进了"):
+
+| 路径 | 走哪 |
+|---|---|
+| 数据面 put / get / delete / metadata / replica-metadata / segments / verify / scrub-report / 手动 compact | ✅ 该分区所在盘的池 |
+| 本地 worker:flush(逐 replica 并发提交)、compaction(顺序提交) | ✅ 该副本所在盘的池 |
+| 拉复制每轮(本地盘读写) | ✅ 该 pid 所在盘的池 |
+| **健康探测**(write/read/unlink)、**盘容量 `statvfs`** | ❌ 仍走进程级池,但**每盘至多一发在飞**(见「二」)—— 让探测去抢请求的池,等于坏盘把探测器一起拖进去 |
+| **建副本前的目录创建**(`ensure_replica`)、**流式 put 的暂存文件 `unlink`** | ❌ 仍走进程级池(前者在建之前还不知道盘 id,后者见「五」)。**残留风险**,见下 |
+| tonic / axum / 各客户端内部 | 与存储无关 |
+
+**测试证据**(`cargo test -p antfs-store`;每条都带失败时限 —— 坏了当场红,不挂死):
+
+| 用例 | 守什么性质 |
+|---|---|
+| `disk_pool::tests::runs_on_a_pool_thread_and_closes_the_loop` | 任务确实跑在池线程上(线程名带盘 id),收尾后计数归 0 |
+| `workers_run_tasks_in_parallel` | N 个 worker **真并行**(防"被一把锁串起来"导致吞吐腰斩) |
+| `capacity_is_exactly_workers_plus_queue_and_rejection_leaks_nothing` | 容量**恰好** = workers+queue;运行期计数可见;被拒不占容量 |
+| `rejection_never_consumes_capacity` | 连拒 10 次后容量仍是 workers |
+| `queue_is_fifo` / `queue_absorbs_a_burst_when_worker_frees_up` / `queue_full_waits_then_rejects` | 队列 FIFO;**等到** vs **等满超时才拒**(既不是一律拒,也不是无限排队) |
+| `rejection_is_bounded_not_unbounded_queueing` | 拒绝可以**立刻**发生(不退化成无限排队) |
+| `a_saturated_disk_does_not_block_another_disk` | **本改动存在意义的直接证明**:A 满,B 照常且 B 的队列始终为 0 |
+| `each_disk_owns_its_own_named_threads` | 线程按盘分开且可辨认(排查"哪个盘的线程卡住了") |
+| `panicking_job_neither_kills_the_worker_nor_drifts_the_counts` / `repeated_panics_do_not_degrade_the_pool` | 任务 panic **不打死 worker**、**不漂计数**、**不漏许可**(50 连炸后并发度不变) |
+| `admitted_job_is_not_killed_by_the_acquire_timeout` | 准入之后不再有超时(把语义边界钉住) |
+| `unknown_disk_is_rejected` / `job_payload_can_be_non_copy` | 未知盘明确失败;任意 `Send` 载荷(非 Copy)原样取回 |
+| `worker_threads_exit_when_pools_are_dropped` | **线程随池析构退出**(反复建销 store-server 不攒线程) |
+| `many_concurrent_submitters_lose_nothing` | 200 并发提交结果一个不丢、不错位 |
+| `closing_a_pool_fails_queued_waiters` | 池关停时排队中的请求立刻得到明确失败(不永远吊着) |
+| `worker_allocation_prefers_per_disk_size_then_default` / `zero_per_disk_pool_size_is_clamped_to_one` | 每盘参数优先、其余走每盘默认;0 被钳到 1 |
+| `data_plane::disk_pool_sizing_from_config_is_wired_through` | 配置 → 池 → 指标在**真装配**里闭环 |
+| `data_plane::saturated_disk_pool_returns_503_with_retry_after` | 用户可见面:**503 + `Retry-After`** + 指标 + 放行后恢复 |
+| `worker::saturated_disk_pool_makes_worker_skip_not_hang` | 池满时 flush/compaction **跳过而不是卡住整轮** |
+| `server::pool_reject_maps_overload_to_503_and_job_panic_to_500` | 过载 503 vs 任务 panic 500(+ `join_error` 计数) |
+| `health::tests::skipped_round_keeps_the_previous_verdict` / `late_verdict_is_adopted_on_the_next_round` / `probe_round_covers_every_disk` | 探测"跳过轮不覆盖健康值"、"迟到结果被采纳"、"每块盘都被探到"(见「二」) |
+
+**收益:结构性收益与吞吐收益分开说**
+
+- **结构性(已被上表测试证明)**:单盘 hang/过载不再吃共享池;失败形态从"吊到客户端超时"变成
+  "短暂排队后 503";panic 不再永久削减并发;线程生命周期有界。
+- **吞吐收益:未标定(如实标注)**。每盘 worker 数是本改动新引入的并发上限,默认 16 是**经验值**
+  (机械盘有用队列深度通常个位数、NVMe 可 32~128)。**上线前请用 `store_server_disk_pool_queued`
+  (持续排队 = 不够)与 `store_server_disk_pool_rejected_total`(开始拒 = 过大或盘真慢)标定**,
+  或用 `benchmark/` 下的压测做前后对比;高并发小对象场景**不要**不看这两个指标就直接套默认值。
+
+**残留风险(如实标注,上线前逐条确认)**
+
+1. **建副本前的目录创建**与**流式 put 的暂存文件 `unlink`** 仍走进程级阻塞池:坏盘上的这两类操作
+   (尤其 `unlink`)理论上仍是共享池的入口。当前靠"每盘至多一发探测"与"暂存目录可配"缓解;彻底归口留给
+   `store-disk-isolation` 的后续阶段。
+2. **一次已准入的操作没有超时**:盘挂死时该盘最多 `pool_size` 个请求会一直挂着,直到客户端放弃或盘恢复。
+   **健康闸门(D2)与 IO 看门狗(D3)已在 §12.12 落地** —— 新请求会对被隔离的盘**快速 503**;
+   但"已经进到 syscall 里的那一发"**仍然无法取消**(Rust 既不能取消 blocking 任务,也不能 kill 线程),
+   这是硬边界,不假装做到了。
+3. **进程退出/重启期间**:池析构会清空队列 —— 排队中的请求拿到**明确失败**(不是静默丢),但不会被执行。
+4. **任务 panic 之后**引擎侧可能留下半截记录 —— 由既有崩溃恢复(CRC 扫描 + `open_rebuild_index`)兜底,
+   与"进程被杀"同一路径;池只保证"线程活下来 + 计数/许可正确"。
+5. **配置耦合**:`pool_default_size` 是**每盘**的值(不是总预算) —— 加盘不会改变已有盘的并发,但节点总
+   线程数会随盘数线性增长(16 × 盘数),大节点请注意进程线程上限。
+6. **UI**:admin 的「磁盘指标」页目前展示 `disk_in_flight_requests`(在飞代偿);**真队列深度**
+   (`disk_pool_queued`、`disk_pool_workers`、`disk_pool_rejected_total`)已由本改动提供,接入该页留作下一步。
+
+**二、探测单飞(`health.rs`)**
+
+原先每轮对每块盘发 write→read 两道 `spawn_blocking`,各自套 `timeout`。但 **`timeout` 只放弃等待,线程仍卡在
+盘里**:一块坏盘每轮漏 1 个池线程(默认 60s 一轮 → 约 8.5 小时吃光 512 个),而且这与业务流量无关 —— 是探测
+自己在漏;`tokio::time::interval` 默认 `Burst`(一轮超时后紧接着再跑),多块坏盘时漏得更快。现在:
+
+- 一发探测 = 一个阻塞任务(四步合并,`unlink` 也进超时:坏盘上删除同样会挂);
+- 超时后**留住句柄**(`StuckProbe`),该盘**后续轮次不再叠加探测**(`SlotAction::Skip`),只按卡住的步骤报
+  `WRITE_TIMEOUT` / `READ_TIMEOUT` / `MOUNT_NOT_ACCESSIBLE` / `DELETE_ERROR`;
+- 那个线程回来了则**取它的迟到结果**作为本轮观测(`SlotAction::Adopt`)—— 对抖动的慢盘,这是自动恢复的正常路径;
+- **跳过期间不写 `HealthMap`**:该盘保持上一轮的坏值,绝不因"这一轮没探到"而回到 `HEALTHY`(未知 ≠ 健康)。
+
+线程永不回来时进程内无从得知盘况(任何新探测同样会卡死在同一设备队列里),那属于内核 fail-fast / 熔断 /
+重启的范畴,见该 change 的 D3 / D7。
+
+**三、盘维度打点(纯观测,不做任何拒绝)**
+
+`OpTimer::with_disk`(拿到副本句柄后调)把每个数据面请求归到具体盘上。这是 `HealthMap` 之外**唯一**能回答
+"哪块盘在出问题"的现网信号(admin 的「磁盘指标」页,hash `#hostdisks`,就用它);`disk_slow_requests_total`
+的阈值**直接复用** `disk_health_timeout_secs` —— 纯观测项不为它单开配置。
+
+| 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_server_disk_requests_total` | counter | `disk_id`,`op` | 次 | **落到该盘上**的数据面请求数(`rate()` = 该盘 IOPS);含随后被拒的(413 body 超限、`store_full` 等)—— 它们在 `bytes_total` 里不计,故"有 IOPS、带宽为 0"是合法读数,两列要一起看 | — |
+| `store_server_disk_bytes_total` | counter | `disk_id`,`op` | 字节 | 该盘上**成功**请求的字节数(`rate()` = 该盘带宽;失败/早退不计) | — |
+| `store_server_disk_request_duration_seconds` | histogram | `disk_id`,`op` | 秒 | 该盘上请求的**端到端**延迟(含阻塞池排队,与 `request_duration` 同口径) | — |
+| `store_server_disk_in_flight_requests` | gauge | `disk_id`,`op` | 个 | 该盘在途请求数;UI 上作为**排队深度代偿**(真队列深度随每盘池落地) | — |
+| `store_server_disk_slow_requests_total` | counter | `disk_id`,`op` | 次 | 端到端超过 `disk_health_timeout_secs` 的请求数(超时计数) | — |
+| `store_server_disk_probe_stuck` | gauge | `disk_id` | 0/1 | 该盘是否有一发探测卡在盘里未归(仅 `disk_health_enabled` 时非 0) | — |
+| `store_server_disk_probe_skipped_total` | counter | `disk_id` | 轮 | 因上一发探测未归而跳过的探测轮次数(× 周期 ≈ 卡住时长) | — |
+
+**四、其它 reactor 阻塞点(一并出清)**
+
+盘 IO 一律不再出现在 reactor 线程上。这类调用的共同点是"在坏盘上会挂,而挂在 reactor 上就是 HTTP 工作线程
+被一块坏盘押住":
+
+| 位置 | 处理 |
+|---|---|
+| `health.rs` 探测的 `exists` / `write` / `read` / `unlink` | 合并进**一个**阻塞任务(超时由异步侧加,见上) |
+| `heartbeat.rs` 盘容量 `statvfs`(原 `dm.refresh()` 全盘同步调用) | 逐盘单飞刷新(`spawn_refresh` / `collect_refresh` + `DiskManager::apply_statfs`);未归的盘沿用上一拍容量值,而**心跳照发**(否则"盘抽风"会被 master 读成"节点死") |
+| `server.rs` 流式 put 的暂存文件 `unlink`(`StagedFile`) | **正常出口**显式等一次删除(跑在阻塞池里,契约不变:响应发出 ⇒ 暂存文件已清);**取消出口**(handler future 被 drop)靠 `Drop` 丢一个分离删除任务兜底,运行时已关则直删;遗留 `*.tmp` 由启动时 `clean_tmp_dir` 收尾 |
+
+**五、暂存目录可配(`store_server.staging_dir`)**
+
+流式 put 的中转文件默认落在**各数据盘自己的 `tmp/` 子目录**(逐盘隔离:哪个盘上的分区,就暂存在哪个盘上)。
+配了 `store_server.staging_dir` 则本节点**所有盘**的暂存文件都落那一个目录 —— 用途是把"大对象中转"的写入
+从数据盘上挪开(单独的本地 SSD / scratch 盘)。两条代价必须知道:
+
+- **它成了单点**:该目录所在的盘坏掉,本节点所有分区的**大对象上传**一起失败(≤1 MiB 的小对象走内存路径,
+  不经暂存,不受影响);
+- **空间口径变了**:需要 ≈ 在途大对象数 × 单对象大小,而且这部分**不进任何容量上报**(暂存文件不是数据),
+  撑爆时表现为上传失败(400 `staging body failed`),而不是"盘将满"告警 —— 运维得自己盯这个目录。
+
+**别指到 tmpfs / 内存盘**:大文件暂存会直接吃内存(默认放数据盘就是这个原因)。
+
+其它口径:目录不存在时由启动挂载创建(嵌套路径也建)、启动时清掉遗留 `*.tmp`;各盘 `tmp/` 仍照旧清理
+(升级前留下的残渣不会复活、也不会被当成数据)。**留空 = 默认,既有落点不变**(CLAUDE.md §5.1 不擅改默认)。
+
+口径边界(如实记录):
+
+- 全是**请求级**数字,不是块设备 IOPS/带宽;引擎内部 IO(flush / compaction / 入向复制 apply)尚未归口到盘维度,
+  随每盘池(N4)一并接入 —— 故 UI 上这两个读数**偏低于**设备真实值,别拿它当设备计量;
+- 延迟是**端到端**(含共享阻塞池排队),不区分"盘慢"还是"排队慢";真正的 syscall 耗时要等每盘看门狗落地时
+  单独立的那组指标;
+- 阻塞池自身的线程数/排队深度**没有**打点:tokio 那几个 API 需要 `RUSTFLAGS="--cfg tokio_unstable"`,不为纯观测
+  给全体部署加一条隐藏构建要求(取舍记录见 `crates/store/src/server.rs` 里那段注释);
+- **从未探过的盘**(如默认关探测的部署)在**本节这一版**里上报的 `health` 是空串,而 master `placement.rs`
+  把空串当"可用"。**这一条已被 §12.12 取代**:现在上报显式的 `UNKNOWN`,master 侧也把 `UNKNOWN` 归入
+  "可放新副本"(两边必须同时改,否则默认部署一块盘都放不了)。
+
+**配置项清单(本批新增,⚠️ 含地基性变更)**
+
+> 完整清单见 [`cluster.md` §9](./cluster.md);默认值/校验与代码 `impl Default` + `Validate` 逐项对齐(CLAUDE.md §7)。
+
+| key(TOML 路径) | 类型 | 默认 | 范围/校验 | 含义/影响 | 对齐 Ambry |
+|---|---|---|---|---|---|
+| `store_server.data_dirs` | Array\<String \| Table\> | (必填) | 至少一项;**每项 basename 必须唯一**(盘 id = basename);空目录/每盘池大小 <1 均拒 | 盘声明。两种写法:**裸目录**(`data_dirs = ["/data/d1"]`,池大小走默认)或**每盘参数**(`[[store_server.data_dirs]]` 下 `dir` + 可选 `pool_size`)。basename 重复以前能安静跑起来但池/心跳/master 放置会串,现在当场拒 | — |
+| `store_server.pool_default_size` | u32 | 16 | ≥1 | **每盘默认池大小**(worker 线程数):`data_dirs` 里没给自己 `pool_size` 的盘都用它。每个 worker = 1 条 OS 线程、同时最多 1 次在飞 IO;机械盘有用队列深度通常个位数、NVMe 可 32~128,故默认取 16 这个偏保守的中间值。**上线前请按盘类型标定**(见上「一」的收益一节) | — |
+| (每盘)`pool_size` | u32 | (可选) | ≥1 | 该盘自己的池大小,覆盖 `pool_default_size`。例:`[[store_server.data_dirs]]` 下 `dir = "/data/nvme0"` + `pool_size = 64` | — |
+| `store_server.pool_queue_size` | u32 | 32 | ≥0(`0` = 不排队,满即拒) | 每盘池的排队容量(worker 全忙时允许等待的请求数)。**有界**是刻意的:无限排队会推高延迟、占死连接,还掩盖"这块盘已经不行了" | — |
+| `store_server.pool_acquire_timeout_ms` | u64 | 200 | ≥0(`0` = 不等) | 池满时的**准入等待上限**(等的是"有空位",不是"这次 IO 做完")。超时 ⇒ **503 + `Retry-After`**;短暂排队能吸收瞬时突发,又不至于把请求拖成"看起来挂了" | — |
+| `store_server.staging_dir` | String | `""` | 空 = 默认;非空不得带前后空格 | 流式 put 的暂存目录(见上「五」) | — |
+
+> 探测开关/周期/超时沿用既有三项(`disk_health_enabled` / `disk_health_interval_secs` /
+> `disk_health_timeout_secs`,见 §12.4 与 cluster.md §9);慢请求阈值复用其中最后一项,**不新增配置**。
+
+**监控项权威清单**见 [`cluster.md` §9](./cluster.md)(本节同步登记)。
+
+### 12.12 健康闸门(D2)+ IO 看门狗(D3):把"盘 hang"收敛成"那块盘被隔离"
+
+> # ⚠️ 地基性变更:数据面新增一层"盘不可服务 ⇒ 快速失败"的闸门
+>
+> 本节把 §12.11 留下的最关键缺口补上:**一块盘挂死时,落在这块盘上的新请求不再排队等死,而是立刻 503。**
+> 这是**行为变更**(以前这类请求会一直挂着直到客户端超时),影响全节点数据面的可达性口径 ——
+> 上线前请把下面「配置」「监控」「残留风险」三节看完。
+>
+> **一句话**:§12.11 让"单盘故障不吃别人的线程";本节让"单盘故障**快速失败 + 可观测 + 能自愈**"。
+>
+> **不做的**:不改引擎 IO 模型(仍是同步阻塞 `std::fs`);不取消已进 syscall 的那一发 IO(做不到);
+> 不在 store 侧自动搬副本(那是 master 侧的 D4,见 [`cluster.md` §9](./cluster.md))。
+
+#### 一、两层判定:原始观测 ≠ 可服务性
+
+这是整个设计的**要害**。`health.rs` 给出的是**单轮**结论("这一轮探测写超时了");直接拿它摘盘就是
+"偶尔一次抽风踢掉一块好盘"(盘越忙越容易闪一下)。所以拆成两层:
+
+| 层 | 字段 | 谁用 |
+|---|---|---|
+| **原始轮次判定** | `DiskStatus::verdict`(最近一次观测的结论) | 心跳上报 / 日志 / 排查 |
+| **可服务性(迟滞后)** | `DiskStatus::is_available()` | **闸门唯一判据** |
+| **延迟劣化(迟滞后,DEGRADED)** | `DiskStatus::is_degraded()` | 上报 + master 停止放新副本;**不用于 503** |
+
+三档的意义:只有"可用/不可用"两档时,一块 p99 从 1ms 涨到 2s 的盘**既不会被隔离、也没人停止往它放副本**
+——它就这么一直烂着(离 30s 的看门狗 deadline 还差得远)。`DEGRADED` 补的正是这一格:
+**不 503**(慢不等于坏,摘盘只会更动荡)、**不撤离**(撤离只认 `UNAVAILABLE`,避免"有点慢就搬 GB 数据")、
+**只做两件便宜事**——让运维看见,以及不再往它放新副本。两台迟滞机共用同一套 `Latch` 逻辑(同一个测透的实现)。
+
+判定状态在 `crates/store/src/disk_health.rs`(纯内存、不持久化)。**重启后从"从未观测"重来**(即
+`UNKNOWN` ⇒ 可服务)是刻意的:重启后没有任何观测证据说它坏,把整节点的盘全锁死才是灾难。
+
+#### 二、迟滞参数:两个方向都给了"轮数 + 时长",取先到者
+
+| 方向 | 判据(任一满足) | 为什么两条都要 |
+|---|---|---|
+| 进入 `UNAVAILABLE` | 连续坏 ≥ `disk_health_bad_rounds` 轮 **或** 坏态持续 ≥ `disk_health_bad_secs` 秒 | 只按轮数:探测周期调到 300s 时"连续 3 轮"= 15 分钟才隔离一块真死的盘;只按时长:周期调到 5s 时"持续 30s"= 6 轮,等于没防抖 |
+| 复位(恢复可服务) | 连续好 ≥ `disk_health_good_rounds` 轮 **且** 从进入连续好态起稳定满 `disk_health_recover_stable_secs` 秒 | 复位比进入**更严**是刻意的:刚缓过来的盘立刻接回全部流量,大概率又被压垮(同 master 侧"盘将满 RW→RO 只置不回"的防抖精神) |
+
+**混轮次不抖**:好轮清零"连续坏"计数、坏轮清零"连续好"计数;坏态**片段**收尾时计数一并清零 ——
+否则复位后**第一个**坏轮就会凭残留计数再次摘盘(迟滞等于没有)。这三条各有单测钉住。
+
+#### 三、上报值域:未知 ≠ 健康
+
+`DiskBeat.health`(字符串,proto 不变)现在取 `DiskStatus::reported_state()`:
+
+| 上报值 | 含义 |
+|---|---|
+| `HEALTHY` | 可服务,且最近一轮观测也健康 |
+| 具体故障值(`WRITE_TIMEOUT` / `READ_ERROR` / …) | 可服务(迟滞未触发),但最近一轮如实报了故障 —— master 侧据此**先避开新放置**,闸门仍放行 |
+| `UNAVAILABLE` | **迟滞判定后的隔离态**(派生态压过具体故障值):闸门 503 |
+| `UNKNOWN` | **从未有过**有效观测(刚启动 / 探测未启用)。**绝不报空串、绝不报 `HEALTHY`** |
+
+新增一个故障值 **`IO_TIMEOUT`**:来自看门狗(不是某一轮探测的具体步骤),故不并进
+`WRITE_TIMEOUT`/`READ_TIMEOUT` —— 那会谎报"我们在写/读",而实际超期的可能是 flush、compaction 或 `stat`。
+
+> **⚠️ 联动改动(不做就是回归)**:store 侧把"没探过"从**空串**改成 `UNKNOWN` 之后,master 的
+> `placement.rs` 必须把 `UNKNOWN` 归入**可放新副本**的集合 —— 因为 `disk_health_enabled` **默认就是 false**,
+> 默认部署里**每块盘**都报 `UNKNOWN`。若 master 把 `UNKNOWN` 当坏,**默认部署一块盘都放不了,集群建不起来**。
+> 可放集合 = `""`(旧节点)| `HEALTHY` | `UNKNOWN`;`UNAVAILABLE` 与具体故障值照旧不放。
+> 两侧各有单测守着(`placement::unknown_health_stays_usable_so_default_deployments_keep_working`)。
+
+#### 四、闸门作用面:哪些被挡、哪些必须照常
+
+| 请求 | 闸门行为 | 理由 |
+|---|---|---|
+| 数据面全部 `/partitions/{pid}/...`(put/get/delete/metadata/scrub-report/verify) | ✅ 盘不可服务 ⇒ **503 + `Retry-After: 1`** | 落在这块盘上的请求必然失败,排队等死毫无收益 |
+| **拉复制读**(`?replication=1`)/ **`replica-metadata`** / **`segments*`** | ✅ **一样 503**(**不沿用** `RequestControl` 的豁免) | 从一块已经坏了的盘上拉数据/拉段**本来就拉不动**,放进去只是再占一条卡死的线程。对端收到 503 后按既有语义"这轮拉不到"处理,保守留在 `BOOTSTRAP`,**永不被误判为追平**(方向是安全的) |
+| `/metrics` 与**任何** `/admin/**` | ❌ **永不被短路** | 与 `RequestControl` 同一条硬规则:**不能做出一个无法远程恢复的节点**。盘坏了运维更要能看见、能下发指令 |
+| 本地 worker(flush / compaction) | 跳过该盘上的副本 | 否则每轮都往一块卡死的盘上再塞任务 |
+| 拉复制每轮 | 跳过该盘上的 pid,**且不动游标** | 恢复后从原游标续拉(与 `/admin/replication-control` 的暂停语义一致) |
+
+**寻盘用同一个来源**:闸门在中间件里用 `ReplicaManager::get(pid)` 定位盘 —— 与 handler 里
+`OpTimer::with_disk` 是**同一个**调用,不另起一套寻盘逻辑。闸门挂在 **handler 之前**(extractor 之前),
+故被拒请求**连 body 都不读**,也不进 `errors_total` / `request_duration` / `in_flight`。
+
+**拒绝计数**:`store_server_rejected_requests_total{op, reason="disk_unavailable"}`。三个 reason 的区别务必分清:
+**`disk_unavailable`** = 盘被隔离 / **`pool_full` 类**(每盘池满,见 §12.11)= 盘被压满 / **`disabled`** = 人工静默。
+`op` 标签由 `request_control::path_op` 给(含 `replication_get` / `replica_metadata` / `segments` 等豁免但受闸门管的端点),
+新增数据面路由必须在那里归类(有单测 `path_op_names_every_data_plane_route` 把这条钉住)。
+
+#### 五、IO 看门狗(D3):计时点必须在闭包内
+
+**为什么不能量端到端**:端到端时长包含"在池里排队"。盘正常但池忙时,一次 5ms 的读会被量成 2s,
+于是**健康盘被判成坏盘**。这是本设计最容易写错的一处,故:
+
+- **计时点在阻塞闭包内、紧贴 syscall 前后**(`JobTimer` 守卫,panic 展开时也照样记一次 ——
+  于是有一条干净的不变量:**每个真正开跑的 job 恰好产生一个时长样本**);
+- 看门狗的"最久在途"来自 `IoWatch`:每盘一个 `BTreeMap<开始时刻, 条数>`。**用多重集而不是"最早开始时刻"标量**:
+  任务完成的顺序与开始顺序无关(A 先开始、B 后开始、A 先结束 —— 标量会一直停在 A 的开始时刻,把健康盘的
+  "最久在途"越算越大,最后误判)。**排队中的任务不盖戳**,故排队不推高"最久在途"。
+- 判据:该盘最久一发在途 IO 超过**它那个 op 的门槛** ⇒ 记 `IO_TIMEOUT` **一次坏观测**,
+  照走迟滞(`bad_rounds`/`bad_secs`)—— **单次超期不摘盘**。
+- **延迟劣化的观测**(`DEGRADED`)也由看门狗每轮产生:池在闭包内按 `disk_degraded_io_ms` 分类每一发 IO
+  (增量计数,不是直方图差分 —— "慢 IO 占比"要精确的分子分母),看门狗**读走并清零**该盘的计数
+  (`swap(0)`,保证每发 IO 只被**一轮**统计到),算占比,喂给延迟迟滞机。
+  **本轮一发 IO 都没有 ⇒ 不产生结论**(空闲 ≠ 慢),与探测"跳过轮不覆盖健康值"同一条纪律。
+- **门槛按 op 分档**(`disk_watchdog_ms_by_op`,默认空 = 全部用 `disk_watchdog_ms`):compaction / flush 要
+  拷整段,天然比一次 4KiB 读**慢几个数量级**;共用一个门槛时只有两个坏选择 —— 要么门槛大到"真死的盘
+  半天不被隔离",要么小到"健康盘的 compaction 天天误报"。分档后每个 op 用自己那把尺子。
+  `IoWatch` 因此按 `(disk, op)` 分层记账,看门狗**逐 op** 检查;一块盘上多个 op 同时超期只记一次
+  "这块盘出了问题"(`tripped` 按盘去重),但每个 op 各计一次 trips(看得出是哪类 IO 在超期)。
+  看门狗的 tick 周期取**所有门槛的最小值**,故给某个 op 设更紧的门槛不会被默认周期拖慢。
+- **看门狗是独立任务**:不在任何盘的池里跑(否则它自己会被同一批卡死的线程挡住),
+  且**不受 `disk_health_enabled` 约束** —— 默认部署(探测关着)才是绝大多数,若它也跟着关,
+  `UNAVAILABLE` 就再没有第二个来源,整条链路在默认配置下全哑。
+- tick 周期就用 `disk_watchdog_ms` 本身(不新增旋钮)⇒ **最坏发现延迟是它的 2 倍**,别按"30s"理解 SLA。
+
+**诚实边界(不假装做到)**:已经卡在 syscall 里的那一发 IO **取消不掉**(Rust 既不能取消 blocking 任务,
+也不能 kill 线程)。看门狗把"泄漏 + 无人知晓"变成"泄漏 + 已知 + 有界决策",它**不解决泄漏**;
+"让在途请求快速失败"只对**排队/后续**请求成立。
+
+#### 六、逃生舱:真挂死 ⇒ 进程自杀(默认关)
+
+某盘池**全部 worker 都被超期 IO 占住**且最早那一发已超过 `disk_watchdog_escalate_secs` ⇒ `std::process::abort()`,
+交 supervisor(`systemd Restart=always` / `docker-compose restart: always`)重启。
+
+- **默认 0 = 永不升级**(CLAUDE.md §5.1)。为什么默认关:antfs 是**单进程多盘**(Ceph 是一 OSD 一进程),
+  自杀会**带走健康盘上的服务** —— 误杀一次等于自造一次全节点故障。
+- 配置校验强制 `escalate_secs ≥ disk_watchdog_ms/1000`(或 0):低于它等于"刚超期一次"就被判成
+  "永远不会回来了"。
+- 对齐 Ceph `osd_op_thread_suicide_timeout`;**偏离与代价如实记录**如上。开启时建议 ≥ 600。
+
+#### 七、测试证据(`cargo test`;每条都带失败时限,坏了当场红,不挂死)
+
+**单测(`disk_health.rs`,注入合成时刻,零 sleep)**
+
+| 用例 | 守什么性质 |
+|---|---|
+| `never_observed_is_unknown_and_still_serves` | **从未观测 ⇒ `UNKNOWN` 且 ≠ `HEALTHY`,而且仍可服务**(默认部署行为不变) |
+| `a_single_bad_round_does_not_take_the_disk_out` | **一次坏轮不摘盘**(这就是"别因抽风踢盘") |
+| `bad_rounds_trigger_unavailable` / `bad_secs_triggers_first_when_the_interval_is_long` | 两条进入判据各自可达,且**先到者**生效 |
+| `alternating_rounds_never_trip_the_disk` | 坏好交替 20 轮**一次都不摘盘**(防抖真的有效) |
+| `recovery_is_stricter_than_entry` | 复位要"连续 M 轮好 **且** 稳定满 T2",缺一不可 |
+| `a_bad_round_resets_the_good_streak` | 复位途中夹一个坏轮 ⇒ 连续好清零,不许"糊过去" |
+| `counters_do_not_leak_across_episodes` | **复位后第一个坏轮不得凭旧计数立刻再摘**(迟滞不能因计数残留而失效) |
+| `repeated_bad_rounds_while_unavailable_do_not_re_transition` | 已在坏态不重复产迁移事件(计数不被刷成噪声) |
+| `observe_disk_writes_gauges_and_transitions` | 状态 gauge **整族摆平**(当前 1、其余 0);迁移只记"可服务性变了"那一次,且 `from` 是**变化前那个上报值** |
+| `watchdog_round_only_touches_overdue_disks` | 只碰超期的盘;未超期的盘连一条 series 都不产生;单次超期不摘盘 |
+| `repeated_watchdog_trips_take_the_disk_out_via_hysteresis` | 反复超期经**同一台状态机**累计到阈值才摘盘 |
+| `escalation_requires_all_workers_stuck_and_is_off_by_default` | 逃生判据:`0 = 永不升级`;必须"每条 worker 都被占住 + 超时门槛" |
+
+**单测(`disk_pool.rs`:看门狗的数据源)**
+
+| 用例 | 守什么性质 |
+|---|---|
+| `io_watch_tracks_the_oldest_start_across_out_of_order_completion` | **完成顺序 ≠ 开始顺序**时,"最久在途"正确推进(钉死"用标量"那个反例) |
+| `io_watch_is_per_disk_and_read_only_queries_do_not_leak_entries` | 按盘分开;只读查询不造空 entry |
+| `queueing_is_excluded_from_the_io_watch_and_duration` | **排队不计入在途、不计入时长**(构造出"第二发至少排了 50ms",它记下的时长必须 ≪ 那个值)—— §五那个"最容易写错的地方"的守门人 |
+| `a_panicking_job_still_releases_its_io_watch_entry` | panic 后不留"幽灵在途"(否则健康盘被看门狗误判),且照样产生一个时长样本 |
+
+**集成(`tests/disk_health_gate.rs`:真 HTTP 数据面,故障注入走 `force_disk_unavailable`)**
+
+| 用例 | 守什么性质 |
+|---|---|
+| `unknown_disk_state_does_not_gate` | **默认部署回归**:从未观测 ⇒ 一律放行 + `/metrics` 上显式可见 `UNKNOWN` |
+| `unavailable_disk_fails_fast_on_every_data_plane_route` | 7 条数据面路由(含**拉复制读**/`replica-metadata`/`segments`)统一 **503 + `Retry-After: 1`**;`op` 标签逐个对得上;**被挡请求不进引擎**(盘维度请求数不增长、在途不残留) |
+| `a_bad_disk_does_not_take_down_requests_on_another_disk` | **盘的隔离性**:另一块盘坏掉时这块盘上的读写完全不受影响 |
+| `metrics_and_admin_stay_reachable_while_a_disk_is_unavailable` | **可远程恢复**:`/metrics` 与 `/admin/**` 照常 200 |
+| `unknown_partition_is_still_404` | 闸门不吞 404(没有本地副本 ≠ 盘坏) |
+| `recovering_the_disk_restores_service` | 迟滞**退出**方向:好轮数不够不许复位;补满后服务与数据一并回来,并留下 `UNAVAILABLE→HEALTHY` 迁移记录 |
+| `background_worker_skips_the_unavailable_disk` | flush/compaction 跳过坏盘且**跳过可见**(`disk_worker_skipped_total`);健康时的基线也先证一遍 |
+
+**其它**:`heartbeat::disk_beats_report_unknown_and_unavailable_never_a_blank_string`(上报值域闭环)、
+`request_control::path_op_names_every_data_plane_route`(新增路由必须归类)、
+`placement::unknown_health_stays_usable_so_default_deployments_keep_working` /
+`unavailable_and_failure_values_are_both_excluded`(master 侧值域)、
+`config::disk_health_defaults_match_documented_proposal` / `disk_health_validation_rejects_dangerous_values`(默认值与校验)。
+
+**故障注入怎么做的**:`StoreServer::force_disk_unavailable(disk_id)` **不绕过任何判据** ——
+它喂的是与生产探测/看门狗**完全相同**的迟滞状态机(`bad_rounds` 次合成 `IO_TIMEOUT` 观测),
+只是省掉"真把一块盘弄坏"。真 D 状态在测试里造不出来,也不该在开发机上造。
+生产代码里**没有**任何调用点,误用的代价(该盘请求全 503 且不会自行恢复)写在方法文档里。
+
+#### 八、配置项清单(§12.4 / cluster.md §9 同步登记)
+
+> 全部为**经验初值**(CLAUDE.md §5.1):采纳 `store-disk-isolation` 提案里已定的数字,实现时**没有**
+> 顺手另定一个。上线前请按 [`cluster.md` §9.4 阈值标定手册](./cluster.md) 标定 —— 那里给出了每个数字的
+> **测量查询与判据**,以及标定完成后必须做的三步(改代码 / 改文档表 / 改钉住默认值的单测)。
+
+| key(TOML 路径) | 类型 | 默认 | 范围/校验 | 含义/影响 |
+|---|---|---|---|---|
+| `store_server.disk_watchdog_ms` | u64 | 30000 | ≥1 | 单次引擎 IO 的**系统调用**时长软上限(闭包内测,不含池排队);超时 ⇒ 记一次 `IO_TIMEOUT` 坏观测。必须**远大于** p99.9 与 compaction 大块拷贝时长。**不受 `disk_health_enabled` 约束** |
+| `store_server.disk_degraded_io_ms` | u64 | **0(= 关闭)** | ≥0 | **DEGRADED 的判定阈值**(毫秒):一次**闭包内**测得 ≥ 本值即记一次"慢 IO"。默认 **0 = 关**(新判定口径,先观测一周期再开)。**含义**:① 该盘仍**服务**(不 503);② master **不再往它放新副本**;③ **不触发撤离**(撤离只认 `UNAVAILABLE`) |
+| `store_server.disk_degraded_ratio` | f64 | 0.1 | (0,1] | 一轮里"慢 IO"占比 ≥ 本值即算该轮劣化。为什么是占比:"偶尔一次慢 IO"在一百万次里是噪声,占比才反映"这块盘持续慢下来了"。与本项配合的是上面那个阈值(后者为 0 时本项无意义) |
+| `store_server.disk_watchdog_ms_by_op` | Table\<op → u64\> | **空**(全部用 `disk_watchdog_ms`) | key 必须是已知池上 op([`KNOWN_OPS`](../../crates/store/src/disk_pool.rs));值 ≥1 | **按 op 覆盖**看门狗门槛(毫秒):给大 IO 单开一档,避免 compaction/flush 的天然长耗时误报 `IO_TIMEOUT`。覆盖值可小于默认(该 op 更紧);看门狗 tick 取所有门槛**最小值**。例:`[store_server.disk_watchdog_ms_by_op]` 下 `compaction = 300000`。**拼错的 key 会在配置校验期被拒**(否则门槛静默失效) |
+| `store_server.disk_watchdog_escalate_secs` | u64 | 0(永不升级) | 0,或 ≥ `disk_watchdog_ms` 向上取整的秒数 | 某盘池全部 worker 被超期 IO 占住且持续此秒数 ⇒ `process::abort()` 交 supervisor 重启。**单进程多盘,误杀代价 = 全节点故障**,故默认关(见「六」) |
+| `store_server.disk_health_bad_rounds` | u64 | 3 | ≥1 | 连续 N 轮坏 ⇒ `UNAVAILABLE` |
+| `store_server.disk_health_bad_secs` | u64 | 30 | ≥1 | 与上者取**先到**:坏态持续 ≥ T 也置 `UNAVAILABLE` |
+| `store_server.disk_health_good_rounds` | u64 | 3 | ≥1 | 复位要求连续 M 轮好 |
+| `store_server.disk_health_recover_stable_secs` | u64 | 120 | ≥0(`0` = 只按轮数) | 复位还要求"稳定满 T2 秒" |
+| `store_server.disk_health_enabled` | bool | false(**不动**) | — | **语义变更**:探测从"纯观测"变为**闸门的输入之一**。默认关 ⇒ 闸门只剩看门狗这一条输入(故看门狗**不可关**);启动时会记一条 `warn` 提醒 |
+| `store_server.disk_health_interval_secs` | u64 | 60(**不动**) | ≥1 | **语义澄清**:与 `disk_health_timeout_secs` 及迟滞参数**联合**决定隔离延迟,最坏 ≈ `min(bad_rounds × interval, bad_secs + interval)`。另外探测是**逐盘串行**的,`盘数 × timeout` 超过 `interval` 时轮次会追尾,建议 `interval ≥ 盘数 × timeout` |
+| `store_server.disk_health_timeout_secs` | u64 | 10(**不动**) | ≥1 | **它已被三处复用**:探测超时、拉复制 HTTP timeout、慢请求观测阈值(`disk_slow_requests`)。改它**会连带影响三处口径** |
+
+#### 九、监控项清单(cluster.md §9 同步登记)
+
+| 指标名 | 类型 | 标签 | 单位 | 含义 |
+|---|---|---|---|---|
+| `store_server_disk_io_duration_seconds` | histogram | `disk_id`,`op` | 秒 | **闭包内**测得的单次 IO 时长(syscall,**不含**池排队)—— "这盘自己快不快"的唯一正确口径。桶特意铺到 120s(看门狗 deadline 就是要看的长尾,Prometheus 默认桶 10s 就封顶了) |
+| `store_server_disk_io_watchdog_trips_total` | counter | `disk_id` | 次 | 看门狗判定超期的次数(一次超期 = 一次坏观测,是否摘盘由迟滞决定) |
+| `store_server_disk_health_state` | gauge | `disk_id`,`state` | 0/1 | 该盘当前**上报状态**,`state` ∈ `HEALTHY`/`UNAVAILABLE`/`UNKNOWN`/具体故障值。**整族每次摆平**(只置 1 不置 0 会让看板上出现"一块盘又健康又坏掉") |
+| `store_server_disk_health_transitions_total` | counter | `disk_id`,`from`,`to` | 次 | 可服务性**迁移**次数(只有"可服务性变了"才计,原始判定变化不算)。频繁迁移 = 阈值定得太紧 |
+| `store_server_disk_worker_skipped_total` | counter | `disk_id`,`task` | 次 | 因盘不可服务而跳过的后台工作(`flush`/`compaction`/`replication`)—— 让"坏盘被跳过"**可见**,否则表现为"这块盘上的副本悄悄不推进了" |
+| `store_server_rejected_requests_total` | counter | `op`,`reason` | 次 | **`reason` 新增取值 `disk_unavailable`**(与 `disabled` 并列;三者区别见「四」) |
+
+#### 十、残留风险(如实标注,上线前逐条确认)
+
+1. ~~**只做了一半的链路**~~ **已补齐(master 侧 D4/D5/D6 已落地)**:坏盘上的副本会被**自动搬走**
+   (先补后删、且继任者必须已追平才删源),判活加了迟滞(一次抖动不再判死节点),再复制加了每 tick 预算。
+   详见 [`cluster.md` §7.7](./cluster.md) 与 §9。**仍未做**:`DROPPED` 删目录回收、admin 页接入真队列深度与
+   健康状态、全部阈值的压测标定。
+2. **阈值未压测标定**:上面 6 个数字都是经验值 —— **测量步骤与判据见
+   [`cluster.md` §9.4 阈值标定手册](./cluster.md)**(全部 12 个数字一并列出,含"标定完成后必须做的三步")。
+   每个数字都有单测钉着,改默认值必须显式改测试,不会悄悄漂。
+3. **`UNKNOWN` 参与撤离判据这件事还没法验证**:D4 未落地,故"只有 `UNAVAILABLE` 触发撤离"这条
+   在默认关探测的部署里**只能靠看门狗产出 `UNAVAILABLE`** —— 这条路径的可达性在 D4 落地时要一并核对。
+4. **已进 syscall 的 IO 无法取消**(见「五」的诚实边界):盘真挂死时,该盘最多 `pool_size` 个请求
+   仍会挂着,直到客户端放弃或盘恢复;看门狗只保证"后续请求不再进来"。
+5. ~~**`disk_watchdog_ms` 与 compaction 大 IO 的关系**~~ **已由"按 op 分档"解决**:
+   `disk_watchdog_ms_by_op` 可以给 `compaction` / `flush` 单开一档(例如 300s / 120s),不必为了让
+   compaction 不误报而把普通读的门槛一起放大。**仍待标定的是"那档该取多大"** —— 见
+   [`cluster.md` §9.4](./cluster.md) 标定手册第 1、2 行(必须专门跑一次全库 compaction 看单次峰值)。
+6. **看门狗口径只覆盖"该盘池里的 IO"**:`ensure_replica` 建目录、流式 put 的暂存 `unlink` 仍走共享
+   阻塞池(§12.11 残留风险 1),它们不受本看门狗保护。
+7. ~~**UI 未接**~~ **已接**:admin「磁盘指标」页现在展示**真队列深度**(`disk_pool_queued / disk_pool_workers`)、
+   池在飞与池拒绝计数、**盘健康状态**(`disk_health_state`)、看门狗超期次数、后台跳过数,以及
+   **两把 RT 尺子**(端到端 / syscall 闭包内)并排 —— 后者正是"这盘慢不慢"的判据。
+   ~~仍未接:分位点(UI 只算平均,`parse.rs` 刻意极简、不聚合 `le` 桶)。~~ **分位点已做**(2026-09-24):
+   `disk_json` 新增 `rt_p50_seconds` / `rt_p99_seconds`(端到端)与 `io_p50_seconds` / `io_p99_seconds`(syscall),
+   页面上 RT 两列显示"平均 / p99"(p50 在 hover 提示里)。**实现口径与边界**(别把边界当缺陷,但也别忽略):
+   - 分位点由 `_bucket` 的 `le` 桶**逐盘跨 op 求和**后**线性插值**得到(口径照抄 Prometheus
+     `histogram_quantile`),与同一盘的 `_sum`/`_count` 是**同一批观测**;`parse.rs` 仍未改语义,
+     桶的聚合在 admin 侧(`crates/admin/src/server.rs::histogram_quantile`,带单测)。
+   - 最高桶是 `+Inf`:秩落在里面时**只给下界**(= 最高有限 `le`,即"真实分位点 ≥ 这个数"),
+     **不声称超出最高桶的精度**。store 侧 IO 直方图的桶铺到 120s,故超过 120s 的观测只能得到"≥ 120s"。
+   - **只聚合到分位点这一层,不往上传 `le` 桶**:admin JSON 里没有桶数组,前端也就无法做跨盘/跨节点合并,
+     主机汇总卡的 p99 取的是**该主机最差盘的 p99**(分位点不能相加,它是主机 p99 的上界)。
+   - 没有桶样本(老版本 store / 该盘零请求)→ `null` → UI 显示「—」,**不显示 0**:没数据 ≠ 零延迟。

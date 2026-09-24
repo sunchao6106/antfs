@@ -22,9 +22,10 @@
 ## 2. 写路径(W = 实际副本数 / 2 + 1)
 
 ```
-allocate_one(): 本地号段里**按分区轮转**取 → offset++(零 RPC)
-                所有分区的号段都取完 → 补段:ListPartitions 拿当前可写(RW)分区列表
-                                      → 对每个分区各 GetBlobIds 一小批(id_segment_size 个)
+allocate_one(): 本地号段里**按 partition 写权重**取(平滑加权轮转) → offset++(零 RPC)
+                所有分区的号段都取完 → 补段:ListPartitions 拿当前可写(RW)分区列表 + **写权重**
+                                      → 总预留(分区数 × id_segment_size)按写权重切份额
+                                      → 对每个缺段的分区各 GetBlobIds 该份额
                                         (master 侧先 Raft 抬水位再发,见 blobid-master-assign)
 put(key, bytes): 解析 key 的高 32 位得 partitionId
                 → 取该 partition 的**全部**副本位置(发号响应带回,或 LookupPartition)
@@ -32,17 +33,35 @@ put(key, bytes): 解析 key 的高 32 位得 partitionId
                 → 收满 W = 副本数/2+1 个 ack 即返回成功(其余请求被取消,由拉复制补齐)
 ```
 
-- **发号按分区轮转(打散写 IOPS)**:稳态下 router **每个可写分区各持一段**号,取号在它们之间轮转 —— 相邻写落在不同
-  分区(进而是不同副本、不同盘),而不是把一段号连续耗尽在一个分区上。分区集合仍由 **master** 给(router 不自造 id):
-  补段用 `ListPartitions(state=RW)` 取权威可写列表 + 显式点名 `partition_id` 的 `GetBlobIds`(master 复核该分区确实
-  可写、有副本)。单个分区取号失败(期间转 RO/封存)只跳过它;router **不做**容量/副本自选 —— 代价是负载由 D10 的
-  "按剩余容量加权随机"变成"可写分区上的**均匀轮转**",理由与取舍见 `openspec/changes/router-partition-round-robin`。
+- **发号按 partition 写权重分配(既打散写 IOPS,又按容量分配)**:稳态下 router **每个可写分区各持一段**号,取号
+  在它们之间**按写权重**挑 —— 相邻写仍落在不同分区(进而是不同副本、不同盘),不在一个分区上连续耗尽一段号,
+  同时**越空的分区拿到越多号**。权重由 **master 下发**(`PartitionEntry.write_weight`,**千分比** `0..=1000`):
+  `1000` = 该分区完全空,越接近 `1` 越满;`0` = **未下发 / 无意见 → 按均权处理**(旧 master 兼容,CLAUDE.md §3.4);
+  计算值**下限为 1**,故 `0` 永不表示"零分配"。router **只当相对权重用** —— **不自算容量、不解释 policy**(容量
+  口径只活在 master;权重怎么算、将来是否由 admin 手动设置,与客户端无关)。取号用**平滑加权轮转(SWRR)**:每拍给
+  在册分区各加 `weight` 信用、取最大者、再减去在册权重总和,于是**任意窗口**内的取号比例都趋近权重之比。这一条
+  **不能只靠"按权重切段大小 + 顺序轮转取号"实现**:顺序轮转每轮给每个分区各 1 个号,任何中途窗口内各分区计数都
+  **相等**,权重只能决定"最满的那个何时停止发号";所以**取号本身必须按权重挑**,段大小再按权重配比(让各分区同步
+  耗尽)。分区集合仍由 **master** 给(router 不自造 id):补段用 `ListPartitions(state=RW)` 取权威可写列表 + 显式
+  点名 `partition_id` 的 `GetBlobIds`(master 复核该分区确实可写、有副本)。单个分区取号失败(期间转 RO/封存)只
+  跳过它。收口了上一轮 change 自认的偏离(均匀轮转),见 `openspec/changes/router-weighted-partition-alloc`。
+- **号段份额与段尾收敛**:号段总预留 = `id_segment_size × 可写分区数`(**与均权轮转时不变** —— 空洞上界、换段频率
+  都不变),按权重切成各分区份额 `max(1, pool × w_i / Σw)`(余数按小数部分降序、pid 升序分配)。下界 `1` 保证不
+  存在 0 长度的段 —— "这个分区不发号"应当由 **master** 把它转 RO 来表达,不是靠发个空段。**均权时每份恰好
+  `id_segment_size`**,逐位退化为原来的均权轮转。**补段 / 后台刷新还按新份额收敛已持有号段的段尾**
+  (`end = min(end, next + share)`):收敛掉的余号成**空洞**(D3 无害),收敛到没号的段直接丢掉 —— 这一步把
+  "权重改动何时生效"压在**一个刷新周期**内,不必等整池号段自然轮完。
+- **反馈滞后与生效粒度(如实)**:权重来自 store 心跳上报的 `used_bytes`(`store_server.heartbeat_interval_secs`
+  默认 3s),router 只在**补段 / 后台刷新**那一拍拉取(后台周期 `router.partition_refresh_secs` 默认 30s)。它是
+  **心跳级的粗粒度容量反馈,不是精确配额** —— 只做粗粒度修正,不声称各分区能被用到毫厘不差。`partition_refresh_secs
+  = 0`(关后台刷新)时退化为"整池轮完才更新权重";可接受:号段亏空的写路径自己会同步一次。
 - **补段的代价**:一次补段 = 1 次 `ListPartitions` + 「分区数」次 `GetBlobIds`,整轮在号段锁里单飞(并发调用各补一轮会放大
   RPC 并可能重号)。故 `id_segment_size` 是**每个分区**的号段大小,稳态持有「可写分区数 × N」个号。
-- **可写分区列表由后台任务保鲜**:`connect` 起一个后台任务,按 `partition_refresh_secs` 周期拉一次列表 —— 已不可写的
-  分区**丢掉号段**(余号成空洞,无害,D3)、新出现的可写分区**补一段**;号段耗尽的写路径自己也会同步一次(故周期配
-  `0` 也能跑,只是缓存跟不上分区增减)。任务持号段池的 `Weak`,最后一个 `Router` 析构后自行退出;重建轮转顺序时
-  **保持轮转相位**,空刷新不会让同一分区连出两个号。
+- **可写分区列表由后台任务保鲜**:`connect` 起一个后台任务,按 `partition_refresh_secs` 周期拉一次列表(与**写权重**
+  同一份来源)—— 已不可写的分区**丢掉号段**(余号成空洞,无害,D3)、新出现的可写分区**补一段**、已有的段按新份额
+  收敛段尾;**信用只留给手上还有号段的分区**(补段的分区从 0 起,不留空转期攒下的信用变成突发)。号段耗尽的写路径
+  自己也会同步一次(故周期配 `0` 也能跑,只是缓存跟不上分区增减)。任务持号段池的 `Weak`,最后一个 `Router` 析构后
+  自行退出;一次什么都没补的空刷新不会把"下一个轮到谁"清空重来(由信用高低决定相位)。
 
 - **W 是实算的,不是配置项**:RF=3 → 2(等于 Ambry `routerPutSuccessTarget=2`)、RF=2 → 2、RF=1 → 1、RF=5 → 3。
   低于多数派的写会破坏"已确认 ⇒ 多数副本有"的前提,故**不提供配置开关**(避免有人调低它静默削弱持久性)。
@@ -91,12 +110,15 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router.master_addr` | String | `127.0.0.1:7101` | 非空 | master 控制面 gRPC 地址。**须指向 leader**(见 §7 待办) | Ambry 从 clustermap 拿地址,不配 |
 | `router.cluster_secret` | String | `""` | — | 集群准入密钥(与 master 一致);空 = 关校验(仅本地测试) | 无(Ambry 用 account/container 鉴权) |
 | `router.request_timeout_secs` | u64 | `10` | ≥1 | 单请求超时(同时用于 master gRPC 与数据面 HTTP) | `router.routerRequestTimeoutMs`(默认 20s) |
-| `router.id_segment_size` | u32 | `1024` | ≥1 | **每个可写分区**一次向 master 申请的 blobId 个数(号段 N)。稳态持有「可写分区数 × N」个号:越大越省 RPC、router 崩溃留下的空洞越大(空洞无害,D3) | 无(Ambry 的 id 是本地随机生成,无发号) |
+| `router.id_segment_size` | u32 | `1024` | ≥1 | **均分时**每个可写分区一次向 master 申请的 blobId 个数(号段 N)。总预留 = 分区数 × 该值(SWRR 分配的**总**号码池;**实际按写权重配比**切成各分区份额)。越大越省 RPC、router 崩溃留下的空洞越大(空洞无害,D3) | 无(Ambry 的 id 是本地随机生成,无发号) |
 | `router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新**可写分区列表**的周期(秒):已不可写分区的号段被丢掉、新出现的可写分区补一段 | 无 |
+| `router.latency_aware_routing` | bool | `true` | — | **读路由按观测延迟排序副本**(慢盘处置的客户端侧那一半):读恒为 R=1(第一个成功即返回),故"先试哪个副本"直接决定读延迟。开着时记录每副本请求耗时的 EWMA,读时 **`up` 优先 → 延迟升序 → master 原序**;未测副本按"已测均值"当先验;无数据时是**恒等变换**。**只改顺序、不改候选集** ⇒ 不改变 W/R 与冲突解决语义。关掉用于定位/对照压测。详见 [`cluster.md` §9.3](./cluster.md) | 无 |
 
 > **请求哪个 partition**:补段时先 `ListPartitions(state=RW)` 拿可写分区列表,再对**每个**分区显式点名
 > `partition_id` 申请一小批(master 复核该分区 RW 且**至少有一个副本**,否则 `ok=false` 只跳过该分区)。
 > `partition_id` 缺省 = 由 master 按剩余容量加权挑一个 —— **分区分派始终由 master 定**,router 不自选(D10)。
+> **权重的来源**是同一份列表里的 `PartitionEntry.write_weight`(千分比;`0` 或未下发 = 按均权,见 §2);
+> 客户端只把它当**相对**权重用,不自算容量、不解释 policy。
 > (早期版本用"`0` 表示自动",导致第 0 号分区无法被点名,已改。)
 
 > **没有 W/R 配置项**(见 §2)、**没有重试次数配置项**(失败即返回,重试由调用方决定)。
@@ -122,21 +144,34 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_partition_refresh_total` | counter | `outcome` | 次 | 后台刷新可写分区列表的次数(失败为 `error`) | 无 |
 | `router_writable_partitions` | gauge | — | 个 | 本地**持有号段的分区数**(后台刷新后刷新;0 = 当前无可写分区) | 无 |
 
+> **权重是否生效怎么观测(本次不新增指标)**:发号按写权重分配本身**不打点** —— 它是一条分配策略,不是故障。
+> 要核它是否生效,看这两处:`Router::write_weights() -> Vec<(PartitionId, u32)>`(当前生效的权重只读快照,pid 升序)
+> 与 `benchmark/router` 打印的分配分布报告 —— 后者把「权重 → 期望 %」与实际落点分布**并列**输出,一眼可核。
+> 实战读法:若实际分布与期望比例长期背离,先怀疑**刷新滞后**(权重只在补段/刷新那一拍生效,见 §2)与
+> `partition_refresh_secs` 的取值,而不是怀疑发号逻辑。
+
 ## 7. 与 Ambry 的差异 / 已知取舍 / 待办
 
 **相对 Ambry 的差异(有意为之)**:
 1. **blobId 由 master 发号**(号段批处理 + Raft 水位),不是 router 本地随机铸 —— 见 `blobid-master-assign` D1–D4。
    代价:写路径多一次 master RPC(经号段摊薄至 ≈0)+ 号可枚举(D6 已知取舍);
    收益:id 连续可数、partition 由 master 按容量兼顾均衡挑选(D10)、无"随机撞陈旧分区"问题。
-2. **partition 由 master 选**(D10):客户端不再本地挑可写分区。
+2. **partition 由 master 选**(D10):客户端不再本地挑可写分区。它现在**消费 master 下发的相对写权重**
+   (`PartitionEntry.write_weight`)来决定"同一时刻该用哪个可写分区发号",但**仍不自选分区、不自算容量**
+   —— 权重怎么算(policy)只活在 master 侧。
 3. `stat`/`delete` 直接对数据面端点,无 account/container 维度(D7:blobId 64 位塞不下)。
 
 **已知取舍**:
-- 号段内已发放但未使用的号 = **空洞**(router 崩溃、换段时丢弃);master 侧 `master_id_alloc_holes_total` 可观测。
-  **任何逻辑不得假设"发了号 = 对象存在"**(D3)。
+- 号段内已发放但未使用的号 = **空洞**(router 崩溃、换段时丢弃;按新份额**收敛段尾**也会留下空洞);
+  master 侧 `master_id_alloc_holes_total` 可观测。**任何逻辑不得假设"发了号 = 对象存在"**(D3)。
 - 读路由缓存(`partitionId → 副本位置`)**不过期**:副本迁移后可能试到已迁走的副本 —— 读会换副本成功(R=1),
   写扇出则可能打不满 W。当前靠"重启进程 / 重新 LookupPartition"收敛。
 - 写失败**不做跨 partition 重试**(避免掩盖问题)。
+- **按权重发号只是"按容量粗粒度分配",不是精确配额**:权重来自心跳级的 `used_bytes`(§2 的反馈滞后)。
+  极端偏斜(如权重 1000:1)时最满的分区每轮只拿 1 个号(≈0.1%)—— 它**仍是可写分区**,写进去仍可能 507,
+  **错误照旧上报**,不静默吞掉;正确处置是运维把它转 RO / 封存。
+- **SWRR 每次发号 O(n)**(n = 本地持段分区数,即"可写分区数")。它与 `id_segment_size` 相乘构成总预留,
+  实际规模有限;十万级分区需要换 O(log n) 结构(见待办)。
 
 **待办**:
 - [ ] **leader 重定向**:master 现在回填的 `leader_addr` 是 **raft 内部地址**(membership 里存的是 `RaftInternal` 端口),
@@ -146,6 +181,12 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 - [ ] 读路由缓存 TTL / 失败后强制刷新。
 - [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,frontend 的 `x-ambry-ttl-ms` 已是单次原子写)。
 - [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
+- [ ] **admin 手动权重入口 → master**:现在写权重只有"由容量现算"一个来源(`capacity_weight_permille`)。要做人工
+  压权重,路径是 admin → master 写进同一处 → 同一个 `write_weight` 字段下发,**客户端零改动**(router 只当相对权重用)。
+- [ ] **SWRR 的 O(n) → O(log n)**:分区数上千时每次发号遍历在册分区不划算,需要换堆 / 树的加权调度结构。当前
+  规模(`可写分区数 × id_segment_size`)下 O(n) 可接受,故本轮不做。
+- [ ] **507 / silenced 驱动的本地降权**:现在客户端**不**根据写失败自行降权(失败照旧上报;它只消费 master 下发
+  的相对权重)。若将来要让 507 立即影响本地分配,须先从"运维动作(转 RO)"与"客户端自降权"之间选定一侧。
 
 ## 8. 配套工具(不在本 crate 内)
 

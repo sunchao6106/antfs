@@ -36,6 +36,10 @@
 ### D1:运行时——移除 monoio,采用同步阻塞 IO 模型
 - 采用 `std::fs::File`(`read_at`/`write_at`)+ 显式线程池/后台线程执行 IO 及 fsync,统一为**同步阻塞语义**,对齐 ambry-store(其 log 读写即同步阻塞 `FileChannel`)。
 - **盘 hang 容错不在引擎层**:阻塞 IO 在单盘 hang 时会占住池线程——这是**可用性/容错**问题,由集群层的磁盘健康检测(`DiskHealthStatus`,超时/隔离)与多副本兜底,不靠把单次 IO 改异步解决(对本质阻塞的磁盘设备,异步不能凭空提速,只会少占线程)。
+  > **后续(2026-09,已落地一半)**:本决策**未变**(引擎 IO 仍同步阻塞、盘 hang 不靠改异步解决),而"集群层兜底"
+  > 的服务侧隔离已实现:**每盘有界池**(每盘自有 worker 线程 + 有界队列,池满 503)——见
+  > [`docs/design/store.md` §12.11](../../../docs/design/store.md) 与 `openspec/changes/store-disk-isolation/`。
+  > 健康闸门/看门狗/坏盘撤离仍在该 change 里待办。
 - 可选:`tokio` + `spawn_blocking` 承载阻塞 IO(需异步便利时的选项),但引擎核心为同步阻塞语义。
 - **否决**:monoio(thread-per-core 无阻塞池,阻塞 IO 卡整核)、io_uring/O_DIRECT(需 Seastar 式整套缓存才经济)、以「伪异步」为由强换异步 IO(ambry-store 本就是同步阻塞,此理由不成立)。
 

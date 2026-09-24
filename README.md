@@ -76,6 +76,46 @@ The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [Se
 Storage engine highlights:
 
 - **I/O**: synchronous blocking `std::fs` + buffered (OS page cache), aligned with original Ambry.
+  *Where* those blocking calls run changed in Phase 1: each disk owns a **bounded pool** (its own worker threads
+  + a bounded queue), so one wedged disk can no longer drain the shared blocking pool and stall healthy disks;
+  pool saturation fails fast with `503` + `Retry-After`. The IO primitive itself is untouched — no async/AIO.
+  On top of that, each disk now has a **serviceability gate** (a wedged disk's requests fail fast instead of
+  queueing forever) and an **IO watchdog** (in-closure syscall timing, independent of the active-probe switch).
+  See [`docs/design/store.md` §12.11](docs/design/store.md) and [§12.12](docs/design/store.md) (both marked as
+  foundational changes) and `docs/design/cluster.md` §6 **N4**.
+- **Disk-fault containment (single process, many disks)**: one bad disk is downgraded from "the whole node is
+  unusable" to "that disk is isolated, its replicas get replaced". Four layers, all opt-in-safe by default:
+
+  | Layer | What it does | Status |
+  |---|---|---|
+  | **D1** per-disk bounded pool | one wedged disk can only consume *its own* worker threads; saturation ⇒ `503 + Retry-After` | ✅ landed (store) |
+  | **D2** serviceability gate | disk judged `UNAVAILABLE` ⇒ all `/partitions/**` requests on it fail fast, incl. replication reads / `replica-metadata` / `segments`; `/metrics` and `/admin/**` are **never** short-circuited (a node must stay remotely recoverable) | ✅ landed (store) |
+  | **D3** IO watchdog | watches the **longest in-flight syscall** per disk (queueing excluded); trips `IO_TIMEOUT` ⇒ same hysteresis ⇒ `UNAVAILABLE`. Independent of `disk_health_enabled` (which defaults to off) | ✅ landed (store) |
+  | **D4** evacuation | move replicas off a bad disk — copy first, remove the source **only after** the successor is caught up (never lose the last copy) | ✅ landed (master) |
+  | **D5** liveness debounce | a node needs K consecutive missed ticks to be declared down, so one hiccup no longer means "node dead ⇒ re-replicate everything" | ✅ landed (master) |
+  | **D6** re-replication budget | cap how many under-replicated partitions start moving per tick; the throttled remainder is exposed as a gauge | ✅ landed (master) |
+
+  Health is **hysteretic** (N bad rounds / T seconds, whichever first; stricter on the way back) so a single
+  hiccup never evicts a good disk. "Never observed" is reported as `UNKNOWN` — never as healthy, and never as an
+  empty string. Full design, config keys, metric names, test-evidence tables and residual risks:
+  [`docs/design/store.md` §12.12](docs/design/store.md).
+
+- **Slow disks (as opposed to dead ones)**: "slow ≠ dead", so slow disks are *not* evicted — they get three
+  cheaper treatments instead:
+  1. **Per-op watchdog deadlines** (`disk_watchdog_ms_by_op`) — a compaction copying a whole segment is orders of
+     magnitude slower than a 4 KiB read; sharing one deadline forces you to choose between "a truly dead disk
+     isn't isolated for ages" and "healthy compactions trip the watchdog daily".
+  2. **`DEGRADED` tier** (`disk_degraded_io_ms`, **off by default**) — a disk whose *in-closure* slow-IO ratio
+     stays above a threshold is reported as `DEGRADED`: it **still serves (never 503)**, master **stops placing
+     new replicas** on it, and it is **not evacuated** (evacuation only reacts to `UNAVAILABLE`).
+  3. **Latency-aware read routing** (client side, `router.latency_aware_routing`, on by default) — reads are
+     R=1 (first success wins), so *which replica is tried first* directly decides read latency. Replicas are
+     ordered by `up` → observed latency (EWMA) → master order. It only changes the **attempt order, never the
+     candidate set**, so W/R and conflict resolution are untouched, and with no measurements yet it is the
+     identity. See [`docs/design/router.md`](docs/design/router.md) and `docs/design/cluster.md` §9.3.
+
+  Threshold calibration for all of the above (12 numbers, none of them benchmarked yet) is a written
+  procedure with queries and decision rules: `docs/design/cluster.md` §9.4.
 - **Index**: concurrent active segments + **mmap'd sealed segments + persistent Binary Fuse filters**.
 
 Design docs live in [`docs/design/`](docs/design/) (overview + per-module); decision archives live in [`openspec/changes/`](openspec/changes/).

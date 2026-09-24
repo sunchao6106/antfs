@@ -78,6 +78,38 @@
 blob 引擎当前要点:
 
 - IO:**同步阻塞 `std::fs` + buffered(OS page cache)**,对齐 Ambry 原版
+  —— **IO 原语没变**(没有引入 async/AIO);变的是"这些阻塞调用在哪个线程上跑":每块盘拥有**自己的有界池**
+  (专属 worker 线程 + 有界队列),一块盘挂死不再吃光共享阻塞池、不再拖住健康盘;池满则快速失败
+  (`503` + `Retry-After`)。见 [`docs/design/store.md` §12.11](docs/design/store.md)(内标"地基性变更")
+  与 `docs/design/cluster.md` §6 **N4**
+- **单盘故障隔离(单进程多盘)**:把"一块盘坏"从"整台机不可用"降级为"那块盘被隔离、其上副本被替换"。四层,
+  默认配置下都不会误伤:
+
+  | 层 | 做什么 | 状态 |
+  |---|---|---|
+  | **D1** 每盘有界池 | 一块盘挂死只吃**自己**的 worker 线程;池满 ⇒ `503 + Retry-After` | ✅ 已落地(store) |
+  | **D2** 可服务性闸门 | 盘被判 `UNAVAILABLE` ⇒ 该盘上所有 `/partitions/**` 请求快失败(含拉复制读 / `replica-metadata` / `segments`);`/metrics` 与任何 `/admin/**` **永不被短路**(节点必须可远程恢复) | ✅ 已落地(store) |
+  | **D3** IO 看门狗 | 盯每盘**最久未归的那一次 syscall**(不含池排队);超期记 `IO_TIMEOUT` ⇒ 同一套迟滞 ⇒ `UNAVAILABLE`。**不受** `disk_health_enabled`(默认关)约束 | ✅ 已落地(store) |
+  | **D4** 坏盘撤离 | 把副本从坏盘搬走:**先补后删**,继任者**追平后**才删源(绝不丢最后一份) | ✅ 已落地(master) |
+  | **D5** 判活迟滞 | 连续 K 拍观察不到心跳才判节点死;一次抖动不再等于"节点死 ⇒ 全量再复制" | ✅ 已落地(master) |
+  | **D6** 再复制预算 | 每 tick 限制新发起搬迁的分区数;被限速的余量暴露成 gauge,让"正在限速"可见 | ✅ 已落地(master) |
+
+  健康判定带**迟滞**(连续 N 轮坏 / 持续 T 秒,取先到;复位更严),故**偶尔一次抽风不会摘掉一块好盘**。
+  "从未观测过"一律报 `UNKNOWN` —— 不报健康、也不报空串。完整设计、配置项、监控项、**测试证据表**与残留风险:
+  [`docs/design/store.md` §12.12](docs/design/store.md)。
+- **慢盘(与"盘坏"是两回事)**:**慢 ≠ 坏**,故慢盘**不摘**,而是三条更便宜的处理:
+  1. **按 op 分档的看门狗门槛**(`disk_watchdog_ms_by_op`)—— compaction 拷整段比 4KiB 读慢几个数量级,
+     共用一个门槛只能二选一:「真死的盘半天不被隔离」或「健康盘的 compaction 天天误报」。
+  2. **`DEGRADED` 中间档**(`disk_degraded_io_ms`,**默认关**)—— **闭包内**慢 IO 占比持续超阈值即报
+     `DEGRADED`:该盘**仍然服务(绝不 503)**、master **不再往它放新副本**、且**不触发撤离**
+     (撤离只认 `UNAVAILABLE`)。
+  3. **延迟感知读路由**(客户端侧,`router.latency_aware_routing`,默认开)—— 读是 R=1(第一个成功即返回),
+     故"先试哪个副本"直接决定读延迟;顺序为 `up` → 观测延迟(EWMA)→ master 原序。它**只改试的顺序、
+     不改候选集** ⇒ W/R 与冲突解决语义不变,而没有测量数据时它就是恒等变换。
+     见 [`docs/design/router.md`](docs/design/router.md) 与 `docs/design/cluster.md` §9.3。
+
+  以上全部阈值的**标定步骤**(12 个数字,目前都还没压测过)连查询与判据都写好了:
+  `docs/design/cluster.md` §9.4。
 - 索引:并发活跃段 + **mmap 封存段 + 持久化 Binary Fuse 过滤器**
 
 详细设计见 [`docs/design/`](docs/design/)(总览 + 各模块);决策档案见 [`openspec/changes/`](openspec/changes/)。

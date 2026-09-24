@@ -321,6 +321,7 @@ message MasterDirective {
 - master↔master 的 Raft 内部 RPC 走 openraft 自己的网络层(可另起一个 gRPC `RaftInternal` 服务),与上面控制面服务分开。
 - proto **带版本字段**(D2 要求)。
 - **`partition_states`(已实现)**:每拍**全量**下发该节点承载副本的分区可写态(`RW`/`RO`/`SEALED`)**+ 墓碑回收闸门 `tombstones_reclaim_allowed`**(master 权威:该分区的**所有副本都已追平** —— 各副本上报 `ACTIVE` 且 `lag_bytes == 0`;缺上报 / 节点 down / 空 placement 都算未追平)。前者供 store 侧挑本地维护(定时 compaction)的候选集,后者是 compaction 的**判活口径**闸门 —— store 不自行从"能不能写"反推可写态、也不自行推断删除是否已传播,只认 master 的权威值(见 §9.1)。与 `Transition.target_state`(副本实然态 `ACTIVE`/`BOOTSTRAP`/`DROPPED`)是两码事。
+- **`ListPartitions` / `PartitionEntry.write_weight`(已实现)**:控制面全量视图的 `PartitionEntry` 多带一个**写权重**(`uint32`,千分比 `0..=1000`)= 该分区**剩余容量占容量上限的比例** —— `1000` = 完全空,越接近 `1` 越满,**下限 1**,`0` = 未下发 / 无意见 → 客户端**按均权处理**(故 `0` 永不表示"零分配")。它是给 **router(客户端)** 用的:发号时按各可写分区的**相对**权重挑分区(平滑加权轮转),于是"越空的分区拿到越多号"。这**与 master 自己在 `partition_id` 缺省时加权挑分区共用同一个定义**(`capacity_weight_permille`),不让集群里出现两套自相矛盾的容量权重。权重取自心跳软状态(每分区各副本 `used_bytes` 的**最大值**,RF 不重复计数),**不进 Raft / apply**(切主后由心跳重建);**容量 policy 只活在 master**,客户端只用相对值(见 [`router.md` §2](./router.md) 与 [`openspec/changes/router-weighted-partition-alloc`](../../openspec/changes/router-weighted-partition-alloc/proposal.md))。
 - **`AssignReplicaIncarnation`(已实现)**:store **从零建副本目录**时申领副本身份。四条语义要点:① master 每次发**全新的更大号**(不是取回旧号),号由 apply 发放并已写进 placement,故 `LookupPartition` 里 `ReplicaLoc.incarnation` 看到的是同一个值;② leader-only + 准入密钥,非 leader 回 `leader_addr`(store 侧**不代转**,只记 `warn` 并保留本地兜底值 = 建库/装载时取的**本机时刻**);③ 副本不在 placement → `ok=false`,不发号也不改状态;④ **幂等空转不重领** —— 判据是"**盘上原本没有**这份副本"(而不是"内存里没有句柄"):OFFLINE 摘除后挂回、进程重启重开都不申领(否则身份每换一次,别的节点手里的复制游标就被作废一次、白跑一轮全量)。
 - **`Transition.target_state` 取值**:placement 的目标态(现阶段统一 `ACTIVE`)或 **`DROPPED`**(删源副本 —— 迁移/下线完成后让源节点删掉本地副本/目录;**proto 不新增字段**,复用既有 `target_state`)。下发 DROPPED 的**三条确认**(placement 已移除 + 继任者已 `ACTIVE`(无 move 记账时退化为"其余副本 ≥ RF 且无 ERROR")+ 源仍上报该副本)与"保守性/不拖延/幂等重发"细则见 §7.3;拿不准一律不发。
 - **维护模式语义**(`SetMaintenance`;`ClusterState.maintenance`/`pause_autogrow` 对外可见):
@@ -336,8 +337,8 @@ message MasterDirective {
 ② 建分区:       admin CreatePartitions → 分配 id(raft 单调)→ 故障域选盘置 N 副本(写 raft placement,target=BOOTSTRAP)
                  → 心跳下发 transition → 副本 BOOTSTRAP 追平 → STANDBY
 ③ 读:           client/frontend LookupPartition → 按副本 current_state 门控(§7.2)选一个 → 直连该 SN 走 HTTP 读(R=1,首个成功即返回)
-④ 写:           client/frontend ListPartitions(RW)+ 对每个分区 GetBlobIds(各一小批 objectId 号段)
-                 → 本地按分区**轮转**取号 → 向该号所属分区副本并行 HTTP 写,收 W=副本数/2+1 个 ack 即返回(§10)
+④ 写:           client/frontend ListPartitions(RW + 写权重)+ 对每个分区 GetBlobIds(各一小批 objectId 号段)
+                 → 本地按各分区**写权重**加权轮转(SWRR)取号 → 向该号所属分区副本并行 HTTP 写,收 W=副本数/2+1 个 ack 即返回(§10)
 ⑤ 节点失联:     心跳超时 → 相关副本标 ERROR → reconciler 选新盘补副本(target=BOOTSTRAP)→ 产再复制任务 → scheduler 执行
 ```
 
@@ -377,7 +378,12 @@ message MasterDirective {
 | `master.data_dir` | String | `master-data` | 非空 | redb 目录(Raft log + 状态机快照) |
 | `master.initial_members` | Vec\<u64\> | `[]` | — | 初始成员集(引导);空=由外部 `initialize` 引导 |
 | `master.cluster_secret` | String | `""` | — | 准入密钥(Q1);空=关校验(仅本地测试) |
-| `master.heartbeat_timeout_secs` | u64 | 15 | ≥1 | 超过则软状态标节点 down |
+| `master.heartbeat_timeout_secs` | u64 | 15 | ≥1 | 单窗口判活阈值:超过则软状态标该节点**过期**。**语义变更(D5)**:它不再是唯一判活判据 —— 过期还要**连续** `node_down_debounce_ticks` 拍才判死,有效窗口 ≈ 本值 + 迟滞拍数 × `reconcile_interval_secs` |
+| `master.node_down_debounce_ticks` | u64 | 3 | ≥0(**0 = 关迟滞**,保持改造前行为) | **判活迟滞(D5)**:节点判 down 需连续 K 个 reconcile tick 都观察到心跳过期(有效窗口 15 + 3×5 ≈ 30s)。为什么需要:原先单窗口判活 + store 每 3s 一拍 ⇒ 一次 GC/调度停顿、一次 `statvfs` 卡顿就能跨过阈值,**一次抖动 = 判死 = 全节点再复制**(几万个分区一起搬)。连击**单调累积**:长期 down 不会被清零,收到心跳才清零 |
+| `master.rereplication_max_per_tick` | u64 | 4 | ≥1 | **再复制每 tick 预算(D6)**:每 tick 最多新发起这么多个欠副本分区的补副本(按 `PartitionId` 确定性取前 K),其余下 tick 继续,被压下的量见 `master_rereplication_deferred`。限的是"每 tick **数量**",**不是** `balance_max_in_flight` 那种并发信号量 |
+| `master.disk_evac_enabled` | bool | **false** | — | **坏盘撤离总开关(D4)**。默认关(这是新写的**自动搬迁动作**,与该类动作的保守惯例一致,同 `auto_grow_enabled`)。关着时坏盘只被"不再接新副本"避开,**不做任何自动搬迁** |
+| `master.disk_evac_min_bad_secs` | u64 | 300 | ≥1 | **持续证据门槛**:某盘为 `UNAVAILABLE` 需**持续**这么久才允许撤离它上面的副本。为什么单轮故障枚举不够 —— 一次抖动就搬 GB 级数据,代价不对称(判坏 3 轮/30s,撤离默认 300s)。**健康值一变就重置计时**,故反复跳动的盘永远攒不满 |
+| `master.disk_evac_max_in_flight` | u64 | 1 | ≥1 | **在途撤离预算**:同时在途的撤离分区数上限。在途 = "已为它开过撤离,且坏盘上那份副本还在硬放置里"。撤离是真搬 GB 数据,风格对齐 `balance_max_in_flight = 1` |
 | `master.partition_capacity_bytes` | u64 | 100 GiB | ≥1 | 分区容量上界;选盘时盘可用容量须 ≥ 它(M2,§7.3) |
 | `master.disk_near_full_ratio` | f64 | 0.8 | (0,1] | 盘用量超此比例:① 不再放新分区/新副本(选盘跳过);② 其上 RW 分区被 reconciler 自动转 RO(**只置不回**,恢复靠运维)(本项目默认 0.8,较 Ambry ≈95% 更保守) |
 | `master.auto_grow_enabled` | bool | false | — | Q5 自动扩容开关(默认关,安全) |
@@ -444,6 +450,10 @@ message MasterDirective {
 | `master_blob_ids_failures_total` | counter | — | 次 | 发号失败数(非 leader / 无可写分区 / objectId 耗尽 / raft 提交失败) |
 | `master_id_alloc_raft_commits_total` | counter | — | 次 | 为抬水位而做的 Raft 提交次数(摊薄效果 = 发放数 / 该值 ≈ 号段 × 倍数) |
 | `master_id_alloc_holes_total` | counter | — | 个 | 换号段时未发完而被丢弃的号数(即"空洞";**无害**,仅作观测) |
+| `master_node_down_total` | counter | — | 次 | 判定节点 down 的次数(**迟滞后**才计;连击达标那一刻记一次,持续 down 不每拍重复计)。便于确认判活没被一次心跳抖动污染;`node_down_debounce_ticks = 0` 时退化为"每拍超时即计",会持续增长(D5) |
+| `master_rereplication_deferred` | gauge | — | 个 | 因每 tick 预算被推后到下轮的欠副本分区数。它让"我们正在**限速**"可见 —— 否则运维看到的现象是"系统不动了",而不是"在按预算补齐"(D6) |
+| `master_disk_evac_planned_total` | counter | `result` | 次 | 坏盘撤离计划生成(`planned`)/ 被预算挡住或无法满足(`unsatisfiable`)的次数。**持续 `unsatisfiable` = 有坏盘要搬但没地方搬(需加节点/盘)或预算太小**(D4) |
+| `master_disk_evacuating` | gauge | — | 个 | 在途撤离分区数(坏盘上那份副本还在硬放置里;受 `disk_evac_max_in_flight` 约束)。**注意它比硬放置晚一拍收敛**(本 tick 动作之前刷新)(D4) |
 
 ## 8. blobId 结构(D3 的落地)
 
@@ -516,13 +526,21 @@ store server(一个进程 / 一台数据节点)
 - [x] **N2 拉复制归属**:**内嵌 store server**(对齐 Ambry ReplicationManager,同进程贴本地副本;用 N4 每盘池限流)。
 - [x] **N3 bootstrap 拉全量方式**:**混合,全部实现(不推后,MTTR 优先)**——封存段(不可变)走**物理流式拷贝**(快;对齐 Ambry `FileCopyBasedReplication` / SeaweedFS 卷拷;disk-aware 每盘限并发,呼应 N4);活跃段尾巴走**逻辑 catch-up**(token,复用拉复制)补拷贝期间的新写。协议需含 FileCopy 类消息(§7.4)。
 - [x] **N4 本地并发模型**:**每盘一个小线程池**(池大小按盘 IO 能力定;同盘上的 BlobStore 共享;贴合 §9 DiskManager + Ambry DiskIOScheduler)。异步网络层(axum/tonic)通过该池 offload 阻塞的 store 调用,不卡 tokio reactor;并发被限制在硬件可承受范围。衔接 store D4 P4。
+  **⚠️ 已落地(store 侧,地基性变更)**:每盘自建 worker 线程 + 有界队列 + "短暂排队后 503"的准入语义;
+  配置 `store_server.data_dirs[].pool_size` / `pool_default_size` / `pool_queue_size` / `pool_acquire_timeout_ms`;
+  **引擎 IO 仍同步阻塞,未引入 async/AIO**(与 `io-index-design` D1 一致)。详见
+  [`store.md` §12.11](./store.md)(含测试证据表与残留风险清单)与 `openspec/changes/store-disk-isolation/`。
+  **⚠️ 配套已落地(store 侧 D2/D3)**:每盘**可服务性闸门**(盘被判定不可服务 ⇒ 该盘上所有 `/partitions/**`
+  请求快失败 `503 + Retry-After`,含拉复制读/`replica-metadata`/`segments`;`/metrics` 与 `/admin/**` **永不被挡**)
+  + **IO 看门狗**(闭包内 syscall 计时,不受探测开关约束)。详见 [`store.md` §12.12](./store.md)。
+  **master 侧 D4/D5/D6 仍待续**(见下面「待续」)。
 - [ ] **store 需补 `drop`**:关闭 + 删 partition-replica 目录、回收磁盘。
 
 ### 9.1 实现状态 + 配置/监控清单(CLAUDE.md §7 必须项)
 
 **S1(数据节点骨架 + 数据面)已实现**(`crates/store`,见 `openspec/changes/store-server/`):`DiskManager`(`statfs` 探真实容量,Q1)、`ReplicaManager`(按 partition 管 `BlobStore`,幂等)、`DataHttpServer`(axum `PUT`/`GET`,同步引擎经 `spawn_blocking` offload)。过集成测试(put/get 往返 + 409/404/400)+ 单测(statfs、ensure_replica 幂等)。**不接 master / 不复制 / 不含 EC(暂不解锁)**。
 
-**S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报)。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
+**S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报;**每盘至多一发在飞探测**——超时后不再叠加新探测、改收它的迟到结果,见 [store.md §12.11](./store.md))。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
 
 - 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射;**删除不可逆**,见 `openspec/changes/simplify-delete-model/`)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)+ `GET /metrics`(Prometheus 文本导出,无鉴权)+ `POST /admin/partitions/{pid}/compact`(手动触发该分区本地副本全库 compact,对齐 Ambry `TriggerCompaction`;响应 JSON `{live_bytes, dead_bytes, segments_before, segments_after}`,无本地副本 → 404)。
   - **`PUT ...?expiration_ms=<i64>`**(见 `blob-io-end-to-end`):建对象时**即带 TTL**(分片上传的孤儿回收需要"出生即带 TTL")。
@@ -556,7 +574,12 @@ store server(一个进程 / 一台数据节点)
 **S3b(封存段物理拷贝,N3 混合完成)已实现**(见 `openspec/changes/store-bootstrap-copy/`):`blob` 引擎加封存段只读拷贝原语(`sealed_segments`/`read_segment_prefix`/`LogSegment::raw_prefix`)+ `open_rebuild_index_with`;数据节点加发送端点(`GET .../segments`、`GET .../segments/{position}_{generation}`)+ 接收装载 `ReplicaManager::install_bootstrap`(段文件 `tmp→fsync→rename` 崩溃安全 + 重建打开);复制器对**空**副本首次先物理拷贝封存段(不可变),续拉游标 = 最高封存段末尾(**并绑定 peer 的 incarnation**),再逻辑补活跃尾;无 peer/无封存段回落纯逻辑。过单测(封存段枚举/拷贝重建)+ 集成测试(多封存段 + 活跃尾混合 bootstrap,真 HTTP 收敛)。
   - **清单与取段的形态**:`GET .../segments` 回 `{incarnation, segments:[{position, generation, data_end}]}`(每段带**代次**,清单连同**本副本 incarnation** 一起回来 —— bootstrap 后的初始游标据此绑定副本身份);取段是 `GET .../segments/{position}_{generation}`,路径参数就是**段身份**:认不出该段 → **404**,畸形名(位置/代次解析不出)→ **400**。
   - **与 compact 的竞态(已加固)**:分段拷贝**前后各列一次清单**,任一条成立即**丢弃整份拷贝**、回落纯逻辑拉取:① **取段 404 / 出错**(段身份已变,或网络失败);② 取回的字节**段头自述代次**与清单不符(`peek_generation` 再核一道,防"不发 404 的换段路径");③ 拷完再列清单发现对端 **incarnation 变了**(整份副本被重建)。否则"同位置、新代次"的字节会被当成清单里那一段装进去 —— 逐段取来的字节横跨两代副本,拼出的是**混合快照**(还可能带着对端已删的活记录)。丢弃重来是幂等的、必然收敛。
- - 待续:disk-aware 每盘并发限流(N4);放置据 `DiskHealth` 避让;`DROPPED` 删目录回收。**EC 仍锁定(暂不解锁)**。
+ - **已落地(2026-09-24)**:store 侧 D1 每盘有界池 / D2 健康闸门 / D3 IO 看门狗
+  (见 [store.md §12.11](./store.md)(线程模型)与 [§12.12](./store.md)(闸门 + 看门狗,含测试证据表与残留风险清单));
+  **master 侧 D4 坏盘撤离 / D5 判活迟滞 / D6 每 tick 再复制预算**(配置与监控见下面两张表/§7.7)。
+- 待续:`DROPPED` 删目录回收;admin「磁盘指标」页接入真队列深度与健康状态;
+  全部阈值的**压测标定**(默认值都是经验初值)。
+- **EC 仍锁定(暂不解锁)**。
  - **已补齐(见 `blob-io-end-to-end`)**:router SDK(router 库 + CLI)、frontend(REST 网关)、master 发号 `GetBlobIds`、
    流式 put(网络流式 + 落盘暂存 + 引擎 `put_from_reader`)、`.../metadata` 端点、`StoreFull → 507`、`PUT ?expiration_ms=`。
 
@@ -599,6 +622,20 @@ store server(一个进程 / 一台数据节点)
 | `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限(挂在数据面路由的 `DefaultBodyLimit`;**流式 PUT 另按 `Content-Length` 前置校验,超限 413 且不读 body**)。默认与 axum 的 `DefaultBodyLimit` 默认值一致(§5.1 不擅改默认),要收真正的大 blob 须显式调大 |
 | `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0 | `/admin/request-control` 请求未传 `ttl_secs` 时的默认静默时长(秒);**0 = 不设默认时长(即留空即永久禁用)**(批 1) |
 | `store_server.scrub_max_batch_bytes` | u64 | 67108864 | ≥1 | `GET /partitions/{pid}/verify` 缺省的单次扫描读取字节上限(深扫读全量数据体,限流防打爆盘;到点响应 `truncated=true`)(Wave3) |
+| `store_server.data_dirs` | Array\<String \| Table\> | (必填) | 至少一项;basename 必须唯一;空目录/每盘池 <1 拒 | 盘声明:裸目录或 `[[store_server.data_dirs]]` + `dir`/可选 `pool_size`(**地基性变更**见 store.md §12.11) |
+| `store_server.pool_default_size` | u32 | 16 | ≥1 | **每盘**默认池大小(worker 线程数):没给 `pool_size` 的盘用它。每个 worker = 1 条 OS 线程 + 1 次在飞 IO;上线前按盘类型标定 |
+| `store_server.pool_queue_size` | u32 | 32 | ≥0(0 = 不排队) | 每盘池排队容量;池满时短暂排队,超 `pool_acquire_timeout_ms` 即 **503 + `Retry-After`** |
+| `store_server.pool_acquire_timeout_ms` | u64 | 200 | ≥0(0 = 不等) | 准入等待上限(等空位,不等这次 IO);见 store.md §12.11 |
+| `store_server.staging_dir` | String | `""` | 空 = 默认;**非空不得带前后空格** | **流式 put 的暂存目录**:空 = 各数据盘的 `tmp/` 子目录(逐盘,既有默认);非空 = 本节点所有盘的暂存文件都落该目录(要把大对象中转从数据盘挪开时用)。**两条代价**:该目录成为单点(它所在的盘坏 ⇒ 全节点大对象上传一起失败,小对象走内存路径不受影响)、空间口径变为"在途大对象数 × 单对象大小"且不进任何容量上报。**别指 tmpfs**(吃内存)。目录由启动挂载创建 + 清遗留 `*.tmp`(见 store.md §12.11) |
+| `store_server.disk_watchdog_ms` | u64 | 30000 | ≥1 | **IO 看门狗**:单次引擎 IO 的**系统调用**时长软上限(闭包内测,**不含**池排队);超时 ⇒ 记一次 `IO_TIMEOUT` 坏观测,再由迟滞决定是否摘盘。必须远大于 p99.9 与 compaction 大 IO 时长;**不受 `disk_health_enabled` 约束**(探测可关,看门狗不可关)(store.md §12.12 D3) |
+| `store_server.disk_degraded_io_ms` | u64 | **0(关)** | ≥0 | **DEGRADED 阈值**(毫秒):闭包内 ≥ 本值即记一次"慢 IO"。关着时整档不生效(也零开销:连计数都不读)。开着时:该盘仍服务、master 不再放新副本、不触发撤离 |
+| `store_server.disk_degraded_ratio` | f64 | 0.1 | (0,1] | 一轮"慢 IO"占比 ≥ 本值即算该轮劣化;连续多轮(走 `disk_health_bad_rounds`/`bad_secs`)才报 `DEGRADED` |
+| `store_server.disk_watchdog_ms_by_op` | Table\<op→u64\> | 空 | key 必须是已知池上 op;值 ≥1 | **按 op 覆盖**看门狗门槛(毫秒):给 compaction/flush 这类拷整段的大 IO 单开一档,避免它们的长耗时被误判成盘超期。覆盖值可小于默认。拼错的 key 当场拒(否则门槛静默失效) |
+| `store_server.disk_watchdog_escalate_secs` | u64 | 0 | 0,或 ≥ `disk_watchdog_ms` 的秒数 | **逃生舱**:某盘池全部 worker 被超期 IO 占住且持续此秒数 ⇒ `process::abort()` 交 supervisor 重启。**默认 0 = 永不升级**:antfs 单进程多盘,自杀会带走健康盘上的服务,误杀 = 自造全节点故障(D3) |
+| `store_server.disk_health_bad_rounds` | u64 | 3 | ≥1 | 迟滞**进入**判据一:连续 N 轮坏 ⇒ 该盘 `UNAVAILABLE`(D2) |
+| `store_server.disk_health_bad_secs` | u64 | 30 | ≥1 | 迟滞**进入**判据二(与上者**取先到**):坏态持续 ≥ T 秒也置 `UNAVAILABLE`。防"探测周期调大后隔离太慢"(D2) |
+| `store_server.disk_health_good_rounds` | u64 | 3 | ≥1 | 迟滞**退出**判据一:连续 M 轮好才考虑复位(D2) |
+| `store_server.disk_health_recover_stable_secs` | u64 | 120 | ≥0(0 = 只按轮数) | 迟滞**退出**判据二:从进入连续好态起还要**稳定满 T2 秒**。复位比进入更严是刻意的(D2) |
 
 > store 引擎自身配置(段大小等)复用 `[store]` 段(见 store.md §10);`start_with` 可注入(测试/小部署)。
 
@@ -626,7 +663,7 @@ store server(一个进程 / 一台数据节点)
 | `store_server_flushes_total` | counter | 次 | 本地 worker flush 次数(S4) |
 | `store_server_compactions_total` | counter | 次 | 本地 worker 发生压缩的 replica 次数(S4) |
 | `store_server_blob_request_duration_seconds` | histogram | 秒 | **成功** blob 请求延迟,label `op`(put/get)× `size`(small/medium/large,分桶边界 50 KiB / 1 MiB);错误/早退路径不 observe(批 1) |
-| `store_server_rejected_requests_total` | counter | 次 | 被 RequestControl 静默拒掉的请求数(在进引擎之前),label `op` × `reason`(目前仅 `disabled`)(批 1) |
+| `store_server_rejected_requests_total` | counter | 次 | 被**闸门**拒掉的请求数(在进引擎之前),label `op` × `reason`(`disabled` = RequestControl 人工静默 / **`disk_unavailable` = 盘被隔离**;三者口径区别见 store.md §12.12「四」)(批 1 + D2) |
 | `store_server_replication_paused` | gauge | — | 拉复制是否被运维暂停(`/admin/replication-control`;1 = 暂停本节点主动拉,0 = 正常)(A7) |
 | `store_server_scrub_reports_total` | counter | 次 | `GET /partitions/{pid}/scrub-report` 调用次数(Wave3) |
 | `store_server_verify_runs_total` | counter | 次 | `GET /partitions/{pid}/verify` 调用次数(Wave3) |
@@ -634,6 +671,103 @@ store server(一个进程 / 一台数据节点)
 | `store_server_verify_duration_seconds` | histogram | 秒 | 单次本地校验耗时(Wave3) |
 | `store_server_compaction_jobs_total` | counter | 次 | 后台 compact 任务按状态计数,label `state`(`running` / `done` / `failed`;提交即计 `running`,终态再计一次)(A3) |
 | `store_server_replicas_dropped_total` | counter | 个 | 按 master `DROPPED` 指令删掉的本地副本数(A3 同期) |
+| `store_server_disk_requests_total` | counter | 次 | 落在该盘上的数据面请求数(`rate()` = 该盘 IOPS;含随后被拒的请求,见 store.md §12.11),label `disk_id` × `op`(盘 hang 隔离批) |
+| `store_server_disk_bytes_total` | counter | 字节 | 该盘上**成功**请求的字节数(`rate()` = 该盘带宽),label `disk_id` × `op`(同上) |
+| `store_server_disk_request_duration_seconds` | histogram | 秒 | 该盘上请求的**端到端**延迟(含阻塞池排队),label `disk_id` × `op`(同上) |
+| `store_server_disk_in_flight_requests` | gauge | 个 | 该盘在途请求数;UI 上作为**排队深度代偿**(真队列深度随每盘池落地),label `disk_id` × `op`(同上) |
+| `store_server_disk_slow_requests_total` | counter | 次 | 端到端超过 `disk_health_timeout_secs` 的请求数(**超时计数**),label `disk_id` × `op`(同上) |
+| `store_server_disk_probe_stuck` | gauge | 0/1 | 该盘是否有一发探测卡在盘里未归(`disk_health_enabled` 关闭时恒 0),label `disk_id`(同上) |
+| `store_server_disk_probe_skipped_total` | counter | 轮 | 因上一发探测未归而跳过的探测轮次数(× 周期 ≈ 卡住时长),label `disk_id`(同上) |
+| `store_server_disk_pool_workers` | gauge | 个 | 每盘池的 worker 线程数(启动时定死),label `disk_id`(**地基性变更**见 store.md §12.11) |
+| `store_server_disk_pool_in_flight` | gauge | 个 | 每盘池**已准入未完成**的任务数(含排队中),label `disk_id`(同上) |
+| `store_server_disk_pool_queued` | gauge | 个 | 每盘池**已准入但未被 worker 取走**的任务数 = **真队列深度**(与在飞代偿口径不同),label `disk_id`(同上) |
+| `store_server_disk_pool_rejected_total` | counter | 次 | 每盘池拒绝的提交数,label `disk_id` × `op` × `reason`(`saturated` 池满超时 / `job_panicked` 任务 panic / `unknown_disk` / `closed`);**持续非零 = 该盘供不上,该调池或查盘**(同上) |
+| `store_server_disk_io_duration_seconds` | histogram | 秒 | **闭包内**测得的单次 IO 时长(syscall,**不含**池排队)—— "这盘自己快不快"的唯一正确口径(与 `disk_request_duration_seconds` 的端到端口径**刻意区分**)。桶铺到 120s(看门狗 deadline 就是要看的长尾),label `disk_id` × `op`(store.md §12.12 D3) |
+| `store_server_disk_io_watchdog_trips_total` | counter | 次 | 看门狗判定超期的次数(一次超期 = **一次坏观测**,是否摘盘由迟滞决定),label `disk_id`(同上) |
+| `store_server_disk_health_state` | gauge | 0/1 | 该盘当前**上报状态**,label `disk_id` × `state`(`HEALTHY`/**`DEGRADED`**/`UNAVAILABLE`/`UNKNOWN`/`MOUNT_NOT_ACCESSIBLE`/`WRITE_TIMEOUT`/`WRITE_ERROR`/`READ_TIMEOUT`/`READ_ERROR`/`READ_MISMATCH`/`DELETE_ERROR`/`IO_TIMEOUT`)。**整族每次摆平**(当前值 1、其余 0);`UNKNOWN` = 从未观测(默认关探测的部署里每块盘都是它)(同上 D2) |
+| `store_server_disk_health_transitions_total` | counter | 次 | 可服务性**迁移**次数,label `disk_id` × `from` × `to`;**只有"可服务性变了"才计**(原始判定变化不算);频繁迁移 = 阈值定得太紧(同上) |
+| `store_server_disk_worker_skipped_total` | counter | 次 | 因盘不可服务而被跳过的后台工作,label `disk_id` × `task`(`flush`/`compaction`/`replication`)—— 让"坏盘被跳过"**可见**(同上) |
+
+### 9.2 部署前提:设备级 fail-fast(D7,**不是代码,是上线检查项**)
+
+> **为什么单列一节**:上面 D2/D3 的进入判据来自"探测失败"与"IO 超期",而 D1/D3 的最终逃生舱是进程自杀。
+> **如果设备层永远 hang**,那么:引擎自关(`io_error_count_to_trigger_shutdown`)**永远等不到错误**
+> (被动链路全哑);看门狗**拿不到 errno**,只能超时隔离(而隔离的代价是该盘请求全部 503、线程**仍然泄漏**);
+> 整条阶梯就退化成"把盘摘掉但永远补不回来 + 线程继续漏"。**内核不给超时,用户态做什么都是在猜。**
+
+| 层 | 配置 | 要点 |
+|---|---|---|
+| SCSI | `/sys/class/scsi_device/*/device/timeout` | 设 30s,让 IO 以 **EIO** 返回而非永久 D 状态(默认值随内核/发行版浮动,须显式落盘) |
+| NVMe | `nvme_core.io_timeout = 30`、`nvme_core.max_retries = 5` | 同上;重试次数决定"多久才放弃" |
+| dm-multipath | `no_path_retry = N` | **绝不用 `queue_if_no_path`** —— 那正是"无界排队 = 永久 hang"的教科书例子,与"池满快失败"的设计精神正好相反 |
+| NFS(若把 `data_dir` 放网络盘) | `timeo=` / `retrans=` / 必要时 `soft` | 网络盘的 hang 语义与本地盘不同,必须显式设超时 |
+| antfs 引擎 | `[store] io_error_count_to_trigger_shutdown = 3..10` | **建议部署显式打开**(默认 0 = 关,§5.1 不擅改默认)。打开后"设备层 EIO → 连续错误 → 引擎自关 → hook → replica `ERROR` → 心跳上报 → master 再复制"这条**已有**闭环才真正工作 |
+| 进程守护 | `systemd Restart=always` / `docker-compose restart: always` | D3 的逃生舱(`disk_watchdog_escalate_secs`,**默认关**)一旦开启,靠它把自杀的进程拉回来 |
+
+代码侧只做一件便宜的事:启动时若 `disk_health_enabled == false`,记一条 `tracing::warn!` 提示
+"探测关着 ⇒ `UNAVAILABLE` 只剩看门狗一个来源,建议开启引擎自关";**不改任何默认值**(CLAUDE.md §5.1)。
+
+### 9.3 慢盘:客户端侧的延迟感知读路由(**已落地**)
+
+> **一句话**:读恒为 R=1(第一个成功即返回),故"先试哪个副本"直接决定读延迟 —— 于是让 router
+> **先试快的那个**。这是慢盘处置里**收益/代价比最高**的一条,也是唯一不需要改服务端的一条。
+
+- **做什么**:router 记录每个副本最近若干次请求的耗时(指数移动平均,`alpha = 0.2` **写死不做配置**),
+  读路径(`get` / `get_file` / `stat`)的副本顺序变为 **`up` 优先 → 观测延迟升序 → master 原序**。
+- **为什么敢默认开着**:它**只改试副本的顺序,不改候选集** —— 读的候选、写的 W 多数派语义、
+  冲突解决全都不变,**不可能引入新的正确性问题**;而没有测量数据时它退化为 **恒等变换**
+  (全都没测 ⇒ 所有键相等 ⇒ 保持 master 顺序,即与关掉时完全一致)。
+- **未测副本的先验**:按**已测副本的均值**参与排序 —— 既不奖励也不惩罚刚出现的副本。
+- **`up = false` 的副本永远排最后**,哪怕它历史最快(master 已经说它不健康,先撞它只会白等一次超时)。
+- **关掉它**(`router.latency_aware_routing = false`)的场景:排查"为什么读打到了某个副本"、
+  或对照压测时想要确定性顺序。
+- **诚实边界**:顺序变化会改变"你**先**看到哪个副本的状态"。对象不可变 + 删除是墓碑 ⇒ 滞后副本可能
+  暂时读不到(→ 404 → 试下一个)或暂时看到已删对象仍活着 —— **这个风险在任意顺序下都存在**,
+  本节只改变"先撞上哪一个",不引入新的语义类别。
+- **代码**:`crates/common/router/src/lib.rs`(`LatencyTable` / `order_by_latency`),单测 6 条
+  (快者优先、无数据恒等、关闭恒等、down 永远最后、未测用均值先验、EWMA 平滑与量级)。
+
+### 9.4 阈值标定手册(**待执行**)
+
+> # ⚠️ 本节的默认值全部是**经验初值**,尚未标定
+>
+> 盘故障处置这条链上一共有 **12 个**数字(见下表),它们都取自
+> `openspec/changes/store-disk-isolation/design.md` 的【提案】值 —— 实现时**没有**"顺手定一个",
+> 但也**没有**经过压测。CLAUDE.md §5.1 要求"不擅自改默认值",同样要求**别把经验值当成标定过的值**:
+> 下面给出每项的**测量步骤与判据**,标定完成后再回写代码 `impl Default` **和**两张配置表。
+>
+> **防静默变更的闸门已经就位**:每个数字都有单测钉着,改默认值必须显式改测试 ——
+> store 侧 `config::tests::{pool_defaults_match_documented_values, disk_health_defaults_match_documented_proposal}`;
+> master 侧 `config::tests::disk_fault_defaults_are_pinned_pending_calibration`。
+>
+> **本节只写方法与判据,不写数字。** 数字必须来自真实机器上的真实负载 —— 从别处抄一组数字填进来,
+> 比留着"未标定"更危险。
+
+**共同前提**:所有测量都用**闭包内**口径的 `store_server_disk_io_duration_seconds`(syscall 时长,
+**不含**池排队)与 `store_server_disk_pool_*`(池水位)。**绝不要**用端到端的
+`store_server_disk_request_duration_seconds` 去定任何隔离阈值 —— 它含排队,会把"池忙"读成"盘慢"
+(这是整个设计里最容易走偏的一处,见 [`store.md` §12.12](./store.md) 五)。
+
+| # | 旋钮 | 要测什么 | 判据(怎么改) |
+|---|---|---|---|
+| 1 | `store.disk_watchdog_ms` | **健康盘的 p99.9**(闭包内):`histogram_quantile(0.999, sum by (le,disk_id) (rate(store_server_disk_io_duration_seconds_bucket[1h])))` | 取**全集群健康盘 p99.9 的最大值 × 5~10**;同时必须 **远大于**一次全库 compaction 的单次大 IO 时长(见 #2)。**偏小 = 把健康盘判死**;偏大 = 坏死盘迟迟不被隔离 |
+| 2 | `store.disk_watchdog_ms_by_op` | 跑**一次全库 compaction / flush**,看 `store_server_disk_io_duration_seconds{op=~"compaction\|flush"}` 的**最大值** | 给这几个 op 单开一档,取"实测最大值 × 3~5"。**已实现**(按 op 分档);不配就是全部用 `disk_watchdog_ms`,那时大 IO 的长耗时会误报 —— 大段/慢盘的部署**必须**配 |
+| 3 | `store.disk_health_bad_rounds` / `bad_secs` | 隔离延迟目标 vs 探测周期:最坏 ≈ `min(bad_rounds × interval, bad_secs + interval)` | 先定"一块真死的盘多久必须被隔离"(建议 ≤60s),再反解两个数;**两者取先到**,所以两个都要满足 |
+| 4 | `store.disk_health_good_rounds` / `recover_stable_secs` | 复位后盘是否再次被压垮:看 `store_server_disk_health_transitions_total{to="HEALTHY"}` 之后 `to="UNAVAILABLE"` 的**频繁往返** | **迁移频繁 = 阈值太松**;目标是"复位后不再回头"。宁可调长 `recover_stable_secs` |
+| 4b | `store.disk_degraded_io_ms` / `disk_degraded_ratio` | 健康盘 p99 与 p99.9 的**比值**,以及"慢 IO 占比"的分布:`histogram_quantile(0.99, ...)` 对比 `histogram_quantile(0.999, ...)` | 阈值取 **p99 的 2~3 倍**(远高于绝大多数 IO、又低于真出问题的量级);占比从 0.1 起试。**先只开观测**(把该盘报成 `DEGRADED` 只影响"不再放新副本",几乎零代价)跑一周期,看**误报率**:若健康盘频繁进出 `DEGRADED`,调大阈值或调小占比 |
+| 5 | `store.pool_default_size`(每盘可覆盖) | 稳态下 `store_server_disk_pool_queued` 与 `store_server_disk_io_duration_seconds` 的分位 | **持续排队(queued 长期 > 0)= 池不够**;同时看该盘 RT 分位**有没有随池变大而恶化**(恶化说明盘已饱和,加池无用,该加盘) |
+| 6 | `store.pool_queue_size` / `pool_acquire_timeout_ms` | `store_server_disk_pool_rejected_total{reason="saturated"}` 的速率 vs 上游 `Retry-After` 后的成功重试率 | 拒绝**偶发**且重试立刻成功 = 排队位/等待时长合适;拒绝**持续** = 要么加池(#5)、要么这块盘真不行 |
+| 7 | `store.disk_watchdog_escalate_secs` | 有没有出现"某盘池 100% 被超期 IO 占住且**永不恢复**":`store_server_disk_pool_in_flight == workers` 且 `io_watchdog_trips_total` 持续增长 | **默认 0 先跑一个完整周期**。确认过"真出现过永不恢复"再开,且取值 ≥ 600:单进程多盘,误杀一次 = 自造一次全节点故障 |
+| 8 | `master.node_down_debounce_ticks` | `master_node_down_total` 的增长模式,叠加"判死之后实际搬了多少数据" | 目标是**只对真死计一次**。若运维看到"节点抖一下就判死",加拍数;若真死要 1 分钟才发现,减拍数 |
+| 9 | `master.rereplication_max_per_tick` | `master_rereplication_deferred`(被压下的量)+ 再复制期间集群的**网络/盘写**水位 | `deferred` 长期 > 0 = 限速在起作用(正常);**若它持续不降**= 预算太小,欠副本永远追不上;若再复制把带宽打满 = 预算太大 |
+| 10 | `master.disk_evac_min_bad_secs` | 一次真故障的 `UNAVAILABLE` 持续时长 vs 一次抖动的持续时长 | 门槛要落在两者**之间**:明显大于抖动、明显小于真故障的平均修复时间。**先只开观测**(`disk_evac_enabled = false`)看一周期这两个分布,再决定 |
+| 11 | `master.disk_evac_max_in_flight` | 撤离期间集群的写入延迟与 `master_disk_evacuating` | 撤离是真搬 GB 数据:从 1 起,只有当"写入延迟没被抬起来"时才往上加 |
+| 12 | `store.disk_health_interval_secs` / `timeout_secs` | 探测是**逐盘串行**的:`盘数 × timeout` 必须 < `interval`,否则轮次追尾(Burst) | 大节点(几十块盘)必须显式调 `interval`,或用 `磁盘指标` 页的 `probe_skipped_total` 看有没有追尾迹象 |
+
+**标定完成后的收口动作(三步,缺一不可)**:
+1. 改代码 `impl Default`(store: `crates/store/src/config.rs`;master: `crates/master/src/config.rs`);
+2. 改**两张文档表**([`store.md` §12.12](./store.md) 八 与本节所属的 §9 / §7.7),并把"经验初值"的标注去掉、写上标定日期与机器/负载描述;
+3. 改**钉住默认值的单测**(见本节开头的清单),否则下一个人会以为默认值还是经验值。
 
 ## 10. 数据面读写 + quorum(D4 展开)
 
@@ -726,8 +860,16 @@ client/frontend: 解析 partitionId → LookupPartition(master,可缓存;副本�
 - **`POST|GET /api/stores/{node_id}/request-control`**(POST 为 operator):把 `{op, partition_id?, enable, ttl_secs?}` 原样转发到该 store 的 `/admin/request-control`(`node_id → addr` 从 master 节点清单取,无此节点 → 404)。store 的**状态码与 body 原样透出**(未知 op → 400、本地无该副本 → 404),只有超时/连接失败 → 502 + 原因文本。store 侧语义与豁免清单见 §9.1。
 - **均衡(计划式)四条路由**:`GET /api/balance`(viewer 可读)= 当前计划 + master 派生的进度(`{present, plan:{plan_id, status, created_at_ms, max_in_flight, total, pending, in_flight, done, failed, moves:[{partition_id, from_node_id, from_disk_id, to_node_id, to_disk_id, status, error}]}}`;`present=false` 时 `plan` 为 null);`POST /api/balance/eval`(operator,body `{max_moves?}`,省略 = master 配置默认)→ `{ok, error, plan}`(评估并落 PREVIEW 计划);`POST /api/balance/start`(operator,body `{plan_id}`)→ `{ok, error}`(确认执行,plan_id 防陈旧确认);`POST /api/balance/cancel`(operator,body `{plan_id}`)→ `{ok, error}`(清计划,**不回滚**已 apply 的搬迁)。master 侧 `ok=false`(如 plan_id 不匹配)仍回 **200 + `{ok:false, error}`**,错误文本交前端展示;viewer 调写接口 → 403。UI 见「均衡」tab(计划状态卡 + 进度条 + 迁移明细表 + 评估/执行/取消)。
 - **一致性巡检(Wave3)两条路由**:`POST /api/partitions/{id}/scrub`(operator,query `deep=1` 才做深扫):逐副本并发取**只读素材**——`GET scrub-report`(摘要)+ `GET replica-metadata?max_bytes=16MiB`(最近窗口,按 key 求最终态;窗口被截断 → 该副本 `partial=true`),`deep=1` 时再加 `GET verify`;admin 侧做**逻辑态比对**(摘要逐字段 + key 存在性/生命版本/标志位,见 `crates/admin/src/scrub.rs`)→ 200 `{partition_id, checked_at_ms, deep, replicas:[{node_id, ok, error, report:{...}|null, key_count, partial, verify:{records,bad_records,index_mismatch,truncated}|null}], verdict:{consistent, inconclusive, partial, divergences:[{kind:"summary",field,detail} | {kind:"verify",node_id,detail} | {kind:"key",key_hex,nodes:[{node_id,state}]}]}, error}`。分区不存在 → 404。**素材取不全不致命**:某副本 `replica-metadata` 读不出来(典型:该副本 log 有坏记录)时,该副本不参与 key 级比对并标 `partial`(避免把"未知"报成"缺失"),`deep` 的 `verify` 仍照常执行并报出坏记录位置。`GET /api/scrub`(viewer 可读)= 最近 32 轮巡检的紧凑摘要(内存环形,重启即空)。指标 `admin_scrub_runs_total` / `admin_scrub_divergences_total`。UI:分区页行内「一致性」面板(结论徽标 + 逐副本摘要 + 差异明细 + 深度校验开关)、运维页「最近一致性巡检」列表。
-- **`/api/metrics`** master 段增 `maintenance` / `writable_used_bytes` / `writable_free_bytes` / `disk_skew`;stores 段增 `blob_put_small_count`/`blob_put_medium_count`/`blob_put_large_count`/`blob_get_*_count`(取自 `store_server_blob_request_duration_seconds_count{op,size}`,**按标签精确取**——同名下有 6 组 sample,按名求和会把这 6 组混成一锅)。
+- **`/api/metrics`** master 段增 `maintenance` / `writable_used_bytes` / `writable_free_bytes` / `disk_skew`;stores 段增 `blob_put_small_count`/`blob_put_medium_count`/`blob_put_large_count`/`blob_get_*_count`(取自 `store_server_blob_request_duration_seconds_count{op,size}`,**按标签精确取**——同名下有 6 组 sample,按名求和会把这 6 组混成一锅);stores 段另增 **`disks` 逐盘明细**(盘维度打点见 [store.md §12.11](./store.md)):`[{disk_id, requests_total, bytes_total, slow_requests_total, in_flight, rt_sum_seconds, rt_count, probe_stuck, probe_skipped_total}]` —— 盘列表**从样本里的 `disk_id` label 枚举**(不假设盘号/盘数,按 `disk_id` 升序),数值**跨 `op` 求和**,`probe_stuck` 取"任一为 1 则 1",`rt_sum_seconds`/`rt_count` 是直方图 `_sum`/`_count`(平均 RT 由 UI 算,**不做分位点**:`parse.rs` 刻意极简、不聚合 `le` 桶);抓取失败 → `disks: []`,失败与成功两条分支共用同一处构造(空样本入参),键集不会漂移。
 - **UI**:概览页改分层仪表盘(健康横幅 + 4 张大卡 + 「容量趋势 / 集群概况」两列 + 「磁盘水位榜 / 可写分区速览」两列);新增 tab**「容量」**(viewer 可见:集群水位、可写集合四卡、增速读数与增速折线、可写分区列表含前端窗口差分的 1 分钟增量);运维页**「维护模式」**面板(开启需二次确认、可勾选连带暂停自动扩容);节点页行内**「限流」**面板(op × 有效期 + 当前禁用集);指标页增**按 blob 大小分桶的 put/get 速率**两张图。跨 tab 筛选走 hash query(`#partitions?state=RW`、`#nodes?q=101`),刷新/分享链接后仍生效。
+- **UI(磁盘指标页)**:新增 tab **「磁盘指标」**(viewer 可见,hash `#hostdisks`)——按 **store 节点(=主机)** 分组,每主机一段:主机级汇总(Σ IOPS / Σ 带宽 / 平均 RT = Σrt_sum/Σrt_count / Σ 超时速率 / Σ 在飞 / 容量水位 + 最差盘健康徽标)+ **逐盘表**(盘 / 健康 / 容量 / IOPS / RT(平均 ms) / 带宽 / 超时速率 / 在飞 / 探测卡住)。数据 = `/api/metrics` 的单例窗口(5s)∪ `/api/nodes`,按 `(node_id, disk_id)` **两侧并集**(只有容量或只有指标的盘都留行,缺的一侧显示「—」,不静默丢行);IOPS/带宽/超时速率走 `trend.ts` 的窗口差分(抓取失败按**断线**处理,不把"抓不到"差分成假速率),RT/在飞取瞬时值。**「在飞」列刻意标注为排队深度代偿**:真队列深度需要 `RUSTFLAGS="--cfg tokio_unstable"`,刻意不加,随 `openspec/changes/store-disk-isolation/` 的每盘有界池落地;页首写明口径是**请求级**、引擎内部 IO(flush / compaction / 入向复制)尚未归盘。
+> **⚠️ 已更新(2026-09-24)**:本页现在展示**真队列深度**(`disk_pool_queued / disk_pool_workers`)、
+> 池在飞与池拒绝、**盘健康状态**(`disk_health_state`)、看门狗超期次数、后台跳过数,以及**两把 RT 尺子**
+> (端到端 / syscall 闭包内)并排。原先那句"'在飞'列刻意标注为排队深度代偿"已不适用 —— 代偿换成了真值。
+> **延迟分位点也已补上**:两列 RT 现在都显示 **平均 / p99**(另有 p50,放在单元格 hover 提示里,不占列宽),
+> 由该盘 `le` 桶**逐盘跨 op 聚合**后按 Prometheus `histogram_quantile` 口径**线性插值**;
+> 最高桶是 `+Inf`,秩落在里面时**只能给下界**(= 最高有限桶,读作"≥ X"),**不声称超出最高桶的精度**;
+> 没有桶样本显示「—」而不是 `0.00 ms`。见 [store.md §12.12 残留风险 7](./store.md)。
 - **UI(指标页采集与展现)**:`/api/metrics` 的轮询收敛到**进程内单例**(`crates/admin/ui/src/metricsStore.ts`)——概览/容量/指标三个 tab 共享同一份滚动窗口(此前各自轮询、切 tab 要从零攒样本),首个订阅者启动、无人订阅时停;窗口在 `sessionStorage` 留种子(只接受 5 分钟内的样本),刷新页面**瞬时出图**;挂载后 1s 补采一次,速率类曲线秒级有斜率。指标页新增采集状态条(最后更新时刻 / 样本数 / 各 store 抓取状态徽标 / 手动刷新)、图表按「请求与延迟 / 存储引擎 / 集群容量与健康」分组;`/api/metrics` 的 `master_ok:false` 时显示"master 不可达"横幅、master 类 KPI 显示 "—"、master 类曲线按**断线**(null)而非占位 0 绘制;样本超过 3× 采样间隔未更新时打 "stale" 标记(种子里的旧值不当作"当前值"喂 KPI)。uPlot 侧:`scales.x.range` 给最小 1 分钟窗口(首屏 1~2 个样本时不再切到难读的亚秒刻度、单点也不会撑出无意义跨度),y 轴 `size: 96`(自定义 `values` 后 uPlot 不再自动预留标签宽度,否则长标签被裁)。
 
 ### 11.1 配置项清单(`AdminConfig`,TOML `[admin]` 表下;加载用 `Loader::load_table("admin")`,**同时兼容顶层 flat key**)
