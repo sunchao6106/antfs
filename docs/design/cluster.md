@@ -623,6 +623,9 @@ store server(一个进程 / 一台数据节点)
 | `store_server.compaction_dead_ratio` | f64 | 0.3 | (0,1] | **可回收**字节占比 ≥ 此值才压缩(partition 级闸门与段级选择同一阈值);可回收 = 被取代的旧记录 + TTL 过期对象 + 墓碑过保留期(S4) |
 | `store_server.compaction_include_rw` | bool | true | — | 是否把 **RW 分区**也纳入候选集(仅压其封存段);`SEALED` 永不入选,`false` = 只压 RO(S4) |
 | `store_server.compaction_tombstone_retention_secs` | u64 | 86400 | ≥0 | **墓碑保留期**:`delete` 后满此时长才允许回收(`0` = 立即允许);应大于副本可能滞后的上界,防副本修复复活已删对象(S4) |
+| `store_server.compaction_policy` | String | `"hybrid"` | incremental/cost-benefit/hybrid | **compaction 调度策略**:incremental=按段死占比增量 / cost-benefit=最优连续段区间 / hybrid=日常 cost-benefit + 每 `compaction_policy_switch_days` 天穿插一次 CompactAll(对齐 Ambry `HybridCompactionPolicy`)(S4 策略) |
+| `store_server.compaction_policy_switch_days` | u32 | 6 | 1–365 | Hybrid 模式下两次 CompactAll 之间的**最少间隔天数**(对齐 Ambry `store.compaction.policy.switch.timestamp.days`)(S4 策略) |
+| `store_server.compaction_min_log_segment_count_to_reclaim` | usize | 1 | ≥1 | cost-benefit 选出的区间**净减段数** < 此值时不动手(对齐 Ambry `store.min.log.segment.count.to.reclaim.to.trigger.compaction`)(S4 策略) |
 | `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限(挂在数据面路由的 `DefaultBodyLimit`;**流式 PUT 另按 `Content-Length` 前置校验,超限 413 且不读 body**)。默认与 axum 的 `DefaultBodyLimit` 默认值一致(§5.1 不擅改默认),要收真正的大 blob 须显式调大 |
 | `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0 | `/admin/request-control` 请求未传 `ttl_secs` 时的默认静默时长(秒);**0 = 不设默认时长(即留空即永久禁用)**(批 1) |
 | `store_server.scrub_max_batch_bytes` | u64 | 67108864 | ≥1 | `GET /partitions/{pid}/verify` 缺省的单次扫描读取字节上限(深扫读全量数据体,限流防打爆盘;到点响应 `truncated=true`)(Wave3) |
@@ -666,6 +669,7 @@ store server(一个进程 / 一台数据节点)
 | `store_server_bootstrap_bytes_total` | counter | 字节 | bootstrap 物理拷贝字节数(S3b) |
 | `store_server_flushes_total` | counter | 次 | 本地 worker flush 次数(S4) |
 | `store_server_compactions_total` | counter | 次 | 本地 worker 发生压缩的 replica 次数(S4) |
+| `store_server_compaction_policy_used_total` | counter | 次 | 按**实际使用的调度策略**计数的 compaction 执行次数,label `policy`(`incremental` / `cost_benefit` / `compact_all`);混合策略默认下用于观测策略分布(S4 策略) |
 | `store_server_blob_request_duration_seconds` | histogram | 秒 | **成功** blob 请求延迟,label `op`(put/get)× `size`(small/medium/large,分桶边界 50 KiB / 1 MiB);错误/早退路径不 observe(批 1) |
 | `store_server_rejected_requests_total` | counter | 次 | 被**闸门**拒掉的请求数(在进引擎之前),label `op` × `reason`(`disabled` = RequestControl 人工静默 / **`disk_unavailable` = 盘被隔离**;三者口径区别见 store.md §12.12「四」)(批 1 + D2) |
 | `store_server_replication_paused` | gauge | — | 拉复制是否被运维暂停(`/admin/replication-control`;1 = 暂停本节点主动拉,0 = 正常)(A7) |

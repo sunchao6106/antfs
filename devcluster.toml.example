@@ -41,6 +41,12 @@ disk_near_full_ratio = 0.8
 # 开启 store 主动盘探测(心跳带 HEALTHY/... 健康值;默认关,只靠 IO 看门狗判不可用)。
 disk_health = false
 
+# store 数据节点的 compaction 调度策略(属于 [store_server] 表;devcluster 用内置默认 Hybrid,
+# 此处仅注释备查,取消注释对 devcluster.toml 无效 —— 要改请直接用 antfs-store 的 store.toml)。
+# compaction_policy = "hybrid"       # incremental / cost-benefit / hybrid
+# compaction_policy_switch_days = 6  # hybrid: min days between CompactAll rounds
+# compaction_min_log_segment_count_to_reclaim = 1  # cost-benefit: min segments to net-reclaim
+
 # 起完集群(等就绪)后在同一进程内跑一轮压测并退出;不写就常驻等 Ctrl-C。
 # run_bench = "router"        # router | frontend
 # bench_ops = 20000

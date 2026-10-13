@@ -6,6 +6,20 @@
 use antfs_config::{at_least, Result, Validate};
 use serde::Deserialize;
 
+/// Compaction 调度策略(对齐 Ambry `CompactionPolicy` 体系)。
+///
+/// - `Incremental`:按段死占比选段增量压缩(改造前的默认行为);
+/// - `CostBenefit`:按 cost/benefit 比选最优连续段区间(对齐 Ambry `StatsBasedCompactionPolicy`);
+/// - `Hybrid`(默认):日常走 `CostBenefit`,每隔 `compaction_policy_switch_days` 穿插一次
+///   CompactAll 全库重写(对齐 Ambry `HybridCompactionPolicy`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactionPolicyKind {
+    Incremental,
+    CostBenefit,
+    Hybrid,
+}
+
 /// 一块盘的**声明**:目录 + 该盘自己的参数。
 ///
 /// 两种写法都吃(TOML):
@@ -129,6 +143,14 @@ pub struct StoreServerConfig {
     ///
     /// 保留期是防「副本修复把已删对象复活」的窗口,应大于副本可能滞后的上界;默认 24h。
     pub compaction_tombstone_retention_secs: u64,
+    /// Compaction 调度策略;默认 `Hybrid`(对齐 Ambry `HybridCompactionPolicy`)。
+    pub compaction_policy: CompactionPolicyKind,
+    /// Hybrid 模式下两次 CompactAll 之间的最少天数;默认 6(对齐 Ambry
+    /// `store.compaction.policy.switch.timestamp.days`)。
+    pub compaction_policy_switch_days: u32,
+    /// cost-benefit 策略的最小回收段数阈值:选出的区间净减段数 < 此值时不动手;默认 1(对齐 Ambry
+    /// `store.min.log.segment.count.to.reclaim.to.trigger.compaction`)。
+    pub compaction_min_log_segment_count_to_reclaim: usize,
     /// 数据面单请求 body 上限(字节),经 axum `DefaultBodyLimit` 生效。
     /// **默认 2 MiB = axum `DefaultBodyLimit` 的默认值**(CLAUDE.md §5.1 不擅自改默认):要观测/接收
     /// 真正的大 blob 需显式调大;调小则超限请求在 extractor 前即被 413 拒掉。
@@ -256,6 +278,9 @@ impl Default for StoreServerConfig {
             compaction_dead_ratio: 0.3,
             compaction_include_rw: true,
             compaction_tombstone_retention_secs: 86400,
+            compaction_policy: CompactionPolicyKind::Hybrid,
+            compaction_policy_switch_days: 6,
+            compaction_min_log_segment_count_to_reclaim: 1,
             // axum `DefaultBodyLimit` 的默认值(2 MiB);不擅自改默认,调大才收得下真正的大 blob。
             max_body_bytes: 2 * 1024 * 1024,
             request_control_default_ttl_secs: 1800,
@@ -502,6 +527,17 @@ impl Validate for StoreServerConfig {
                 format!("must be local time \"HH:MM\": {why}"),
             )
         })?;
+        if self.compaction_policy_switch_days < 1 || self.compaction_policy_switch_days > 365 {
+            return Err(antfs_config::ConfigError::invalid(
+                "store_server.compaction_policy_switch_days",
+                "must be in 1..=365",
+            ));
+        }
+        at_least(
+            "store_server.compaction_min_log_segment_count_to_reclaim",
+            self.compaction_min_log_segment_count_to_reclaim as u64,
+            1,
+        )?;
         Ok(())
     }
 }
@@ -948,5 +984,63 @@ mod tests {
             "墓碑保留 24h"
         );
         assert_eq!(parse_hhmm(&c.compaction_start_time).unwrap(), 3600);
+    }
+
+    #[test]
+    fn compaction_policy_defaults_and_validation() {
+        let base = || StoreServerConfig {
+            data_dirs: vec![DataDir::Plain("/data/a".to_string())],
+            ..Default::default()
+        };
+        let c = base();
+        assert_eq!(c.compaction_policy, CompactionPolicyKind::Hybrid);
+        assert_eq!(c.compaction_policy_switch_days, 6);
+        assert_eq!(c.compaction_min_log_segment_count_to_reclaim, 1);
+        assert!(c.validate().is_ok());
+
+        let bad = StoreServerConfig {
+            compaction_policy_switch_days: 0,
+            ..base()
+        };
+        assert!(bad.validate().is_err(), "switch_days=0 must be rejected");
+        let bad = StoreServerConfig {
+            compaction_policy_switch_days: 366,
+            ..base()
+        };
+        assert!(bad.validate().is_err(), "switch_days=366 must be rejected");
+        let ok = StoreServerConfig {
+            compaction_policy_switch_days: 1,
+            ..base()
+        };
+        assert!(ok.validate().is_ok());
+        let ok = StoreServerConfig {
+            compaction_policy_switch_days: 365,
+            ..base()
+        };
+        assert!(ok.validate().is_ok());
+
+        let bad = StoreServerConfig {
+            compaction_min_log_segment_count_to_reclaim: 0,
+            ..base()
+        };
+        assert!(bad.validate().is_err(), "min_reclaim=0 must be rejected");
+    }
+
+    #[test]
+    fn compaction_policy_kind_deserializes_kebab_case() {
+        #[derive(Deserialize)]
+        struct W {
+            p: CompactionPolicyKind,
+        }
+        let w = serde_json::from_str::<W>(r#"{"p":"incremental"}"#).unwrap();
+        assert_eq!(w.p, CompactionPolicyKind::Incremental);
+        let w = serde_json::from_str::<W>(r#"{"p":"cost-benefit"}"#).unwrap();
+        assert_eq!(w.p, CompactionPolicyKind::CostBenefit);
+        let w = serde_json::from_str::<W>(r#"{"p":"hybrid"}"#).unwrap();
+        assert_eq!(w.p, CompactionPolicyKind::Hybrid);
+        assert!(
+            serde_json::from_str::<W>(r#"{"p":"magic"}"#).is_err(),
+            "unknown policy must be rejected"
+        );
     }
 }

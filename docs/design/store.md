@@ -423,6 +423,9 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.compaction.io_per_mb_write_latency_threshold_ms` | u32 | 20 | ≥0 | 归一化写延迟阈值 | `store.compaction.io.per.mb.write.latency.threshold.ms` |
 | `store.compaction.min_buffer_size_bytes` | u64 | 10485760 | ≥0 | copy 阶段最小缓冲 | `store.compaction.min.buffer.size` |
 | `store.compaction.purge_delete_tombstone` | bool | false | — | 清除过期删除墓碑 | `store.compaction.purge.delete.tombstone` |
+| `store_server.compaction_policy` | String | `"hybrid"` | incremental/cost-benefit/hybrid | 调度策略(incremental=按段死占比增量/cost-benefit=最优区间/hybrid=日常 cost-benefit + 周期 CompactAll) | `store.compaction.policy.factory` |
+| `store_server.compaction_policy_switch_days` | u32 | 6 | 1–365 | Hybrid 模式下两次 CompactAll 最少间隔天数 | `store.compaction.policy.switch.timestamp.days` |
+| `store_server.compaction_min_log_segment_count_to_reclaim` | usize | 1 | ≥1 | cost-benefit 选出的区间净减段数 < 此值时不动手 | `store.min.log.segment.count.to.reclaim.to.trigger.compaction` |
 
 > Ambry 的 `store.compaction.enable.direct.io` / `direct.io.buffer.size` / `throttler.check.interval.ms` / `filter` 与本项目路线乙(buffered IO)不匹配或实现细节化,**暂不纳入**。
 
@@ -513,6 +516,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store_compaction_reclaimed_bytes_total` | counter | `store` | 字节 | 累计回收字节 | `CompactionBytesReclaimedCount` |
 | `store_compaction_duration_seconds` | histogram | `store`,`kind`(full/partial) | 秒 | 单次 compaction 耗时 | `CompactionFinishedForAStoreTimeInMs`/`PartialRange…` |
 | `store_compaction_cost` / `store_compaction_benefit` | gauge | `store` | — | 选段 cost/benefit | `CompactionCost`/`CompactionBenefit` |
+| `store_server_compaction_policy_used_total` | counter | `policy`(incremental/cost_benefit/compact_all) | 次 | 按实际使用的调度策略计数的 compaction 执行次数 | — |
 
 ### 11.6 BlobStoreStats(死数据扫描)
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |

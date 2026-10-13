@@ -476,7 +476,7 @@ async fn background_worker_skips_the_unavailable_disk() {
     let cfg = srv.config();
     let compacted = tokio::time::timeout(
         Duration::from_secs(10),
-        antfs_store::worker::compact_all(&pool, &replicas, &health, &metrics, cfg, true),
+        antfs_store::worker::compact_all(&pool, &replicas, &health, &metrics, cfg, true, false),
     )
     .await
     .expect("坏盘上 compaction 不该卡住");

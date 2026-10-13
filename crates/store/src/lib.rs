@@ -4,6 +4,7 @@
 //! `openspec/changes/store-server/`。**S1**:骨架 + 数据面(HTTP put/get)+ `statfs` 容量。
 //! 不接 master、不复制、**不含 EC**(暂不解锁)。
 
+pub mod compact_state;
 pub mod compaction_jobs;
 pub mod config;
 pub mod disk;

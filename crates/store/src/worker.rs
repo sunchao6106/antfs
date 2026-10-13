@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use antfs_blob::CompactPolicy;
 
-use crate::config::{parse_hhmm, StoreServerConfig};
+use crate::config::{parse_hhmm, CompactionPolicyKind, StoreServerConfig};
 use crate::disk_health::DiskHealthMap;
 use crate::disk_pool::DiskPools;
 use crate::metrics::StoreServerMetrics;
@@ -84,7 +84,15 @@ pub async fn flush_all(
     n
 }
 
-/// 对本节点每个 replica 按策略增量压缩,返回实际发生压缩的 replica 数。
+/// 对本节点每个 replica 按策略压缩,返回实际发生压缩的 replica 数。
+///
+/// **策略分派**(`config.compaction_policy`,对齐 Ambry `CompactionPolicy` 体系):
+/// - `Incremental` → [`BlobStore::compact_if_needed`](antfs_blob::BlobStore::compact_if_needed);
+/// - `CostBenefit` → [`BlobStore::compact_cost_benefit`](antfs_blob::BlobStore::compact_cost_benefit);
+/// - `Hybrid` → `do_compact_all`(本轮是否轮到全库重写,由 [`should_compact_all`] 逐轮判定)为真时
+///   走 [`BlobStore::compact`](antfs_blob::BlobStore::compact)(CompactAll),否则走 cost-benefit。
+///
+/// `do_compact_all` 是**节点级、逐轮**的判定,非 Hybrid 策略恒为 `false`(它们从不自动触发 CompactAll)。
 ///
 /// **候选集**(按 master 下发的分区可写态,见 [`crate::replica::ReplicaHandle::partition_state_now`]):
 /// - `SEALED`:永不入选(封存分区留给后续 EC 转换,不在其身上搬字节);
@@ -105,6 +113,7 @@ pub async fn compact_all(
     metrics: &StoreServerMetrics,
     config: &StoreServerConfig,
     include_rw: bool,
+    do_compact_all: bool,
 ) -> usize {
     let mut n = 0;
     for (pid, h) in replicas.handles() {
@@ -139,14 +148,33 @@ pub async fn compact_all(
             config,
             tombstones_allowed(config.master_addr.is_empty(), &h),
         );
+        let kind = config.compaction_policy;
+        let min_reclaim = config.compaction_min_log_segment_count_to_reclaim;
         let store = h.store.clone();
         match pool
-            .run(&h.disk_id, "compaction", move || {
-                store.compact_if_needed(&policy)
+            .run(&h.disk_id, "compaction", move || match kind {
+                CompactionPolicyKind::Incremental => store.compact_if_needed(&policy),
+                CompactionPolicyKind::CostBenefit => {
+                    store.compact_cost_benefit(&policy, min_reclaim)
+                }
+                CompactionPolicyKind::Hybrid if do_compact_all => store.compact(&policy).map(Some),
+                CompactionPolicyKind::Hybrid => store.compact_cost_benefit(&policy, min_reclaim),
             })
             .await
         {
-            Ok(Ok(Some(_))) => n += 1,
+            Ok(Ok(Some(_))) => {
+                let label = match (kind, do_compact_all) {
+                    (CompactionPolicyKind::Incremental, _) => "incremental",
+                    (CompactionPolicyKind::CostBenefit, _) => "cost_benefit",
+                    (CompactionPolicyKind::Hybrid, true) => "compact_all",
+                    (CompactionPolicyKind::Hybrid, false) => "cost_benefit",
+                };
+                metrics
+                    .compaction_policy_used
+                    .with_label_values(&[label])
+                    .inc();
+                n += 1;
+            }
             Ok(Ok(None)) => {}
             Ok(Err(e)) => {
                 tracing::warn!(partition = pid, error = %e, "local-worker compaction failed")
@@ -161,6 +189,29 @@ pub async fn compact_all(
         }
     }
     n
+}
+
+/// Hybrid 模式:本轮是否该用 CompactAll 而不是 cost-benefit。
+///
+/// - 非 Hybrid 策略:`false`(它们从不自动触发 CompactAll);
+/// - Hybrid 且无历史(`None`):`true`(首跑触发一次全库重写,对齐 Ambry);
+/// - Hybrid 且距上次 ≥ `switch_days` 天:`true`。
+fn should_compact_all(
+    policy: CompactionPolicyKind,
+    switch_days: u32,
+    last_compact_all: Option<i64>,
+    now: i64,
+) -> bool {
+    if policy != CompactionPolicyKind::Hybrid {
+        return false;
+    }
+    match last_compact_all {
+        None => true,
+        Some(last) => {
+            let elapsed_secs = now.saturating_sub(last);
+            elapsed_secs >= i64::from(switch_days) * 86_400
+        }
+    }
 }
 
 /// 分区可写态 → 是否进 compaction 候选集。
@@ -235,20 +286,80 @@ fn spawn_compaction_loop(
 
     tokio::spawn(async move {
         let mut last_fire: Option<i64> = None;
+        // Hybrid 调度状态:上次 CompactAll 的 unix 秒。首轮从盘上读回(重启不丢),此后由本 loop
+        // 维护 —— 每轮据此决定走 CompactAll 还是 cost-benefit。
+        let mut last_compact_all: Option<i64> = None;
+        let mut state_loaded = false;
         loop {
             let now = now_epoch_secs();
             let delay = next_delay_secs(now, last_fire, start_secs_of_day, period_secs, &clock);
             tokio::time::sleep(Duration::from_secs(delay)).await;
 
+            if !state_loaded {
+                last_compact_all = read_round_compact_state(&replicas);
+                state_loaded = true;
+            }
+
+            let round_now = now_epoch_secs();
+            let do_compact_all = should_compact_all(
+                config.compaction_policy,
+                config.compaction_policy_switch_days,
+                last_compact_all,
+                round_now,
+            );
+
             let cfg = config.clone();
             let r = replicas.clone();
             let m = metrics.clone();
             let h = health.clone();
-            let n = compact_all(&pool, &r, &h, &m, &cfg, cfg.compaction_include_rw).await;
+            let n = compact_all(
+                &pool,
+                &r,
+                &h,
+                &m,
+                &cfg,
+                cfg.compaction_include_rw,
+                do_compact_all,
+            )
+            .await;
             m.compactions.inc_by(n as u64);
+
+            // 本轮真的发生了全库重写(至少一个副本)才推进时间戳并落盘;全部副本都被跳过时保持旧值,
+            // 下一轮再试(安全方向:宁可多跑一次,不可漏跑)。
+            if do_compact_all && n > 0 {
+                last_compact_all = Some(round_now);
+                write_round_compact_state(&replicas, round_now);
+            }
             last_fire = Some(now_epoch_secs());
         }
     });
+}
+
+/// 扫描本节点所有 replica 的状态文件,取**最新**的 CompactAll 时间戳。
+/// 时间戳是**节点级**概念(所有副本在同一轮做同一次 CompactAll),故任一副本落了盘即有效,取最大值。
+fn read_round_compact_state(replicas: &ReplicaManager) -> Option<i64> {
+    replicas
+        .handles()
+        .iter()
+        .filter_map(|(pid, _)| replicas.replica_dir(*pid))
+        .filter_map(|dir| crate::compact_state::read_last_compact_all(&dir))
+        .max()
+}
+
+/// 把本轮的 CompactAll 时间戳写到**每个** replica 目录(节点级状态冗余落盘:任一副本目录被读到即可)。
+fn write_round_compact_state(replicas: &ReplicaManager, epoch_secs: i64) {
+    for (pid, _) in replicas.handles() {
+        let Some(dir) = replicas.replica_dir(pid) else {
+            continue;
+        };
+        if let Err(e) = crate::compact_state::write_last_compact_all(&dir, epoch_secs) {
+            tracing::warn!(
+                partition = pid,
+                error = %e,
+                "failed to persist compact-all timestamp"
+            );
+        }
+    }
 }
 
 /// 由配置装配 compaction 策略;**每次调用都取当前时钟**(过期/保留期判定以"现在"为准),
@@ -481,7 +592,7 @@ mod tests {
         assert_eq!(flushed, 0, "池满 ⇒ 该盘本轮 flush 跳过");
         let compacted = tokio::time::timeout(
             Duration::from_secs(10),
-            compact_all(&pool, &rm, &health, &metrics, &config(), true),
+            compact_all(&pool, &rm, &health, &metrics, &config(), true, false),
         )
         .await
         .expect("池满时 compaction 不该卡住");
@@ -573,12 +684,41 @@ mod tests {
         let h = handle_with_dead_data(&rm);
         let before = h.store.stats().unwrap().dead_bytes;
 
-        compact_all(&pool, &rm, &health, &metrics, &config(), true).await;
+        compact_all(&pool, &rm, &health, &metrics, &config(), true, false).await;
 
         let after = h.store.stats().unwrap().dead_bytes;
         assert!(
             after < before,
             "compaction must reduce dead bytes: {before} -> {after}"
+        );
+    }
+
+    /// 策略指标按**实际走的路径**计:一次落到 CompactAll 的 compaction 必须让
+    /// `compaction_policy_used{policy="compact_all"}` +1(而不是按配置值猜)。
+    #[tokio::test]
+    async fn compaction_policy_used_counts_compact_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rm = manager(tmp.path());
+        let pool = pool_for(tmp.path());
+        let (health, metrics) = health_and_metrics();
+        let h = handle_with_dead_data(&rm);
+        let before = h.store.stats().unwrap().dead_bytes;
+
+        // 默认配置即 Hybrid;无状态文件 ⇒ `do_compact_all = true` ⇒ 本轮走 CompactAll。
+        compact_all(&pool, &rm, &health, &metrics, &config(), true, true).await;
+
+        let after = h.store.stats().unwrap().dead_bytes;
+        assert!(
+            after < before,
+            "本用例的前提是确实压了一轮: {before} -> {after}"
+        );
+        assert!(
+            metrics
+                .compaction_policy_used
+                .with_label_values(&["compact_all"])
+                .get()
+                >= 1,
+            "走了 CompactAll 就必须计入 policy=compact_all"
         );
     }
 
@@ -672,7 +812,7 @@ mod tests {
             if !state.is_empty() {
                 assert!(rm.set_partition_state(1, state), "状态应写入句柄");
             }
-            let got = compact_all(&pool, &rm, &health, &metrics, &config(), include_rw).await;
+            let got = compact_all(&pool, &rm, &health, &metrics, &config(), include_rw, false).await;
             assert_eq!(got, want, "state={state:?} include_rw={include_rw}");
             let after = h.store.stats().unwrap().dead_bytes;
             if want == 1 {
@@ -696,7 +836,7 @@ mod tests {
         *rm.get(1).unwrap().current_state.write().unwrap() =
             crate::replica::STATE_BOOTSTRAP.to_string();
         assert_eq!(
-            compact_all(&pool, &rm, &health, &metrics, &config(), true).await,
+            compact_all(&pool, &rm, &health, &metrics, &config(), true, false).await,
             0
         );
 
@@ -710,7 +850,7 @@ mod tests {
         *h2.current_state.write().unwrap() = crate::replica::STATE_BOOTSTRAP.to_string();
         assert!(!rm2.set_partition_state(1, ""), "状态本来就是空的");
         assert_eq!(
-            compact_all(&pool2, &rm2, &health2, &metrics2, &config(), true).await,
+            compact_all(&pool2, &rm2, &health2, &metrics2, &config(), true, false).await,
             1
         );
     }
@@ -768,6 +908,51 @@ mod tests {
         assert_eq!(
             next_delay_secs(last + 3600, Some(last), ONE_AM, 6 * 3600, &c),
             5 * 3600
+        );
+    }
+
+    /// Hybrid 策略的逐轮判定矩阵:
+    /// - 非 Hybrid(`Incremental`/`CostBenefit`)恒 `false`(从不自动 CompactAll);
+    /// - Hybrid + 无历史 ⇒ `true`(首跑全库重写,对齐 Ambry);
+    /// - Hybrid + 未满 `switch_days` ⇒ `false`;恰满 / 超过 ⇒ `true`。
+    #[test]
+    fn should_compact_all_matrix() {
+        const DAY: i64 = 86_400;
+        let now = 1_700_000_000;
+
+        for policy in [
+            CompactionPolicyKind::Incremental,
+            CompactionPolicyKind::CostBenefit,
+        ] {
+            assert!(
+                !should_compact_all(policy, 6, None, now),
+                "非 Hybrid 策略不得自动 CompactAll(无历史也不行)"
+            );
+            assert!(
+                !should_compact_all(policy, 6, Some(now - 100 * DAY), now),
+                "非 Hybrid 策略永远为 false"
+            );
+        }
+
+        assert!(
+            should_compact_all(CompactionPolicyKind::Hybrid, 6, None, now),
+            "Hybrid 无历史 ⇒ 首跑触发 CompactAll"
+        );
+        assert!(
+            !should_compact_all(CompactionPolicyKind::Hybrid, 6, Some(now - 5 * DAY), now),
+            "5 天 < 6 天 ⇒ 不触发"
+        );
+        assert!(
+            should_compact_all(CompactionPolicyKind::Hybrid, 6, Some(now - 6 * DAY), now),
+            "恰满 6 天 ⇒ 触发(≥ 语义)"
+        );
+        assert!(
+            should_compact_all(CompactionPolicyKind::Hybrid, 6, Some(now - 10 * DAY), now),
+            "超过 6 天 ⇒ 触发"
+        );
+        assert!(
+            !should_compact_all(CompactionPolicyKind::Hybrid, 6, Some(now + DAY), now),
+            "时间戳在未来(时钟回拨)⇒ 不得触发(饱和减法不 panic)"
         );
     }
 }

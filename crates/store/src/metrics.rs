@@ -143,6 +143,7 @@ pub struct StoreServerMetrics {
     pub bootstrap_bytes: IntCounter,
     pub flushes: IntCounter,
     pub compactions: IntCounter,
+    pub compaction_policy_used: IntCounterVec,
 }
 
 impl StoreServerMetrics {
@@ -385,6 +386,12 @@ impl StoreServerMetrics {
                 registry,
                 "store_server_compactions_total",
                 "local-worker segment compactions run",
+            )?,
+            compaction_policy_used: counter_vec(
+                registry,
+                "store_server_compaction_policy_used_total",
+                "compaction executions by policy actually used",
+                &["policy"],
             )?,
         })
     }

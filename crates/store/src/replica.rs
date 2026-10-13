@@ -510,6 +510,17 @@ impl ReplicaManager {
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
+
+    /// 某分区副本的**盘上目录**(`<disk.dir>/partition_<pid>`)。
+    ///
+    /// 本地维护写 `COMPACT_POLICY_STATE` 等每副本状态文件需要它,而 `BlobStore` 的 `dir` 字段
+    /// **不对外**(引擎层冻结,见 CLAUDE.md);句柄/盘都不在 → `None`。目录定位口径与
+    /// [`ensure_replica_with_origin`](Self::ensure_replica_with_origin) 建副本时**同一处**推导。
+    pub fn replica_dir(&self, pid: PartitionId) -> Option<std::path::PathBuf> {
+        let disk_id = self.get(pid).map(|h| h.disk_id)?;
+        let disk = self.disks.disks().iter().find(|d| d.id == disk_id)?;
+        Some(disk.dir.join(format!("partition_{pid}")))
+    }
 }
 
 #[cfg(test)]
