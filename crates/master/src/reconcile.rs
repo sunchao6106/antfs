@@ -597,6 +597,7 @@ mod tests {
                     incarnation: 0,
                 })
                 .collect(),
+            capacity_bytes: 0,
         }
     }
 

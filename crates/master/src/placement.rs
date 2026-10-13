@@ -41,12 +41,35 @@ pub enum PlacementError {
     ZeroReplicationFactor,
 }
 
+/// 一块盘的**可用容量上限** = `capacity × (1 − disk_reserved_ratio)`(G2)。
+///
+/// 为 index 文件 / Binary Fuse filter / `.tmp` / 文件系统元数据等非 log-segment 开销预留空间。
+/// `capacity == 0`(盘容量未知)→ 0,调用方的 `spec.capacity_bytes == 0` 检查会另行排除该盘。
+pub(crate) fn usable_capacity(capacity_bytes: u64, reserved_ratio: f64) -> u64 {
+    let ratio = reserved_ratio.clamp(0.0, 1.0);
+    // 浮点乘后转 u64:`as` 对 f64→整数是**饱和**转换(越界值被夹到边界),非 UB;输入为真实盘容量,
+    // 值域远小于 u64::MAX,此转换恒在 [0, capacity] 内。故此处 `as` 是确证不变量,非逃逸。
+    ((capacity_bytes as f64) * (1.0 - ratio)) as u64
+}
+
 /// 某块盘的实时快照(软状态,心跳上报)。
 #[derive(Clone, Debug)]
 pub struct DiskFree {
+    /// 选盘用的**有效可用空间**:身份是心跳上报的物理余量,但 leader 侧对新建分区做了内存即时扣减
+    /// (`adjusted_free`),故这里是扣减后的值。物理空间检查 `free_bytes ≥ partition_cap` 用它。
     pub free_bytes: u64,
     /// 该盘主动探测的健康结果(空串 = **未启用主动探测**,视为可用;见 [`select_disks`])。
     pub health: String,
+    /// 该盘上**所有已承诺分区**的 `capacity_bytes` 之和(D1 逻辑承诺)。
+    ///
+    /// 由 [`placement::select_disks`] 的调用方从 **Raft partition table** 扫描得到(非心跳,无延迟):
+    /// 遍历该盘上所有副本(RW + RO + SEALED 全计入,DROPPED 已从 table 移除故不计)。
+    pub committed_bytes: u64,
+    /// 该盘可用容量上限 = `capacity × (1 − disk_reserved_ratio)`(G2)。
+    ///
+    /// 逻辑承诺检查 `committed + partition_cap ≤ usable_capacity` 用它,而非物理 `capacity` ——
+    /// 预留出 index 文件 / filter / tmp / FS 元数据等非 log-segment 开销。
+    pub usable_capacity: u64,
 }
 
 /// 一块候选盘(展平后带定位与排序键)。
@@ -62,6 +85,9 @@ struct Candidate {
 /// - `usage`:`(node_id, disk_id) -> DiskFree`;**未上报余量的盘视为不可用**(不放)。
 /// - `partition_cap`:分区容量上界,盘可用容量须 ≥ 它。
 /// - `near_full_ratio`:盘用量超此比例视为将满,跳过(用量 = 1 - free/capacity)。
+///
+/// **逻辑承诺硬限制**(D1):该盘已承诺(`committed_bytes`)+ 本次 `partition_cap` 不得超过
+/// `usable_capacity`。防"物理还空但逻辑已超卖"——`free_bytes` 只看当下物理余量,不看已承诺的总量。
 ///
 /// 规则:候选 = 余量 ≥ 上界、未将满、**健康**;按余量降序贪心,**每个副本落不同节点**、优先不同 rack;
 /// 不足则 `InsufficientDisks`(不降 rf)。确定性:同输入恒产同输出(按 (node,disk) 稳定定序)。
@@ -101,6 +127,11 @@ pub fn select_disks(
             }
             if free.free_bytes < partition_cap {
                 continue; // 容量不足
+            }
+            // D1 逻辑承诺:已承诺 + 本次承诺不得超过该盘可用容量(usable = capacity×(1−reserved))。
+            // 与上面的物理余量检查互补——`free_bytes` 只看当下物理空闲,这里防"逻辑超卖"。
+            if free.committed_bytes.saturating_add(partition_cap) > free.usable_capacity {
+                continue; // 逻辑承诺已满
             }
             if spec.capacity_bytes == 0 {
                 continue;
@@ -203,19 +234,33 @@ mod tests {
 
     const CAP: u64 = 100;
 
-    /// 盘余量快照(health 空串 = 该盘未启用主动探测)。
+    /// 盘余量快照(health 空串 = 该盘未启用主动探测)。默认无逻辑承诺、可用容量无限。
     fn free(free_bytes: u64) -> DiskFree {
         DiskFree {
             free_bytes,
             health: String::new(),
+            committed_bytes: 0,
+            usable_capacity: u64::MAX,
         }
     }
 
-    /// 带健康上报的盘余量快照。
+    /// 带健康上报的盘余量快照(默认无逻辑承诺、可用容量无限)。
     fn free_health(free_bytes: u64, health: &str) -> DiskFree {
         DiskFree {
             free_bytes,
             health: health.to_string(),
+            committed_bytes: 0,
+            usable_capacity: u64::MAX,
+        }
+    }
+
+    /// 带逻辑承诺(`committed_bytes`)与可用容量上限(`usable_capacity`)的盘余量快照。
+    fn free_committed(free_bytes: u64, committed_bytes: u64, usable_capacity: u64) -> DiskFree {
+        DiskFree {
+            free_bytes,
+            health: String::new(),
+            committed_bytes,
+            usable_capacity,
         }
     }
 
@@ -387,6 +432,75 @@ mod tests {
         let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
         let usage = BTreeMap::from([((1, "d0".to_string()), free_health(1000, "HEALTHY"))]);
         assert_eq!(select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap().len(), 1);
+    }
+
+    /// D1:物理余量充足但逻辑承诺已满(`committed + cap > usable`)→ 跳过 → 候选不足。
+    #[test]
+    fn rejects_logically_overcommitted_disk() {
+        let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
+        let usage = BTreeMap::from([((1, "d0".to_string()), free_committed(800, 0, 90))]);
+        let err = select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap_err();
+        assert!(matches!(err, PlacementError::InsufficientDisks { .. }));
+    }
+
+    /// D1 边界含等号:`committed + cap == usable` 应放行。
+    #[test]
+    fn allows_disk_at_exact_logic_limit() {
+        let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
+        let usage = BTreeMap::from([((1, "d0".to_string()), free_committed(800, 300, 400))]);
+        assert_eq!(select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap().len(), 1);
+    }
+
+    /// 空盘(committed=0)照常可选。
+    #[test]
+    fn empty_disk_with_headroom_is_usable() {
+        let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
+        let usage = BTreeMap::from([((1, "d0".to_string()), free_committed(900, 0, 950))]);
+        assert_eq!(select_disks(&nodes, &usage, 1, CAP, 0.95).unwrap().len(), 1);
+    }
+
+    /// 分区删除后 `committed` 回落 → 原本超卖的盘重新可选(`committed` 是调用方扫描出的标量)。
+    #[test]
+    fn released_commit_reopens_disk() {
+        let nodes = BTreeMap::from([(1, node("rA", &[("d0", 1000)]))]);
+        let full = BTreeMap::from([((1, "d0".to_string()), free_committed(800, 400, 400))]);
+        assert!(select_disks(&nodes, &full, 1, CAP, 0.95).is_err());
+        let released = BTreeMap::from([((1, "d0".to_string()), free_committed(800, 200, 400))]);
+        assert_eq!(
+            select_disks(&nodes, &released, 1, CAP, 0.95).unwrap().len(),
+            1
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// D1 不变量:凡被选中的盘,其 `committed + partition_cap ≤ usable_capacity` 恒成立。
+        #[test]
+        fn committed_never_exceeds_usable(
+            n_nodes in 1usize..5,
+            committeds in prop::collection::vec(0u64..400, 1..5),
+            usable in prop::collection::vec(50u64..400, 1..5),
+        ) {
+            let mut nodes = BTreeMap::new();
+            let mut usage = BTreeMap::new();
+            for i in 0..n_nodes {
+                let id = i as u64 + 1;
+                nodes.insert(id, node(&format!("r{i}"), &[("d0", 1000)]));
+                let c = committeds[i % committeds.len()];
+                let u = usable[i % usable.len()];
+                usage.insert((id, "d0".to_string()), free_committed(1000, c, u));
+            }
+            if let Ok(placed) = select_disks(&nodes, &usage, 1, CAP, 0.95) {
+                for p in &placed {
+                    let f = &usage[&(p.node_id, p.disk_id.clone())];
+                    prop_assert!(
+                        f.committed_bytes + CAP <= f.usable_capacity,
+                        "placed disk must satisfy committed + cap <= usable"
+                    );
+                }
+            }
+        }
     }
 
     proptest! {

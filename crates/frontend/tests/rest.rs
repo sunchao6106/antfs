@@ -136,6 +136,7 @@ async fn create_partition(master: &MasterNode, replicas: Vec<ReplicaPlacement>) 
         .client_write(MasterCommand::CreatePartition {
             replication_factor: rf,
             replicas,
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");

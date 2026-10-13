@@ -152,6 +152,7 @@ async fn create_partition(leader: &MasterNode, replicas: &[u64]) -> u32 {
                     incarnation: 0,
                 })
                 .collect(),
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");

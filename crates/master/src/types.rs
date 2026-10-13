@@ -86,6 +86,10 @@ pub struct PartitionInfo {
     pub replication_factor: u8,
     pub state: PartitionState,
     pub replicas: Vec<ReplicaPlacement>,
+    /// 该分区的容量上限(字节)。`0` = 未设置(旧快照 / 建分区时未带容量)→ 判定回退到
+    /// `MasterConfig::partition_capacity_bytes`。
+    #[serde(default)]
+    pub capacity_bytes: u64,
 }
 
 /// 集群放置策略。
@@ -309,6 +313,7 @@ impl MasterState {
             MasterCommand::CreatePartition {
                 replication_factor,
                 replicas,
+                partition_capacity,
             } => {
                 // 选盘在 leader 侧已算好(读软状态,非确定);apply 只做确定动作:分配 id + 写 placement。
                 let id = self.next_partition_id;
@@ -327,6 +332,7 @@ impl MasterState {
                         replication_factor: *replication_factor,
                         state: PartitionState::ReadWrite,
                         replicas: placed,
+                        capacity_bytes: *partition_capacity,
                     },
                 );
                 MasterResponse::PartitionId(id)
@@ -524,6 +530,9 @@ pub enum MasterCommand {
     CreatePartition {
         replication_factor: u8,
         replicas: Vec<ReplicaPlacement>,
+        /// 该分区的容量上限快照(leader 提案时取当时 `config.partition_capacity_bytes` 写入;
+        /// 此后不变,见 design D1)。apply 存入 [`PartitionInfo::capacity_bytes`]。
+        partition_capacity: u64,
     },
     /// 再复制:向已有分区追加一个副本(恢复冗余,M3;选盘在 leader 侧先算)。
     AddReplica {
@@ -756,12 +765,17 @@ mod tests {
         let r = s.apply_command(&MasterCommand::CreatePartition {
             replication_factor: 2,
             replicas: replicas.clone(),
+            partition_capacity: 8_000_000_000,
         });
         assert_eq!(r, MasterResponse::PartitionId(0));
         assert_eq!(s.next_partition_id, 1);
         let p = &s.partitions[&0];
         assert_eq!(p.replication_factor, 2);
         assert_eq!(p.state, PartitionState::ReadWrite);
+        assert_eq!(
+            p.capacity_bytes, 8_000_000_000,
+            "apply 必须把提案里的 partition_capacity 快照进 PartitionInfo::capacity_bytes"
+        );
         // 落点是提案里的那份(逐字段),但**身份是 apply 现发的**:提案里的 0 是占位,不采信。
         assert_eq!(
             p.replicas
@@ -792,6 +806,7 @@ mod tests {
                 target_state: "ACTIVE".into(),
                 incarnation: 0,
             }],
+            partition_capacity: 0,
         });
         let add = MasterCommand::AddReplica {
             partition_id: 0,
@@ -831,6 +846,7 @@ mod tests {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         });
         s.apply_command(&MasterCommand::DecommissionNode { node_id: 2 });
         assert!(s.decommissioning.contains(&2));
@@ -860,6 +876,7 @@ mod tests {
                 target_state: "ACTIVE".into(),
                 incarnation: 0,
             }],
+            partition_capacity: 0,
         });
         assert_eq!(s.partitions[&0].state, PartitionState::ReadWrite);
         s.apply_command(&MasterCommand::SetPartitionState {
@@ -933,6 +950,7 @@ mod tests {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         });
         let mv = MasterCommand::MoveReplica {
             partition_id: 0,
@@ -1003,6 +1021,7 @@ mod tests {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         });
         // evacuation 式移除(无 move 记账):也要记待删,靠冗余判据确认。
         s.apply_command(&MasterCommand::RemoveReplica {
@@ -1077,6 +1096,7 @@ mod tests {
                 target_state: "ACTIVE".into(),
                 incarnation: 0,
             }],
+            partition_capacity: 0,
         });
         s.apply_command(&MasterCommand::MoveReplica {
             partition_id: 0,

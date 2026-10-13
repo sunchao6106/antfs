@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::pb::{BalanceMove, BalancePlan};
-use crate::placement::{select_disks, DiskFree};
+use crate::placement::{select_disks, usable_capacity, DiskFree};
 use crate::soft::DiskUsage;
 use crate::types::{
     BalanceMoveRecord, BalancePlanRecord, BalanceStatus, DiskId, NodeId, NodeInfo, PartitionId,
@@ -56,6 +56,8 @@ pub struct BalanceInputs<'a> {
     pub partition_capacity_bytes: u64,
     /// 盘将满阈值(落地校验,同 [`select_disks`])。
     pub near_full_ratio: f64,
+    /// 盘预留比例(`disk_reserved_ratio`):`usable = capacity × (1 − ratio)`,同 [`select_disks`]。
+    pub reserved_ratio: f64,
 }
 
 /// 一块合格盘的均衡视图(计划演算中被就地模拟更新)。
@@ -98,6 +100,7 @@ pub fn plan_balance(inputs: &BalanceInputs) -> Vec<BalanceMoveRecord> {
         skew_threshold,
         partition_capacity_bytes,
         near_full_ratio,
+        reserved_ratio,
     } = *inputs;
     if max_moves == 0 || skew_threshold <= 0.0 {
         return Vec::new();
@@ -144,14 +147,36 @@ pub fn plan_balance(inputs: &BalanceInputs) -> Vec<BalanceMoveRecord> {
         stats.values().map(DiskStat::ratio).sum::<f64>() / stats.len() as f64
     };
 
+    // D1 逻辑承诺:每盘已承诺 = Σ 该盘上所有副本所属分区的 `capacity_bytes`(旧分区缺省回退全局上界)。
+    // 与 `server::placement_usage` 同源(Raft partition table),故 move 进行中源/目标各计一份,保守正确。
+    let mut committed: BTreeMap<(NodeId, DiskId), u64> = BTreeMap::new();
+    for info in partitions.values() {
+        let cap = if info.capacity_bytes > 0 {
+            info.capacity_bytes
+        } else {
+            partition_capacity_bytes
+        };
+        for r in &info.replicas {
+            let e = committed.entry((r.node_id, r.disk_id.clone())).or_insert(0);
+            *e = e.saturating_add(cap);
+        }
+    }
+
     let disk_free: BTreeMap<(NodeId, DiskId), DiskFree> = usage
         .iter()
         .map(|(k, u)| {
+            let capacity = nodes
+                .get(&k.0)
+                .and_then(|n| n.disks.get(&k.1))
+                .map(|d| d.capacity_bytes)
+                .unwrap_or(0);
             (
                 k.clone(),
                 DiskFree {
-                    free_bytes: u.free_bytes,
+                    free_bytes: u.adjusted_free,
                     health: u.health.clone(),
+                    committed_bytes: committed.get(k).copied().unwrap_or(0),
+                    usable_capacity: usable_capacity(capacity, reserved_ratio),
                 },
             )
         })
@@ -400,6 +425,7 @@ pub fn plan_view(
 mod tests {
     use super::*;
     use crate::types::{DiskSpec, PartitionState, ReplicaPlacement};
+    use std::time::Instant;
 
     const CAP: u64 = 1_000_000_000_000; // 1 TB
     const PART_CAP: u64 = 100_000_000_000; // 100 GB
@@ -436,6 +462,8 @@ mod tests {
                         capacity_bytes: CAP,
                         free_bytes: free,
                         health: health.to_string(),
+                        adjusted_free: free,
+                        last_heartbeat_time: Instant::now(),
                     },
                 )
             })
@@ -455,6 +483,7 @@ mod tests {
                     incarnation: 0,
                 })
                 .collect(),
+            capacity_bytes: 0,
         }
     }
 
@@ -507,6 +536,7 @@ mod tests {
                 skew_threshold: 1.0,
                 partition_capacity_bytes: PART_CAP,
                 near_full_ratio: 0.95,
+                reserved_ratio: 0.0,
             }
         }
     }
@@ -587,6 +617,8 @@ mod tests {
                 capacity_bytes: CAP,
                 free_bytes: 900_000_000_000,
                 health: "WRITE_TIMEOUT".into(),
+                adjusted_free: 900_000_000_000,
+                last_heartbeat_time: Instant::now(),
             },
         );
         assert!(plan_balance(&fx.inputs(100)).is_empty());

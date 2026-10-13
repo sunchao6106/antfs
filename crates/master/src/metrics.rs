@@ -94,6 +94,8 @@ pub struct MasterMetrics {
     /// 因"副本所在盘将满"被自动置为 RO 的分区数(counter;只置不回,恢复靠运维。
     /// 盘满止损,对齐 Ambry `storeReadOnlyEnableSizeThresholdPercentage`)。
     pub partitions_forced_ro: IntCounter,
+    /// 因分区自身已用逼近其容量上限(容量 − 一个段容量)被自动置为 RO 的分区数(counter;只置不回)。
+    pub partitions_full_ro: IntCounter,
     /// 待删源副本对数(gauge,`pending_drop`:placement 已移除、等源节点确认后下发 `DROPPED`)。
     pub pending_drops: IntGauge,
     /// 下发的 `DROPPED` 指令数(counter,迁移/下线完成后删源目录)。
@@ -314,6 +316,11 @@ impl MasterMetrics {
                 registry,
                 "master_partitions_forced_ro_total",
                 "partitions forced to ReadOnly because a replica disk is near full (never auto-reverted)",
+            )?,
+            partitions_full_ro: counter(
+                registry,
+                "master_partitions_full_ro",
+                "partitions converted to ReadOnly because their own usage approached capacity (never auto-reverted)",
             )?,
             pending_drops: gauge(
                 registry,

@@ -12,12 +12,19 @@ use crate::types::{DiskId, NodeId, PartitionId};
 #[derive(Clone, Debug)]
 pub struct DiskUsage {
     pub capacity_bytes: u64,
+    /// 心跳上报的**原始**物理余量(监控/观测用;选盘用的是 [`Self::adjusted_free`])。
     pub free_bytes: u64,
     /// 该盘主动探测的健康结果(`HEALTHY` / `WRITE_TIMEOUT` / …,见 store `DiskHealth`)。
     ///
     /// **空串 = 该盘未启用主动探测**(store 侧默认关)→ 视为可用;语义见
     /// [`placement::select_disks`](crate::placement::select_disks)。
     pub health: String,
+    /// 选盘决策用的**有效可用空间**:心跳值基础上叠加 leader 侧"建分区即时扣减",并受单调递减守卫保护
+    /// (防滞后心跳回滚扣减,见 [`SoftState::record_beat`])。
+    pub adjusted_free: u64,
+    /// 最近一次处理该盘心跳的时刻。守卫据此判"距上次心跳是否超过 `adjusted_free_timeout`",
+    /// 超过则允许 `adjusted_free` 回升(compaction 释放空间 / 节点重启后恢复)。
+    pub last_heartbeat_time: Instant,
 }
 
 #[derive(Debug)]
@@ -56,16 +63,66 @@ pub struct SoftState {
 }
 
 impl SoftState {
-    /// 记录一次心跳:刷新 `last_beat` 与各盘实时状态(余量 + 健康)。
-    pub fn record_beat(&self, node_id: NodeId, disks: HashMap<DiskId, DiskUsage>) {
+    /// 记录一次心跳:刷新 `last_beat` 与各盘实时状态(**merge** 语义,不整体覆盖)。
+    ///
+    /// `capacity_bytes` / `health` / `free_bytes` 一律取最新心跳值;`adjusted_free` 走**单调递减守卫**
+    /// (防滞后心跳把"建分区即时扣减"回滚掉):
+    /// - 首次见到该盘:`adjusted_free = free_bytes`。
+    /// - `reported < adjusted_free` → 覆盖(盘上有新写入,实际更少)。
+    /// - `reported >= adjusted_free` 且距上次心跳 `< timeout` → **保持**(多半是扣减还没被物理写入反映)。
+    /// - `reported >= adjusted_free` 且距上次心跳 `≥ timeout`(盘沉默过久 = 重启/分区/compaction)→ 覆盖。
+    ///
+    /// 本拍未上报的盘会被移除(心跳携带该节点当前全部盘)。
+    pub fn record_beat(
+        &self,
+        node_id: NodeId,
+        disks: HashMap<DiskId, DiskUsage>,
+        timeout: Duration,
+    ) {
+        let now = Instant::now();
         let mut g = self.inner.write().expect("soft state lock poisoned");
-        g.nodes.insert(
-            node_id,
-            Liveness {
-                last_beat: Instant::now(),
-                disks,
-            },
-        );
+        let entry = g.nodes.entry(node_id).or_insert_with(|| Liveness {
+            last_beat: now,
+            disks: HashMap::new(),
+        });
+        entry.last_beat = now;
+        let mut merged = HashMap::with_capacity(disks.len());
+        for (disk_id, incoming) in disks {
+            let (adjusted_free, last_heartbeat_time) = match entry.disks.get(&disk_id) {
+                Some(prev) if incoming.free_bytes < prev.adjusted_free => {
+                    (incoming.free_bytes, now)
+                }
+                Some(prev) if now.duration_since(prev.last_heartbeat_time) < timeout => {
+                    (prev.adjusted_free, prev.last_heartbeat_time)
+                }
+                Some(_) => (incoming.free_bytes, now),
+                None => (incoming.free_bytes, now),
+            };
+            merged.insert(
+                disk_id,
+                DiskUsage {
+                    capacity_bytes: incoming.capacity_bytes,
+                    free_bytes: incoming.free_bytes,
+                    health: incoming.health,
+                    adjusted_free,
+                    last_heartbeat_time,
+                },
+            );
+        }
+        entry.disks = merged;
+    }
+
+    /// 建分区(apply 成功后)对某盘 `adjusted_free` 的**即时扣减**(D3):把刚承诺的 `partition_cap`
+    /// 从有效可用空间里扣掉,不等下一次心跳,避免短时间连续建分区时超过盘物理余量。
+    ///
+    /// 该节点/盘不在软状态(如 leader 刚切换、还没收到心跳)→ 无操作(committed 检查仍在兜底)。
+    pub fn deduct_disk_free(&self, node_id: NodeId, disk_id: &DiskId, amount: u64) {
+        let mut g = self.inner.write().expect("soft state lock poisoned");
+        if let Some(liveness) = g.nodes.get_mut(&node_id) {
+            if let Some(u) = liveness.disks.get_mut(disk_id) {
+                u.adjusted_free = u.adjusted_free.saturating_sub(amount);
+            }
+        }
     }
 
     /// 节点是否在 `timeout` 内有心跳(据此在 `ListNodes` 标 up/down)。
@@ -392,5 +449,148 @@ mod tests {
         let after_remove = crate::digest::digest_of([(1u32, "d1", "ACTIVE", 0u64, 101u64)]);
         assert_eq!(soft.node_digest(1), after_remove);
         assert_eq!(soft.node_digest(99), 0, "未知节点摘要为 0");
+    }
+
+    fn disk(cap: u64, free: u64, health: &str) -> DiskUsage {
+        DiskUsage {
+            capacity_bytes: cap,
+            free_bytes: free,
+            health: health.to_string(),
+            adjusted_free: free,
+            last_heartbeat_time: Instant::now(),
+        }
+    }
+
+    /// 首次心跳:adjusted_free 初始化为上报的 free_bytes。
+    #[test]
+    fn first_beat_initializes_adjusted_free() {
+        let soft = SoftState::default();
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 400, "HEALTHY"))]),
+            Duration::from_secs(120),
+        );
+        let u = soft.usage_snapshot()[&(1, "d0".to_string())].clone();
+        assert_eq!(u.adjusted_free, 400);
+        assert_eq!(u.free_bytes, 400);
+    }
+
+    /// 建分区扣减:adjusted_free 单调下降,原始 free_bytes 不动。
+    #[test]
+    fn deduct_lowers_adjusted_free_only() {
+        let soft = SoftState::default();
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 400, ""))]),
+            Duration::from_secs(120),
+        );
+        soft.deduct_disk_free(1, &"d0".to_string(), 100);
+        let u = soft.usage_snapshot()[&(1, "d0".to_string())].clone();
+        assert_eq!(u.adjusted_free, 300);
+        assert_eq!(u.free_bytes, 400);
+    }
+
+    /// 扣减 saturating 到 0;未知节点/盘的扣减是无操作。
+    #[test]
+    fn deduct_saturates_and_ignores_unknown() {
+        let soft = SoftState::default();
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 50, ""))]),
+            Duration::from_secs(120),
+        );
+        soft.deduct_disk_free(1, &"d0".to_string(), 9999);
+        assert_eq!(
+            soft.usage_snapshot()[&(1, "d0".to_string())].adjusted_free,
+            0
+        );
+        soft.deduct_disk_free(2, &"d0".to_string(), 10); // 未知节点
+        soft.deduct_disk_free(1, &"dx".to_string(), 10); // 未知盘
+    }
+
+    /// 守卫:心跳值更高且未超时 → 不回滚扣减(adjusted 保持),但原始 free_bytes 取新值。
+    #[test]
+    fn heartbeat_above_adjusted_within_timeout_does_not_roll_back() {
+        let soft = SoftState::default();
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 400, ""))]),
+            Duration::from_secs(120),
+        );
+        soft.deduct_disk_free(1, &"d0".to_string(), 100); // adjusted = 300
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 400, ""))]),
+            Duration::from_secs(120),
+        );
+        let u = soft.usage_snapshot()[&(1, "d0".to_string())].clone();
+        assert_eq!(u.adjusted_free, 300, "未超时的向上心跳不得回滚扣减");
+        assert_eq!(u.free_bytes, 400, "原始值永远取最新心跳");
+    }
+
+    /// 心跳值更低 → 立即覆盖(盘上有新写入)。
+    #[test]
+    fn heartbeat_below_adjusted_overwrites() {
+        let soft = SoftState::default();
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 400, ""))]),
+            Duration::from_secs(120),
+        );
+        soft.deduct_disk_free(1, &"d0".to_string(), 100); // 300
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 200, ""))]),
+            Duration::from_secs(120),
+        );
+        assert_eq!(
+            soft.usage_snapshot()[&(1, "d0".to_string())].adjusted_free,
+            200
+        );
+    }
+
+    /// 超出 timeout → 接受心跳值(compaction 释放空间 / 节点重启后恢复)。
+    #[test]
+    fn heartbeat_above_adjusted_after_timeout_is_accepted() {
+        let soft = SoftState::default();
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 100, ""))]),
+            Duration::from_secs(120),
+        );
+        soft.deduct_disk_free(1, &"d0".to_string(), 50); // 50
+                                                         // timeout = 0 ⇒ `elapsed < 0` 恒假 ⇒ 守卫失效,直接接受心跳值。
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 100, ""))]),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            soft.usage_snapshot()[&(1, "d0".to_string())].adjusted_free,
+            100
+        );
+    }
+
+    /// 本拍未上报的盘被移除(心跳携带该节点当前全部盘)。
+    #[test]
+    fn disk_absent_from_beat_is_removed() {
+        let soft = SoftState::default();
+        soft.record_beat(
+            1,
+            HashMap::from([
+                ("d0".to_string(), disk(1000, 400, "")),
+                ("d1".to_string(), disk(1000, 500, "")),
+            ]),
+            Duration::from_secs(120),
+        );
+        assert_eq!(soft.usage_snapshot().len(), 2);
+        soft.record_beat(
+            1,
+            HashMap::from([("d0".to_string(), disk(1000, 400, ""))]),
+            Duration::from_secs(120),
+        );
+        let snap = soft.usage_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(snap.contains_key(&(1, "d0".to_string())));
     }
 }

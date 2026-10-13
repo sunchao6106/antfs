@@ -35,7 +35,7 @@ use crate::pb::{
     SetMaintenanceResponse, SetPartitionStateRequest, SetPartitionStateResponse,
     StartBalanceRequest, StartBalanceResponse,
 };
-use crate::placement::{select_disks, DiskFree, PlacementError};
+use crate::placement::{select_disks, usable_capacity, DiskFree, PlacementError};
 use crate::reconcile::{
     drop_confirmed, plan_evacuation, plan_move, plan_partition_states, plan_rereplication,
     plan_transitions, tombstones_reclaim_allowed, EvacAction, SuccessorConfirm,
@@ -55,18 +55,53 @@ const PROTO_VERSION: u32 = 1;
 /// [`MasterService::heartbeat`] 与 [`drop_confirmed`]。
 const DROPPED: &str = "DROPPED";
 
-/// 选盘输入:软状态(余量 + 盘健康)→ [`DiskFree`] 快照(re-replication / repair / move / 建分区共用)。
+/// 选盘输入:软状态(有效余量 + 盘健康)+ Raft partition table(逻辑承诺)→ [`DiskFree`] 快照
+///(re-replication / repair / move / 建分区共用)。
+///
+/// - **物理余量**:取 `adjusted_free`(心跳原始值叠加建分区即时扣减,见 [`SoftState::record_beat`])。
+/// - **逻辑承诺**(D1):扫描 `state.partitions`,把每个副本的 `capacity_bytes` 累加到其所在盘。
+///   RW + RO + SEALED 全计入(DROPPED 已从 table 移除);`capacity_bytes == 0`(旧分区)→ 回退
+///   `config.partition_capacity_bytes`。
+/// - **可用容量上限**:`capacity × (1 − reserved_ratio)`(见 [`usable_capacity`])。
 ///
 /// 盘健康由此进入放置决策:非空且 ≠ `HEALTHY` 的盘会被 `select_disks` 排除(见其文档)。
-fn placement_usage(soft: &SoftState) -> BTreeMap<(NodeId, DiskId), DiskFree> {
+fn placement_usage(
+    soft: &SoftState,
+    state: &MasterState,
+    config: &MasterConfig,
+) -> BTreeMap<(NodeId, DiskId), DiskFree> {
+    let used_map = soft.used_bytes_by_partition();
+    let mut committed: HashMap<(NodeId, DiskId), u64> = HashMap::new();
+    for (pid, info) in &state.partitions {
+        let cap = if info.capacity_bytes > 0 {
+            info.capacity_bytes
+        } else {
+            config.partition_capacity_bytes
+        };
+        let contribution = match info.state {
+            PartitionState::ReadWrite => cap,
+            PartitionState::ReadOnly | PartitionState::Sealed => {
+                match used_map.get(pid) {
+                    Some(&used) if used > 0 => used,
+                    _ => cap,
+                }
+            }
+        };
+        for r in &info.replicas {
+            let e = committed.entry((r.node_id, r.disk_id.clone())).or_insert(0);
+            *e = (*e).saturating_add(contribution);
+        }
+    }
     soft.usage_snapshot()
         .into_iter()
         .map(|(k, u)| {
             (
-                k,
+                k.clone(),
                 DiskFree {
-                    free_bytes: u.free_bytes,
+                    free_bytes: u.adjusted_free,
                     health: u.health,
+                    committed_bytes: committed.get(&k).copied().unwrap_or(0),
+                    usable_capacity: usable_capacity(u.capacity_bytes, config.disk_reserved_ratio),
                 },
             )
         })
@@ -76,6 +111,17 @@ fn placement_usage(soft: &SoftState) -> BTreeMap<(NodeId, DiskId), DiskFree> {
 /// 一块盘的已用比例(`free/capacity`;capacity=0 视为不可判 → `None`)。
 fn used_ratio(u: &DiskUsage) -> Option<f64> {
     (u.capacity_bytes > 0).then(|| 1.0 - (u.free_bytes as f64 / u.capacity_bytes as f64))
+}
+
+/// 分区级"将满"判定:分区已用 ≥ `capacity − segment_capacity` 即应转 RO。
+///
+/// 阈值留出**一个段容量**:当前活跃段封存/滚动仍需整段空间,逼近上限时提前止损。`capacity == 0`
+/// (未配上限,无意见)返回 `false`,不触发。
+fn should_convert_to_ro(capacity_bytes: u64, segment_capacity: u64, max_used: u64) -> bool {
+    if capacity_bytes == 0 {
+        return false;
+    }
+    max_used >= capacity_bytes.saturating_sub(segment_capacity)
 }
 
 /// 写权重的上界(千分比):1000 = 该分区完全空。下界固定 1(见 [`capacity_weight_permille`])。
@@ -423,31 +469,21 @@ impl MasterNode {
                     );
                 }
                 prev_up = up.clone();
-                let (
-                    partitions,
-                    all_nodes,
-                    decom,
-                    moving,
-                    move_targets,
-                    pending_drop,
-                    maintenance,
-                    balance,
-                ) = {
+                let state = {
                     let g = match sm_data.read() {
                         Ok(g) => g,
                         Err(_) => continue,
                     };
-                    (
-                        g.state.partitions.clone(),
-                        g.state.nodes.clone(),
-                        g.state.decommissioning.clone(),
-                        g.state.moving.clone(),
-                        g.state.move_targets.clone(),
-                        g.state.pending_drop.clone(),
-                        g.state.maintenance,
-                        g.state.balance.clone(),
-                    )
+                    g.state.clone()
                 };
+                let partitions = &state.partitions;
+                let all_nodes = &state.nodes;
+                let decom = &state.decommissioning;
+                let moving = &state.moving;
+                let move_targets = &state.move_targets;
+                let pending_drop = state.pending_drop.clone();
+                let maintenance = state.maintenance;
+                let balance = state.balance.clone();
 
                 // 补副本目标:失联再复制(M3)∪ 下线 evacuation 的"先补"(M4)∪ **坏盘撤离**的"先补"(D4)。
                 // 动作相同,合并去重。
@@ -492,13 +528,13 @@ impl MasterNode {
                     } else {
                         std::collections::BTreeSet::new() // 关着 ⇒ 什么都不抖出(既有行为)
                     };
-                let evac = plan_evacuation(&partitions, &decom, &evicted_disks, &up, &active);
+                let evac = plan_evacuation(partitions, decom, &evicted_disks, &up, &active);
 
                 // 集群级观测 gauge(周期刷新,仅 leader;对齐 under_replicated_partitions 的更新时机)。
                 {
                     let (mut n_rw, mut n_ro, mut n_sealed, mut n_majority_down) =
                         (0i64, 0i64, 0i64, 0i64);
-                    for (pid, info) in &partitions {
+                    for (pid, info) in partitions {
                         match info.state {
                             PartitionState::ReadWrite => n_rw += 1,
                             PartitionState::ReadOnly => n_ro += 1,
@@ -556,7 +592,7 @@ impl MasterNode {
                     metrics.pending_drops.set(pending_drop.len() as i64);
                     // 每盘承载的副本数(hard placement 口径):已注册盘(含 0 副本)∪ placement 涉及的盘。
                     let mut per_disk: BTreeMap<(NodeId, DiskId), i64> = BTreeMap::new();
-                    for (id, info) in &all_nodes {
+                    for (id, info) in all_nodes {
                         for disk_id in info.disks.keys() {
                             per_disk.insert((*id, disk_id.clone()), 0);
                         }
@@ -580,7 +616,7 @@ impl MasterNode {
                 }
 
                 let mut add_targets: std::collections::BTreeSet<PartitionId> =
-                    plan_rereplication(&partitions, &up, &errored)
+                    plan_rereplication(partitions, &up, &errored)
                         .into_iter()
                         .collect();
                 // D4 的"先补"受**在途预算**约束:在途 = 该分区在硬放置里**还带着坏盘上那个副本**
@@ -643,7 +679,9 @@ impl MasterNode {
                 // 维护期也应生效(维护窗口换盘正是要它先兜住)。只在当前为 RW 时写,故天然幂等:转 RO 后
                 // 下个周期不再命中,不会每 tick 空转 raft。空间释放后**不自动恢复 RW**(恢复靠运维
                 // `POST /api/partitions/{id}/state`,避免"抖动即回"把写流量又引回将满的盘)。
-                for (pid, info) in &partitions {
+                let mut ro_this_tick: std::collections::BTreeSet<PartitionId> =
+                    std::collections::BTreeSet::new();
+                for (pid, info) in partitions {
                     if info.state != PartitionState::ReadWrite {
                         continue;
                     }
@@ -665,6 +703,7 @@ impl MasterNode {
                         .is_ok()
                     {
                         metrics.partitions_forced_ro.inc();
+                        ro_this_tick.insert(*pid);
                         tracing::warn!(
                             partition = *pid,
                             node = node_id,
@@ -672,6 +711,41 @@ impl MasterNode {
                             used_ratio = ratio,
                             threshold = config.disk_near_full_ratio,
                             "磁盘将满:分区自动转只读(只置不回,恢复请走 SetPartitionState)"
+                        );
+                    }
+                }
+
+                // D4 分区级写满 → 转 RO(**只置不回**,同上)。与上面的盘级判定互补:盘级看整块盘的余量,
+                // 分区级看单个分区自身的已用。已在本拍被盘级判定转过的分区跳过,避免重复提案。
+                let used_map = soft.used_bytes_by_partition();
+                for (pid, info) in partitions {
+                    if info.state != PartitionState::ReadWrite || ro_this_tick.contains(pid) {
+                        continue;
+                    }
+                    let cap = if info.capacity_bytes > 0 {
+                        info.capacity_bytes
+                    } else {
+                        config.partition_capacity_bytes
+                    };
+                    let max_used = used_map.get(pid).copied().unwrap_or(0);
+                    if !should_convert_to_ro(cap, config.segment_capacity_bytes, max_used) {
+                        continue;
+                    }
+                    if raft
+                        .client_write(MasterCommand::SetPartitionState {
+                            partition_id: *pid,
+                            state: PartitionState::ReadOnly,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        metrics.partitions_full_ro.inc();
+                        tracing::info!(
+                            partition = *pid,
+                            max_used,
+                            threshold = cap.saturating_sub(config.segment_capacity_bytes),
+                            capacity = cap,
+                            "partition approaching capacity: converted to read-only"
                         );
                     }
                 }
@@ -708,7 +782,7 @@ impl MasterNode {
                         .collect();
                     exclude.extend(decom.iter().copied());
                     if try_add_replica(
-                        &raft, &soft, &all_nodes, &config, &metrics, pid, &exclude, &up,
+                        &raft, &soft, &state, all_nodes, &config, &metrics, pid, &exclude, &up,
                     )
                     .await
                     .is_err()
@@ -760,7 +834,7 @@ impl MasterNode {
                     })
                     .copied()
                     .collect();
-                for (pid, node) in plan_move(&partitions, &moving, &up, &successor_active) {
+                for (pid, node) in plan_move(partitions, moving, &up, &successor_active) {
                     if raft
                         .client_write(MasterCommand::RemoveReplica {
                             partition_id: pid,
@@ -807,7 +881,7 @@ impl MasterNode {
                         if let Some(p) = &balance {
                             for m in &p.moves {
                                 let (phase, _) =
-                                    crate::balance::move_phase(p, m, &partitions, &moving);
+                                    crate::balance::move_phase(p, m, partitions, moving);
                                 if matches!(
                                     phase,
                                     crate::balance::MovePhase::Done
@@ -828,9 +902,7 @@ impl MasterNode {
                             let phases: Vec<crate::balance::MovePhase> = plan
                                 .moves
                                 .iter()
-                                .map(|m| {
-                                    crate::balance::move_phase(plan, m, &partitions, &moving).0
-                                })
+                                .map(|m| crate::balance::move_phase(plan, m, partitions, moving).0)
                                 .collect();
                             let count = |want: crate::balance::MovePhase| {
                                 phases.iter().filter(|p| **p == want).count()
@@ -952,7 +1024,7 @@ impl MasterNode {
                                                 BTreeMap::from([(m.to_node_id, info.clone())]);
                                             select_disks(
                                                 &candidates,
-                                                &placement_usage(&soft),
+                                                &placement_usage(&soft, &state, &config),
                                                 1,
                                                 config.partition_capacity_bytes,
                                                 config.disk_near_full_ratio,
@@ -1022,6 +1094,7 @@ impl MasterNode {
 /// 在健康、非排除的节点里为一个新副本选盘(re-replication / repair / move 共用)。
 fn pick_replica_disk(
     soft: &SoftState,
+    state: &MasterState,
     all_nodes: &BTreeMap<NodeId, NodeInfo>,
     config: &MasterConfig,
     exclude: &std::collections::HashSet<NodeId>,
@@ -1034,7 +1107,7 @@ fn pick_replica_disk(
         .collect();
     let mut reps = select_disks(
         &candidates,
-        &placement_usage(soft),
+        &placement_usage(soft, state, config),
         1,
         config.partition_capacity_bytes,
         config.disk_near_full_ratio,
@@ -1120,6 +1193,7 @@ fn replica_caught_up(
 async fn try_add_replica(
     raft: &Raft<TypeConfig>,
     soft: &SoftState,
+    state: &MasterState,
     all_nodes: &BTreeMap<NodeId, NodeInfo>,
     config: &MasterConfig,
     metrics: &MasterMetrics,
@@ -1127,7 +1201,7 @@ async fn try_add_replica(
     exclude: &std::collections::HashSet<NodeId>,
     up: &std::collections::HashSet<NodeId>,
 ) -> Result<Option<(NodeId, DiskId)>, PlacementError> {
-    let replica = match pick_replica_disk(soft, all_nodes, config, exclude, up) {
+    let replica = match pick_replica_disk(soft, state, all_nodes, config, exclude, up) {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(partition = pid, error = %e, "no eligible disk to add replica");
@@ -1153,6 +1227,7 @@ async fn try_add_replica(
 fn has_spare_disk(
     all_nodes: &BTreeMap<NodeId, NodeInfo>,
     soft: &SoftState,
+    state: &MasterState,
     config: &MasterConfig,
     exclude: &std::collections::HashSet<NodeId>,
     up: &std::collections::HashSet<NodeId>,
@@ -1164,7 +1239,7 @@ fn has_spare_disk(
         .collect();
     select_disks(
         &candidates,
-        &placement_usage(soft),
+        &placement_usage(soft, state, config),
         1,
         config.partition_capacity_bytes,
         config.disk_near_full_ratio,
@@ -1405,6 +1480,7 @@ impl Master for MasterService {
         let metrics = self.metrics.clone();
         let secret = self.config.cluster_secret.clone();
         let up_timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+        let adjusted_free_timeout = Duration::from_secs(self.config.adjusted_free_timeout_secs);
         let placement_epoch = self.placement_epoch.clone();
         let placement_index = self.placement_index.clone();
         let (tx, rx) = mpsc::channel(16);
@@ -1435,11 +1511,14 @@ impl Master for MasterService {
                                 capacity_bytes: d.capacity_bytes,
                                 free_bytes: d.free_bytes,
                                 health: d.health,
+                                // 占位:adjusted_free / last_heartbeat_time 由 record_beat 的守卫逻辑重算。
+                                adjusted_free: d.free_bytes,
+                                last_heartbeat_time: Instant::now(),
                             },
                         )
                     })
                     .collect();
-                soft.record_beat(node_id, disks);
+                soft.record_beat(node_id, disks, adjusted_free_timeout);
 
                 // M3/M7:记录副本实然态(全量替换 / 增量合并 + 显式摘除)。
                 if full_report {
@@ -1821,7 +1900,14 @@ impl Master for MasterService {
                         let mut exclude: std::collections::HashSet<NodeId> =
                             part.replicas.iter().map(|r| r.node_id).collect();
                         exclude.extend(g.state.decommissioning.iter().copied());
-                        has_spare_disk(&g.state.nodes, &self.soft, &self.config, &exclude, &up_set)
+                        has_spare_disk(
+                            &g.state.nodes,
+                            &self.soft,
+                            &g.state,
+                            &self.config,
+                            &exclude,
+                            &up_set,
+                        )
                     }
                 };
                 PartitionEntry {
@@ -2163,7 +2249,14 @@ impl Master for MasterService {
                             part.replicas.iter().map(|r| r.node_id).collect();
                         exclude.insert(req.node_id);
                         exclude.extend(g.state.decommissioning.iter().copied());
-                        !has_spare_disk(&g.state.nodes, &self.soft, &self.config, &exclude, &up_set)
+                        !has_spare_disk(
+                            &g.state.nodes,
+                            &self.soft,
+                            &g.state,
+                            &self.config,
+                            &exclude,
+                            &up_set,
+                        )
                     })
                     .map(|(pid, _)| *pid)
                     .collect()
@@ -2249,7 +2342,7 @@ impl Master for MasterService {
         }
 
         // 排除该分区已有副本节点 + 所有下线节点(同 reconciler 的补副本约束)。
-        let (all_nodes, exclude) = {
+        let (state, exclude) = {
             let g = self
                 .sm_data
                 .read()
@@ -2260,14 +2353,15 @@ impl Master for MasterService {
             let mut exclude: std::collections::HashSet<NodeId> =
                 part.replicas.iter().map(|r| r.node_id).collect();
             exclude.extend(g.state.decommissioning.iter().copied());
-            (g.state.nodes.clone(), exclude)
+            (g.state.clone(), exclude)
         };
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let up = self.soft.up_nodes(timeout);
         match try_add_replica(
             &self.raft,
             &self.soft,
-            &all_nodes,
+            &state,
+            &state.nodes,
             &self.config,
             &self.metrics,
             req.partition_id,
@@ -2320,7 +2414,7 @@ impl Master for MasterService {
 
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let up = self.soft.up_nodes(timeout);
-        let (all_nodes, decom, part_replicas, already_moving) = {
+        let (state, part_replicas, already_moving) = {
             let g = self
                 .sm_data
                 .read()
@@ -2329,8 +2423,7 @@ impl Master for MasterService {
                 return fail("partition not found".to_string());
             };
             (
-                g.state.nodes.clone(),
-                g.state.decommissioning.clone(),
+                g.state.clone(),
                 part.replicas.clone(),
                 g.state
                     .moving
@@ -2350,7 +2443,7 @@ impl Master for MasterService {
         // 候选排除:现有副本节点 ∪ 下线节点(自动选择时;指定目标时另作校验)。
         let mut exclude: std::collections::HashSet<NodeId> =
             part_replicas.iter().map(|r| r.node_id).collect();
-        exclude.extend(decom.iter().copied());
+        exclude.extend(state.decommissioning.iter().copied());
         let replica = if req.to_node_id != 0 {
             if !up.contains(&req.to_node_id) {
                 return fail(format!("target node {} is not up", req.to_node_id));
@@ -2361,14 +2454,14 @@ impl Master for MasterService {
                     req.to_node_id
                 ));
             }
-            let Some(info) = all_nodes.get(&req.to_node_id) else {
+            let Some(info) = state.nodes.get(&req.to_node_id) else {
                 return fail(format!("target node {} not registered", req.to_node_id));
             };
             // 选盘限定在该节点。
             let candidates = BTreeMap::from([(req.to_node_id, info.clone())]);
             match select_disks(
                 &candidates,
-                &placement_usage(&self.soft),
+                &placement_usage(&self.soft, &state, &self.config),
                 1,
                 self.config.partition_capacity_bytes,
                 self.config.disk_near_full_ratio,
@@ -2377,7 +2470,14 @@ impl Master for MasterService {
                 Err(_) => return fail("no eligible disk".to_string()),
             }
         } else {
-            match pick_replica_disk(&self.soft, &all_nodes, &self.config, &exclude, &up) {
+            match pick_replica_disk(
+                &self.soft,
+                &state,
+                &state.nodes,
+                &self.config,
+                &exclude,
+                &up,
+            ) {
                 Ok(r) => r,
                 Err(_) => return fail("no eligible disk".to_string()),
             }
@@ -2531,6 +2631,7 @@ impl Master for MasterService {
             skew_threshold: self.config.balance_skew_threshold,
             partition_capacity_bytes: self.config.partition_capacity_bytes,
             near_full_ratio: self.config.disk_near_full_ratio,
+            reserved_ratio: self.config.disk_reserved_ratio,
         });
         let record = BalancePlanRecord {
             // plan_id 单调:旧计划 id + 1(读自已提交状态,切主后不回头;时间戳同理由提案带入)。
@@ -2742,13 +2843,13 @@ async fn place_one_partition(
     metrics: &MasterMetrics,
     rf: u8,
 ) -> Result<crate::types::PartitionId, String> {
-    let nodes = {
+    let state = {
         let g = sm_data.read().map_err(|_| "sm lock poisoned".to_string())?;
-        g.state.nodes.clone()
+        g.state.clone()
     };
     let replicas = select_disks(
-        &nodes,
-        &placement_usage(soft),
+        &state.nodes,
+        &placement_usage(soft, &state, config),
         rf,
         config.partition_capacity_bytes,
         config.disk_near_full_ratio,
@@ -2757,16 +2858,24 @@ async fn place_one_partition(
         metrics.partition_create_failed.inc();
         format!("placement: {e}")
     })?;
+    let placed: Vec<(NodeId, DiskId)> = replicas
+        .iter()
+        .map(|r| (r.node_id, r.disk_id.clone()))
+        .collect();
     match raft
         .client_write(MasterCommand::CreatePartition {
             replication_factor: rf,
             replicas,
+            partition_capacity: config.partition_capacity_bytes,
         })
         .await
     {
         Ok(resp) => match resp.data {
             crate::types::MasterResponse::PartitionId(id) => {
                 metrics.partitions_created.inc();
+                for (node, disk) in &placed {
+                    soft.deduct_disk_free(*node, disk, config.partition_capacity_bytes);
+                }
                 Ok(id)
             }
             other => Err(format!("unexpected apply response: {other:?}")),
@@ -2812,5 +2921,270 @@ mod tests {
         // cap 取到 u64 上界也不许溢出/panic(u128 内部算)。
         assert_eq!(capacity_weight_permille(u64::MAX, 0), 1000);
         assert_eq!(capacity_weight_permille(u64::MAX, u64::MAX / 2), 500);
+    }
+
+    /// 分区级写满阈值:已用 ≥ `容量 − 一个段容量` 才转 RO;未配容量(cap=0)永不触发。
+    #[test]
+    fn should_convert_to_ro_uses_segment_headroom_threshold() {
+        let gib = 1024 * 1024 * 1024u64;
+        let cap = 100 * gib;
+        let seg = 4 * gib;
+        let threshold = cap - seg; // 96 GiB
+
+        assert!(
+            !should_convert_to_ro(cap, seg, threshold - 1),
+            "阈值下一字节不转"
+        );
+        assert!(should_convert_to_ro(cap, seg, threshold), "恰达阈值即转");
+        assert!(should_convert_to_ro(cap, seg, cap), "写满必转");
+        assert!(should_convert_to_ro(cap, seg, cap * 2), "超卖也转");
+        assert!(!should_convert_to_ro(cap, seg, 0), "空分区不转");
+        assert!(
+            !should_convert_to_ro(0, seg, u64::MAX),
+            "cap=0 无意见,永不转"
+        );
+    }
+
+    /// 分区容量小于一个段容量时,剩余余量 `saturating_sub` 落到 0:任何非空用量都视为将满。
+    #[test]
+    fn should_convert_to_ro_saturates_when_capacity_below_segment() {
+        assert!(should_convert_to_ro(1024, 4096, 1), "cap<seg 时非空即转");
+        assert!(
+            should_convert_to_ro(1024, 4096, 0),
+            "cap<seg 时 0 用已达阈值 0"
+        );
+    }
+
+    #[test]
+    fn placement_usage_mixed_committed_accounting() {
+        use crate::soft::{DiskUsage, ReplicaState, SoftState};
+        use crate::types::{
+            MasterState, NodeInfo, PartitionInfo, PartitionState, Policy, ReplicaPlacement,
+        };
+        use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+        let gib = 1024u64 * 1024 * 1024;
+        let config = MasterConfig {
+            partition_capacity_bytes: 100 * gib,
+            disk_reserved_ratio: 0.0, // no reserve, simplify math
+            ..MasterConfig::default()
+        };
+
+        // 1 node, 1 disk
+        let node_id = 1u64;
+        let disk_id = "d0".to_string();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            node_id,
+            NodeInfo {
+                dc: "dc1".into(),
+                rack: "r1".into(),
+                addr: "127.0.0.1:1".into(),
+                disks: BTreeMap::from([(
+                    disk_id.clone(),
+                    crate::types::DiskSpec {
+                        capacity_bytes: 800 * gib,
+                    },
+                )]),
+                registered_at_ms: 0,
+            },
+        );
+
+        let mk_replica = |nid, did: &str| ReplicaPlacement {
+            node_id: nid,
+            disk_id: did.to_string(),
+            target_state: "ACTIVE".into(),
+            incarnation: 1,
+        };
+
+        let mut partitions = BTreeMap::new();
+        // 2 RW partitions (committed = capacity_bytes each)
+        partitions.insert(0, PartitionInfo {
+            replication_factor: 1,
+            state: PartitionState::ReadWrite,
+            replicas: vec![mk_replica(node_id, &disk_id)],
+            capacity_bytes: 100 * gib,
+        });
+        partitions.insert(1, PartitionInfo {
+            replication_factor: 1,
+            state: PartitionState::ReadWrite,
+            replicas: vec![mk_replica(node_id, &disk_id)],
+            capacity_bytes: 100 * gib,
+        });
+        // 3 RO partitions (committed = used_bytes if available)
+        for i in 2..5 {
+            partitions.insert(i, PartitionInfo {
+                replication_factor: 1,
+                state: PartitionState::ReadOnly,
+                replicas: vec![mk_replica(node_id, &disk_id)],
+                capacity_bytes: 100 * gib,
+            });
+        }
+        // 1 SEALED partition
+        partitions.insert(5, PartitionInfo {
+            replication_factor: 1,
+            state: PartitionState::Sealed,
+            replicas: vec![mk_replica(node_id, &disk_id)],
+            capacity_bytes: 100 * gib,
+        });
+
+        let state = MasterState {
+            next_partition_id: 6,
+            next_incarnation: 10,
+            object_next: BTreeMap::new(),
+            nodes,
+            partitions,
+            policy: Policy::default(),
+            decommissioning: BTreeSet::new(),
+            moving: BTreeSet::new(),
+            move_targets: BTreeMap::new(),
+            pending_drop: BTreeSet::new(),
+            maintenance: false,
+            pause_autogrow: false,
+            balance: None,
+        };
+
+        // Soft state: report used_bytes for RO/SEALED partitions
+        let soft = SoftState::default();
+        let mut disks = HashMap::new();
+        disks.insert(
+            disk_id.clone(),
+            DiskUsage {
+                capacity_bytes: 800 * gib,
+                free_bytes: 500 * gib,
+                health: String::new(),
+                adjusted_free: 500 * gib,
+                last_heartbeat_time: std::time::Instant::now(),
+            },
+        );
+        soft.record_beat(
+            node_id,
+            disks,
+            std::time::Duration::from_secs(config.adjusted_free_timeout_secs),
+        );
+
+        // Report used_bytes: RO partitions 2,3,4 at 40G each; SEALED partition 5 at 80G
+        // RW partitions 0,1 at 50G each (should NOT affect committed)
+        let replicas_data: Vec<(crate::types::PartitionId, ReplicaState)> = vec![
+            (0, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 50 * gib }),
+            (1, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 50 * gib }),
+            (2, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 40 * gib }),
+            (3, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 40 * gib }),
+            (4, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 40 * gib }),
+            (5, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 80 * gib }),
+        ];
+        soft.record_replicas(node_id, replicas_data, &[], true);
+
+        let usage = placement_usage(&soft, &state, &config);
+        let disk_free = &usage[&(node_id, disk_id.clone())];
+        let expected_committed = 2 * 100 * gib + 3 * 40 * gib + 80 * gib;
+        assert_eq!(
+            disk_free.committed_bytes, expected_committed,
+            "mixed committed: RW=cap, RO/SEALED=used_bytes; got {} expected {}",
+            disk_free.committed_bytes / gib,
+            expected_committed / gib
+        );
+
+        // Without mixed accounting it would be 6×100G = 600G
+        assert!(
+            disk_free.committed_bytes < 6 * 100 * gib,
+            "mixed accounting must be less than all-capacity"
+        );
+    }
+
+    #[test]
+    fn placement_usage_fallback_when_used_bytes_missing() {
+        use crate::soft::{DiskUsage, SoftState};
+        use crate::types::{
+            MasterState, NodeInfo, PartitionInfo, PartitionState, Policy, ReplicaPlacement,
+        };
+        use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+        let gib = 1024u64 * 1024 * 1024;
+        let config = MasterConfig {
+            partition_capacity_bytes: 100 * gib,
+            disk_reserved_ratio: 0.0,
+            ..MasterConfig::default()
+        };
+
+        let node_id = 1u64;
+        let disk_id = "d0".to_string();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            node_id,
+            NodeInfo {
+                dc: "dc1".into(),
+                rack: "r1".into(),
+                addr: "127.0.0.1:1".into(),
+                disks: BTreeMap::from([(
+                    disk_id.clone(),
+                    crate::types::DiskSpec {
+                        capacity_bytes: 800 * gib,
+                    },
+                )]),
+                registered_at_ms: 0,
+            },
+        );
+
+        let mk_replica = |nid, did: &str| ReplicaPlacement {
+            node_id: nid,
+            disk_id: did.to_string(),
+            target_state: "ACTIVE".into(),
+            incarnation: 1,
+        };
+
+        let mut partitions = BTreeMap::new();
+        // 1 RO partition — no used_bytes will be reported → fallback to capacity_bytes
+        partitions.insert(0, PartitionInfo {
+            replication_factor: 1,
+            state: PartitionState::ReadOnly,
+            replicas: vec![mk_replica(node_id, &disk_id)],
+            capacity_bytes: 100 * gib,
+        });
+
+        let state = MasterState {
+            next_partition_id: 1,
+            next_incarnation: 2,
+            object_next: BTreeMap::new(),
+            nodes,
+            partitions,
+            policy: Policy::default(),
+            decommissioning: BTreeSet::new(),
+            moving: BTreeSet::new(),
+            move_targets: BTreeMap::new(),
+            pending_drop: BTreeSet::new(),
+            maintenance: false,
+            pause_autogrow: false,
+            balance: None,
+        };
+
+        let soft = SoftState::default();
+        let mut disks = HashMap::new();
+        disks.insert(
+            disk_id.clone(),
+            DiskUsage {
+                capacity_bytes: 800 * gib,
+                free_bytes: 700 * gib,
+                health: String::new(),
+                adjusted_free: 700 * gib,
+                last_heartbeat_time: std::time::Instant::now(),
+            },
+        );
+        soft.record_beat(
+            node_id,
+            disks,
+            std::time::Duration::from_secs(config.adjusted_free_timeout_secs),
+        );
+        // No replica used_bytes reported → used_map has no entry for partition 0
+
+        let usage = placement_usage(&soft, &state, &config);
+        let disk_free = &usage[&(node_id, disk_id)];
+
+        // Fallback: RO with no used_bytes → capacity_bytes = 100G
+        assert_eq!(
+            disk_free.committed_bytes,
+            100 * gib,
+            "RO without used_bytes must fallback to capacity_bytes"
+        );
     }
 }

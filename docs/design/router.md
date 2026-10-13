@@ -122,6 +122,9 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 > (早期版本用"`0` 表示自动",导致第 0 号分区无法被点名,已改。)
 
 > **没有 W/R 配置项**(见 §2)、**没有重试次数配置项**(失败即返回,重试由调用方决定)。
+> 唯一例外:`put_file_with_ttl` 在**全部副本都报 507(分区写满)**时内部换分区重试(写死最多 2 次,
+> 见 §6 `router_put_store_full_retries_total`);`put_with_ttl` 的 key 已绑定分区,只摘掉该分区号段并返回
+> `StoreFull`,不重试。
 >
 > 若要从 TOML 文件加载(C 里目前只有 CLI flag / 代码内构造两条路径),同样要像 frontend 那样包一层表名
 > (`[router]` 表 → 一个顶层 `{ router: RouterConfig }` 包装),否则 `[router]` 表会被静默忽略。
@@ -138,6 +141,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_put_bytes_total` | counter | — | 字节 | 成功写入的字节数 | 无 |
 | `router_put_seconds` | histogram | `outcome` | 秒 | 单次写延迟(含取号段/扇出等待) | `RouterMetrics.putBlobOperationLatencyMs` |
 | `router_put_replica_errors_total` | counter | `kind` | 次 | **单个副本**写失败分类(kind 同错误表) | 无 |
+| `router_put_store_full_retries_total` | counter | — | 次 | 因分区写满(全副本 507)而**换分区重试**的次数(`put_file_with_ttl` 内部重试,最多 2 次) | 无 |
 | `router_get_total` | counter | `outcome` | 次 | 读请求数 | `RouterMetrics.getBlobOperationRate` |
 | `router_get_bytes_total` | counter | — | 字节 | 成功读出的字节数 | 无 |
 | `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`stat` 操作数 | `RouterMetrics.*OperationRate` |

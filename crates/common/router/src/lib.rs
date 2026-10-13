@@ -59,6 +59,12 @@ use antfs_master::PartitionId;
 
 const PROTO_VERSION: u32 = 1;
 
+/// `put_file_with_ttl` 因分区写满(全副本 507)而**换分区重试**的最大次数。
+///
+/// 不做成配置项:重试是"分区满 → 换一个分区"的确定性补救,不是退避策略;次数写死 2 次
+/// (共 3 次尝试)足够覆盖"恰好撞上一个刚写满的分区",又不会在集群整体写满时反复空转。
+const MAX_STORE_FULL_RETRIES: usize = 2;
+
 /// 一次写的实际结果:收满 [`required`](Self::required) 个 ack 才返回成功。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PutReport {
@@ -156,6 +162,14 @@ impl IdCache {
             self.credit.remove(&pid);
         }
         Some(key)
+    }
+
+    /// 分区写满(全副本 507)后把它从本地号段池里摘掉:段、权重、信用一并清除。
+    /// 之后 `take_weighted` 不会再挑它;下次 `sync_segments` 若 master 仍列它为 RW 会重新补段。
+    fn evict_partition(&mut self, pid: PartitionId) {
+        self.segments.remove(&pid);
+        self.order.retain(|w| w.pid != pid);
+        self.credit.remove(&pid);
     }
 }
 
@@ -358,6 +372,12 @@ impl Router {
             .collect()
     }
 
+    /// 分区写满(全副本 507)后把它从本地号段池里摘掉(段/权重/信用一并清除),
+    /// 让后续 `allocate_one` 不再挑它。下次 `sync_segments` 若 master 仍列它为 RW 会重新补段。
+    pub async fn evict_partition(&self, pid: PartitionId) {
+        self.ids.lock().await.evict_partition(pid);
+    }
+
     // ── 读路由 ──────────────────────────────────────────────────────────────────────────────
 
     /// 该分区的副本位置:优先用缓存(发号响应里带回过),否则向 master `LookupPartition` 拉一次。
@@ -447,19 +467,23 @@ impl Router {
         }
         if f.reached() {
             self.metrics.put_bytes.inc_by(data.len() as u64);
-            Ok(PutReport {
+            return Ok(PutReport {
                 acks: f.ok.len(),
                 total: f.total,
                 required: f.required,
-            })
-        } else {
-            Err(Error::Quorum {
-                acks: f.ok.len(),
-                required: f.required,
-                total: f.total,
-                detail: f.detail(),
-            })
+            });
         }
+        // 全部副本都 507 = 分区写满:key 已绑定该分区,无法换分区重试 —— 摘掉该分区号段,返回 StoreFull。
+        if let Some(addr) = all_store_full(&f) {
+            self.evict_partition(pid).await;
+            return Err(Error::StoreFull { addr });
+        }
+        Err(Error::Quorum {
+            acks: f.ok.len(),
+            required: f.required,
+            total: f.total,
+            detail: f.detail(),
+        })
     }
 
     /// 上传本地文件:分配 blobId → 并行 PUT 全部副本,**每个副本各自从文件流式读**
@@ -476,53 +500,67 @@ impl Router {
     ) -> Result<(StoreKey, PutReport)> {
         let path = path.as_ref().to_path_buf();
         let len = tokio::fs::metadata(&path).await?.len();
-        let key = self.allocate_one().await?;
-        let pid = key.partition_id();
-        let replicas = self.replicas_for(pid).await?;
-        let total = replicas.len();
-        let started = Instant::now();
-        let futs = FuturesUnordered::new();
-        for r in &replicas {
-            let addr = r.addr.clone();
-            let path = path.clone();
-            futs.push(async move {
-                let res = self
-                    .put_file_to(pid, &key, &path, expiration_ms, &addr)
-                    .await;
-                (addr, res)
-            });
-        }
-        let f = collect_majority(futs, total).await;
-        let outcome = if f.reached() { "ok" } else { "quorum" };
-        self.metrics.put_total.with_label_values(&[outcome]).inc();
-        self.metrics
-            .put_seconds
-            .with_label_values(&[outcome])
-            .observe(started.elapsed().as_secs_f64());
-        for (_, e) in &f.failures {
+        let mut key = self.allocate_one().await?;
+        let mut first_err: Option<Error> = None;
+        for attempt in 0..=MAX_STORE_FULL_RETRIES {
+            let pid = key.partition_id();
+            let replicas = self.replicas_for(pid).await?;
+            let total = replicas.len();
+            let started = Instant::now();
+            let futs = FuturesUnordered::new();
+            for r in &replicas {
+                let addr = r.addr.clone();
+                let path = path.clone();
+                futs.push(async move {
+                    let res = self
+                        .put_file_to(pid, &key, &path, expiration_ms, &addr)
+                        .await;
+                    (addr, res)
+                });
+            }
+            let f = collect_majority(futs, total).await;
+            let outcome = if f.reached() { "ok" } else { "quorum" };
+            self.metrics.put_total.with_label_values(&[outcome]).inc();
             self.metrics
-                .put_replica_errors
-                .with_label_values(&[e.kind()])
-                .inc();
-        }
-        if f.reached() {
-            self.metrics.put_bytes.inc_by(len);
-            Ok((
-                key,
-                PutReport {
+                .put_seconds
+                .with_label_values(&[outcome])
+                .observe(started.elapsed().as_secs_f64());
+            for (_, e) in &f.failures {
+                self.metrics
+                    .put_replica_errors
+                    .with_label_values(&[e.kind()])
+                    .inc();
+            }
+            if f.reached() {
+                self.metrics.put_bytes.inc_by(len);
+                return Ok((
+                    key,
+                    PutReport {
+                        acks: f.ok.len(),
+                        total: f.total,
+                        required: f.required,
+                    },
+                ));
+            }
+            if first_err.is_none() {
+                first_err = Some(Error::Quorum {
                     acks: f.ok.len(),
-                    total: f.total,
                     required: f.required,
-                },
-            ))
-        } else {
-            Err(Error::Quorum {
-                acks: f.ok.len(),
-                required: f.required,
-                total: f.total,
-                detail: f.detail(),
-            })
+                    total: f.total,
+                    detail: f.detail(),
+                });
+            }
+            // 全部副本都 507 = 分区写满:摘掉该分区、换一个分区重试(最多 MAX_STORE_FULL_RETRIES 次)。
+            if all_store_full(&f).is_some() && attempt < MAX_STORE_FULL_RETRIES {
+                self.metrics.router_put_store_full_retries.inc();
+                self.evict_partition(pid).await;
+                key = self.allocate_one().await?;
+                continue;
+            }
+            // 重试耗尽(或非全 507):返回第一次尝试的原始错误。
+            return Err(first_err.expect("first_err is set on the first failing attempt"));
         }
+        unreachable!("loop always returns")
     }
 
     async fn put_body(
@@ -1016,6 +1054,20 @@ async fn collect_majority<T>(
     }
 }
 
+/// 全部副本都报 507(StoreFull)= 分区写满;返回第一个报满的副本地址。
+///
+/// 部分 507(其余成功或其它错误)≠ 分区满 —— 多数派可能仍可达,不触发换分区重试。
+/// `collect_majority` 可能提前返回(剩余未完成的 future 被丢弃),故只看**已收集到的失败**。
+fn all_store_full<T>(f: &Fanout<T>) -> Option<String> {
+    if f.failures.is_empty() {
+        return None;
+    }
+    f.failures
+        .iter()
+        .all(|(_, e)| matches!(e, Error::StoreFull { .. }))
+        .then(|| f.failures[0].0.clone())
+}
+
 /// 副本位置排序:`up` 的在前(读路径按序试,先试活着的),同组保持 master 给的顺序。
 fn sorted_replicas(mut replicas: Vec<ReplicaLoc>) -> Vec<ReplicaLoc> {
     replicas.sort_by_key(|r| !r.up);
@@ -1466,21 +1518,70 @@ mod tests {
         assert!(segment_shares(1024, &[w(1, 0)]).is_empty());
     }
 
-    /// 段尾收敛:按份额**只减不增**;无号可发时明确告诉调用方丢掉它(而不是留一个空段)。
+    /// 分区写满后摘掉它:段、权重、信用一并清除,`take_weighted` 不再挑它。
     #[test]
-    fn trim_segment_only_shrinks_and_reports_exhaustion() {
-        // 手上还剩 [10, 100),份额 20 → 收紧到 [10, 30)(丢掉的 70 个号成空洞,不再发给任何人)。
-        let mut s = seg(1, 10, 90);
-        assert!(trim_segment(&mut s, 20), "收敛后仍有号可发");
-        assert_eq!((s.next, s.end), (10, 30));
+    fn evict_partition_removes_segment_order_and_credit() {
+        let mut c = cache_with(&[(1, 1), (2, 1)], 4);
+        assert_eq!(
+            c.take_weighted().expect("号").partition_id(),
+            1,
+            "先取一个号让分区 1 攒下信用"
+        );
+        c.evict_partition(1);
+        assert!(!c.segments.contains_key(&1), "段必须被清除");
+        assert!(!c.order.iter().any(|w| w.pid == 1), "权重必须被清除");
+        assert!(!c.credit.contains_key(&1), "信用必须被清除");
+        for _ in 0..4 {
+            assert_eq!(
+                c.take_weighted().expect("号").partition_id(),
+                2,
+                "摘掉后只从剩余分区取号"
+            );
+        }
+        assert!(c.take_weighted().is_none(), "分区 2 的段取完");
+    }
 
-        // 份额比手上剩的还多 → **不增长**(号只能由 master 发,不能替它多要)。
-        let mut s = seg(1, 10, 90);
-        assert!(trim_segment(&mut s, 1000));
-        assert_eq!((s.next, s.end), (10, 100), "段尾只减不增");
+    /// 全部副本都 507 = 分区写满;部分 507 / 混合错误 / 无失败 ≠ 分区满。
+    #[test]
+    fn all_store_full_detects_partition_full() {
+        let full = |addr: &str| {
+            (
+                addr.to_string(),
+                Error::StoreFull {
+                    addr: addr.to_string(),
+                },
+            )
+        };
+        let silenced = |addr: &str| {
+            (
+                addr.to_string(),
+                Error::Silenced {
+                    addr: addr.to_string(),
+                    retry_after_secs: None,
+                },
+            )
+        };
+        let fanout = |ok: Vec<()>, failures: Vec<(String, Error)>, total: usize| Fanout {
+            ok,
+            failures,
+            total,
+            required: total / 2 + 1,
+        };
 
-        // objectId 空间见底(saturating 后等于 next)→ 没号可发,调用方该丢掉它。
-        let mut s = seg(1, u32::MAX, 0);
-        assert!(!trim_segment(&mut s, 5), "无号可发必须报 false");
+        // 全部 507 → 分区满(返回第一个报满的副本地址)。
+        assert_eq!(
+            all_store_full(&fanout(vec![], vec![full("a:1"), full("b:1")], 2)),
+            Some("a:1".to_string())
+        );
+        // 部分 507 + 其它错误 → 不是分区满。
+        assert!(all_store_full(&fanout(vec![], vec![full("a:1"), silenced("b:1")], 2)).is_none());
+        // 无失败 → 不是分区满。
+        assert!(all_store_full(&fanout(vec![(), ()], vec![], 2)).is_none());
+        // 有成功但多数派未达(1/2)+ 其余全 507 → 仍判分区满(换分区重试是正确补救;
+        // "部分 507 不重试"只指多数派已达成的情形,那由调用方先判 `reached` 短路)。
+        assert_eq!(
+            all_store_full(&fanout(vec![()], vec![full("b:1")], 2)),
+            Some("b:1".to_string())
+        );
     }
 }

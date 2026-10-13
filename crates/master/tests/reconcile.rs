@@ -176,6 +176,7 @@ async fn reconcile_transitions_and_rereplication() {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");
@@ -309,6 +310,7 @@ async fn decommission_evacuates_replicas_add_before_remove() {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");
@@ -473,6 +475,7 @@ async fn repair_and_move_replica_validation() {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");
@@ -561,6 +564,7 @@ async fn repair_and_move_replica_validation() {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         })
         .await
         .expect("create partition 2");
@@ -740,6 +744,7 @@ async fn move_replica_completes_add_before_remove() {
                     incarnation: 0,
                 },
             ],
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");
@@ -945,6 +950,7 @@ async fn assign_lookup_counters_and_cluster_gauges() {
                         incarnation: 0,
                     },
                 ],
+                partition_capacity: 0,
             })
             .await
             .expect("create partition");
@@ -1116,6 +1122,7 @@ async fn create_partition(leader: &MasterNode, replicas: &[u64]) -> u32 {
                     incarnation: 0,
                 })
                 .collect(),
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");
@@ -1670,6 +1677,96 @@ async fn near_full_disk_forces_partition_read_only_without_auto_revert() {
     );
 }
 
+/// D4 分区级写满:分区自身已用逼近其容量上限(即便盘还空)也须转 RO,且只置不回。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partition_over_capacity_threshold_forces_read_only_without_auto_revert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = start_masters(tmp.path(), 0).await;
+    let leader = leader_of(&nodes);
+    let mut client = connect(leader).await;
+
+    register_data_nodes(leader, &[(101, "rA"), (102, "rB"), (103, "rC")]).await;
+    let pid = create_partition(leader, &[101, 102, 103]).await;
+
+    // 分区容量 100 GiB、段容量 4 GiB → 阈值 96 GiB。上报 97 GiB,而盘仍健康、余量 90%
+    // (盘级判定不会命中)→ 只应由分区级判定转 RO。
+    let over_threshold = 97 * 1024 * 1024 * 1024u64;
+    let mut hb = client
+        .heartbeat(tokio_stream::iter(vec![beat_disk(
+            101,
+            vec![replica(pid, "ACTIVE", over_threshold)],
+            DISK_FREE,
+            "",
+        )]))
+        .await
+        .expect("hb")
+        .into_inner();
+    hb.message().await.expect("recv").expect("directive");
+    for id in [102u64, 103] {
+        send_beat(
+            &mut client,
+            id,
+            vec![replica(pid, "ACTIVE", over_threshold)],
+        )
+        .await;
+    }
+
+    let sm = leader.sm_data.clone();
+    let state_of = |pid: u32| {
+        sm.read()
+            .expect("sm")
+            .state
+            .partitions
+            .get(&pid)
+            .map(|p| p.state)
+    };
+    let forced = wait_until(Duration::from_secs(20), || {
+        state_of(pid) == Some(antfs_master::types::PartitionState::ReadOnly)
+    })
+    .await;
+    assert!(
+        forced,
+        "a partition over its capacity threshold must go ReadOnly; state={:?}",
+        state_of(pid)
+    );
+    let counted = wait_until(Duration::from_secs(20), || {
+        gauge(leader, "master_partitions_full_ro") == Some(1)
+            && gauge(leader, "master_partitions_rw") == Some(0)
+    })
+    .await;
+    assert!(
+        counted,
+        "partition-full-RO must be counted once, dump:\n{}",
+        antfs_metric::gather(&leader.registry).unwrap_or_default()
+    );
+    assert_eq!(
+        gauge(leader, "master_partitions_forced_ro_total").unwrap_or(0),
+        0,
+        "disk-level forced-RO must NOT fire while the disk has ample free space"
+    );
+
+    // 用量回落到 10 GiB + 跨多拍 → **不自动回 RW**(只置不回,同盘级判定)。
+    let mut hb = client
+        .heartbeat(tokio_stream::iter(vec![beat_disk(
+            101,
+            vec![replica(pid, "ACTIVE", 10 * 1024 * 1024 * 1024)],
+            DISK_FREE,
+            "",
+        )]))
+        .await
+        .expect("hb")
+        .into_inner();
+    hb.message().await.expect("recv").expect("directive");
+    let reverted = wait_until(Duration::from_secs(3), || {
+        state_of(pid) == Some(antfs_master::types::PartitionState::ReadWrite)
+    })
+    .await;
+    assert!(
+        !reverted,
+        "space freed must NOT auto-revert RO → RW (运维手工恢复)"
+    );
+}
+
 /// A6:DROPPED 的确认闸门。宽限期关掉 reconciler(只验证心跳路径的判定)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_requires_successor_active_and_keeps_retrying() {
@@ -1977,6 +2074,7 @@ async fn heartbeat_directive_carries_partition_states() {
                 target_state: "ACTIVE".into(),
                 incarnation: 0,
             }],
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");
@@ -2102,6 +2200,7 @@ async fn create_partition_on(leader: &MasterNode, on: &[u64]) -> u32 {
         .client_write(MasterCommand::CreatePartition {
             replication_factor: on.len() as u8,
             replicas,
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");

@@ -22,6 +22,8 @@ pub struct RouterMetrics {
     pub put_seconds: antfs_metric::HistogramVec,
     /// 单个副本写失败数,label `kind`(分类同 [`crate::Error::kind`])。
     pub put_replica_errors: IntCounterVec,
+    /// 因分区写满(全副本 507)而换分区重试的次数(counter)。
+    pub router_put_store_full_retries: IntCounter,
     /// blob 读请求数,label `outcome`。
     pub get_total: IntCounterVec,
     /// 读出的字节数(counter,只计成功)。
@@ -70,6 +72,11 @@ impl RouterMetrics {
                 "router_put_replica_errors_total",
                 "per-replica put failures by kind",
                 &["kind"],
+            )?,
+            router_put_store_full_retries: counter(
+                registry,
+                "router_put_store_full_retries_total",
+                "put retries after all replicas reported partition full (507)",
             )?,
             get_total: counter_vec(
                 registry,

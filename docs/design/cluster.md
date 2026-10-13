@@ -387,6 +387,9 @@ message MasterDirective {
 | `master.disk_evac_min_bad_secs` | u64 | 300 | ≥1 | **持续证据门槛**:某盘为 `UNAVAILABLE` 需**持续**这么久才允许撤离它上面的副本。为什么单轮故障枚举不够 —— 一次抖动就搬 GB 级数据,代价不对称(判坏 3 轮/30s,撤离默认 300s)。**健康值一变就重置计时**,故反复跳动的盘永远攒不满 |
 | `master.disk_evac_max_in_flight` | u64 | 1 | ≥1 | **在途撤离预算**:同时在途的撤离分区数上限。在途 = "已为它开过撤离,且坏盘上那份副本还在硬放置里"。撤离是真搬 GB 数据,风格对齐 `balance_max_in_flight = 1` |
 | `master.partition_capacity_bytes` | u64 | 100 GiB | ≥1 | 分区容量上界;选盘时盘可用容量须 ≥ 它(M2,§7.3) |
+| `master.segment_capacity_bytes` | u64 | 4 GiB | ≥1 | 段容量上界。**分区级写满阈值**用它留出一个段的余量:分区已用 ≥ `容量 − 段容量` → reconciler 自动转 RO(见 `master_partitions_full_ro_total`) |
+| `master.disk_reserved_ratio` | f64 | 0.05 | [0.0,1.0) | 磁盘预留空间比例:可用容量上限 `usable = disk_capacity × (1 − ratio)`。预留覆盖 index/filter/tmp/FS 元数据/compaction 临时空间;逻辑承诺检查和物理空间检查均用 `usable` |
+| `master.adjusted_free_timeout_secs` | u64 | 120 | ≥1 | `adjusted_free` 单调递减守卫超时:心跳 `free_bytes > adjusted_free` 且距上次心跳不超过此值则不覆盖(防滞后心跳回滚建分区扣减);超时后接受心跳值 |
 | `master.disk_near_full_ratio` | f64 | 0.8 | (0,1] | 盘用量超此比例:① 不再放新分区/新副本(选盘跳过);② 其上 RW 分区被 reconciler 自动转 RO(**只置不回**,恢复靠运维)(本项目默认 0.8,较 Ambry ≈95% 更保守) |
 | `master.auto_grow_enabled` | bool | false | — | Q5 自动扩容开关(默认关,安全) |
 | `master.auto_grow_min_writable` | u64 | 4 | — | 低水位:RW 分区数低于它就补建 |
@@ -443,6 +446,7 @@ message MasterDirective {
 | `master_disk_skew` | gauge | — | 个 | 每盘副本数的 max − min(无盘 = 0;越小越均衡,均衡器目标信号;对齐 Ceph balancer 的 OSD 用量方差类指标) |
 | `master_unhealthy_disks` | gauge | — | 块 | 主动探测报出不健康的盘数(`health` 非空且 ≠ `HEALTHY`;**探测未启用的盘(空串)不计**;reconciler 周期刷新,仅 leader) |
 | `master_partitions_forced_ro_total` | counter | — | 个 | 因副本所在盘将满被自动置 RO 的分区数(**只置不回**,恢复靠运维;对齐 Ambry `storeReadOnlyEnableSizeThresholdPercentage`) |
+| `master_partitions_full_ro` | counter | — | 个 | 因分区**自身**已用 ≥ `容量 − segment_capacity_bytes` 被自动置 RO 的分区数(**只置不回**,恢复靠运维)。与 `master_partitions_forced_ro_total` 互补:前者看整块盘余量,此者看单个分区占用 |
 | `master_pending_drops` | gauge | — | 对 | 待删源副本对数(`pending_drop`:placement 已移除、等源节点确认已删后清;源节点长期不回则该记账保留、gauge > 0;reconciler 周期刷新,仅 leader) |
 | `master_dropped_directives_total` | counter | — | 次 | 下发的 `DROPPED` 指令数(迁移/下线完成后删源副本/目录;每轮心跳重发会重复计数) |
 | `master_balance_pending` | gauge | — | 条 | 当前均衡计划内 pending(未受理)的搬迁数(无计划 = 0;reconciler 周期刷新,仅 leader;对齐 Ceph balancer 的 plan 进度观测) |

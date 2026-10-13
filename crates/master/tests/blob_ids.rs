@@ -106,8 +106,11 @@ fn beat(node: &MasterNode, node_id: u64, free: u64) {
                 capacity_bytes: 1 << 40,
                 free_bytes: free,
                 health: String::new(),
+                adjusted_free: free,
+                last_heartbeat_time: std::time::Instant::now(),
             },
         )]),
+        std::time::Duration::from_secs(120),
     );
 }
 
@@ -150,6 +153,7 @@ async fn create_partition(node: &MasterNode, replicas: Vec<ReplicaPlacement>) ->
         .client_write(MasterCommand::CreatePartition {
             replication_factor: rf,
             replicas,
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");

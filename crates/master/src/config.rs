@@ -94,6 +94,19 @@ pub struct MasterConfig {
     /// "在途" = 该分区在硬放置里**还带着坏盘上的那个副本**(搬迁未完成)。撤离是真搬 GB 数据,
     /// 风格对齐 `balance_max_in_flight = 1`:宁可慢,也别把网络与盘写一次打满。
     pub disk_evac_max_in_flight: u64,
+    /// 磁盘预留空间比例(`0.0..1.0`):可用容量上限 `usable = disk_capacity × (1 − ratio)`。
+    ///
+    /// 预留覆盖 index 文件(Binary Fuse Filter、`.idx`)、`COMPACT_POLICY_STATE`、暂存 `.tmp`、
+    /// 文件系统元数据以及 compaction 临时双份空间。`select_disks` 的逻辑承诺检查和物理空间检查
+    /// 均用 `usable` 而非 `disk_capacity`。
+    pub disk_reserved_ratio: f64,
+    /// 引擎单段容量(字节):用于分区级写满感知(`used >= capacity − segment_cap` → 转 RO)。
+    ///
+    /// **须与 store 侧 `store.segment_size_bytes` 一致**;错配时 master 侧偏保守(提前一点转 RO)。
+    pub segment_capacity_bytes: u64,
+    /// `adjusted_free` 单调递减守卫超时(秒):心跳上报 `free_bytes > adjusted_free` 时,
+    /// 若距上次心跳不超过此值则不覆盖(防滞后心跳回滚扣减);超时后接受心跳值。
+    pub adjusted_free_timeout_secs: u64,
 }
 
 impl Default for MasterConfig {
@@ -129,6 +142,9 @@ impl Default for MasterConfig {
             disk_evac_enabled: false,
             disk_evac_min_bad_secs: 300,
             disk_evac_max_in_flight: 1,
+            disk_reserved_ratio: 0.05,
+            segment_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            adjusted_free_timeout_secs: 120,
         }
     }
 }
@@ -207,6 +223,22 @@ impl Validate for MasterConfig {
         at_least(
             "master.disk_evac_max_in_flight",
             self.disk_evac_max_in_flight,
+            1,
+        )?;
+        if !(self.disk_reserved_ratio >= 0.0 && self.disk_reserved_ratio < 1.0) {
+            return Err(antfs_config::ConfigError::invalid(
+                "master.disk_reserved_ratio",
+                "must be in [0.0, 1.0)",
+            ));
+        }
+        at_least(
+            "master.segment_capacity_bytes",
+            self.segment_capacity_bytes,
+            1,
+        )?;
+        at_least(
+            "master.adjusted_free_timeout_secs",
+            self.adjusted_free_timeout_secs,
             1,
         )?;
         if self.raft_addr.is_empty() {
@@ -308,6 +340,68 @@ mod tests {
         assert!(
             no_debounce.validate().is_ok(),
             "0 = 关迟滞(保持改造前行为),必须合法以便回退对比"
+        );
+    }
+
+    #[test]
+    fn capacity_guard_defaults_are_pinned() {
+        let c = MasterConfig::default();
+        assert!(
+            (c.disk_reserved_ratio - 0.05).abs() < f64::EPSILON,
+            "默认预留 5%"
+        );
+        assert_eq!(
+            c.segment_capacity_bytes,
+            4 * 1024 * 1024 * 1024,
+            "默认 4 GiB 对齐 store 侧"
+        );
+        assert_eq!(c.adjusted_free_timeout_secs, 120, "默认 120 秒超时");
+    }
+
+    #[test]
+    fn capacity_guard_validation() {
+        let base = MasterConfig::default();
+
+        for (field, cfg) in [
+            (
+                "disk_reserved_ratio negative",
+                MasterConfig {
+                    disk_reserved_ratio: -0.1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "disk_reserved_ratio >= 1.0",
+                MasterConfig {
+                    disk_reserved_ratio: 1.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "segment_capacity_bytes = 0",
+                MasterConfig {
+                    segment_capacity_bytes: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "adjusted_free_timeout_secs = 0",
+                MasterConfig {
+                    adjusted_free_timeout_secs: 0,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert!(cfg.validate().is_err(), "{field} 应被拒绝");
+        }
+
+        let edge = MasterConfig {
+            disk_reserved_ratio: 0.0,
+            ..base
+        };
+        assert!(
+            edge.validate().is_ok(),
+            "disk_reserved_ratio = 0.0 合法(不预留)"
         );
     }
 }

@@ -25,3 +25,12 @@ target/
 # admin SPA 依赖 / 构建中间产物(dist/index.html 需入库供 include_str! 内嵌)
 crates/admin/ui/node_modules/
 crates/admin/ui/*.tsbuildinfo
+.codemap/
+.codemaker/codemap/
+.codemaker/codeindex/
+.codemaker/rules/codemap.mdc
+.codemaker/mcps.json
+.codemaker/hooks.json
+.claude/skills/codemap-*/
+.claude/skills/code-index-*/
+.claude/settings.local.json

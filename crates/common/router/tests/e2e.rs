@@ -24,7 +24,7 @@ use antfs_master::types::{
     DiskSpec, MasterCommand, MasterResponse, NodeInfo, PartitionState, ReplicaPlacement,
 };
 use antfs_master::{MasterConfig, MasterNode};
-use antfs_router::{Error, Router, RouterConfig, StoreKey};
+use antfs_router::{Error, Router, RouterConfig, StoreKey, NO_EXPIRATION};
 use antfs_store::{StoreServer, StoreServerConfig};
 use openraft::BasicNode;
 use tonic::transport::Channel;
@@ -74,13 +74,23 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
 
 /// 起一个真数据节点(不接 master:注册走测试直连 Raft,避免心跳噪声/等待)。
 async fn start_store(dir: &std::path::Path, node_id: u64) -> (StoreServer, String) {
+    start_store_with(dir, node_id, 64 << 20, 8 << 20).await
+}
+
+/// 起一个真数据节点,可指定分区容量与段大小(写满 → 507 的测试用)。
+async fn start_store_with(
+    dir: &std::path::Path,
+    node_id: u64,
+    partition_capacity_bytes: u64,
+    segment_size_bytes: u64,
+) -> (StoreServer, String) {
     let http_addr = addr(free_port());
     let cfg = StoreServerConfig {
         node_id,
         data_dirs: vec![dir.to_string_lossy().into_owned().into()],
         http_addr: http_addr.clone(),
         master_addr: String::new(),
-        partition_capacity_bytes: 64 << 20,
+        partition_capacity_bytes,
         max_body_bytes: 8 << 20,
         local_worker_enabled: false,
         ..Default::default()
@@ -89,7 +99,7 @@ async fn start_store(dir: &std::path::Path, node_id: u64) -> (StoreServer, Strin
     let srv = StoreServer::start_with(
         cfg,
         antfs_blob::StoreConfig {
-            segment_size_bytes: 8 << 20,
+            segment_size_bytes,
             index_max_inmem_elements: 100_000,
             io_error_count_to_trigger_shutdown: 0,
         },
@@ -138,6 +148,7 @@ async fn create_partition(node: &MasterNode, replicas: Vec<ReplicaPlacement>) ->
         .client_write(MasterCommand::CreatePartition {
             replication_factor: rf,
             replicas,
+            partition_capacity: 0,
         })
         .await
         .expect("create partition");
@@ -449,8 +460,11 @@ fn report_used(node: &MasterNode, replicas: &[(u32, u64)]) {
                 capacity_bytes: 1 << 40,
                 free_bytes: 1 << 39,
                 health: String::new(),
+                adjusted_free: 1 << 39,
+                last_heartbeat_time: std::time::Instant::now(),
             },
         )]),
+        std::time::Duration::from_secs(120),
     );
     node.soft.record_replicas(
         101,
@@ -655,4 +669,163 @@ async fn set_state(node: &MasterNode, pid: u32, state: PartitionState) {
         })
         .await
         .expect("set partition state");
+}
+
+/// 直连 store 写满一个分区(直到 507),证明该分区已不可写。
+///
+/// 用**高 objectId**(1_000_000 起)填充:master 发号从 0 起,测试里不会撞上这些号,
+/// 避免与 router 后续分配的 key 冲突(AlreadyExists)。
+///
+/// 填充体取 **1024 B**(≤ 各测试里 router 的最小写入体):507 意味着活跃段剩余 < 24+1024,
+/// 于是 router 任何 ≥ 1024 B 的写入都必然再吃 507 —— 否则"写满"后小写仍能塞进残段,测试失真。
+async fn fill_partition_until_full(addr: &str, pid: u32) {
+    let client = reqwest::Client::new();
+    let mut saw_full = false;
+    for i in 0..128u32 {
+        let key = StoreKey::from_parts(pid, 1_000_000 + i);
+        let url = format!(
+            "http://{addr}/partitions/{pid}/blobs/{}",
+            hex::encode(key.as_bytes())
+        );
+        let resp = client
+            .put(&url)
+            .body(vec![7u8; 1024])
+            .send()
+            .await
+            .expect("fill put");
+        if resp.status().as_u16() == 507 {
+            saw_full = true;
+            break;
+        }
+        assert_eq!(
+            resp.status().as_u16(),
+            201,
+            "fill put should ack until full"
+        );
+    }
+    assert!(saw_full, "partition {pid} must fill up and return 507");
+}
+
+/// **分区写满(全副本 507)自动换分区重试**:`put_file_with_ttl` 内部发号,命中已满分区时
+/// 摘掉该分区号段、重新发号到空分区,重试成功;`router_put_store_full_retries_total` 计数。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_file_retries_on_store_full_partition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    // 节点 A:分区容量极小(64 KiB),写满即 507;节点 B:正常容量。
+    let (_sa, addr_a) =
+        start_store_with(&tmp.path().join("store-a"), 101, 64 << 10, 64 << 10).await;
+    let (_sb, addr_b) = start_store_with(&tmp.path().join("store-b"), 102, 64 << 20, 8 << 20).await;
+    register_node(&node, 101, &addr_a).await;
+    register_node(&node, 102, &addr_b).await;
+
+    let full_pid = create_partition(&node, vec![placement(101)]).await;
+    let empty_pid = create_partition(&node, vec![placement(102)]).await;
+    ensure_replica(&addr_a, full_pid).await;
+    ensure_replica(&addr_b, empty_pid).await;
+    fill_partition_until_full(&addr_a, full_pid).await;
+
+    // 关后台刷新:让"摘掉已满分区"在测试窗口内保持(否则刷新会把它重新补回来)。
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(
+        RouterConfig {
+            id_segment_size: 64,
+            partition_refresh_secs: 0,
+            ..client_cfg(&grpc)
+        },
+        &registry,
+    )
+    .await
+    .expect("connect");
+
+    let src = tmp.path().join("upload.bin");
+    tokio::fs::write(&src, payload(4096, 1)).await.unwrap();
+    // 多次上传:首次命中已满分区 → 自动换分区重试;之后只从空分区取号。全部必须成功。
+    for _ in 0..20 {
+        let (key, report) = client
+            .put_file_with_ttl(&src, NO_EXPIRATION)
+            .await
+            .expect("put_file_with_ttl must succeed via retry");
+        assert_eq!(key.partition_id(), empty_pid, "成功写入的号必须落在空分区");
+        assert_eq!(report.acks, 1);
+    }
+    assert!(
+        client.metrics().router_put_store_full_retries.get() > 0,
+        "至少一次命中已满分区触发换分区重试"
+    );
+}
+
+/// **`put_with_ttl` 全副本 507 → 摘掉该分区号段 + 返回 StoreFull**(key 已绑定分区,不重试)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_with_ttl_evicts_full_partition_and_returns_store_full() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) =
+        start_store_with(&tmp.path().join("store-a"), 101, 64 << 10, 64 << 10).await;
+    register_node(&node, 101, &addr_a).await;
+    let pid = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, pid).await;
+    fill_partition_until_full(&addr_a, pid).await;
+
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(
+        RouterConfig {
+            partition_refresh_secs: 0,
+            ..client_cfg(&grpc)
+        },
+        &registry,
+    )
+    .await
+    .expect("connect");
+
+    let key = client.allocate_one().await.expect("allocate");
+    assert_eq!(key.partition_id(), pid);
+    let err = client
+        .put_with_ttl(key, bytes::Bytes::from(payload(1024, 2)), NO_EXPIRATION)
+        .await
+        .expect_err("写已满分区必须失败");
+    assert!(matches!(err, Error::StoreFull { .. }), "got {err:?}");
+    // 分区被摘掉:写权重快照里不再有它(后台刷新已关,窗口内不会被重新补回)。
+    let weights = client.write_weights().await;
+    assert!(
+        !weights.iter().any(|(wpid, _)| *wpid == pid),
+        "已满分区必须从本地号段池摘掉,实际 {weights:?}"
+    );
+}
+
+/// **部分副本 507 ≠ 分区满**:RF=3 中一个副本写满、其余两个正常 → 多数派(2/3)仍可达,
+/// 写成功且**不触发**换分区重试。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_store_full_still_reaches_quorum() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) =
+        start_store_with(&tmp.path().join("store-a"), 101, 64 << 10, 64 << 10).await;
+    let (_sb, addr_b) = start_store_with(&tmp.path().join("store-b"), 102, 64 << 20, 8 << 20).await;
+    let (_sc, addr_c) = start_store_with(&tmp.path().join("store-c"), 103, 64 << 20, 8 << 20).await;
+    register_node(&node, 101, &addr_a).await;
+    register_node(&node, 102, &addr_b).await;
+    register_node(&node, 103, &addr_c).await;
+
+    let pid = create_partition(&node, vec![placement(101), placement(102), placement(103)]).await;
+    ensure_replica(&addr_a, pid).await;
+    ensure_replica(&addr_b, pid).await;
+    ensure_replica(&addr_c, pid).await;
+    fill_partition_until_full(&addr_a, pid).await;
+
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect");
+    let key = client.allocate_one().await.expect("allocate");
+    let report = client
+        .put_with_ttl(key, bytes::Bytes::from(payload(4096, 3)), NO_EXPIRATION)
+        .await
+        .expect("两个健康副本必须凑够多数派");
+    assert_eq!((report.total, report.required, report.acks), (3, 2, 2));
+    assert_eq!(
+        client.metrics().router_put_store_full_retries.get(),
+        0,
+        "部分 507 且多数派可达 → 不重试"
+    );
 }
