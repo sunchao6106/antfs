@@ -355,13 +355,15 @@ pub struct DiskPool {
 
 impl Drop for DiskPool {
     fn drop(&mut self) {
-        // 先清队列:排队中的任务被丢弃 → 其 `oneshot` sender 一起丢,等待中的调用方立刻拿到
-        // `Closed`(不会永远吊着),permit 也随闭包析构而释放。
+        // **先置关停标志,再清队列**:清队列会把排队任务的 `oneshot` sender 丢掉、等待方被唤醒,
+        // 它按"此刻 `closed` 是否已置位"归因(见 `run` 的收尾)——顺序反了(先清后置)就会出现
+        // "sender 已丢、`closed` 还没置"的窗口,把关停误报成 `JobPanicked`。
+        // 代价是反方向的误报:关停进行中又 panic 的任务会被报成 `Closed` —— 反正池在收尾,可接受。
+        self.inner.close();
         {
             let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.clear();
         }
-        self.inner.close();
     }
 }
 
@@ -1282,11 +1284,13 @@ mod tests {
         .await;
 
         // 手工走一遍 `Drop for DiskPool` 的动作(测试里提交方自己持 `Arc<DiskPools>`,真 drop 要等它们
-        // 退出 —— 那样测的反而是循环等待)。
+        // 退出 —— 那样测的反而是循环等待)。**顺序必须与 Drop 一致:先置关停再清队列**——清队列会
+        // 唤醒排队等待方,它按"此刻 `closed` 是否已置位"归因;顺序反了,唤醒方会在 `closed` 置位前
+        // 读到 false,把关停误报成 `JobPanicked`(ubuntu CI 上踩中过)。
         {
             let pool = f.pool.pools.get(&id).expect("pool exists").clone();
-            pool.inner.queue.lock().expect("queue").clear();
             pool.inner.close();
+            pool.inner.queue.lock().expect("queue").clear();
         }
 
         match queued.await.expect("join") {
