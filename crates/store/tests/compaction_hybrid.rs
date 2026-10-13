@@ -95,7 +95,10 @@ async fn hybrid_first_round_uses_compact_all() {
     assert_eq!(n, 1, "该副本必须真的压了一轮");
 
     let after = h.store.stats().unwrap().dead_bytes;
-    assert!(after < before, "CompactAll 必须回收死数据: {before} -> {after}");
+    assert!(
+        after < before,
+        "CompactAll 必须回收死数据: {before} -> {after}"
+    );
     assert!(policy_used(&metrics, "compact_all") >= 1);
 }
 
@@ -116,7 +119,10 @@ async fn incremental_policy_uses_compact_if_needed() {
     assert_eq!(n, 1, "增量策略必须选中并压缩达阈段");
 
     let after = h.store.stats().unwrap().dead_bytes;
-    assert!(after < before, "增量压缩必须回收死数据: {before} -> {after}");
+    assert!(
+        after < before,
+        "增量压缩必须回收死数据: {before} -> {after}"
+    );
     assert!(policy_used(&metrics, "incremental") >= 1);
 }
 

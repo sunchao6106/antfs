@@ -812,7 +812,8 @@ mod tests {
             if !state.is_empty() {
                 assert!(rm.set_partition_state(1, state), "状态应写入句柄");
             }
-            let got = compact_all(&pool, &rm, &health, &metrics, &config(), include_rw, false).await;
+            let got =
+                compact_all(&pool, &rm, &health, &metrics, &config(), include_rw, false).await;
             assert_eq!(got, want, "state={state:?} include_rw={include_rw}");
             let after = h.store.stats().unwrap().dead_bytes;
             if want == 1 {
