@@ -80,12 +80,10 @@ fn placement_usage(
         };
         let contribution = match info.state {
             PartitionState::ReadWrite => cap,
-            PartitionState::ReadOnly | PartitionState::Sealed => {
-                match used_map.get(pid) {
-                    Some(&used) if used > 0 => used,
-                    _ => cap,
-                }
-            }
+            PartitionState::ReadOnly | PartitionState::Sealed => match used_map.get(pid) {
+                Some(&used) if used > 0 => used,
+                _ => cap,
+            },
         };
         for r in &info.replicas {
             let e = committed.entry((r.node_id, r.disk_id.clone())).or_insert(0);
@@ -2999,34 +2997,46 @@ mod tests {
 
         let mut partitions = BTreeMap::new();
         // 2 RW partitions (committed = capacity_bytes each)
-        partitions.insert(0, PartitionInfo {
-            replication_factor: 1,
-            state: PartitionState::ReadWrite,
-            replicas: vec![mk_replica(node_id, &disk_id)],
-            capacity_bytes: 100 * gib,
-        });
-        partitions.insert(1, PartitionInfo {
-            replication_factor: 1,
-            state: PartitionState::ReadWrite,
-            replicas: vec![mk_replica(node_id, &disk_id)],
-            capacity_bytes: 100 * gib,
-        });
-        // 3 RO partitions (committed = used_bytes if available)
-        for i in 2..5 {
-            partitions.insert(i, PartitionInfo {
+        partitions.insert(
+            0,
+            PartitionInfo {
                 replication_factor: 1,
-                state: PartitionState::ReadOnly,
+                state: PartitionState::ReadWrite,
                 replicas: vec![mk_replica(node_id, &disk_id)],
                 capacity_bytes: 100 * gib,
-            });
+            },
+        );
+        partitions.insert(
+            1,
+            PartitionInfo {
+                replication_factor: 1,
+                state: PartitionState::ReadWrite,
+                replicas: vec![mk_replica(node_id, &disk_id)],
+                capacity_bytes: 100 * gib,
+            },
+        );
+        // 3 RO partitions (committed = used_bytes if available)
+        for i in 2..5 {
+            partitions.insert(
+                i,
+                PartitionInfo {
+                    replication_factor: 1,
+                    state: PartitionState::ReadOnly,
+                    replicas: vec![mk_replica(node_id, &disk_id)],
+                    capacity_bytes: 100 * gib,
+                },
+            );
         }
         // 1 SEALED partition
-        partitions.insert(5, PartitionInfo {
-            replication_factor: 1,
-            state: PartitionState::Sealed,
-            replicas: vec![mk_replica(node_id, &disk_id)],
-            capacity_bytes: 100 * gib,
-        });
+        partitions.insert(
+            5,
+            PartitionInfo {
+                replication_factor: 1,
+                state: PartitionState::Sealed,
+                replicas: vec![mk_replica(node_id, &disk_id)],
+                capacity_bytes: 100 * gib,
+            },
+        );
 
         let state = MasterState {
             next_partition_id: 6,
@@ -3066,12 +3076,60 @@ mod tests {
         // Report used_bytes: RO partitions 2,3,4 at 40G each; SEALED partition 5 at 80G
         // RW partitions 0,1 at 50G each (should NOT affect committed)
         let replicas_data: Vec<(crate::types::PartitionId, ReplicaState)> = vec![
-            (0, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 50 * gib }),
-            (1, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 50 * gib }),
-            (2, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 40 * gib }),
-            (3, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 40 * gib }),
-            (4, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 40 * gib }),
-            (5, ReplicaState { disk_id: disk_id.clone(), current_state: "ACTIVE".into(), lag_bytes: 0, used_bytes: 80 * gib }),
+            (
+                0,
+                ReplicaState {
+                    disk_id: disk_id.clone(),
+                    current_state: "ACTIVE".into(),
+                    lag_bytes: 0,
+                    used_bytes: 50 * gib,
+                },
+            ),
+            (
+                1,
+                ReplicaState {
+                    disk_id: disk_id.clone(),
+                    current_state: "ACTIVE".into(),
+                    lag_bytes: 0,
+                    used_bytes: 50 * gib,
+                },
+            ),
+            (
+                2,
+                ReplicaState {
+                    disk_id: disk_id.clone(),
+                    current_state: "ACTIVE".into(),
+                    lag_bytes: 0,
+                    used_bytes: 40 * gib,
+                },
+            ),
+            (
+                3,
+                ReplicaState {
+                    disk_id: disk_id.clone(),
+                    current_state: "ACTIVE".into(),
+                    lag_bytes: 0,
+                    used_bytes: 40 * gib,
+                },
+            ),
+            (
+                4,
+                ReplicaState {
+                    disk_id: disk_id.clone(),
+                    current_state: "ACTIVE".into(),
+                    lag_bytes: 0,
+                    used_bytes: 40 * gib,
+                },
+            ),
+            (
+                5,
+                ReplicaState {
+                    disk_id: disk_id.clone(),
+                    current_state: "ACTIVE".into(),
+                    lag_bytes: 0,
+                    used_bytes: 80 * gib,
+                },
+            ),
         ];
         soft.record_replicas(node_id, replicas_data, &[], true);
 
@@ -3079,7 +3137,8 @@ mod tests {
         let disk_free = &usage[&(node_id, disk_id.clone())];
         let expected_committed = 2 * 100 * gib + 3 * 40 * gib + 80 * gib;
         assert_eq!(
-            disk_free.committed_bytes, expected_committed,
+            disk_free.committed_bytes,
+            expected_committed,
             "mixed committed: RW=cap, RO/SEALED=used_bytes; got {} expected {}",
             disk_free.committed_bytes / gib,
             expected_committed / gib
@@ -3135,12 +3194,15 @@ mod tests {
 
         let mut partitions = BTreeMap::new();
         // 1 RO partition — no used_bytes will be reported → fallback to capacity_bytes
-        partitions.insert(0, PartitionInfo {
-            replication_factor: 1,
-            state: PartitionState::ReadOnly,
-            replicas: vec![mk_replica(node_id, &disk_id)],
-            capacity_bytes: 100 * gib,
-        });
+        partitions.insert(
+            0,
+            PartitionInfo {
+                replication_factor: 1,
+                state: PartitionState::ReadOnly,
+                replicas: vec![mk_replica(node_id, &disk_id)],
+                capacity_bytes: 100 * gib,
+            },
+        );
 
         let state = MasterState {
             next_partition_id: 1,
