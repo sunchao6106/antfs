@@ -1099,8 +1099,9 @@
   `partition_capacity_bytes` 同名),大对象按 4 GiB/分区跑通。**前端 503≠意外:先查容量口径。**
 - **顺修**:`vm-cargo.sh` 硬编码旧机器路径 → 改为随脚本目录解析(colima 以同路径 virtiofs 挂载);
   VM 侧缺 protoc 已补装。
-- **后续可打的靶(A 组,经归因修正)**:~~段滚转+fsync 台阶~~(已归因:滚转点同步 fsync 全责、
-  周期 flush 追不上、段大小是延迟分摊旋钮 —— 256MiB 段 p99 12→0.6ms;但**生产 4GiB 段下该台阶
-  根本不显形**,降级为小段部署事项,不值一 change);真靶换为 **frontend→router ~45% 吞吐折损**
-  (先 flame)+ **冷读口径**(当前读数字全是热 cache)。 benches 新增 `--flush-interval-ms`
-  形态对齐口(A/B 负结果一并入档 BASELINE.md)。
+- **后续可打的靶(A 组,两轮修正)**:~~段滚转+fsync 台阶~~ → 第一轮归因(fallocate 无罪、fsync
+  全责,64 MiB 口径)误推「生产 4 GiB 段不显形」,**4 GiB 实测推翻:1 次真实滚转 max 1.16 s(裸)/
+  1.53 s(带周期 flush——不减轻反更糟)**;fsync 大段=吞吐墙(~3 GB/s,分摊不掉总量),低频秒级
+  写锁停摆,风险藏 max/p99.9。**滚转异步化立案 `log-rollover-off-critical`**。另有真靶:
+  frontend→router ~45% 折损(先 flame)+ 冷读口径。bench-blob 增 `--flush-interval-ms`
+  形态对齐口(两轮 A/B 负结果一并入档 BASELINE.md)。
