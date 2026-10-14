@@ -1401,12 +1401,8 @@ mod tests {
     fn auto_chunk_math() {
         let chunk = 4 * 1024 * 1024;
         assert_eq!(1u64.div_ceil(chunk), 1);
-        assert_eq!(u64::from(chunk).div_ceil(chunk), 1);
-        assert_eq!(
-            (u64::from(chunk) + 1).div_ceil(chunk),
-            2,
-            "300 KiB / 96 KiB 类边界:恰整除不加片"
-        );
+        assert_eq!(chunk.div_ceil(chunk), 1);
+        assert_eq!((chunk + 1).div_ceil(chunk), 2, "恰整除不加片,过了界加一片");
         assert_eq!(
             auto_chunk_total_limit(chunk),
             MAX_CHUNKS as u64 * chunk,
