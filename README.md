@@ -44,21 +44,47 @@ The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [Se
 ## Architecture
 
 ```text
-                          ┌────────────┐
-                          │ Admin Web  │  topology · nodes · disks · partitions · metrics
-                          └─────┬──────┘
-                                │
-   clients ── REST /blobs ──▶ Frontend ── embeds ──▶ Router SDK ── lease blobId ranges ──▶ ┌────────────────┐
-                                  │                   (W-quorum writes, R=1 reads)          │ Master (Raft)  │
-                                  │                            │                            │ placement      │
-                                  │                            ▼                            │ reconcile      │
-                                  │                ┌───────────────────────┐   heartbeat    │ decommission   │
-                                  │                │ Store nodes (× N)     │ ◀───────────── │ blobId ranges  │
-                                  └── replicate ──▶│  └─ blob engine:      │               └────────────────┘
-                                                   │    Log / LogSegment / │
-                                                   │    PersistentIndex    │
-                                                   └───────────────────────┘
+   REST clients               S3 clients (aws-cli / AWS SDKs)
+   curl · HTTP · bench        PutObject · multipart · ListObjectsV2 · SigV4
+        │                              │
+        ▼                              ▼  name ↔ blobId          ┌─────────────────────┐
+┌────────────────────────┐  ┌────────────────────────┐ ─────── ─▶ │ MetaStore (external)│
+│ Frontend — REST        │  │ S3 gateway             │            │ PostgreSQL / MySQL  │
+│ · /blobs · TTL · DELETE│  │ · buckets · objects ·  │            │ gateway is stateless│
+│ · auto-chunk > 4 MiB:  │  │   multipart · list     │            └─────────────────────┘
+│   chunks + stitch      │  │ · SigV4 (header ·      │
+│   descriptor (GET/HEAD │  │   presigned) · creds   │
+│   stitch transparently)│  │   admin token          │
+└───────────┬────────────┘  └───────────┬────────────┘
+            │                           │
+            └─────────────┬─────────────┘
+                          ▼  both gateways embed the same
+        ┌────────────────────────────────────────┐  blobId ranges · topology (gRPC)
+        │ Router SDK                             │ ─────────────────────────┐
+        │ · W-quorum writes (acks return early,  │◀─────────────────────────┐
+        │   3rd copy converges via replication)  │  ranges · placements    │ ┌──────────────────┐
+        │ · R=1 reads · latency-aware ordering   │                          │ │ Master (Raft)    │
+        │ · partition-full (507) → switch        │                          │ │ · placement      │
+        │   partition & auto-retry               │                          │ │ · reconcile      │
+        │ · large-blob streaming                 │                          │ │ · decommission   │
+        └────────────────────┬───────────────────┘                          │ │ · blobId ranges  │
+                             │ HTTP data plane (streaming PUT/GET)          │ └────────┬─────────┘
+                             ▼                                              │          │
+        ┌────────────────────────────────────────┐  heartbeat · disk reports│          │ admin API
+        │ Store nodes (× N)                      │◀─────────────────────────┘          │
+        │ · multi-disk · bounded per-disk pools  │                                     │
+        │ · blob engine: Log / LogSegment /      │   ┌───────────────────────────┐     │
+        │   PersistentIndex + binary-fuse filter │   │ Admin Web (port 7300)     │◀────┘
+        │ · compaction · crash recovery          │   │ topology · nodes · disks  │
+        │   multipart/auto-chunk chunks are      │   │ partitions · metrics      │
+        │   plain blobs — assembled on read      │   └───────────────────────────┘
+        │ ◀── pull replication (tombstone-wins   │
+        │     merge · aligned segments · retries │
+        │     are safe & idempotent) ──────────▶ │
+        └────────────────────────────────────────┘
 ```
+
+Layered reading: **gateways** (Frontend / S3) are stateless translators — every object id is self-locating (blobId, D3), no per-object metadata inside the cluster; the **Router SDK** is the only place W/R semantics live; the **master** owns topology via built-in Raft (no ZooKeeper); **store nodes** hold the append-only blob engine, where large objects land as ordinary chunks plus a stitch/multipart descriptor that reads back as one logical stream.
 
 | Component | Description | Status |
 |---|---|---|
@@ -145,7 +171,7 @@ current directory — it is read automatically when present, and CLI flags overr
 
 ### Prebuilt binaries
 
-Every `v*` tag produces tarballs for Linux (x86_64 / aarch64) and macOS (arm64 / x86_64) on the [Releases page](https://github.com/sunchao6106/antfs/releases). Each tarball contains `antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-admin` and `antfs-devcluster`:
+Every `v*` tag produces tarballs for Linux (x86_64 / aarch64) and macOS (arm64 / x86_64) on the [Releases page](https://github.com/sunchao6106/antfs/releases). Each tarball contains `antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-s3`, `antfs-admin` and `antfs-devcluster`:
 
 ```bash
 target=x86_64-unknown-linux-gnu    # or aarch64-unknown-linux-gnu / aarch64-apple-darwin / x86_64-apple-darwin
@@ -184,7 +210,7 @@ mkdir -p data && sudo chown -R 10001:10001 data
 docker run --rm -p 7300:7300 -p 7400:7400 -v "$PWD/data:/data" ghcr.io/sunchao6106/antfs:latest
 ```
 
-The image also ships the individual components (`antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-admin`), so you can run one of them instead of the whole cluster:
+The image also ships the individual components (`antfs-master`, `antfs-store`, `antfs-frontend`, `antfs-s3`, `antfs-admin`), so you can run one of them instead of the whole cluster:
 
 ```bash
 docker run --rm --entrypoint antfs-master -p 7101:7101 ghcr.io/sunchao6106/antfs:latest

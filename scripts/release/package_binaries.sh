@@ -11,7 +11,7 @@ version=${1:?usage: package_binaries.sh <version> <target> [bin-dir]}
 target=${2:?usage: package_binaries.sh <version> <target> [bin-dir]}
 bin_dir=${3:-}
 
-bins=(antfs-master antfs-store antfs-frontend antfs-admin antfs-devcluster)
+bins=(antfs-master antfs-store antfs-frontend antfs-s3 antfs-admin antfs-devcluster)
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 if [[ -z $bin_dir ]]; then

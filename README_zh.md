@@ -44,21 +44,46 @@
 ## 架构
 
 ```text
-                          ┌────────────┐
-                          │ Admin Web  │  拓扑 · 节点 · 盘 · 分区 · 指标
-                          └─────┬──────┘
-                                │
-   客户端 ── REST /blobs ──▶ Frontend ── 内嵌 ──▶ Router SDK ── 租 blobId 号段 ──▶ ┌────────────────┐
-                                  │               (W 多数派写,R=1 读)               │ Master (Raft)  │
-                                  │                            │                    │ 放置           │
-                                  │                            ▼                    │ 调谐           │
-                                  │                ┌───────────────────────┐ 心跳   │ 下线           │
-                                  │                │ Store 数据节点 (× N)  │ ◀───── │ blobId 号段    │
-                                  └── 复制 ──────▶ │  └─ blob 引擎:        │        └────────────────┘
-                                                   │    Log / LogSegment / │
-                                                   │    PersistentIndex    │
-                                                   └───────────────────────┘
+   REST 客户端                 S3 客户端(aws-cli / AWS SDK)
+   curl · HTTP · 压测          PutObject · multipart · ListObjectsV2 · SigV4
+        │                              │
+        ▼                              ▼  名字 ↔ blobId          ┌──────────────────────┐
+┌────────────────────────┐  ┌────────────────────────┐ ────────▶ │ MetaStore(外部)     │
+│ Frontend — REST        │  │ S3 网关                │           │ PostgreSQL / MySQL   │
+│ · /blobs · TTL · DELETE│  │ · 桶 · 对象 ·          │           │ 网关自身无状态       │
+│ · 大 body 自动分片     │  │   multipart · 列表     │           └──────────────────────┘
+│   (>4 MiB → 多片 +     │  │ · SigV4(header ·      │
+│   拼装描述符,GET/HEAD  │  │   presigned)· 凭证    │
+│   透明拼装)            │  │   管理(admin token)   │
+└───────────┬────────────┘  └───────────┬────────────┘
+            │                           │
+            └─────────────┬─────────────┘
+                          ▼  两个网关内嵌同一个
+        ┌────────────────────────────────────────┐  blobId 号段 · 拓扑(gRPC)
+        │ Router SDK                             │ ─────────────────────────┐
+        │ · W 多数派写(ACK 即返回,第 3 份       │◀─────────────────────────┐
+        │   由拉复制收敛)                        │  号段 · 放置结果        │ ┌──────────────────┐
+        │ · R=1 读 · 延迟感知的副本顺序          │                          │ │ Master(Raft)    │
+        │ · 分区写满(507)→ 换分区              │                          │ │ · 放置           │
+        │   自动重试                             │                          │ │ · 调谐           │
+        │ · 大对象流式                           │                          │ │ · 下线           │
+        └────────────────────┬───────────────────┘                          │ │ · blobId 号段    │
+                             │ HTTP 数据面(流式 PUT/GET)                   │ └────────┬─────────┘
+                             ▼                                              │          │
+        ┌────────────────────────────────────────┐  心跳 · 盘上报           │          │ admin API
+        │ Store 数据节点 (× N)                   │◀─────────────────────────┘          │
+        │ · 多盘 · 每盘有界池                    │                                     │
+        │ · blob 引擎:Log / LogSegment /        │   ┌───────────────────────────┐    │
+        │   PersistentIndex + 二元融合过滤器    │   │ Admin Web(端口 7300)     │◀───┘
+        │ · compaction · 崩溃恢复               │   │ 拓扑 · 节点 · 盘          │
+        │   multipart/自动分片的片都是普通      │   │ 分区 · 指标               │
+        │   blob —— 读时按描述符拼装            │   └───────────────────────────┘
+        │ ◀── 拉复制(墓碑恒胜合并 · 对齐段 ·   │
+        │     重试安全幂等)──────────────────▶ │
+        └────────────────────────────────────────┘
 ```
+
+分层读法:**网关层**(Frontend / S3)是无状态翻译层 —— 对象 id 自定位(blobId,D3),集群内没有每对象元数据;**Router SDK** 是 W/R 语义的唯一真源;**master** 用内建 Raft 管拓扑(无 ZooKeeper);**store 节点**承载追加式 blob 引擎,大对象以普通分片 + 拼装/multipart 描述符落盘,读回时拼成一条逻辑字节流。
 
 ## 模块
 
@@ -137,7 +162,7 @@ cargo run -p antfs-devcluster
 
 ### 预编译二进制
 
-打 `v*` tag 会在 [Releases 页面](https://github.com/sunchao6106/antfs/releases)产出 Linux(x86_64 / aarch64)与 macOS(arm64 / x86_64)四个平台的包,每个包里含 `antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-admin`、`antfs-devcluster`:
+打 `v*` tag 会在 [Releases 页面](https://github.com/sunchao6106/antfs/releases)产出 Linux(x86_64 / aarch64)与 macOS(arm64 / x86_64)四个平台的包,每个包里含 `antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-s3`、`antfs-admin`、`antfs-devcluster`:
 
 ```bash
 target=x86_64-unknown-linux-gnu    # 或 aarch64-unknown-linux-gnu / aarch64-apple-darwin / x86_64-apple-darwin
@@ -176,7 +201,7 @@ mkdir -p data && sudo chown -R 10001:10001 data
 docker run --rm -p 7300:7300 -p 7400:7400 -v "$PWD/data:/data" ghcr.io/sunchao6106/antfs:latest
 ```
 
-镜像里同时带了各独立组件(`antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-admin`),可以只起其中一个:
+镜像里同时带了各独立组件(`antfs-master`、`antfs-store`、`antfs-frontend`、`antfs-s3`、`antfs-admin`),可以只起其中一个:
 
 ```bash
 docker run --rm --entrypoint antfs-master -p 7101:7101 ghcr.io/sunchao6106/antfs:latest

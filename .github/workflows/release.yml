@@ -74,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo_args=(--release --locked --target "${{ matrix.target }}"
-            -p antfs-master -p antfs-store -p antfs-frontend -p antfs-admin -p antfs-devcluster)
+            -p antfs-master -p antfs-store -p antfs-frontend -p antfs-s3 -p antfs-admin -p antfs-devcluster)
           if [[ "${{ matrix.cross }}" == "true" ]]; then
             cargo zigbuild "${cargo_args[@]}"
           else
