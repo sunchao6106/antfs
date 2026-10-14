@@ -1005,3 +1005,33 @@
 - devcluster:`--s3-metastore-url` 给出时同进程起 S3 网关(默认 7500;缺省不起)。
 - 后续(不在本 change,见 openspec §15):Versioning / SSE / CopyObject / aws-chunked 签名 /
   后台 GC(soft-delete 过期 + 孤儿 multipart)/ 虚拟主机路由 / 配额计费 / LDAP-OIDC 凭证源。
+
+## 步骤 39:store 指标断言竞态 —— 单发即断改有界轮询(2026-10-14)
+
+- **背景**:CI(ubuntu 2 核慢机)间歇性挂两处"取一次读数就断言"的测试:①`tests/data_plane.rs`
+  断言请求完成后 in-flight 归零 —— store 返回响应后内部 accounting 并非同步回落,单发断言撞上
+  收尾窗口即挂;②`disk_pool` 用例的 `series()` 直读 gauge —— 指标在 worker 线程操作前后上报,
+  采集早于异步路由完成就拿旧值。均非被测逻辑错,是断言手段自身竞态。
+- **修法**(提交 `4c388da`):统一改**有界轮询**(deadline 10s、轮询 5ms,每轮重读重断言):
+  `disk_pool.rs` 的 `series()` 改 async,约 20 处调用 `.await` 化;`data_plane.rs` 抽
+  `metrics_wait()` helper 承接那个已被实证必挂的 in-flight=0 断言。对齐 CLAUDE.md §6(测试
+  同步禁 `sleep`,用带超时的确定性等待,上限兜底防挂死)。
+- **验证**:store 138 个单测+集成用例全绿;`disk_pool` 用例连跑 5 轮零抖;推送后 CI 全绿
+  (自此未复现)。
+- **留观(未修)**:`cluster_join` 的 15s 放置窗口偶发 —— 新节点 join 后首拍拿不到放置,慢机
+  放大;定性低频环境性问题,本轮不动再触发即按此线索排查。
+
+## 步骤 40:blob 错误注入 no-op 竞态 —— 硬写 0xFF 碰上原值即失效(2026-10-14)
+
+- **背景**:macOS CI(run `38520492697`)`blob::tests::failed_full_compaction_removes_partial_log_new`
+  间歇失败;本地 200~800 次连跑可复现 1 次。`corrupt_last_record_byte` 把末条记录 **crc 的最后
+  一字节**硬写 0xFF 注入损坏 —— 该字节**原值恰为 0xFF** 时 stored==computed,校验照常通过,
+  注入退化为 no-op → compaction 成功返回 → `assert!(is_err)` 失败。
+- **为什么逐 run 不同**:fixture 的墓碑(24 B)携带删除时刻,内容逐 run 变 → crc 逐 run 变 →
+  固定注入字节有 ~1/256 概率"写了等于没写"。取证实证(bad run 墓碑 crc 高字节已 0xFF,good run
+  原值 0xda → 写 0xFF 正常 mismatch → Err);插桩用后即撤,未留痕。
+- **修法**(提交 `00ceb49`):读-改-写 —— 先读原字节,原值 0xFF 则写 0x00,否则写 0xFF,注入
+  **恒有效**。
+- **验证**:修复后本地连跑 200 次零失败;`cargo test -p antfs-blob` 全绿;推上后 CI 全绿。
+- 教训入档:错误注入要"写前先读"保证必然改变 —— 对抗的不是被测代码的稳定性,是自己注入手段
+  的概率性失效;同类注入 fixture 后续按此写。
