@@ -839,8 +839,7 @@ async fn put_auto_retries_on_store_full_partition() {
     let (node, grpc) = solo_master(&tmp.path().join("master")).await;
     let (_sa, addr_a) =
         start_store_with(&tmp.path().join("store-a"), 101, 64 << 10, 64 << 10).await;
-    let (_sb, addr_b) =
-        start_store_with(&tmp.path().join("store-b"), 102, 64 << 20, 8 << 20).await;
+    let (_sb, addr_b) = start_store_with(&tmp.path().join("store-b"), 102, 64 << 20, 8 << 20).await;
     register_node(&node, 101, &addr_a).await;
     register_node(&node, 102, &addr_b).await;
 
