@@ -69,7 +69,7 @@ The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [Se
 | `router` | Client SDK (`crates/common/router`): blobId range leasing, W-majority writes, R=1 reads, large-blob streaming; shared by frontend and benchmarks. Counterpart of Ambry's `NonBlockingRouter` | ✅ Implemented |
 | `frontend` | HTTP REST object layer (`/blobs` + `/metrics`). Counterpart of `ambry-frontend` | ✅ Implemented |
 | `admin` | Admin web: ops actions + control-plane dashboard (topology / nodes / disks / partitions / metrics) | ✅ Implemented |
-| `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject, multipart upload, ListObjectsV2, bucket management, AWS SigV4 auth. Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | 🚧 In progress |
+| `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject, multipart upload, ListObjectsV2, bucket management, AWS SigV4 auth. Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | ✅ Implemented |
 | S3 versioning, multi-tenant ACL, quota | Gateway-layer enhancements | 📋 Planned |
 
 > Naming: `blob` = the single-node blob storage engine; `store` = the data node server.
@@ -222,9 +222,10 @@ The production target is Linux ext4. For fidelity, large-data, or performance te
 - [x] Store server (replication, heartbeat, disk monitoring)
 - [x] Router SDK + REST frontend
 - [x] Admin web dashboard
+- [x] S3-compatible gateway (objects / multipart / SigV4 / buckets, external PostgreSQL or MySQL MetaStore)
 - [ ] Finish the faithful Ambry port and lock correctness (Phase 1 exit)
 - [ ] Performance / concurrency / storage-density optimizations (Phase 2)
-- [ ] S3 gateway, multi-tenant ACL and quota
+- [ ] S3 versioning, multi-tenant ACL and quota
 
 ## Contributing
 
