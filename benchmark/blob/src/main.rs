@@ -274,7 +274,7 @@ fn run_get(store: &Arc<BlobStore>, args: &Args) -> Summary {
 /// 把写阶段热起来的数据页从 page cache 驱逐 —— 供冷读口径。失败(文件消失等)静默忽略:
 /// 这只是基准口径装置,不构成正确性面。仅 Linux 有效(macOS 无 posix_fadvise,no-op)。
 #[cfg(target_os = "linux")]
-fn evict_data_pages(store_dir: &PathBuf) {
+fn evict_data_pages(store_dir: &std::path::Path) {
     let log_dir = store_dir.join("log");
     let Ok(entries) = std::fs::read_dir(&log_dir) else {
         return;
@@ -292,7 +292,7 @@ fn evict_data_pages(store_dir: &PathBuf) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn evict_data_pages(_store_dir: &PathBuf) {}
+fn evict_data_pages(_store_dir: &std::path::Path) {}
 
 fn main() {
     let args = parse_args();
