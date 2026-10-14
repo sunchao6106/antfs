@@ -1099,5 +1099,8 @@
   `partition_capacity_bytes` 同名),大对象按 4 GiB/分区跑通。**前端 503≠意外:先查容量口径。**
 - **顺修**:`vm-cargo.sh` 硬编码旧机器路径 → 改为随脚本目录解析(colima 以同路径 virtiofs 挂载);
   VM 侧缺 protoc 已补装。
-- **后续可打的靶(A 组)**:1 MiB p99 20 ms / 64 KiB max 236 ms 的段滚转+fsync 台阶;frontend
-  对 router 的 ~45% 吞吐折损(HTTP 翻译+并发协调);冷读口径未测。
+- **后续可打的靶(A 组,经归因修正)**:~~段滚转+fsync 台阶~~(已归因:滚转点同步 fsync 全责、
+  周期 flush 追不上、段大小是延迟分摊旋钮 —— 256MiB 段 p99 12→0.6ms;但**生产 4GiB 段下该台阶
+  根本不显形**,降级为小段部署事项,不值一 change);真靶换为 **frontend→router ~45% 吞吐折损**
+  (先 flame)+ **冷读口径**(当前读数字全是热 cache)。 benches 新增 `--flush-interval-ms`
+  形态对齐口(A/B 负结果一并入档 BASELINE.md)。

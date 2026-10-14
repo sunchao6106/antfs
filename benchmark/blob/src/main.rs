@@ -25,6 +25,7 @@ struct Args {
     index_max: usize,
     segment_bytes: u64,
     dir: Option<PathBuf>,
+    flush_interval_ms: u64,
 }
 
 impl Default for Args {
@@ -41,6 +42,7 @@ impl Default for Args {
             index_max: 100_000,
             segment_bytes: 64 * 1024 * 1024,
             dir: None,
+            flush_interval_ms: 0,
         }
     }
 }
@@ -61,6 +63,9 @@ fn parse_args() -> Args {
                 a.segment_bytes = val().parse::<u64>().expect("segment-mib") * 1024 * 1024
             }
             "--dir" => a.dir = Some(PathBuf::from(val())),
+            "--flush-interval-ms" => {
+                a.flush_interval_ms = val().parse::<u64>().expect("flush-interval-ms")
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -86,7 +91,10 @@ fn print_help() {
          --read-threads T  GET 并发线程 (default = CPU 数)\n\
          --index-max N     活跃索引封存阈值 (default 100000)\n\
          --segment-mib M   单段大小 MiB (default 64)\n\
-         --dir PATH        数据目录 (default 临时目录,跑完删除)"
+         --dir PATH        数据目录 (default 临时目录,跑完删除)\n\
+         --flush-interval-ms N  周期 fsync 线程间隔 (default 0 = 关)。store 生产路径有 flush worker\n\
+                            周期清脏页;裸引擎压不带上它会把段的 fsync 尾部整个甩到滚转点\n\
+                            (对齐生产形态请给 1000~5000)"
     );
 }
 
@@ -292,6 +300,25 @@ fn main() {
             .expect("create BlobStore (increase --segment-mib if capacity too small)"),
     );
 
+    let mut flush_thread = None;
+    if args.flush_interval_ms > 0 {
+        let store = store.clone();
+        let interval = std::time::Duration::from_millis(args.flush_interval_ms);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        flush_thread = Some((
+            std::thread::spawn(move || {
+                while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    if let Err(e) = store.flush() {
+                        eprintln!("flush loop error: {e}");
+                    }
+                }
+            }),
+            stop,
+        ));
+    }
+
     let put = run_put(&store, &args);
     store.flush().expect("flush");
     report(&put);
@@ -306,6 +333,12 @@ fn main() {
         store.is_full(),
     );
 
+    if let Some((handle, stop)) = flush_thread {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle
+            .join()
+            .expect("join flush thread (最长再等一个 interval)");
+    }
     Arc::into_inner(store)
         .expect("no dangling refs")
         .close()

@@ -43,7 +43,19 @@
 
 1. **devcluster 默认每分区 64 MiB 是刻意小值**(便于本地验证写满 507/转 RO 路径):4 KiB 场景(≈80 MiB)不触界;**5 MiB×n 大对象场景在 ~120 MiB 后打穿容量 → store_full×2 → quorum 0/2 → 大面积 503**(表象是"全挂",实际是容量语义按设计工作)。本轮为此给 devcluster 加了 `--partition-capacity-bytes` 参数(默认 64 MiB 不变),大对象压测按 4 GiB/分区跑通。**教训入档:压大对象前先看容量口径。**
 2. 容量打穿时的对外形态:frontend 503(`write quorum not reached`),bench 记为 `unavailable`;**不是**错误注入,是容量红线按设计服务降级。
-3. 1 MiB 引擎层 p99 20 ms / 64 KiB max 236 ms 的台阶 = 段滚转 + fsync 边界 —— Phase 2 A 组(组提交/滚转平滑)的直接靶子。
+3. **滚转/fsync 尾部归因(完成,结论反转)**:1 MiB p99 ~12 ms 的台阶 = `Log::roll_over` 同步 `fsync` 写满段(VM ext4 实测 fallocate 64 MiB ≈ 0.1 ms 无罪;fsync 64 MiB ≈ 13 ms 全责)。两个关键负/正结果:
+   - **周期 flush 救不了**:`--flush-interval-ms 500/2000` 复测 p99 持平(~12 ms)——引擎层 2 GB/s 下段 30 ms 就写满,任何周期 fsync 都追不上摊薄节奏;
+   - **段大小是真正的延迟分摊旋钮**:1 MiB × 2000、4 线程,64 MiB 段 p99 12.2 ms vs **256 MiB 段 p99 0.6 ms(约 20 倍,吞吐 +16%)**;
+   - **代价换算**:段每缩 N 倍,滚转频率 ×N、单次 fsync 负载 ÷N——但 p99 台阶 ≈ 段的 fsync 时长,小段用尾部延迟换冷启动/分段粒度;
+   - **生产口径澄清**:生产默认 `segment_size_bytes` = 4 GiB,高吞吐下数十分钟才滚转一次,滚转尾部**不构成生产缺陷**;此台阶只在**刻意小段**部署(如 devcluster 8 MiB)或小段调参场景需要关心。基线表中的 1 MiB p99 20 ms 系 64 MiB 段 + 裸引擎口径,**按此理解**。
+4. 各组均出现一次 max ~600-750 ms 的孤立长停顿(与滚转无关、跨形态同现):colima 虚拟盘(APFS 底层)写回收/首次大分配类环境毛刺,标注为 VM 环境噪声,不归引擎。
+5. bench-blob 新增 `--flush-interval-ms`(默认 0 关):把"生产 flush worker 形态"带进裸引擎压测的能力(A/B 证明本速率下它救不了滚转,但保留了形态对齐的实验口)。
+
+## 下一步真正值得打的靶(基于归因修正)
+
+- ~~段滚转平滑~~(生产 4 GiB 段不显形;小段场景才需,性价比低)
+- **frontend → router ~45% 吞吐折损**(HTTP 翻译 + 并发协调;先 flame 定位)
+- **冷读口径未测**(当前读数字全是热 page cache)
 
 ## 复现
 
