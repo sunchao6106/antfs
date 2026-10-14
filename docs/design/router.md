@@ -69,6 +69,7 @@ put(key, bytes): 解析 key 的高 32 位得 partitionId
 - **提前返回 = 取消剩余请求**:第 3 份靠异步拉复制收敛(`cluster.md §10`),这是 W 语义的应有之义,也是延迟的来源。
 - **失败即报错,不偷偷换 partition 重写**:换分区重写会掩盖问题且可能与已部分写入的副本产生分叉;重试由调用方决定。
 - 变更类(`delete`)同样走多数派扇出。**TTL 只能在写入时给**:`put_with_ttl(key, data, expiration_ms)` / `put_file_with_ttl(path, expiration_ms)` 把绝对过期时刻(`expiration_ms`)随写一并扇出(单次多数派写);`put` / `put_file` 是 `NO_EXPIRATION`(常量由 `antfs_router` 再导出)的包装,等价于"永不过期"。写入之后**没有任何改 TTL 的接口**。
+- **`put_auto` / `put_auto_with_ttl`(内部发号 + 507 换分区重试)**:适用于上层**不关心落在哪个分区**的场景(frontend 小 body 上传、S3 网关)。内部 `allocate_one` → 多数派写 → 全副本 507 时摘掉该分区、重新发号到另一个分区重试(最多 `MAX_STORE_FULL_RETRIES=2` 次,共 3 次尝试),语义与 `put_file_with_ttl` 的重试逻辑完全一致,返回 `(StoreKey, PutReport)`。`put_with_ttl(key, data)` 的 key 由调用方预分配,因此无法换分区——只摘掉号段并返回 `StoreFull`。
 
 ## 3. 读路径(R = 1)
 
@@ -122,7 +123,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 > (早期版本用"`0` 表示自动",导致第 0 号分区无法被点名,已改。)
 
 > **没有 W/R 配置项**(见 §2)、**没有重试次数配置项**(失败即返回,重试由调用方决定)。
-> 唯一例外:`put_file_with_ttl` 在**全部副本都报 507(分区写满)**时内部换分区重试(写死最多 2 次,
+ > 唯一例外:`put_file_with_ttl` 与 `put_auto_with_ttl` 在**全部副本都报 507(分区写满)**时内部换分区重试(写死最多 2 次,
 > 见 §6 `router_put_store_full_retries_total`);`put_with_ttl` 的 key 已绑定分区,只摘掉该分区号段并返回
 > `StoreFull`,不重试。
 >
@@ -141,7 +142,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_put_bytes_total` | counter | — | 字节 | 成功写入的字节数 | 无 |
 | `router_put_seconds` | histogram | `outcome` | 秒 | 单次写延迟(含取号段/扇出等待) | `RouterMetrics.putBlobOperationLatencyMs` |
 | `router_put_replica_errors_total` | counter | `kind` | 次 | **单个副本**写失败分类(kind 同错误表) | 无 |
-| `router_put_store_full_retries_total` | counter | — | 次 | 因分区写满(全副本 507)而**换分区重试**的次数(`put_file_with_ttl` 内部重试,最多 2 次) | 无 |
+| `router_put_store_full_retries_total` | counter | — | 次 | 因分区写满(全副本 507)而**换分区重试**的次数(`put_file_with_ttl` / `put_auto_with_ttl` 内部重试,最多 2 次) | 无 |
 | `router_get_total` | counter | `outcome` | 次 | 读请求数 | `RouterMetrics.getBlobOperationRate` |
 | `router_get_bytes_total` | counter | — | 字节 | 成功读出的字节数 | 无 |
 | `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`stat` 操作数 | `RouterMetrics.*OperationRate` |
@@ -170,7 +171,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
   master 侧 `master_id_alloc_holes_total` 可观测。**任何逻辑不得假设"发了号 = 对象存在"**(D3)。
 - 读路由缓存(`partitionId → 副本位置`)**不过期**:副本迁移后可能试到已迁走的副本 —— 读会换副本成功(R=1),
   写扇出则可能打不满 W。当前靠"重启进程 / 重新 LookupPartition"收敛。
-- 写失败**不做跨 partition 重试**(避免掩盖问题)。
+- **写失败不做跨 partition 重试**(避免掩盖问题)—— 指 `put_with_ttl`(key 已绑定分区)。`put_auto` / `put_auto_with_ttl` / `put_file_with_ttl` 因内部持有发号权,在**全副本 507** 时会换分区重试(最多 2 次);部分 507(多数派仍可达)不重试。
 - **按权重发号只是"按容量粗粒度分配",不是精确配额**:权重来自心跳级的 `used_bytes`(§2 的反馈滞后)。
   极端偏斜(如权重 1000:1)时最满的分区每轮只拿 1 个号(≈0.1%)—— 它**仍是可写分区**,写进去仍可能 507,
   **错误照旧上报**,不静默吞掉;正确处置是运维把它转 RO / 封存。

@@ -829,3 +829,49 @@ async fn partial_store_full_still_reaches_quorum() {
         "部分 507 且多数派可达 → 不重试"
     );
 }
+
+/// **`put_auto` 分区写满自动换分区重试**:与 `put_file_retries_on_store_full_partition` 同一场景,
+/// 但走**内存 body** 路径(`put_auto` / `put_auto_with_ttl`)。验证小 body 写也能在 507 时
+/// 摘掉已满分区、重新发号到空分区,重试成功。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_auto_retries_on_store_full_partition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) =
+        start_store_with(&tmp.path().join("store-a"), 101, 64 << 10, 64 << 10).await;
+    let (_sb, addr_b) =
+        start_store_with(&tmp.path().join("store-b"), 102, 64 << 20, 8 << 20).await;
+    register_node(&node, 101, &addr_a).await;
+    register_node(&node, 102, &addr_b).await;
+
+    let full_pid = create_partition(&node, vec![placement(101)]).await;
+    let empty_pid = create_partition(&node, vec![placement(102)]).await;
+    ensure_replica(&addr_a, full_pid).await;
+    ensure_replica(&addr_b, empty_pid).await;
+    fill_partition_until_full(&addr_a, full_pid).await;
+
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(
+        RouterConfig {
+            id_segment_size: 64,
+            partition_refresh_secs: 0,
+            ..client_cfg(&grpc)
+        },
+        &registry,
+    )
+    .await
+    .expect("connect");
+
+    for _ in 0..20 {
+        let (key, report) = client
+            .put_auto(bytes::Bytes::from(payload(1024, 4)))
+            .await
+            .expect("put_auto must succeed via retry");
+        assert_eq!(key.partition_id(), empty_pid, "成功写入必须落在空分区");
+        assert_eq!(report.acks, 1);
+    }
+    assert!(
+        client.metrics().router_put_store_full_retries.get() > 0,
+        "至少一次命中已满分区触发换分区重试"
+    );
+}

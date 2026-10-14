@@ -486,6 +486,83 @@ impl Router {
         })
     }
 
+    /// 分配 blobId + 写入(不过期),**分区满时自动换分区重试**(最多 [`MAX_STORE_FULL_RETRIES`] 次)。
+    ///
+    /// 与 [`put`] 的区别:key 由 router **内部分配**,因此 507 时可以摘掉该分区、重新发号换另一个
+    /// 分区重写 —— `put(key, data)` 做不到这一点,因为 key(从而 partition)是调用方决定的。
+    ///
+    /// 适用于 frontend / S3 网关等"上层不关心落在哪个分区,只要写成功"的场景。
+    pub async fn put_auto(&self, data: Bytes) -> Result<(StoreKey, PutReport)> {
+        self.put_auto_with_ttl(data, NO_EXPIRATION).await
+    }
+
+    /// [`put_auto`](Self::put_auto) + 写入时定 TTL,语义同 [`put_with_ttl`](Self::put_with_ttl)。
+    pub async fn put_auto_with_ttl(
+        &self,
+        data: Bytes,
+        expiration_ms: i64,
+    ) -> Result<(StoreKey, PutReport)> {
+        let mut key = self.allocate_one().await?;
+        let mut first_err: Option<Error> = None;
+        for attempt in 0..=MAX_STORE_FULL_RETRIES {
+            let pid = key.partition_id();
+            let replicas = self.replicas_for(pid).await?;
+            let total = replicas.len();
+            let started = Instant::now();
+            let futs = FuturesUnordered::new();
+            for r in &replicas {
+                let addr = r.addr.clone();
+                let data = data.clone();
+                futs.push(async move {
+                    let res = self.put_body(pid, &key, data, expiration_ms, &addr).await;
+                    (addr, res)
+                });
+            }
+            let f = collect_majority(futs, total).await;
+            let outcome = if f.reached() { "ok" } else { "quorum" };
+            self.metrics.put_total.with_label_values(&[outcome]).inc();
+            self.metrics
+                .put_seconds
+                .with_label_values(&[outcome])
+                .observe(started.elapsed().as_secs_f64());
+            for (_, e) in &f.failures {
+                self.metrics
+                    .put_replica_errors
+                    .with_label_values(&[e.kind()])
+                    .inc();
+            }
+            if f.reached() {
+                self.metrics.put_bytes.inc_by(data.len() as u64);
+                return Ok((
+                    key,
+                    PutReport {
+                        acks: f.ok.len(),
+                        total: f.total,
+                        required: f.required,
+                    },
+                ));
+            }
+            if first_err.is_none() {
+                first_err = Some(Error::Quorum {
+                    acks: f.ok.len(),
+                    required: f.required,
+                    total: f.total,
+                    detail: f.detail(),
+                });
+            }
+            // 全部副本都 507 = 分区写满:摘掉该分区、换一个分区重试(最多 MAX_STORE_FULL_RETRIES 次)。
+            if all_store_full(&f).is_some() && attempt < MAX_STORE_FULL_RETRIES {
+                self.metrics.router_put_store_full_retries.inc();
+                self.evict_partition(pid).await;
+                key = self.allocate_one().await?;
+                continue;
+            }
+            // 重试耗尽(或非全 507):返回第一次尝试的原始错误。
+            return Err(first_err.expect("first_err is set on the first failing attempt"));
+        }
+        unreachable!("loop always returns")
+    }
+
     /// 上传本地文件:分配 blobId → 并行 PUT 全部副本,**每个副本各自从文件流式读**
     /// (`reqwest::Body::from(File)` 自带 `Content-Length`),内存不随文件大小涨。
     pub async fn put_file(&self, path: impl AsRef<Path>) -> Result<(StoreKey, PutReport)> {
