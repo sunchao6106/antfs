@@ -24,11 +24,11 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 | 方法 | 路径 | 请求 | 成功 | 失败 |
 |---|---|---|---|---|
-| `POST` | `/blobs` | body = blob 裸字节;可选 `x-ambry-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405)。body ≤ `max_body_bytes` 走单 blob;**超过且开启 `auto_chunk_enabled`(默认)时服务端自动分片**(见 §5,201 的 `x-ambry-blob-size` = 逻辑总量) | **201** + `Location: /blobs/{blobId}` + `x-ambry-blob-id: {16 hex}` + `x-ambry-blob-size: {n}` | 400(非法 id/非法 session 头)/ 413(超该路径上限:关自动分片 = `max_body_bytes`,开 = 片数 4096 × `auto_chunk_bytes`)/ 507(分区写满)/ 503(未达多数派) |
+| `POST` | `/blobs` | body = blob 裸字节;可选 `x-antfs-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405)。body ≤ `max_body_bytes` 走单 blob;**超过且开启 `auto_chunk_enabled`(默认)时服务端自动分片**(见 §5,201 的 `x-antfs-blob-size` = 逻辑总量) | **201** + `Location: /blobs/{blobId}` + `x-antfs-blob-id: {16 hex}` + `x-antfs-blob-size: {n}` | 400(非法 id/非法 session 头)/ 413(超该路径上限:关自动分片 = `max_body_bytes`,开 = 片数 4096 × `auto_chunk_bytes`)/ 507(分区写满)/ 503(未达多数派) |
 | `GET` | `/blobs/{blobId}` | — | **200** + 原始字节 | 404(所有副本都没有)/ 400(非法 id)/ 502(分片描述符损坏或片缺失)/ 503(副本不可达) |
-| `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-ambry-blob-size`/`-deleted`/`-expired`/`-expiration-ms`。**拼装对象额外带 `x-ambry-blob-stitched: true` + `x-ambry-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
+| `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-antfs-blob-size`/`-deleted`/`-expired`/`-expiration-ms`。**拼装对象额外带 `x-antfs-blob-stitched: true` + `x-antfs-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
 | `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑;**删除不可逆**;重复删**幂等**,仍 204) | 404 / 503 / 400 |
-| `POST` | `/stitch` | body `{"signedChunkIds":["<16 hex>",…]}`;头 `x-ambry-session: <opaque>` 必填 | **201** + 同 `POST /blobs` 三个头 | 400(session 缺失/空列表/片数 >4096/非法 id/片不可读) |
+| `POST` | `/stitch` | body `{"signedChunkIds":["<16 hex>",…]}`;头 `x-antfs-session: <opaque>` 必填 | **201** + 同 `POST /blobs` 三个头 | 400(session 缺失/空列表/片数 >4096/非法 id/片不可读) |
 | `GET` | `/metrics` | — | **200** + Prometheus 文本 | — |
 
 - **blobId 路径段**:必须能 `hex::decode` 成 **8 字节**,否则 400(文案含 `blob id must be 8 bytes (16 hex)`)。
@@ -42,8 +42,10 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
   但 router 的多副本变更把单副本失败收敛成 `Quorum` → 本层**看不到**这个 409(表现为 503)。
   **`DELETE` 已幂等(2026-09-23 拍板)**:墓碑 key 的重复删由副本直接回 204(不写第二条墓碑)→ 多数派达成 → 本层 204;
   从未存在的 key 仍 404(经多数派聚合为 503,既有口径)。
-- **`x-ambry-*` 头命名**:沿用 Ambry 的既有头名(`x-ambry-blob-id` / `x-ambry-blob-size` / `x-ambry-session` …),
-  便于熟悉 Ambry 的人上手。
+- **`x-antfs-*` 头命名**:前身沿用 Ambry 的 `x-ambry-*` 头名,2026-10 以 antfs 自有前缀**整体改名**——
+  本项目不是 Ambry,头是自己的契约面。改名为不兼容变更(客户端需一次性迁移;开发期项目,不保留旧名别名)。
+  成员:`x-antfs-blob-id` / `x-antfs-blob-size` / `x-antfs-session` / `x-antfs-ttl-ms` /`-blob-deleted` /
+  `-blob-expired` / `-blob-expiration-ms` / `-blob-stitched` / `-blob-stitch-chunks`。
 - **不带 account/container**:blobId 64 位无租户位(D7/D8),路径里不放一个"存不下来又不管事"的段;多租户将来落在
   网关层(那时再加)。
 
@@ -56,7 +58,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 | `HEAD /blobs/{id}` | `stat(&key)`(元数据不读数据体) |
 | `DELETE` | `delete`(多数派写墓碑,**不可逆**) |
 
-- `x-ambry-ttl-ms` 的落地方式:**同一次写** —— frontend 把该头解析成绝对 `expiration_ms` 交给 SDK(`Router::put_with_ttl` /
+- `x-antfs-ttl-ms` 的落地方式:**同一次写** —— frontend 把该头解析成绝对 `expiration_ms` 交给 SDK(`Router::put_with_ttl` /
   `put_file_with_ttl`),数据面 `PUT ...?expiration_ms=` 原子承接,故 TTL 是**单次多数派写**。
   **写入之后没有任何改 TTL 的接口**(不能续期、不能作废、不能永久化)。
 
@@ -64,9 +66,9 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥),故:
 
-1. **分片上传** = 普通 `POST /blobs`(带同一个 `x-ambry-session`);片列表由**客户端自己记**,服务端不存 session。
+1. **分片上传** = 普通 `POST /blobs`(带同一个 `x-antfs-session`);片列表由**客户端自己记**,服务端不存 session。
 2. **`POST /stitch`**:
-   - 校验 `x-ambry-session` 非空、片列表非空且 ≤ 4096、每个 id 是 16 hex;
+   - 校验 `x-antfs-session` 非空、片列表非空且 ≤ 4096、每个 id 是 16 hex;
    - 逐片 `stat` 拿尺寸(拿不到 → 400);
    - 构造**自描述描述符**(小端,当**普通 blob** 写入):
      ```
@@ -84,11 +86,11 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
    缓进内存,CLAUDE.md §5.3),命中则解析描述符、逐片 `get` 并**流式拼接**进响应(内存 O(单片));
    片缺失/描述符损坏 → **502**(上游数据不一致,不是客户端的问题)。
 4. **`HEAD` 与 `GET` 对齐**:`HEAD` 也做同样的 MAGIC 嗅探,拼装对象报**逻辑大小**(各片之和)+
-   `x-ambry-blob-stitched: true` / `x-ambry-blob-stitch-chunks: N`;普通对象报自身大小、不带这两个头。
+   `x-antfs-blob-stitched: true` / `x-antfs-blob-stitch-chunks: N`;普通对象报自身大小、不带这两个头。
    代价可控:描述符按构造 ≤ 1 MiB(`DESCRIPTOR_MAX_BYTES`),故**只有小对象**需要多读一次数据体,
    更大的对象不可能是描述符、直接按 `stat` 的 size 回(不读数据体)。
 4. **`DELETE` 只删描述符本身,不递归删片**:一次删 N 个对象是危险动作(且片可能被多个 stitched blob 共享);
-    孤儿片靠 `x-ambry-ttl-ms` + store 本地 worker 回收。自动分片(§5)产生的对象**删描述符后同样留下孤儿片**
+    孤儿片靠 `x-antfs-ttl-ms` + store 本地 worker 回收。自动分片(§5)产生的对象**删描述符后同样留下孤儿片**
     —— 服务端知悉但故意不递归(无法从描述符区分"片是否被共享"是原因之一;将来若给描述符加 composed
     类型位,可仅对"本服务端铸的片"递归删,挂在 §11 的嗅探待办上)。
 
@@ -114,8 +116,8 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
   2. 从暂存文件**按 `auto_chunk_bytes` 顺序切片,逐片 `put_auto_with_ttl`**(顺序写:并发扇出会把
      "单片内存"乘以片数在途,先不做);片与描述符**同 TTL**,整个逻辑对象一体过期(HEAD 可见
      `expired` / `expiration-ms`);
-  3. 编**同 `/stitch` 的描述符**(session = 请求带的 `x-ambry-session`,缺省空)也当普通 blob 写入;
-  4. 201 返回**描述符的 blobId** + `x-ambry-blob-size: 逻辑总量`;`GET`/`HEAD` 走 §4 的既有透明拼装,
+  3. 编**同 `/stitch` 的描述符**(session = 请求带的 `x-antfs-session`,缺省空)也当普通 blob 写入;
+  4. 201 返回**描述符的 blobId** + `x-antfs-blob-size: 逻辑总量`;`GET`/`HEAD` 走 §4 的既有透明拼装,
      客户端不感知分片。
   **中途失败**:对已 ack 的片逐个写墓碑**尽力回收**(best-effort:删失败只记日志 + 指标,不影响回报调用方的
   原错误;片若已落少数副本,墓碑多数派 + 拉复制"墓碑恒胜"会盖掉)。**重试安全**:重试拿到一套全新 blobId,
@@ -134,7 +136,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 
 `frontend.cors_allowed_origins` 给出**白名单**才挂 `CorsLayer`(非空时才挂);默认 `[]` = 不挂。
 **不用 `permissive()`**:默认放开跨域的 API 是安全问题。放开的方法 `GET/POST/HEAD/DELETE`,
-允许的请求头 `x-ambry-session` / `x-ambry-ttl-ms` / `content-type`,暴露响应头 `x-ambry-*` 与 `location`,共 **8 项**(`CORS_EXPOSED_HEADERS`)。
+允许的请求头 `x-antfs-session` / `x-antfs-ttl-ms` / `content-type`,暴露响应头 `x-antfs-*` 与 `location`,共 **8 项**(`CORS_EXPOSED_HEADERS`)。
 
 ## 7. 与 Ambry frontend 的对照
 
@@ -142,7 +144,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 |---|---|---|
 | 上传路径 | `POST /`(account/container 在 **header**) | `POST /blobs`(**不带** account/container) |
 | blobId 谁生成 | frontend 调 router,router **本地随机铸**(partition 从本地 clustermap 随机挑) | **向 master 申请号段**(`GetBlobIds`) |
-| 上传结果 | `Location: <blobId>` | `Location: /blobs/{blobId}` + `x-ambry-blob-id`/`-blob-size` |
+| 上传结果 | `Location: <blobId>` | `Location: /blobs/{blobId}` + `x-antfs-blob-id`/`-blob-size` |
 | 鉴权/配额 | `AccountService` + `AmbrySecurityService` + quota | **无**(多租户推后到网关期) |
 | 大对象 | chunked upload + `/stitch`(**签名片 id**;分片在 router 做) | `/stitch`(无签名片 id,描述符自描述)+ **服务端自动分片**(§5,分片在 frontend 做) |
 | 元数据/HEAD | `GetBlobInfo`(blob 元数据在 id 内编码 account/container/ttl) | `HEAD /blobs/{id}` → store 的 `.../metadata`(无每对象元数据) |
@@ -214,7 +216,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
       数据面**:推荐在 store 记录头的 `flags` 里加一个"composed"位(SeaweedFS needle `FlagIsChunkManifest` 同款),
       之后 HEAD/GET 只看标志、不再嗅探(顺带省掉 HEAD 对小对象的那次数据体读取)。
       完整复现、三个选项与先例出处见 `openspec/changes/blob-io-end-to-end/tasks.md` 的待办首条。
-- [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**,`x-ambry-ttl-ms` 现为单次多数派写。
+- [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**,`x-antfs-ttl-ms` 现为单次多数派写。
 - [ ] **store 侧真流式 GET**(把数据体整个读进内存的是 store;frontend 侧已落暂存再流式回)。
 - [ ] router 暴露单副本状态,让副本的 409(重复 `put` 命中已存在 key)能透传到 REST 层(现在收敛成 503;重复 `DELETE` 已幂等 204,不在此列)。
 - [ ] S3 兼容层(与 frontend 同层)。

@@ -139,7 +139,7 @@ pub async fn run(cfg: Cfg) -> Result<(), String> {
     Ok(())
 }
 
-/// `POST /blobs` → 201 时返回 blobId(优先 `x-ambry-blob-id`,退回 `Location` 尾段)。
+/// `POST /blobs` → 201 时返回 blobId(优先 `x-antfs-blob-id`,退回 `Location` 尾段)。
 async fn post_blob(
     http: &reqwest::Client,
     base: &str,
@@ -163,7 +163,7 @@ async fn post_blob(
     }
     if let Some(v) = resp
         .headers()
-        .get("x-ambry-blob-id")
+        .get("x-antfs-blob-id")
         .and_then(|v| v.to_str().ok())
     {
         return Ok(v.to_string());

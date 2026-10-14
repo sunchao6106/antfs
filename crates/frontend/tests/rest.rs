@@ -300,16 +300,16 @@ impl Fixture {
             .await
             .expect("upload request");
         assert_eq!(resp.status().as_u16(), 201, "上传必须返回 201");
-        let blob_id = header(&resp, "x-ambry-blob-id");
+        let blob_id = header(&resp, "x-antfs-blob-id");
         assert_eq!(
             header(&resp, "location"),
             format!("/blobs/{blob_id}"),
             "Location 必须指向新对象"
         );
         assert_eq!(
-            header(&resp, "x-ambry-blob-size"),
+            header(&resp, "x-antfs-blob-size"),
             data.len().to_string(),
-            "x-ambry-blob-size 必须是写入字节数"
+            "x-antfs-blob-size 必须是写入字节数"
         );
         blob_id
     }
@@ -367,7 +367,7 @@ async fn uploads_and_downloads_three_mib_roundtrip() {
     assert_eq!(fx.get_ok(&blob_id).await, data, "下载必须逐字节一致");
 }
 
-/// HEAD 只取元数据:200 + 无 body + `x-ambry-blob-size` 正确。
+/// HEAD 只取元数据:200 + 无 body + `x-antfs-blob-size` 正确。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn head_reports_size_without_body() {
     let fx = Fixture::quorum_cluster().await;
@@ -381,10 +381,10 @@ async fn head_reports_size_without_body() {
         .await
         .expect("head request");
     assert_eq!(resp.status().as_u16(), 200, "HEAD 必须 200");
-    assert_eq!(header(&resp, "x-ambry-blob-size"), "4096");
-    assert_eq!(header(&resp, "x-ambry-blob-deleted"), "false");
-    assert_eq!(header(&resp, "x-ambry-blob-expired"), "false");
-    assert_eq!(header(&resp, "x-ambry-blob-expiration-ms"), "-1");
+    assert_eq!(header(&resp, "x-antfs-blob-size"), "4096");
+    assert_eq!(header(&resp, "x-antfs-blob-deleted"), "false");
+    assert_eq!(header(&resp, "x-antfs-blob-expired"), "false");
+    assert_eq!(header(&resp, "x-antfs-blob-expiration-ms"), "-1");
     let body = resp.bytes().await.expect("head body");
     assert!(body.is_empty(), "HEAD 不得带 body");
 }
@@ -420,7 +420,7 @@ async fn delete_is_irreversible() {
         .await
         .expect("head after delete");
     assert_eq!(resp.status().as_u16(), 200, "墓碑的元数据仍可读(HEAD 200)");
-    assert_eq!(header(&resp, "x-ambry-blob-deleted"), "true");
+    assert_eq!(header(&resp, "x-antfs-blob-deleted"), "true");
 
     // 复活端点已删掉:路由不存在 → 404(而不是"以为能复活")。
     let resp = fx
@@ -451,7 +451,7 @@ fn pencil(len: usize) -> Vec<u8> {
 
 // ── 4:TTL ────────────────────────────────────────────────────────────────────────────────
 
-/// TTL 只在**上传时**定(`x-ambry-ttl-ms` → `PUT ?expiration_ms=`,一次多数派写):
+/// TTL 只在**上传时**定(`x-antfs-ttl-ms` → `PUT ?expiration_ms=`,一次多数派写):
 /// 已过去的时刻 → 201 且随即 404 / HEAD `expired: true`;非法值 → 400;
 /// "改期"端点不存在(对象不可变)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -462,13 +462,13 @@ async fn ttl_is_set_at_upload_time_only() {
     let resp = fx
         .http
         .post(fx.url("/blobs"))
-        .header("x-ambry-ttl-ms", "1000")
+        .header("x-antfs-ttl-ms", "1000")
         .body(pencil(512))
         .send()
         .await
         .expect("upload with ttl");
     assert_eq!(resp.status().as_u16(), 201, "带 TTL 的上传必须 201");
-    let blob_id = header(&resp, "x-ambry-blob-id");
+    let blob_id = header(&resp, "x-antfs-blob-id");
     assert_eq!(
         fx.get(&blob_id).await.status().as_u16(),
         404,
@@ -481,19 +481,19 @@ async fn ttl_is_set_at_upload_time_only() {
         .await
         .expect("head expired");
     assert_eq!(resp.status().as_u16(), 200, "过期对象的元数据仍可读");
-    assert_eq!(header(&resp, "x-ambry-blob-expired"), "true");
-    assert_eq!(header(&resp, "x-ambry-blob-expiration-ms"), "1000");
+    assert_eq!(header(&resp, "x-antfs-blob-expired"), "true");
+    assert_eq!(header(&resp, "x-antfs-blob-expiration-ms"), "1000");
 
     // 非法 TTL → 400(不静默当成"不过期")。
     let resp = fx
         .http
         .post(fx.url("/blobs"))
-        .header("x-ambry-ttl-ms", "not-a-number")
+        .header("x-antfs-ttl-ms", "not-a-number")
         .body(pencil(8))
         .send()
         .await
         .expect("bad ttl");
-    assert_eq!(resp.status().as_u16(), 400, "非法 x-ambry-ttl-ms 必须 400");
+    assert_eq!(resp.status().as_u16(), 400, "非法 x-antfs-ttl-ms 必须 400");
 
     // 改 TTL 的端点不存在(带不带参数都不该有这条路)。
     let live = fx.upload(&pencil(64)).await;
@@ -520,7 +520,7 @@ async fn ttl_is_set_at_upload_time_only() {
         .send()
         .await
         .expect("head live");
-    assert_eq!(header(&resp, "x-ambry-blob-expiration-ms"), "-1");
+    assert_eq!(header(&resp, "x-antfs-blob-expiration-ms"), "-1");
 }
 
 // ── 5:分片拼装 ────────────────────────────────────────────────────────────────────────────
@@ -541,26 +541,26 @@ async fn stitch_concatenates_chunks_in_order() {
         let resp = fx
             .http
             .post(fx.url("/blobs"))
-            .header("x-ambry-session", session)
+            .header("x-antfs-session", session)
             .body(part.clone())
             .send()
             .await
             .expect("upload chunk");
         assert_eq!(resp.status().as_u16(), 201, "片就是普通 blob");
-        chunk_ids.push(header(&resp, "x-ambry-blob-id"));
+        chunk_ids.push(header(&resp, "x-antfs-blob-id"));
     }
 
     let body = serde_json::json!({ "signedChunkIds": chunk_ids });
     let resp = fx
         .http
         .post(fx.url("/stitch"))
-        .header("x-ambry-session", session)
+        .header("x-antfs-session", session)
         .json(&body)
         .send()
         .await
         .expect("stitch request");
     assert_eq!(resp.status().as_u16(), 201, "拼装必须 201");
-    let stitched = header(&resp, "x-ambry-blob-id");
+    let stitched = header(&resp, "x-antfs-blob-id");
     assert_eq!(
         header(&resp, "location"),
         format!("/blobs/{stitched}"),
@@ -584,14 +584,14 @@ async fn stitch_concatenates_chunks_in_order() {
         .expect("head stitched");
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        header(&resp, "x-ambry-blob-size")
+        header(&resp, "x-antfs-blob-size")
             .parse::<u64>()
             .expect("number"),
         expected.len() as u64,
         "HEAD 的 size 必须是逻辑大小,与 GET 返回的字节数一致"
     );
-    assert_eq!(header(&resp, "x-ambry-blob-stitched"), "true");
-    assert_eq!(header(&resp, "x-ambry-blob-stitch-chunks"), "3", "三片");
+    assert_eq!(header(&resp, "x-antfs-blob-stitched"), "true");
+    assert_eq!(header(&resp, "x-antfs-blob-stitch-chunks"), "3", "三片");
 
     // 普通对象不受影响:HEAD 报自身大小,且不带 stitched 标记。
     let plain = fx.upload(&pseudo_random(4096)).await;
@@ -602,13 +602,13 @@ async fn stitch_concatenates_chunks_in_order() {
         .await
         .expect("head plain");
     assert_eq!(
-        header(&resp, "x-ambry-blob-size")
+        header(&resp, "x-antfs-blob-size")
             .parse::<u64>()
             .expect("number"),
         4096
     );
     assert!(
-        resp.headers().get("x-ambry-blob-stitched").is_none(),
+        resp.headers().get("x-antfs-blob-stitched").is_none(),
         "普通对象不带 stitched"
     );
 }
@@ -655,7 +655,7 @@ async fn bad_requests_are_rejected_with_400() {
         .send()
         .await
         .expect("stitch request");
-    assert_eq!(resp.status().as_u16(), 400, "缺 x-ambry-session 必须 400");
+    assert_eq!(resp.status().as_u16(), 400, "缺 x-antfs-session 必须 400");
 
     // /stitch:空片列表(含字段缺失)。
     for body in [
@@ -665,7 +665,7 @@ async fn bad_requests_are_rejected_with_400() {
         let resp = fx
             .http
             .post(fx.url("/stitch"))
-            .header("x-ambry-session", "s")
+            .header("x-antfs-session", "s")
             .json(&body)
             .send()
             .await
@@ -677,7 +677,7 @@ async fn bad_requests_are_rejected_with_400() {
     let resp = fx
         .http
         .post(fx.url("/stitch"))
-        .header("x-ambry-session", "s")
+        .header("x-antfs-session", "s")
         .json(&serde_json::json!({ "signedChunkIds": ["zz"] }))
         .send()
         .await
@@ -688,7 +688,7 @@ async fn bad_requests_are_rejected_with_400() {
     let resp = fx
         .http
         .post(fx.url("/stitch"))
-        .header("x-ambry-session", "s")
+        .header("x-antfs-session", "s")
         .json(&serde_json::json!({ "signedChunkIds": [missing_id] }))
         .send()
         .await
@@ -859,7 +859,7 @@ async fn cors_allows_listed_origins_only() {
     const ALLOWED: &str = "https://app.example";
     let fx = Fixture::start(MAX_BODY_BYTES, &[101, 102], vec![ALLOWED.to_string()]).await;
 
-    // 白名单内:回 `access-control-allow-origin`,并暴露 `x-ambry-*` 响应头与 `location`
+    // 白名单内:回 `access-control-allow-origin`,并暴露 `x-antfs-*` 响应头与 `location`
     // (暴露头只在**非预检**响应上出现)。
     let resp = fx
         .http
@@ -882,8 +882,8 @@ async fn cors_allows_listed_origins_only() {
         .unwrap_or_default()
         .to_string();
     assert!(
-        exposed.contains("x-ambry-blob-id") && exposed.contains("location"),
-        "必须暴露 x-ambry-* 与 location: {exposed}"
+        exposed.contains("x-antfs-blob-id") && exposed.contains("location"),
+        "必须暴露 x-antfs-* 与 location: {exposed}"
     );
 
     // 白名单外:**不**放行(没有该头),也绝不回 `*`。
@@ -899,13 +899,13 @@ async fn cors_allows_listed_origins_only() {
         "白名单外的来源不得放行"
     );
 
-    // 预检:暴露方法 + 暴露头都要有(浏览器据此决定能否读 `x-ambry-*`)。
+    // 预检:暴露方法 + 暴露头都要有(浏览器据此决定能否读 `x-antfs-*`)。
     let resp = fx
         .http
         .request(reqwest::Method::OPTIONS, fx.url("/blobs"))
         .header("origin", ALLOWED)
         .header("access-control-request-method", "POST")
-        .header("access-control-request-headers", "x-ambry-ttl-ms")
+        .header("access-control-request-headers", "x-antfs-ttl-ms")
         .send()
         .await
         .expect("preflight request");
@@ -925,8 +925,8 @@ async fn cors_allows_listed_origins_only() {
             .get("access-control-allow-headers")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
-            .contains("x-ambry-session"),
-        "允许的请求头必须含 x-ambry-session"
+            .contains("x-antfs-session"),
+        "允许的请求头必须含 x-antfs-session"
     );
 }
 
@@ -1003,7 +1003,7 @@ async fn auto_chunk_fixture() -> Fixture {
     Fixture::start_with_frontend(cfg, &[101, 102]).await
 }
 
-/// 大 body(300 KiB > 256 KiB)一次 POST 搞定:201 + `x-ambry-blob-size` 是**逻辑总量**(不是描述符
+/// 大 body(300 KiB > 256 KiB)一次 POST 搞定:201 + `x-antfs-blob-size` 是**逻辑总量**(不是描述符
 /// 那几百字节);GET 逐字节一致;HEAD 报拼装标记 + 片数(96+96+96+12 = 4 片)。
 /// 同时钉住边界:**恰等于 max_body_bytes 的 body 仍是单 blob**(HEAD 无 stitched 标记),自动分片
 /// 不改变小对象语义。指标断言打在实际接入的 `Registry` 上(CLAUDE.md §6)。
@@ -1025,11 +1025,11 @@ async fn big_post_is_auto_chunked_and_transparent() {
         "超过 max_body_bytes 的 POST 必须 201"
     );
     assert_eq!(
-        header(&resp, "x-ambry-blob-size"),
+        header(&resp, "x-antfs-blob-size"),
         "307200",
         "size 必须是逻辑总量"
     );
-    let blob_id = header(&resp, "x-ambry-blob-id");
+    let blob_id = header(&resp, "x-antfs-blob-id");
 
     assert_eq!(
         fx.get_ok(&blob_id).await,
@@ -1044,10 +1044,10 @@ async fn big_post_is_auto_chunked_and_transparent() {
         .await
         .expect("head auto-chunked");
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(header(&resp, "x-ambry-blob-size"), "307200");
-    assert_eq!(header(&resp, "x-ambry-blob-stitched"), "true");
+    assert_eq!(header(&resp, "x-antfs-blob-size"), "307200");
+    assert_eq!(header(&resp, "x-antfs-blob-stitched"), "true");
     assert_eq!(
-        header(&resp, "x-ambry-blob-stitch-chunks"),
+        header(&resp, "x-antfs-blob-stitch-chunks"),
         "4",
         "96×3 + 12 = 4 片"
     );
@@ -1063,7 +1063,7 @@ async fn big_post_is_auto_chunked_and_transparent() {
         .await
         .expect("head plain");
     assert!(
-        resp.headers().get("x-ambry-blob-stitched").is_none(),
+        resp.headers().get("x-antfs-blob-stitched").is_none(),
         "恰在上限内不得拼装"
     );
 
@@ -1088,13 +1088,13 @@ async fn auto_chunk_honors_ttl_and_chunked_upload_without_length() {
     let resp = fx
         .http
         .post(fx.url("/blobs"))
-        .header("x-ambry-ttl-ms", "1000")
+        .header("x-antfs-ttl-ms", "1000")
         .body(pencil(300 * 1024))
         .send()
         .await
         .expect("auto-chunk with ttl");
     assert_eq!(resp.status().as_u16(), 201, "带 TTL 的自动分片上传必须 201");
-    let blob_id = header(&resp, "x-ambry-blob-id");
+    let blob_id = header(&resp, "x-antfs-blob-id");
     assert_eq!(fx.get(&blob_id).await.status().as_u16(), 404, "整体已过期");
     let resp = fx
         .http
@@ -1103,9 +1103,9 @@ async fn auto_chunk_honors_ttl_and_chunked_upload_without_length() {
         .await
         .expect("head expired");
     assert_eq!(resp.status().as_u16(), 200, "过期对象的元数据仍可读");
-    assert_eq!(header(&resp, "x-ambry-blob-expired"), "true");
+    assert_eq!(header(&resp, "x-antfs-blob-expired"), "true");
     assert_eq!(
-        header(&resp, "x-ambry-blob-expiration-ms"),
+        header(&resp, "x-antfs-blob-expiration-ms"),
         "1000",
         "描述符带 TTL:整个逻辑对象的一体过期可见"
     );
@@ -1119,7 +1119,7 @@ async fn auto_chunk_honors_ttl_and_chunked_upload_without_length() {
         raw.starts_with("HTTP/1.1 201"),
         "无声明长度的大 POST 必须 201,实际:\n{raw}"
     );
-    let id = header_from_raw(&raw, "x-ambry-blob-id");
+    let id = header_from_raw(&raw, "x-antfs-blob-id");
     assert_eq!(id.len(), 16, "blobId 必须 16 hex");
     assert_eq!(
         fx.get_ok(&id).await,
@@ -1219,7 +1219,7 @@ async fn auto_chunk_put_failure_returns_503_and_retry_recovers() {
         .await
         .expect("big post retry");
     assert_eq!(resp.status().as_u16(), 201, "重试必须成功");
-    let blob_id = header(&resp, "x-ambry-blob-id");
+    let blob_id = header(&resp, "x-antfs-blob-id");
     assert_eq!(
         fx.get_ok(&blob_id).await,
         data,

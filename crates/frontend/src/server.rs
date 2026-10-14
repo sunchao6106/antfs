@@ -37,26 +37,26 @@ use crate::metrics::{
     FrontendMetrics, OP_DELETE, OP_DOWNLOAD, OP_HEAD, OP_STITCH, OP_UPLOAD, OUTCOME_OK,
 };
 
-// ── 请求/响应头(对齐 Ambry frontend 的 `x-ambry-*` 契约)────────────────────────────────────
+// ── 请求/响应头(`x-antfs-*` 契约;前身沿用 Ambry 的 `x-ambry-*`,2026-10 整体改名)──────────────
 
-/// `x-ambry-session`:分片上传的会话标识(客户端生成;片就是普通 blob,frontend 只把它记进描述符)。
-const HEADER_SESSION: HeaderName = HeaderName::from_static("x-ambry-session");
-/// `x-ambry-ttl-ms`:上传时可选带的过期时刻(epoch 毫秒)。
-const HEADER_TTL_MS: HeaderName = HeaderName::from_static("x-ambry-ttl-ms");
-/// `x-ambry-blob-id`:blobId 的 16 位 hex。
-const HEADER_BLOB_ID: HeaderName = HeaderName::from_static("x-ambry-blob-id");
-/// `x-ambry-blob-size`:数据体字节数。
-const HEADER_BLOB_SIZE: HeaderName = HeaderName::from_static("x-ambry-blob-size");
-/// `x-ambry-blob-deleted`:`"true"`/`"false"`。
-const HEADER_BLOB_DELETED: HeaderName = HeaderName::from_static("x-ambry-blob-deleted");
-/// `x-ambry-blob-expired`:`"true"`/`"false"`。
-const HEADER_BLOB_EXPIRED: HeaderName = HeaderName::from_static("x-ambry-blob-expired");
-/// `x-ambry-blob-expiration-ms`:过期时刻(epoch 毫秒;`-1` = 不过期)。
-const HEADER_BLOB_EXPIRATION_MS: HeaderName = HeaderName::from_static("x-ambry-blob-expiration-ms");
-/// `x-ambry-blob-stitched`:该对象是否为分片拼装(`HEAD` 专用;`GET` 会拼装成逻辑字节流)。
-const HEADER_BLOB_STITCHED: HeaderName = HeaderName::from_static("x-ambry-blob-stitched");
-/// `x-ambry-blob-stitch-chunks`:拼装的片数(`HEAD` 专用,仅拼装对象有)。
-const HEADER_BLOB_STITCH_CHUNKS: HeaderName = HeaderName::from_static("x-ambry-blob-stitch-chunks");
+/// `x-antfs-session`:分片上传的会话标识(客户端生成;片就是普通 blob,frontend 只把它记进描述符)。
+const HEADER_SESSION: HeaderName = HeaderName::from_static("x-antfs-session");
+/// `x-antfs-ttl-ms`:上传时可选带的过期时刻(epoch 毫秒)。
+const HEADER_TTL_MS: HeaderName = HeaderName::from_static("x-antfs-ttl-ms");
+/// `x-antfs-blob-id`:blobId 的 16 位 hex。
+const HEADER_BLOB_ID: HeaderName = HeaderName::from_static("x-antfs-blob-id");
+/// `x-antfs-blob-size`:数据体字节数。
+const HEADER_BLOB_SIZE: HeaderName = HeaderName::from_static("x-antfs-blob-size");
+/// `x-antfs-blob-deleted`:`"true"`/`"false"`。
+const HEADER_BLOB_DELETED: HeaderName = HeaderName::from_static("x-antfs-blob-deleted");
+/// `x-antfs-blob-expired`:`"true"`/`"false"`。
+const HEADER_BLOB_EXPIRED: HeaderName = HeaderName::from_static("x-antfs-blob-expired");
+/// `x-antfs-blob-expiration-ms`:过期时刻(epoch 毫秒;`-1` = 不过期)。
+const HEADER_BLOB_EXPIRATION_MS: HeaderName = HeaderName::from_static("x-antfs-blob-expiration-ms");
+/// `x-antfs-blob-stitched`:该对象是否为分片拼装(`HEAD` 专用;`GET` 会拼装成逻辑字节流)。
+const HEADER_BLOB_STITCHED: HeaderName = HeaderName::from_static("x-antfs-blob-stitched");
+/// `x-antfs-blob-stitch-chunks`:拼装的片数(`HEAD` 专用,仅拼装对象有)。
+const HEADER_BLOB_STITCH_CHUNKS: HeaderName = HeaderName::from_static("x-antfs-blob-stitch-chunks");
 
 /// **直接进内存**的 body 上界:≤ 该值走内存路径(`Bytes` → `Router::put`),> 该值(或未声明长度)
 /// 才落盘暂存 + [`Router::put_file`] 流式写。
@@ -68,7 +68,7 @@ const INLINE_BODY_MAX: u64 = 1024 * 1024;
 
 /// 跨域时允许的请求头(仅本接口真正用到的三个)。
 const CORS_ALLOWED_HEADERS: [HeaderName; 3] = [header::CONTENT_TYPE, HEADER_SESSION, HEADER_TTL_MS];
-/// 跨域时暴露给浏览器的响应头(全部 `x-ambry-*` + `Location`)。
+/// 跨域时暴露给浏览器的响应头(全部 `x-antfs-*` + `Location`)。
 const CORS_EXPOSED_HEADERS: [HeaderName; 8] = [
     header::LOCATION,
     HEADER_BLOB_ID,
@@ -323,10 +323,10 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 
 // ── handler ─────────────────────────────────────────────────────────────────────────────────
 
-/// `POST /blobs`:body = 裸 blob 字节 → 201 + `Location` / `x-ambry-blob-id` / `x-ambry-blob-size`。
+/// `POST /blobs`:body = 裸 blob 字节 → 201 + `Location` / `x-antfs-blob-id` / `x-antfs-blob-size`。
 ///
-/// 分片上传的**片就是普通 blob**(带 `x-ambry-session` 也不改变写入路径),片清单由客户端自己记
-/// —— frontend 无状态(D3)。可选头 `x-ambry-ttl-ms` 见 [`upload`]。
+/// 分片上传的**片就是普通 blob**(带 `x-antfs-session` 也不改变写入路径),片清单由客户端自己记
+/// —— frontend 无状态(D3)。可选头 `x-antfs-ttl-ms` 见 [`upload`]。
 /// body 超过 `max_body_bytes` 且开启自动分片时,切片+描述符路径见 [`auto_chunk_store`]。
 async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_UPLOAD);
@@ -367,7 +367,7 @@ async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
 /// 一次成功上传的落点(handler 据此记指标 + 回响应)。
 struct Uploaded {
     key: StoreKey,
-    /// 回报给 `x-ambry-blob-size` 的字节数:单 blob = 数据体;自动分片 = 逻辑总量(各片之和,
+    /// 回报给 `x-antfs-blob-size` 的字节数:单 blob = 数据体;自动分片 = 逻辑总量(各片之和,
     /// 与 GET/HEAD 的拼装口径一致)。
     len: u64,
     /// 走了自动分片路径时的数据片数;单 blob 路径为 `None`。
@@ -376,7 +376,7 @@ struct Uploaded {
 
 /// 上传实现:边界校验 → body ≤ `max_body_bytes` 时走单 blob 路径(小进内存 / 大落暂存流式,行为
 /// 与自动分片之前完全一致);超过(且开启自动分片)→ 暂存整包后切片多次上传(见 [`auto_chunk_store`])
-/// → 写入时定 TTL(`x-ambry-ttl-ms`,缺省不过期)。
+/// → 写入时定 TTL(`x-antfs-ttl-ms`,缺省不过期)。
 async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
     // 先解析 TTL 头:非法立即 400,不白读一遍 body。
     let expiration_ms = ttl_header(req.headers())?.unwrap_or(NO_EXPIRATION);
@@ -472,11 +472,11 @@ fn session_of(raw: Option<HeaderValue>) -> Result<Option<String>, Error> {
     };
     let text = raw
         .to_str()
-        .map_err(|_| Error::Invalid("x-ambry-session must be valid text".into()))?
+        .map_err(|_| Error::Invalid("x-antfs-session must be valid text".into()))?
         .to_string();
     if text.len() > u16::MAX as usize {
         return Err(Error::Invalid(
-            "x-ambry-session must be at most 65535 bytes".into(),
+            "x-antfs-session must be at most 65535 bytes".into(),
         ));
     }
     Ok(Some(text))
@@ -628,14 +628,14 @@ async fn download(st: &AppState, blob_id: &str) -> Result<(Response, u64), Error
     Ok((Body::from_stream(stream).into_response(), len))
 }
 
-/// `HEAD /blobs/{blobId}`:200 + 无 body,状态经 `x-ambry-blob-*` 响应头透出(不读数据体)。
+/// `HEAD /blobs/{blobId}`:200 + 无 body,状态经 `x-antfs-blob-*` 响应头透出(不读数据体)。
 async fn head_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<String>) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_HEAD);
     let result = async {
         let key = parse_blob_id(&blob_id)?;
         let mut meta = st.router.stat(&key).await?;
         // 拼装对象:`stat` 只看到**描述符**那个 blob(几百字节),直接报出去会与 `GET`(拼装后的逻辑字节流)对不上。
-        // 故这里做与 `download` 同样的 MAGIC 嗅探,把 size 换成各片之和,并回 `x-ambry-blob-stitched`。
+        // 故这里做与 `download` 同样的 MAGIC 嗅探,把 size 换成各片之和,并回 `x-antfs-blob-stitched`。
         // 代价可控:描述符按构造 ≤ DESCRIPTOR_MAX_BYTES,故**只有小对象**才需要多读一次数据体(≤1 MiB);
         // size 更大者不可能是描述符,直接按原 size 回(不读数据体,保持 HEAD 的语义)。
         // 已删/已过期的拼装对象嗅不出逻辑大小(数据面拒读已过期体,下面 `get` 的失败被静默忽略)
@@ -755,7 +755,7 @@ async fn stitch_inner(
         .get(HEADER_SESSION)
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Invalid("missing header x-ambry-session".into()))?;
+        .ok_or_else(|| Error::Invalid("missing header x-antfs-session".into()))?;
     if body.signed_chunk_ids.is_empty() || body.signed_chunk_ids.len() > MAX_CHUNKS {
         return Err(Error::Invalid(format!(
             "signedChunkIds must have 1..={MAX_CHUNKS} entries"
@@ -820,7 +820,7 @@ fn encode_descriptor(session: &[u8], chunks: &[DescriptorChunk]) -> Result<Vec<u
         )));
     }
     let session_len = u16::try_from(session.len())
-        .map_err(|_| Error::Invalid("x-ambry-session must be at most 65535 bytes".into()))?;
+        .map_err(|_| Error::Invalid("x-antfs-session must be at most 65535 bytes".into()))?;
     let mut out = Vec::with_capacity(
         DESCRIPTOR_HEADER_BYTES + session.len() + chunks.len() * DESCRIPTOR_ENTRY_BYTES,
     );
@@ -1048,7 +1048,7 @@ fn parse_blob_id(blob_id: &str) -> Result<StoreKey, Error> {
     StoreKey::from_slice(&bytes).ok_or_else(|| Error::Invalid(BLOB_ID_INVALID.into()))
 }
 
-/// 已提交对象的响应(201 + `Location` / `x-ambry-blob-id` / `x-ambry-blob-size`),上传与拼装共用。
+/// 已提交对象的响应(201 + `Location` / `x-antfs-blob-id` / `x-antfs-blob-size`),上传与拼装共用。
 fn created_response(key: StoreKey, len: u64) -> Response {
     let blob_id = hex::encode(key.as_bytes());
     let mut resp = StatusCode::CREATED.into_response();
@@ -1078,18 +1078,18 @@ fn put_header(resp: &mut Response, name: HeaderName, value: &str) {
     }
 }
 
-/// 上传可选头 `x-ambry-ttl-ms`:给了就用带 TTL 的写入;给了但非法 → 400。
+/// 上传可选头 `x-antfs-ttl-ms`:给了就用带 TTL 的写入;给了但非法 → 400。
 fn ttl_header(headers: &HeaderMap) -> Result<Option<i64>, Error> {
     match headers.get(HEADER_TTL_MS) {
         None => Ok(None),
         Some(raw) => {
             let text = raw.to_str().map_err(|_| {
-                Error::Invalid("x-ambry-ttl-ms must be an integer (epoch ms)".into())
+                Error::Invalid("x-antfs-ttl-ms must be an integer (epoch ms)".into())
             })?;
             text.trim()
                 .parse::<i64>()
                 .map(Some)
-                .map_err(|_| Error::Invalid("x-ambry-ttl-ms must be an integer (epoch ms)".into()))
+                .map_err(|_| Error::Invalid("x-antfs-ttl-ms must be an integer (epoch ms)".into()))
         }
     }
 }

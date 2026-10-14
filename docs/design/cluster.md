@@ -22,7 +22,7 @@
 | **store server**(数据节点) | 承载 [`store`](./store.md) 引擎(挂 N disk、每 disk 一堆 BlobStore),服务 put/get,跑副本复制 | 已实现(见 §9) |
 | **master** | partition→replica 放置、节点/副本状态机、故障处置、**发号(blobId 号段)**;**内建 Raft**(自包含,不依赖外部协调器) | 已实现(见 §7) |
 | **router**(客户端 SDK / 通用组件) | Router 逻辑做成**库**(`crates/common/router`):号段缓存、选分区、拼 blobId、直连 store server 做 W/R、切副本;**frontend 与压测二进制共用同一份实现** | 已实现(见 [`router.md`](./router.md)) |
-| **frontend**(HTTP REST 入口) | `POST/GET/HEAD/DELETE /blobs`、写入时定 TTL(`x-ambry-ttl-ms`)、分片拼装、`/metrics`;**内嵌同一 router SDK**,不重复实现 W/R | 已实现(见 [`frontend.md`](./frontend.md)) |
+| **frontend**(HTTP REST 入口) | `POST/GET/HEAD/DELETE /blobs`、写入时定 TTL(`x-antfs-ttl-ms`)、分片拼装、`/metrics`;**内嵌同一 router SDK**,不重复实现 W/R | 已实现(见 [`frontend.md`](./frontend.md)) |
 | **S3 网关**(远景) | S3 协议翻译 + auth/quota;与 frontend 同层,复用同一 SDK | 规划 |
 | **scheduler**(待定 P1) | 集群级 compaction 编排 / 再复制 / 均衡 / EC 调度 | 待定(见 §4) |
 | **admin web**(独立服务) | 运维操作(经 master admin gRPC)+ 控制面状态 dashboard(拓扑/节点/盘/分区/副本);指标时序复用 Prometheus+Grafana;需 operator 鉴权 | 已实现(见 §11) |

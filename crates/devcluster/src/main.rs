@@ -543,7 +543,7 @@ fn print_summary(args: &DevClusterConfig, banner: &Banner) {
         println!("    curl http://{fa}/blobs/<blobId> -o /tmp/b.bin && cmp /tmp/a.bin /tmp/b.bin");
         println!("    curl -I http://{fa}/blobs/<blobId>             # 元数据头(不读数据体)");
         println!("    curl -X DELETE http://{fa}/blobs/<blobId> -i   # 204");
-        println!("    curl -X POST --data-binary @/tmp/a.bin -H 'x-ambry-ttl-ms: 1780000000000' http://{fa}/blobs -i   # 201;TTL 只能在写入时定");
+        println!("    curl -X POST --data-binary @/tmp/a.bin -H 'x-antfs-ttl-ms: 1780000000000' http://{fa}/blobs -i   # 201;TTL 只能在写入时定");
         println!("    cargo run -p antfs-bench-frontend --release -- --frontend http://{fa} \\");
         println!("      --ops 20000 --concurrency 32 --size 4096 --read-ratio 20");
     }

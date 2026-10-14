@@ -976,3 +976,13 @@
   `cargo test --workspace` 全绿、clippy 零告警。已知取舍与缺口(删描述符留孤儿片、失败回收路径无
   确定性集成测试)记录在 frontend.md §4/§5。
 
+## 步骤 37:REST/S3 契约头整体改名 `x-ambry-*` → `x-antfs-*`(2026-10-14)
+
+- 全量替换头部字面量(`session`/`ttl-ms`/`blob-id`/`blob-size`/`blob-deleted`/`blob-expired`/
+  `blob-expiration-ms`/`blob-stitched`/`blob-stitch-chunks`)及其文档、测试断言、devcluster 启动
+  banner 的 curl 示例、benchmark 读取逻辑。s3 网关本就无 `x-ambry-*` 引用(用 S3 自有协议头),点名
+  核对为零命中。
+- 理由旨趣更新(frontend.md §2):不是 Ambry,契约面用自己的前缀;开发期不兼容变更,不留旧名别名。
+  DEVLOG 之前的条目与 `openspec/changes/` 是历史档案,不改写。
+- **验证**:`rg` 确认仓库业务面零残留;`cargo test -p antfs-frontend`(11 单测 + 16 集成)全绿、
+  clippy/fmt 干净,`cargo clippy -p antfs-bench-frontend` 过。
