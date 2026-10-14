@@ -14,24 +14,11 @@ pub async fn create_multipart_upload(
     key: &str,
     req: Request,
 ) -> Result<Response, S3Error> {
-    let content_type = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let mut user_meta = UserMeta::new();
-    for (name, value) in req.headers() {
-        if let Some(meta_key) = name.as_str().strip_prefix("x-amz-meta-") {
-            if let Ok(v) = value.to_str() {
-                user_meta.insert(meta_key.to_string(), v.to_string());
-            }
-        }
-    }
+    let (content_type, user_meta) = crate::handlers::object::capture_object_meta(req.headers())?;
 
     let upload_id = st
         .metastore
-        .create_multipart(bucket, key, content_type.as_deref(), &user_meta)
+        .create_multipart(bucket, key, Some(content_type.as_str()), &user_meta)
         .await?;
 
     let xml = crate::xml::serialize_initiate_multipart(bucket, key, &upload_id);

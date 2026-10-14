@@ -20,6 +20,8 @@ pub enum S3Error {
     MalformedXML(String),
     EntityTooLarge,
     MissingContentLength,
+    MetadataTooLarge,
+    InvalidArgument(String),
 }
 
 impl S3Error {
@@ -42,6 +44,8 @@ impl S3Error {
             Self::MalformedXML(_) => "MalformedXML",
             Self::EntityTooLarge => "EntityTooLarge",
             Self::MissingContentLength => "MissingContentLength",
+            Self::MetadataTooLarge => "MetadataTooLarge",
+            Self::InvalidArgument(_) => "InvalidArgument",
         }
     }
 
@@ -54,6 +58,7 @@ impl S3Error {
                 StatusCode::BAD_REQUEST
             }
             Self::MalformedXML(_) | Self::MissingContentLength => StatusCode::BAD_REQUEST,
+            Self::MetadataTooLarge | Self::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             Self::AccessDenied(_)
             | Self::SignatureDoesNotMatch
             | Self::InvalidAccessKeyId
@@ -107,6 +112,12 @@ impl S3Error {
             Self::MalformedXML(detail) => format!("The XML you provided was not well-formed or did not validate against our published schema. {detail}"),
             Self::EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.".into(),
             Self::MissingContentLength => "You must provide the Content-Length HTTP header.".into(),
+            Self::MetadataTooLarge => {
+                "Your metadata headers exceed the maximum allowed metadata size.".into()
+            }
+            Self::InvalidArgument(detail) => {
+                format!("Invalid argument: {detail}")
+            }
         }
     }
 

@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{header, xml_tag, S3Fixture};
+use common::{header, pseudo_random, xml_tag, S3Fixture};
 
 /// Build the `<CompleteMultipartUpload>` XML body from `(part_number, etag)` pairs. The ETag is
 /// inserted verbatim (the client echoes back the quoted value from UploadPart).
@@ -151,4 +151,48 @@ async fn list_multipart_uploads() {
         xml.contains(&format!("<UploadId>{second}</UploadId>")),
         "second id listed"
     );
+}
+
+/// Metadata carried on CreateMultipartUpload flows through CompleteMultipartUpload into
+/// the stored named object; GetObject echoes Content-Type and x-amz-meta-* back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_metadata_roundtrip() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mp").await;
+    let key = "with-meta.bin";
+
+    let resp = fx
+        .create_multipart_with_headers(
+            &bucket,
+            key,
+            &[
+                ("content-type", "video/mp4"),
+                ("x-amz-meta-project", "demo"),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "initiate must 200");
+    let xml = resp.text().await.expect("initiate body");
+    let upload_id = xml_tag(&xml, "UploadId");
+
+    let chunk = pseudo_random(64);
+    let resp = fx.upload_part(&bucket, key, &upload_id, 1, &chunk).await;
+    assert_eq!(resp.status().as_u16(), 200, "part upload must 200");
+    let etag = header(&resp, "etag");
+
+    let resp = fx
+        .complete_multipart(
+            &bucket,
+            key,
+            &upload_id,
+            complete_xml(&[(1, etag)]).as_bytes(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "complete must 200");
+
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(header(&resp, "content-type"), "video/mp4");
+    assert_eq!(header(&resp, "x-amz-meta-project"), "demo");
 }

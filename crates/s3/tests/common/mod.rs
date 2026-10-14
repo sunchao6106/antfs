@@ -33,7 +33,7 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use openraft::BasicNode;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use sha2::{Digest, Sha256};
 
@@ -647,6 +647,42 @@ impl S3Fixture {
     pub async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> reqwest::Response {
         self.request(Method::PUT, &format!("/{bucket}/{key}"), body.to_vec())
             .await
+    }
+
+    /// PUT carrying extra request headers unsigned. SigV4 only signs host/x-amz-*, so
+    /// additional headers (Content-Type, x-amz-meta-*) travel unsigned by design.
+    pub async fn put_object_with_headers(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        extra: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let uri = format!("/{bucket}/{key}");
+        let mut headers = self.signed_headers("PUT", &uri, body);
+        self.insert_extra_headers(&mut headers, extra);
+        self.send(Method::PUT, &uri, headers, body.to_vec()).await
+    }
+
+    /// POST `?uploads` carrying extra request headers unsigned (CreateMultipartUpload with metadata).
+    pub async fn create_multipart_with_headers(
+        &self,
+        bucket: &str,
+        key: &str,
+        extra: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let uri = format!("/{bucket}/{key}?uploads=");
+        let mut headers = self.signed_headers("POST", &uri, &[]);
+        self.insert_extra_headers(&mut headers, extra);
+        self.send(Method::POST, &uri, headers, Vec::new()).await
+    }
+
+    fn insert_extra_headers(&self, headers: &mut HeaderMap, extra: &[(&str, &str)]) {
+        for (k, v) in extra {
+            let name = HeaderName::from_bytes(k.as_bytes()).expect("valid header name");
+            let value = HeaderValue::from_str(v).expect("valid header value");
+            headers.insert(name, value);
+        }
     }
 
     /// PUT with an `UNSIGNED-PAYLOAD` signature.

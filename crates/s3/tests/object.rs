@@ -140,3 +140,105 @@ async fn etag_is_md5_hex() {
         "ETag must be the hex MD5 of the body"
     );
 }
+
+/// Object metadata (Content-Type + x-amz-meta-*) round-trips: stored in MetaStore on
+/// PutObject, echoed back on GetObject and HeadObject (engine carries no metadata).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn object_metadata_roundtrip() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("obj").await;
+    let body = pseudo_random(64);
+
+    let resp = fx
+        .put_object_with_headers(
+            &bucket,
+            "meta.bin",
+            &body,
+            &[
+                ("content-type", "video/mp4"),
+                ("x-amz-meta-project", "demo"),
+                ("x-amz-meta-owner", "alice"),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "PUT with metadata must 200");
+
+    let resp = fx.get_object(&bucket, "meta.bin").await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(header(&resp, "content-type"), "video/mp4");
+    assert_eq!(header(&resp, "x-amz-meta-project"), "demo");
+    assert_eq!(header(&resp, "x-amz-meta-owner"), "alice");
+
+    let resp = fx.head_object(&bucket, "meta.bin").await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(header(&resp, "content-type"), "video/mp4");
+    assert_eq!(header(&resp, "x-amz-meta-owner"), "alice");
+}
+
+/// PutObject without a Content-Type header stores the S3 default binary/octet-stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn default_content_type_when_absent() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("obj").await;
+    let body = pseudo_random(16);
+
+    let resp = fx.put_object(&bucket, "plain.bin", &body).await;
+    assert_eq!(resp.status().as_u16(), 200, "PUT must return 200");
+
+    let resp = fx.get_object(&bucket, "plain.bin").await;
+    assert_eq!(header(&resp, "content-type"), "binary/octet-stream");
+
+    let resp = fx.head_object(&bucket, "plain.bin").await;
+    assert_eq!(header(&resp, "content-type"), "binary/octet-stream");
+}
+
+/// x-amz-meta-* headers totaling over 2048 bytes get rejected with 400 MetadataTooLarge
+/// and no object is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn metadata_too_large_rejected() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("obj").await;
+    let big = "x".repeat(1100);
+
+    let resp = fx
+        .put_object_with_headers(
+            &bucket,
+            "bigmeta.bin",
+            b"payload",
+            &[("x-amz-meta-a", &big), ("x-amz-meta-b", &big)],
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 400, "oversized metadata must 400");
+    let text = resp.text().await.expect("error body");
+    assert!(text.contains("MetadataTooLarge"), "error code: {text}");
+
+    let resp = fx.get_object(&bucket, "bigmeta.bin").await;
+    assert_eq!(resp.status().as_u16(), 404, "no object must be written");
+}
+
+/// A Content-Type header longer than the 256-byte storage column gets rejected with
+/// 400 InvalidArgument (not a 500 from a failed INSERT).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn oversized_content_type_rejected() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("obj").await;
+    let ct = "a".repeat(257);
+
+    let resp = fx
+        .put_object_with_headers(&bucket, "longct.bin", b"payload", &[("content-type", &ct)])
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "oversized Content-Type must 400"
+    );
+    let text = resp.text().await.expect("error body");
+    assert!(text.contains("InvalidArgument"), "error code: {text}");
+
+    let resp = fx.get_object(&bucket, "longct.bin").await;
+    assert_eq!(resp.status().as_u16(), 404, "no object must be written");
+}

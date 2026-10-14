@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use antfs_router::NO_EXPIRATION;
@@ -9,26 +9,54 @@ use crate::error::S3Error;
 use crate::metastore::types::*;
 use crate::server::AppState;
 
-pub async fn put_object(
-    st: AppState,
-    bucket: &str,
-    key: &str,
-    req: Request,
-) -> Result<Response, S3Error> {
-    let content_type = req
-        .headers()
+/// `Content-Type` 存储默认(AWS 语义:上传未带即按此类型存储,GET 原样回吐)。
+const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
+/// `x-amz-meta-*` 总上限(Σ 键+值 UTF-8 字节;S3 语义官方值,不做成配置)。
+const MAX_USER_META_BYTES: usize = 2048;
+/// `Content-Type` 最大长度,对齐 MetaStore `VARCHAR(256)` 列宽(再长应 400,而非落库时 500)。
+const MAX_CONTENT_TYPE_BYTES: usize = 256;
+
+/// 从请求头采集对象元数据(PutObject 与 CreateMultipart 共用),含 S3 语义边界校验:
+/// 无 `Content-Type` → 存 `binary/octet-stream`;超长 → `InvalidArgument`;
+/// meta 总字节超 2048 → `MetadataTooLarge`。元数据只进 MetaStore,与 blob 引擎隔离。
+pub(crate) fn capture_object_meta(headers: &HeaderMap) -> Result<(String, UserMeta), S3Error> {
+    let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
     let mut user_meta = UserMeta::new();
-    for (name, value) in req.headers() {
+    for (name, value) in headers {
         if let Some(meta_key) = name.as_str().strip_prefix("x-amz-meta-") {
             if let Ok(v) = value.to_str() {
                 user_meta.insert(meta_key.to_string(), v.to_string());
             }
         }
     }
+
+    if let Some(ct) = content_type.as_deref() {
+        if ct.len() > MAX_CONTENT_TYPE_BYTES {
+            return Err(S3Error::InvalidArgument(format!(
+                "Content-Type header exceeds {MAX_CONTENT_TYPE_BYTES} bytes"
+            )));
+        }
+    }
+    let meta_bytes: usize = user_meta.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if meta_bytes > MAX_USER_META_BYTES {
+        return Err(S3Error::MetadataTooLarge);
+    }
+
+    let content_type = content_type.unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string());
+    Ok((content_type, user_meta))
+}
+
+pub async fn put_object(
+    st: AppState,
+    bucket: &str,
+    key: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    let (content_type, user_meta) = capture_object_meta(req.headers())?;
 
     let content_length: Option<u64> = req
         .headers()
@@ -68,7 +96,7 @@ pub async fn put_object(
             blob_id: blob_key,
             size,
             etag: etag.clone(),
-            content_type,
+            content_type: Some(content_type),
             user_meta,
             parts_manifest: None,
         })
