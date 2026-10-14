@@ -13,6 +13,7 @@ antfs-master = { path = "../master" }
 antfs-store = { path = "../store" }
 antfs-admin = { path = "../admin" }
 antfs-frontend = { path = "../frontend" }
+antfs-s3 = { path = "../s3" }
 antfs-router = { path = "../common/router" }
 antfs-bench-router = { path = "../../benchmark/router" }
 antfs-bench-frontend = { path = "../../benchmark/frontend" }

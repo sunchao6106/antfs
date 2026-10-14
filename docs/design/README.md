@@ -8,12 +8,14 @@
 
 | 模块 | 文档 | 状态 |
 |---|---|---|
-| common(公共库:`config` 分层配置 + `metric` 统计打点) | [common.md](./common.md) | 进行中 |
-| store(单机存储引擎:Log / LogSegment / PersistentIndex / BlobStore;对标 Ambry `ambry-store`) | [store.md](./store.md) | 进行中 |
+| common(公共库:`config` 分层配置 + `metric` 统计打点) | [common.md](./common.md) | 已实现 |
+| store(单机存储引擎:Log / LogSegment / PersistentIndex / BlobStore;对标 Ambry `ambry-store`) | [store.md](./store.md) | 已实现 |
 | cluster(集群/服务层:master / store server / router SDK / frontend 角色 + 传输选型;锁定架构目标) | [cluster.md](./cluster.md) | 已实现(S3 网关除外) |
 | router(客户端 SDK / 通用组件:`crates/common/router`,package `antfs-router`;号段缓存、W 多数派写、R=1 读;对标 Ambry `NonBlockingRouter`) | [router.md](./router.md) | 已实现 |
 | frontend(HTTP REST 对象接口层;内嵌 router;对标 Ambry `ambry-frontend`) | [frontend.md](./frontend.md) | 已实现 |
-| S3 网关 / 多租户 ACL、配额(网关层远景) | *(待添加)* | 规划中 |
+| replication(拉复制设计:墓碑恒胜合并 + 游标重校验 + 段身份 + 副本 incarnation) | [replication.md](./replication.md) | 已实现 |
+| S3 网关(S3 协议翻译 + SigV4 鉴权 + MetaStore 名字映射;外接 PG/MySQL,网关无状态) | [s3.md](./s3.md) | 进行中 |
+| 多租户 ACL、配额(网关层远景) | *(待添加)* | 规划中 |
 
 > 决策档案(含被否决方案与理由)见 `openspec/changes/`。
 

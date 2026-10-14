@@ -986,3 +986,22 @@
   DEVLOG 之前的条目与 `openspec/changes/` 是历史档案,不改写。
 - **验证**:`rg` 确认仓库业务面零残留;`cargo test -p antfs-frontend`(11 单测 + 16 集成)全绿、
   clippy/fmt 干净,`cargo clippy -p antfs-bench-frontend` 过。
+
+## 步骤 38:S3 兼容网关(SigV4 / multipart / ListObjectsV2 / 桶管理;MetaStore 外接 PG/MySQL)(2026-10-14)
+
+- **分层**:与 frontend 同层的翻译层(`crates/s3`),**无状态** —— 名字元数据放外部 MetaStore
+  (PostgreSQL / MySQL 各一方言实现,5 表:buckets / named_objects / multipart_uploads /
+  multipart_parts / s3_credentials,sqlx::migrate 启动建表),blob 数据仍走内嵌 router SDK
+  (W 多数派写 / R=1 读 → 与 frontend 完全同一套)。
+- **功能面**:PutObject / GetObject(multipart manifest 逐片流式拼接,Content-Length = Σ片)/
+  HeadObject / DeleteObject / DeleteObjects(batch XML);CreateMultipart → UploadPart →
+  Complete / Abort / ListParts / ListMultipartUploads;ListObjectsV2(prefix / delimiter /
+  CommonPrefixes / 分页);桶 CRUD + ListBuckets;凭证管理(admin token → 签发 / 撤销 access_key)。
+- **鉴权**:AWS SigV4(header 与 presigned URL 双形态;UNSIGNED-PAYLOAD;±15min 时钟窗;
+  constant-time 比对;official test vector 校验)。
+- **评估边界(诚实记录)**:openspec tasks 14/14 节勾完;`cargo clippy --all-targets -D warnings`
+  与 `cargo fmt --check` 本次收口补齐(fmt 两处);`cargo test -p antfs-s3` 在无 PG/MySQL 的环境
+  (含 GitHub CI)**自动忽略**集成用例 —— 带库全量验证仅在生产/真机侧完成过,CI 不 gate 这一层。
+- devcluster:`--s3-metastore-url` 给出时同进程起 S3 网关(默认 7500;缺省不起)。
+- 后续(不在本 change,见 openspec §15):Versioning / SSE / CopyObject / aws-chunked 签名 /
+  后台 GC(soft-delete 过期 + 孤儿 multipart)/ 虚拟主机路由 / 配额计费 / LDAP-OIDC 凭证源。

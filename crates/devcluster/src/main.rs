@@ -67,6 +67,8 @@ fn parse_args(argv: &[String]) -> std::result::Result<(DevClusterConfig, Option<
             "--disk-near-full-ratio" => a.disk_near_full_ratio = num(flag, val()?)?,
             "--disk-health" => a.disk_health = true,
             "--frontend-port" => a.frontend_port = num(flag, val()?)?,
+            "--s3-port" => a.s3_port = num(flag, val()?)?,
+            "--s3-metastore-url" => a.s3_metastore_url = Some(val()?.clone()),
             "--host" => a.host = val()?.clone(),
             "--run-bench" => a.run_bench = Some(val()?.clone()),
             "--bench-ops" => a.bench_ops = num(flag, val()?)?,
@@ -115,6 +117,9 @@ fn print_help() {
          --frontend-port P      frontend REST 端口 (default 7400)\n\
          --host ADDR            对外服务(master gRPC / admin / frontend)的监听 host\n\
                                 (default 127.0.0.1;容器里传 0.0.0.0 才能被 -p 发布的端口访问)\n\
+         --s3-port P            S3 gateway port (default 7500; only when --s3-metastore-url is set)\n\
+         --s3-metastore-url U   MetaStore URL (e.g. postgres://user:pass@localhost/antfs_s3)\n\
+                                When set, starts the S3 gateway; otherwise S3 is not started\n\
          --run-bench MODE       起完集群(等就绪)后跑一轮压测并退出:MODE = router | frontend\n\
                                 (同进程压测,数字只作冒烟参考;正式压测请跑 antfs-bench-* 二进制)\n\
          --bench-ops N          压测写操作数 (default 20000;仅 --run-bench 时用)\n\
@@ -336,6 +341,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 装配见 `start_frontend`:与 admin 一样在进程内起一个 axum 服务,把 REST 请求翻译成 SDK 调用。
     let frontend_addr = start_frontend(&args, &grpc_addr).await;
 
+    // ---- S3 gateway(可选;仅当 --s3-metastore-url 给出时)----
+    let s3_addr = start_s3(&args, &grpc_addr).await;
+
     print_summary(
         &args,
         &Banner {
@@ -344,6 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             store_addrs: &store_addrs,
             admin_addr: &admin_addr,
             frontend_addr: frontend_addr.as_deref(),
+            s3_addr: s3_addr.as_deref(),
             partitions: &all,
             config_file: config_file.as_deref(),
         },
@@ -444,6 +453,78 @@ async fn start_frontend(args: &DevClusterConfig, grpc_addr: &str) -> Option<Stri
     Some(addr)
 }
 
+/// 起 S3 gateway(可选;仅当 `--s3-metastore-url` 给出时)。
+///
+/// 与 [`start_frontend`] 同型:连 MetaStore → 连 router SDK → 组 `AppState` → 起 axum 服务。
+/// 失败只记 warn 并返回 `None` —— S3 是 devcluster 的附加入口,缺了不影响 master+store 主职责。
+async fn start_s3(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
+    let url = args.s3_metastore_url.as_deref()?;
+
+    let cfg = antfs_s3::config::S3GatewayConfig {
+        listen_addr: format!("{}:{}", args.host, args.s3_port),
+        region: "us-east-1".to_string(),
+        metastore: antfs_s3::config::MetaStoreConfig {
+            driver: if url.starts_with("mysql") {
+                "mysql".to_string()
+            } else {
+                "postgres".to_string()
+            },
+            url: url.to_string(),
+            max_connections: 10,
+        },
+        router: antfs_router::RouterConfig {
+            master_addr: grpc_addr.to_string(),
+            cluster_secret: SECRET.to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let registry = antfs_metric::Registry::new();
+    let metastore = match antfs_s3::metastore::connect(&cfg.metastore).await {
+        Ok(ms) => ms,
+        Err(e) => {
+            tracing::warn!(error = %e, "S3 gateway: metastore connect failed");
+            return None;
+        }
+    };
+    let router = match antfs_router::Router::connect(cfg.router.clone(), &registry).await {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            tracing::warn!(error = %e, "S3 gateway: router connect failed");
+            return None;
+        }
+    };
+    let metrics = match antfs_s3::metrics::S3Metrics::new(&registry) {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            tracing::warn!(error = %e, "S3 gateway: metrics registration failed");
+            return None;
+        }
+    };
+    let state = antfs_s3::server::AppState {
+        router,
+        metastore,
+        metrics,
+        registry,
+        config: Arc::new(cfg),
+    };
+    let app = antfs_s3::server::build_router(state);
+    let addr = format!("{}:{}", args.host, args.s3_port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, addr = %addr, "S3 gateway bind failed");
+            return None;
+        }
+    };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tracing::info!(addr = %addr, "S3 gateway listening");
+    Some(addr)
+}
+
 /// 问 master 要**全量**分区 id(按 pid 升序;`limit = 0` = 不分页)。
 ///
 /// 建分区前用它算差额、建完用它出"总数" —— 这样复跑不叠加(理由见调用处注释)。
@@ -487,6 +568,7 @@ struct Banner<'a> {
     store_addrs: &'a [String],
     admin_addr: &'a str,
     frontend_addr: Option<&'a str>,
+    s3_addr: Option<&'a str>,
     partitions: &'a [u32],
     config_file: Option<&'a std::path::Path>,
 }
@@ -498,6 +580,7 @@ fn print_summary(args: &DevClusterConfig, banner: &Banner) {
         store_addrs,
         admin_addr,
         frontend_addr,
+        s3_addr,
         partitions,
         config_file,
     } = *banner;
@@ -517,6 +600,9 @@ fn print_summary(args: &DevClusterConfig, banner: &Banner) {
     println!("  master gRPC   : {grpc_addr}");
     if let Some(fa) = frontend_addr {
         println!("  frontend REST : http://{fa}");
+    }
+    if let Some(sa) = s3_addr {
+        println!("  S3 gateway    : http://{sa}");
     }
     for (i, addr) in store_addrs.iter().enumerate() {
         println!(

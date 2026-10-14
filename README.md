@@ -62,14 +62,15 @@ The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [Se
 
 | Component | Description | Status |
 |---|---|---|
-| `common` | Shared libraries: layered `config` (serde + config), `metric` (Prometheus). Counterpart of Ambry's `config` package + Dropwizard `MetricRegistry` | 🚧 In progress |
-| `blob` | Single-node storage engine: `Log` / `LogSegment` / `PersistentIndex` / `BlobStore` (put / get / delete / compaction / recovery + replication apply). Counterpart of `ambry-store` | 🚧 In progress |
-| `master` | Cluster brain: built-in Raft (`openraft`) for placement, node state, reconciliation, decommission, and blobId range issuance. Replaces the Helix + ZooKeeper stack | 🚧 In progress |
-| `store` | Data node (store server): multi-replica orchestration + HTTP data plane + heartbeat/disk monitoring + pull replication; hosts the `blob` engine | 🚧 In progress |
-| `router` | Client SDK (`crates/common/router`): blobId range leasing, W-majority writes, R=1 reads, large-blob streaming; shared by frontend and benchmarks. Counterpart of Ambry's `NonBlockingRouter` | 🚧 In progress |
-| `frontend` | HTTP REST object layer (`/blobs` + `/metrics`). Counterpart of `ambry-frontend` | 🚧 In progress |
-| `admin` | Admin web: ops actions + control-plane dashboard (topology / nodes / disks / partitions / metrics) | 🚧 In progress |
-| S3 gateway / multi-tenant ACL, quota | Gateway layer (same tier as frontend) | 📋 Planned |
+| `common` | Shared libraries: layered `config` (serde + config), `metric` (Prometheus). Counterpart of Ambry's `config` package + Dropwizard `MetricRegistry` | ✅ Implemented |
+| `blob` | Single-node storage engine: `Log` / `LogSegment` / `PersistentIndex` / `BlobStore` (put / get / delete / compaction / recovery + replication apply). Counterpart of `ambry-store` | ✅ Implemented |
+| `master` | Cluster brain: built-in Raft (`openraft`) for placement, node state, reconciliation, decommission, and blobId range issuance. Replaces the Helix + ZooKeeper stack | ✅ Implemented |
+| `store` | Data node (store server): multi-replica orchestration + HTTP data plane + heartbeat/disk monitoring + pull replication; hosts the `blob` engine | ✅ Implemented |
+| `router` | Client SDK (`crates/common/router`): blobId range leasing, W-majority writes, R=1 reads, large-blob streaming; shared by frontend and benchmarks. Counterpart of Ambry's `NonBlockingRouter` | ✅ Implemented |
+| `frontend` | HTTP REST object layer (`/blobs` + `/metrics`). Counterpart of `ambry-frontend` | ✅ Implemented |
+| `admin` | Admin web: ops actions + control-plane dashboard (topology / nodes / disks / partitions / metrics) | ✅ Implemented |
+| `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject, multipart upload, ListObjectsV2, bucket management, AWS SigV4 auth. Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | 🚧 In progress |
+| S3 versioning, multi-tenant ACL, quota | Gateway-layer enhancements | 📋 Planned |
 
 > Naming: `blob` = the single-node blob storage engine; `store` = the data node server.
 

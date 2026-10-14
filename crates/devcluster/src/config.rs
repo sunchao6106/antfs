@@ -42,6 +42,12 @@ pub struct DevClusterConfig {
     pub disk_health: bool,
     /// frontend REST 端口。
     pub frontend_port: u16,
+    /// S3 gateway 端口 (default 7500)。仅当 [`s3_metastore_url`](Self::s3_metastore_url) 设置时使用。
+    pub s3_port: u16,
+    /// MetaStore 连接 URL。设置后启动 S3 gateway。
+    /// 例:`postgres://user:pass@localhost:5432/antfs_s3`。
+    /// 默认 `None`(不启动 S3 gateway)。
+    pub s3_metastore_url: Option<String>,
     /// 对外服务的监听 host(容器里传 `0.0.0.0` 才能被 `-p` 发布的端口访问)。
     /// **只影响监听地址**:集群内部互连恒为 `127.0.0.1`(master/store/admin/frontend 同进程)。
     pub host: String,
@@ -72,6 +78,8 @@ impl Default for DevClusterConfig {
             disk_near_full_ratio: 0.8,
             disk_health: false,
             frontend_port: 7400,
+            s3_port: 7500,
+            s3_metastore_url: None,
             host: "127.0.0.1".to_string(),
             run_bench: None,
             bench_ops: 20_000,
