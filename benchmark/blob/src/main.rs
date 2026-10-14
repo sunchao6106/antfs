@@ -27,6 +27,7 @@ struct Args {
     dir: Option<PathBuf>,
     flush_interval_ms: u64,
     sync_seal_flush: bool,
+    evict_before_read: bool,
 }
 
 impl Default for Args {
@@ -45,6 +46,7 @@ impl Default for Args {
             dir: None,
             flush_interval_ms: 0,
             sync_seal_flush: false,
+            evict_before_read: false,
         }
     }
 }
@@ -69,6 +71,7 @@ fn parse_args() -> Args {
                 a.flush_interval_ms = val().parse::<u64>().expect("flush-interval-ms")
             }
             "--sync-seal-flush" => a.sync_seal_flush = true,
+            "--evict-before-read" => a.evict_before_read = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -98,7 +101,9 @@ fn print_help() {
          --flush-interval-ms N  周期 fsync 线程间隔 (default 0 = 关)。store 生产路径有 flush worker\n\
                             周期清脏页;裸引擎压不带上它会把段的 fsync 尾部整个甩到滚转点\n\
                             (对齐生产形态请给 1000~5000)\n\
-         --sync-seal-flush        关闭 defer_seal_flush(滚转点同步 fsync 旧段=旧行为,作 A/B 对照)\n"
+         --sync-seal-flush        关闭 defer_seal_flush(滚转点同步 fsync 旧段=旧行为,作 A/B 对照)\n\
+         --evict-before-read      GET 阶段前对数据段 fadvise DONTNEED 驱逐 page cache:\n\
+                            冷读口径(「冷数据·暖索引」——索引 mmap 页未驱逐)\n"
     );
 }
 
@@ -265,6 +270,30 @@ fn run_get(store: &Arc<BlobStore>, args: &Args) -> Summary {
     }
 }
 
+/// 对 log 目录(`dir/log`,引擎固定布局)里每个数据段 `posix_fadvise(DONTNEED)`,
+/// 把写阶段热起来的数据页从 page cache 驱逐 —— 供冷读口径。失败(文件消失等)静默忽略:
+/// 这只是基准口径装置,不构成正确性面。仅 Linux 有效(macOS 无 posix_fadvise,no-op)。
+#[cfg(target_os = "linux")]
+fn evict_data_pages(store_dir: &PathBuf) {
+    let log_dir = store_dir.join("log");
+    let Ok(entries) = std::fs::read_dir(&log_dir) else {
+        return;
+    };
+    use std::os::unix::io::AsRawFd;
+    for ent in entries.flatten() {
+        if ent.file_name().to_string_lossy().ends_with("_log.seg") {
+            if let Ok(f) = std::fs::File::open(ent.path()) {
+                unsafe {
+                    libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn evict_data_pages(_store_dir: &PathBuf) {}
+
 fn main() {
     let args = parse_args();
 
@@ -338,6 +367,10 @@ fn main() {
     store.flush().expect("flush");
     report(&put);
 
+    if args.evict_before_read {
+        // 冷读口径:只驱逐数据段(「冷数据·暖索引」—— 热 GET 走 mmap .idx 常驻,如实记录)。
+        evict_data_pages(&dir);
+    }
     let get = run_get(&store, &args);
     report(&get);
 

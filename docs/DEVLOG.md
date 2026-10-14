@@ -1127,3 +1127,19 @@
   172k ops/s 无回归。4 GiB 口径在 colima 被虚拟盘容量毛刺遮蔽(同步/异步 max 同现
   ~1.2s),标「真机复验」;判别链与全表入 `benchmark/BASELINE.md`「修复后决算」。
 - 归档:`openspec/changes/log-rollover-off-critical/`(proposal/design/specs/tasks 齐)。
+
+## 步骤 46:折损耗解剖 + 冷读口径 —— Phase 2 基线补完两件(2026-10-14)
+
+- **frontend→router「45% 折损」归因(并发扫描 c=8/16/32/64 + CPU 峰值采样)**:拆成两成分 ——
+  ① 每请求**固定税 ≈200 µs**(c=8 即 33%,HTTP 网关两侧栈);② **并发放大**斜率 7×(前端 HTTP 层与
+  全家桶 store/master 挤占 4 vCPU 预算)。CPU 快照:客户端 31%、devcluster 单进程 228%、
+  整机 idle 47%。判定:VM 数字非纯税形状,多核真机外推折损 ≤33%;工程减税(可选)与真机复验
+  分列。两 bench 吞吐 c=8→64 全平 = 层次容量而非 CPU 瓶颈。
+- **冷读口径落地**(`--evict-before-read`,`fadvise(DONTNEED)` 驱逐数据段、暖索引口径):
+  4 KiB 19.2 万 ops/s(752 MB/s,p99 152.6 µs)、64 KiB 3594 MB/s;热对照 108 万 ops/s。
+  **双缓存层警示**:colima 的"冷"仅冷 guest,宿主 APFS 页缓存仍热(p50 µs 级证实),掉电级
+  冷读只能真机;本口径价值 = 「guest 填页成本 + 引擎读路径开销上界」—— 引擎读代码不显形,
+  读路径优化空间在页/预读层次,不在引擎。
+- **真机复验清单三项合一**:4 GiB 滚转(虚拟盘毛刺遮蔽)/ frontend 折损形状 / 掉电冷读。
+- 过程教训(工程面):colima 后台长脚本务必走 `bash -s < 文件`(SSH 传内联多行会被吞换行
+  成僵尸卡死,本轮踩过一次并留下残留进程);VM 侧无 `rg`,一律 `grep`。

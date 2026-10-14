@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 antfs-blob = { path = "../../crates/blob" }
 antfs-metric = { path = "../../crates/common/metric" }
+libc = "0.2"
