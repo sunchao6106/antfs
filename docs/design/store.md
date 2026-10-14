@@ -949,8 +949,8 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
    与"进程被杀"同一路径;池只保证"线程活下来 + 计数/许可正确"。
 5. **配置耦合**:`pool_default_size` 是**每盘**的值(不是总预算) —— 加盘不会改变已有盘的并发,但节点总
    线程数会随盘数线性增长(16 × 盘数),大节点请注意进程线程上限。
-6. **UI**:admin 的「磁盘指标」页目前展示 `disk_in_flight_requests`(在飞代偿);**真队列深度**
-   (`disk_pool_queued`、`disk_pool_workers`、`disk_pool_rejected_total`)已由本改动提供,接入该页留作下一步。
+6. **UI**:~~admin 的「磁盘指标」页目前展示 `disk_in_flight_requests`(在飞代偿)~~ —— **已修**:admin「磁盘指标」页已接入
+   真队列深度(`store_server_disk_pool_queued` 等,见 §12.12 风险表与 DEVLOG 步骤 27 补);本条仅存档演进痕迹。
 
 **二、探测单飞(`health.rs`)**
 

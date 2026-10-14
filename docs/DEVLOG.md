@@ -1035,3 +1035,23 @@
 - **验证**:修复后本地连跑 200 次零失败;`cargo test -p antfs-blob` 全绿;推上后 CI 全绿。
 - 教训入档:错误注入要"写前先读"保证必然改变 —— 对抗的不是被测代码的稳定性,是自己注入手段
   的概率性失效;同类注入 fixture 后续按此写。
+
+## 步骤 41:S3 独立二进制接线修复(发布资源卫生)+ 设计文档去 stale(2026-10-14)
+
+- **问题**:Phase 1 收官对表时发现 `antfs-s3` 独立二进制是空壳 —— `crates/s3/src/main.rs` 只有 `TODO: build_router
+  with real handlers`,起了个空 `axum::Router`;而 v0.0.2 的发布 tarball 已把它当**六件套之一**卖了出去(只有 devcluster
+  内嵌路径接了真网关)。同病根的还有两处接线错误:Loader **未挂任何配置文件**(给了 `antfs-s3.toml` 也不读,全部回落
+  默认值);env 前缀用 `ANTFS_S3`(全仓其它二进制都是 `AMBRY*` 惯例)。
+- **修复**:main 按前端同型接线 —— `with_file("antfs-s3.toml", false)` + `with_env_prefix("AMBRY")`
+  (`AMBRY_S3__*` 生效);connect MetaStore(含 `sqlx::migrate`)→ connect router SDK → `server::build_router` → serve;
+  优雅停机保持。
+- **验证(真表面,非"应通过")**:本地起 devcluster(master gRPC 7101)+ 独立 `antfs-s3` 二进制指向**全新空库**
+  `antfs_s3_smoke` → 启动即现场建齐 6 张表;匿名 `GET /` → 403 AccessDenied;`GET /metrics` → 真 Prometheus 文本;
+  `POST /admin/credentials`(Bearer operator token + JSON)→ 200 回 access/secret 双钥 + 落库核验 `s3_credentials`
+  一行;错 token → 403。`cargo fmt --check` / `clippy --all-targets -D warnings` / `cargo test -p antfs-s3` 干净。
+- **文档去 stale(收官对表顺带发现的失真,共六处)**:replication.md 状态头"实现规划中/角色尚未实现"→ 已实现并注明
+  落地差异(两阶段都走 store HTTP、LEADER 折叠、FindToken 已带段身份+incarnation、sessionId 未持久化留作后续,
+  配置/监控清单指到 cluster.md §9 免双维护);cluster.md 首页/角色表/架构图/接入模式共 4 处"S3 网关=远景/规划"→
+  已实现(见 s3.md);cluster.md §9.1"待续"剔除已落地的 DROPPED 目录回收与 admin 真队列深度;store.md §12.11 残留
+  风险 6(旧"未接真队列深度")标记已修;s3.md 补「启动形态」小节(独立二进制配置文件/env 形态,CLAUDE.md §7)。
+- 发布卫生:修复随 v0.0.3 发布,替换 v0.0.2 tarball 中的空壳二进制(v0.0.2 不撤,Release 页留全量历史)。

@@ -1,7 +1,7 @@
 # cluster 设计:集群/服务层角色与传输选型
 
 本文固化 **store 之上的集群/服务层**的角色划分与关键选型。**状态:master / store server / admin / router SDK / frontend
-均已落地**(见 §7/§9/§10/§11 与 [`router.md`](./router.md) / [`frontend.md`](./frontend.md));S3 网关仍是远景。
+均已落地**(见 §7/§9/§10/§11 与 [`router.md`](./router.md) / [`frontend.md`](./frontend.md) / [`s3.md`](./s3.md));S3 网关亦已实现(见 [`s3.md`](./s3.md))。
 选型依据来自对 Ambry / SeaweedFS / CubeFS 三套系统的源码调研。
 
 ## 1. 角色划分
@@ -11,7 +11,7 @@
        │  ──HTTP 数据面(put W=多数派 / get R=1)──▶ store server  ← 直连,无中间跳
        ▼
   frontend(HTTP REST;内嵌同一个 router)──▶ master / store server
-       │  (远景:同层加 S3 协议翻译 + auth/quota)
+       │  (同层另有 S3 网关做协议翻译 + SigV4 鉴权;见 s3.md)
 
   master ◀─心跳/放置(gRPC)─▶ store server ◀─拉复制(gRPC ReplicaMetadata + HTTP 拉 blob)─▶ 其它 store server
    集群大脑:partition→replica 放置、节点状态机、故障处置(取代 Ambry 的 Helix+ZK)
@@ -23,7 +23,7 @@
 | **master** | partition→replica 放置、节点/副本状态机、故障处置、**发号(blobId 号段)**;**内建 Raft**(自包含,不依赖外部协调器) | 已实现(见 §7) |
 | **router**(客户端 SDK / 通用组件) | Router 逻辑做成**库**(`crates/common/router`):号段缓存、选分区、拼 blobId、直连 store server 做 W/R、切副本;**frontend 与压测二进制共用同一份实现** | 已实现(见 [`router.md`](./router.md)) |
 | **frontend**(HTTP REST 入口) | `POST/GET/HEAD/DELETE /blobs`、写入时定 TTL(`x-antfs-ttl-ms`)、分片拼装、`/metrics`;**内嵌同一 router SDK**,不重复实现 W/R | 已实现(见 [`frontend.md`](./frontend.md)) |
-| **S3 网关**(远景) | S3 协议翻译 + auth/quota;与 frontend 同层,复用同一 SDK | 规划 |
+| **S3 网关** | S3 协议翻译 + SigV4 鉴权(凭证管理);与 frontend 同层,复用同一 SDK;quota 仍规划(见 s3.md 后续方向) | 已实现(见 [`s3.md`](./s3.md)) |
 | **scheduler**(待定 P1) | 集群级 compaction 编排 / 再复制 / 均衡 / EC 调度 | 待定(见 §4) |
 | **admin web**(独立服务) | 运维操作(经 master admin gRPC)+ 控制面状态 dashboard(拓扑/节点/盘/分区/副本);指标时序复用 Prometheus+Grafana;需 operator 鉴权 | 已实现(见 §11) |
 | **EC 冷层**(D5) | 老数据纠删码降本 | 已锁(见 §5) |
@@ -37,7 +37,7 @@
 > - **① 直连模式(SeaweedFS 式)**:app 内嵌 router SDK,直接 gRPC 问 master(发号/查副本)+ HTTP 直连 store server 读写,
 >   **无中间跳**,低延迟高吞吐;适合**内部可信服务**。blobId 即取件凭证。
 > - **② REST 网关模式**:app / `curl` 走 **frontend**(内嵌同一 SDK),由它取号段、写副本、拼接分片。
-> - **③ S3 网关模式(远景)**:标准 S3 客户端走网关做协议翻译 + auth/quota。
+> - **③ S3 网关模式(已实现)**:标准 S3 客户端走网关做协议翻译 + SigV4 鉴权(见 [`s3.md`](./s3.md));quota 规划中。
 > - 关系:三种模式底层 blobId、发号、W/R 数据面**完全一致**,非互斥,可同集群并存。
 
 ## 2. 已定选型(locked)
@@ -585,8 +585,7 @@ store server(一个进程 / 一台数据节点)
  - **已落地(2026-09-24)**:store 侧 D1 每盘有界池 / D2 健康闸门 / D3 IO 看门狗
   (见 [store.md §12.11](./store.md)(线程模型)与 [§12.12](./store.md)(闸门 + 看门狗,含测试证据表与残留风险清单));
   **master 侧 D4 坏盘撤离 / D5 判活迟滞 / D6 每 tick 再复制预算**(配置与监控见下面两张表/§7.7)。
-- 待续:`DROPPED` 删目录回收;admin「磁盘指标」页接入真队列深度与健康状态;
-  全部阈值的**压测标定**(默认值都是经验初值)。
+- 待续:全部阈值的**压测标定**(默认值都是经验初值;`DROPPED` 删目录回收与 admin「磁盘指标」页真队列深度均已落地,见 [store.md §12.6](./store.md)/§12.12 与 DEVLOG 步骤 27 补记)。
 - **EC 仍锁定(暂不解锁)**。
  - **已补齐(见 `blob-io-end-to-end`)**:router SDK(router 库 + CLI)、frontend(REST 网关)、master 发号 `GetBlobIds`、
    流式 put(网络流式 + 落盘暂存 + 引擎 `put_from_reader`)、`.../metadata` 端点、`StoreFull → 507`、`PUT ?expiration_ms=`。
