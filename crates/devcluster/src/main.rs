@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cluster_secret: SECRET.to_string(),
         heartbeat_timeout_secs: 15,
         partition_capacity_bytes: 64 << 20,
+        segment_capacity_bytes: 8 << 20,
         disk_near_full_ratio: args.disk_near_full_ratio,
         auto_grow_enabled: false,
         reconcile_interval_secs: 5,
