@@ -793,11 +793,21 @@ mod tests {
         antfs_metric::gather(&f.registry).expect("gather")
     }
 
-    /// 指标里某条序列的值(读不到 → panic,让用例**当场红**而不是静默通过)。
-    fn series(f: &Fixture, line: &str) -> String {
-        let text = metrics_text(f);
-        assert!(text.contains(line), "指标缺 `{line}`:\\n{text}");
-        line.to_string()
+    /// 断言一条**终态**指标行(有界轮询,读不到超时才 panic,让用例当场红而不是静默通过):
+    /// 收尾计数/gauge 减计发生在 worker 侧收尾路径,慢机器上"run().await 返回 ⇒ 指标已落"
+    /// 不成立(ubuntu 2 核 CI 实测 flake)。静态行(如池的 worker 数)首轮即中,行为不变。
+    async fn series(f: &Fixture, line: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = metrics_text(f);
+            if text.contains(line) {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("指标缺 `{line}`:\n{text}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// 有界等待:等到 `cond` 为真;超时就 panic。
@@ -853,15 +863,18 @@ mod tests {
         series(
             &f,
             &format!(r#"store_server_disk_pool_workers{{disk_id="{id}"}} 1"#),
-        );
+        )
+        .await;
         series(
             &f,
             &format!(r#"store_server_disk_pool_in_flight{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
         series(
             &f,
             &format!(r#"store_server_disk_pool_queued{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
     }
 
     /// worker 是**并行**的:N 个 worker 能同时跑 N 发(不是被一把锁串起来)。
@@ -900,11 +913,13 @@ mod tests {
         series(
             &f,
             &format!(r#"store_server_disk_pool_in_flight{{disk_id="{id}"}} {workers}"#),
-        );
+        )
+        .await;
         series(
             &f,
             &format!(r#"store_server_disk_pool_queued{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
         for tx in releases {
             tx.send(()).unwrap();
         }
@@ -958,7 +973,8 @@ mod tests {
         series(
             &f,
             &format!(r#"store_server_disk_pool_queued{{disk_id="{id}"}} 3"#),
-        );
+        )
+        .await;
 
         // 第 6 发:worker 与队列都满 ⇒ 立刻被拒(准入超时 0)。
         match f.pool.run(&id, "put", || ()).await {
@@ -970,7 +986,7 @@ mod tests {
             &format!(
                 r#"store_server_disk_pool_rejected_total{{disk_id="{id}",op="put",reason="saturated"}} 1"#
             ),
-        );
+        ).await;
 
         // 放行全部:被拒那发**没有**吃掉许可,5 发都应正常完成。
         for tx in releases {
@@ -1067,16 +1083,18 @@ mod tests {
             &format!(
                 r#"store_server_disk_pool_rejected_total{{disk_id="{id}",op="put",reason="job_panicked"}} 1"#
             ),
-        );
+        ).await;
         // 计数必须收回来(否则面板上这块盘永远"还在跑")。
         series(
             &f,
             &format!(r#"store_server_disk_pool_in_flight{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
         series(
             &f,
             &format!(r#"store_server_disk_pool_queued{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
         // worker 还活着:紧接着的任务照常跑(若线程被 panic 带走,这里会 Saturated)。
         assert_eq!(
             f.pool
@@ -1153,7 +1171,7 @@ mod tests {
             &format!(
                 r#"store_server_disk_pool_rejected_total{{disk_id="{ida}",op="put",reason="saturated"}} 1"#
             ),
-        );
+        ).await;
 
         // B 照常干活(连干几发),且 B 的队列始终是空的 —— 请求没有被挪到 B 上。
         for want in 0..3u8 {
@@ -1168,7 +1186,8 @@ mod tests {
         series(
             &f,
             &format!(r#"store_server_disk_pool_queued{{disk_id="{idb}"}} 0"#),
-        );
+        )
+        .await;
 
         release_tx.send(()).unwrap();
         assert!(hold.await.expect("join").is_ok(), "A 的任务应正常完成");
@@ -1250,7 +1269,7 @@ mod tests {
         series(
             &f,
             r#"store_server_disk_pool_rejected_total{disk_id="no-such-disk",op="get",reason="unknown_disk"} 1"#,
-        );
+        ).await;
     }
 
     /// 池关停(store-server 析构那一瞬):排队中的任务立刻拿到明确失败,而不是永远吊着。
@@ -1423,16 +1442,18 @@ mod tests {
             &format!(
                 r#"store_server_disk_pool_rejected_total{{disk_id="{id}",op="get",reason="disk_unavailable"}} 1"#
             ),
-        );
+        ).await;
         // 许可与计数照常收回(丢掉不等于漏账)。
         series(
             &f,
             &format!(r#"store_server_disk_pool_in_flight{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
         series(
             &f,
             &format!(r#"store_server_disk_pool_queued{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
     }
 
     /// **已经开跑**的那发不受影响:它已经进了 syscall,取消不掉(Rust 既不能取消 blocking 任务,
@@ -1784,17 +1805,19 @@ mod tests {
         series(
             &f,
             &format!(r#"store_server_disk_pool_workers{{disk_id="{id}"}} 2"#),
-        );
+        )
+        .await;
         series(
             &f,
             &format!(r#"store_server_disk_pool_in_flight{{disk_id="{id}"}} 0"#),
-        );
+        )
+        .await;
         series(
             &f,
             &format!(
                 r#"store_server_disk_pool_rejected_total{{disk_id="{id}",op="put",reason="job_panicked"}} 50"#
             ),
-        );
+        ).await;
         // 并发度没被吃掉:两发能同时跑起来。
         let (t1, r1) = oneshot::channel::<()>();
         let (_rel1, rx1) = oneshot::channel::<()>();

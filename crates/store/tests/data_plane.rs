@@ -58,6 +58,22 @@ async fn metrics_text(router: &axum::Router) -> String {
     String::from_utf8(body.to_vec()).unwrap()
 }
 
+/// 有界等待一条**终态**指标行:disk-pool 系 gauge 的减计在 worker 收尾路径上,
+/// 慢机器上"请求返回 ⇒ 指标已落"不成立(ubuntu 2 核 CI 实测 flake),轮询到出现为止。
+async fn metrics_wait(router: &axum::Router, line: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let text = metrics_text(router).await;
+        if text.contains(line) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("指标缺 `{line}`:\n{text}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// admin 端点的 JSON 请求。
 fn json_req(method: &str, path: &str, body: &str) -> Request<Body> {
     Request::builder()
@@ -249,10 +265,12 @@ async fn disk_pool_sizing_from_config_is_wired_through() {
         text.contains(r#"store_server_disk_pool_workers{disk_id="d1"} 3"#),
         "没给的盘走每盘默认大小:\n{text}"
     );
-    assert!(
-        text.contains(r#"store_server_disk_pool_in_flight{disk_id="d0"} 0"#),
-        "在飞计数应配平:\n{text}"
-    );
+    // 在飞计数是收尾路径的最终一致量(池 worker 侧减计),轮询到归零而非即刻断言。
+    metrics_wait(
+        &router,
+        r#"store_server_disk_pool_in_flight{disk_id="d0"} 0"#,
+    )
+    .await;
 }
 
 /// 池满 ⇒ **503 + `Retry-After`**(让 router 立刻改用别的副本),而不是拖到客户端超时。
