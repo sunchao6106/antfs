@@ -3097,16 +3097,24 @@ mod tests {
         (store, dir, data_end)
     }
 
-    /// 把段 0 最后一条记录的 crc 字节翻坏:copy 已建出半成品后才撞上它(错误注入点)。
+    /// 把段 0 最后一条记录的 crc 尾字节翻坏:copy 已建出半成品后才撞上它(错误注入点)。
+    ///
+    /// 读-改-写(而不是硬写 0xFF):记录的 crc 尾字节**本来就可能取任何值**,硬写 0xff 在
+    /// ~1/256 的 run 里与原值相等,注入退化成 no-op,copact 照常成功 → 测试间歇性失败
+    /// (CI 与本地均实测过)。翻成"与原值不同"的那个字节,注入才恒有效。
     fn corrupt_last_record_byte(dir: &tempfile::TempDir, data_end: u64) {
         use std::os::unix::fs::FileExt;
         let name = LogSegmentName::new(0, 1).filename();
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(dir.path().join("log").join(name))
+            .open(dir.path().join("log").join(&name))
             .unwrap();
-        f.write_all_at(&[0xFF], 64 + data_end - 1).unwrap();
+        let at = 64 + data_end - 1;
+        let mut orig = [0u8; 1];
+        f.read_exact_at(&mut orig, at).unwrap();
+        let flipped = if orig[0] == 0xFF { 0x00u8 } else { 0xFFu8 };
+        f.write_all_at(&[flipped], at).unwrap();
     }
 
     /// 增量 compact 在 COPY 中途失败:`.tmp` 半成品与 `COMPACT_COMMIT` 标记必须就地清掉
