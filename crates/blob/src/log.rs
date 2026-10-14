@@ -9,7 +9,8 @@
 //!   (100 GiB 分区 + 3 GiB 段 = 33 整段 + 1 个 1 GiB 残段),`total < segment` 也退化为单段。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::{Error, Result};
 use crate::log_segment::LogSegment;
@@ -67,9 +68,23 @@ pub struct Log {
     /// 段内记录只存 key 的低 32bit 后缀(见 `blob.rs` 记录布局)。
     key_prefix: u32,
     entries: RwLock<Vec<Entry>>,
+    /// 已封存但 flush 被延迟的段(滚转入队,由 [`flush`](Self::flush)/[`flush_all`](Self::flush_all)/
+    /// [`close`](Self::close) 与 `BlobStore::flush` 收敛)。滚转不在写路径临界区 fsync 写满段
+    /// —— 4 GiB 段实测为秒级停摆(证据链见 `benchmark/BASELINE.md`);持久化口径不变:
+    /// flush 仍是唯一持久化边界,封存段与活跃段的 at-risk 窗口拉平(≤ flush 间隔)。
+    pending_seals: Mutex<Vec<Arc<LogSegment>>>,
+    /// 旧段 flush 是否延迟(见 [`StoreConfig::defer_seal_flush`](crate::config::StoreConfig) 的
+    /// 同名字段)。原子量而非构造参数:config 经 `finish_di` 在装配尾注入,避免穿透
+    /// `BlobStore` 三层工厂签名;构造缺省 true(新行为),`false` 回到同步滚转 flush。
+    defer_seal_flush: AtomicBool,
 }
 
 impl Log {
+    /// 旧段 flush 是否延迟收敛(`store.defer_seal_flush`,默认 true;false = 旧行为)。
+    pub fn set_defer_seal_flush(&self, defer: bool) {
+        self.defer_seal_flush.store(defer, Ordering::Relaxed);
+    }
+
     /// 段身份表(除活跃段外)的 `(段身份, data_end)`,按位置升序。
     ///
     /// 物 bootstrap(`install_bootstrap`)按它逐段拷;段身份里的**代次**让"对端在拷贝途
@@ -148,6 +163,8 @@ impl Log {
                 generation: first_generation,
                 segment,
             }]),
+            pending_seals: Mutex::new(Vec::new()),
+            defer_seal_flush: AtomicBool::new(true),
         })
     }
 
@@ -188,6 +205,14 @@ impl Log {
         let mut key_prefix: Option<u32> = None;
         for name in names {
             let path = dir.join(name.filename());
+            // 0 字节残骸 = 建段瞬窗(truncate 与 header 落盘之间)崩溃留下的文件:无数据、
+            // 索引不可能引用(索引持久以 log flush 为前提),跳过即可 —— 不让 recovery 卡死。
+            if std::fs::metadata(&path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let segment = Arc::new(LogSegment::open(&path)?);
             // 段头自述的代次必须与文件名一致:不一致说明段文件被替换/名字被改过 → 大声失败。
             if segment.generation() != name.generation {
@@ -223,6 +248,8 @@ impl Log {
             max_segments: total_capacity.div_ceil(segment_capacity),
             key_prefix: key_prefix.expect("at least one segment"),
             entries: RwLock::new(entries),
+            pending_seals: Mutex::new(Vec::new()),
+            defer_seal_flush: AtomicBool::new(true),
         })
     }
 
@@ -232,7 +259,8 @@ impl Log {
         self.key_prefix
     }
 
-    /// 追加一条记录,返回其全局 [`LogOffset`]。段放不下则先 flush 旧段再滚动到新段。
+    /// 追加一条记录,返回其全局 [`LogOffset`]。段放不下则滚转到新段(旧段 flush 延迟到
+    /// [`flush`](Self::flush) 通道收敛,见 [`pending_seals`](struct.Log.html) 字段)。
     ///
     /// 由上层 `write_lock` 保证单写者:活跃段克隆出 `Arc` 后释放 `entries` 读锁再走 `&self` 追加,
     /// 不长时间占锁,读者(read/segment_spans)不被阻塞。
@@ -305,22 +333,44 @@ impl Log {
         segment.read(at.offset, len)
     }
 
-    /// 持久化所有段(硬删除擦除多段后统一 fsync)。
+    /// 持久化所有段(硬删除擦除多段后统一 fsync)。先 drain 延迟封存段,再遍历 entries
+    ///(`Arc::ptr_eq` 跳过刚 drain 过的段,避免秒级重复 fsync)。
     pub fn flush_all(&self) -> Result<()> {
+        let drained = self.drain_pending()?;
         let segments: Vec<Arc<LogSegment>> = {
             let entries = self.entries.read().expect("log entries poisoned");
             entries.iter().map(|e| e.segment.clone()).collect()
         };
         for s in segments {
+            if drained.iter().any(|d| Arc::ptr_eq(d, &s)) {
+                continue;
+            }
             s.flush()?;
         }
         Ok(())
     }
 
-    /// 持久化活跃段(已滚动的旧段在滚动时已 flush)。
+    /// 持久化收敛:活跃段 + 所有滚转时延迟 flush 的封存段。返回后,调用时刻之前的
+    /// 全部已写记录均已落盘(`flush` 是持久化边界,含封存段)。
     pub fn flush(&self) -> Result<()> {
+        self.drain_pending()?;
         let (_, segment) = self.active_segment();
         segment.flush()
+    }
+
+    /// 收敛「滚转时延迟 flush」的封存段:瞬持 `pending_seals` 取出队列,随后**不持任何锁**
+    /// 逐段 flush(write_header + fsync)—— 可与写路径/compaction 并发(段已封存不可变)。
+    /// `BlobStore::flush` 先在写锁外调用本函数(重头),`flush_inner` 在写锁内再做一次
+    /// 增量(通常为空),守住「log 全量持久先于 index flush」的顺序不变量。
+    pub fn drain_pending(&self) -> Result<Vec<Arc<LogSegment>>> {
+        let pending: Vec<Arc<LogSegment>> = {
+            let mut q = self.pending_seals.lock().expect("pending seals poisoned");
+            std::mem::take(&mut *q)
+        };
+        for s in &pending {
+            s.flush()?;
+        }
+        Ok(pending)
     }
 
     /// 当前写入位置。
@@ -370,6 +420,9 @@ impl Log {
 
     /// 关闭全部段(消费 self;残余 `Arc` 引用由读者持有,末次释放时才关文件)。
     pub fn close(self) -> Result<()> {
+        // 先收敛 pending:一为兜底(调用方可能没显式 flush 封存段),二为释放队列里的
+        // Arc 克隆 —— 否则下面 `Arc::try_unwrap` 会被克隆句柄卡住,文件泄着不关。
+        self.drain_pending()?;
         let entries = self.entries.into_inner().expect("log entries poisoned");
         for e in entries {
             if let Ok(seg) = Arc::try_unwrap(e.segment) {
@@ -411,7 +464,19 @@ impl Log {
             return Err(Error::SegmentFull);
         }
         let active = entries.last().expect("log always has an active segment");
-        active.segment.flush()?;
+        if self.defer_seal_flush.load(Ordering::Relaxed) {
+            // 旧段 flush 延迟到既有 flush 通道(见 pending_seals 字段注释):此处同步 fsync 会在
+            // 写路径临界区造成 4 GiB 段秒级停摆。锁序注意:拿 pending_seals 时持 entries 写锁,
+            // drain 侧瞬持 pending_seal 即释放、fsync 不持任何锁 —— 无环。
+            self.pending_seals
+                .lock()
+                .expect("pending seals poisoned")
+                .push(active.segment.clone());
+        } else {
+            // `store.defer_seal_flush = false`(旧行为):滚转点同步落盘,封存段即刻越出
+            // at-risk 窗口,代价 = 写路径承受满段 fsync(4 GiB 实测 1.16~1.53 s)。
+            active.segment.flush()?;
+        }
         let next = active.position + 1;
         // 代次:同一目录内单调递增,永不复用(段身份 = 位置 + 代次)。
         let next_gen = entries.iter().map(|e| e.generation).max().unwrap_or(0) + 1;
@@ -494,6 +559,92 @@ mod tests {
         assert_eq!(log.read(o1, rec.len()).unwrap(), rec);
         assert_eq!(log.read(o2, rec.len()).unwrap(), rec);
 
+        log.close().unwrap();
+    }
+
+    /// 直接读段文件 header 里持久化的 `data_end`(偏移 16,u64 小端,见 `log_segment::hdr`)。
+    fn on_disk_data_end(path: &std::path::Path) -> u64 {
+        let bytes = std::fs::read(path).unwrap();
+        u64::from_le_bytes(bytes[16..24].try_into().unwrap())
+    }
+
+    /// 默认模式(`defer_seal_flush = true`):滚转**不**同步 fsync 旧段 —— 封存段 header 的
+    /// data_end 在 flush 前保持建段初值;`flush()` 收敛后追平。这是「flush 是持久化边界」
+    /// 的字节级钉子(漏 drain = 封存段永远不落盘,这条测试会红)。
+    #[test]
+    fn rollover_defers_seal_fsync_until_flush() {
+        let dir = temp_dir("deferseal");
+        let seg = seg_cap(2);
+        let log = Log::create(dir.path(), seg * 3, seg, 0x1234, 1).unwrap();
+        let rec = vec![5u8; BLOCK as usize + 100];
+
+        log.append(&rec).unwrap();
+        log.append(&rec).unwrap(); // 触发滚转:段 0 封存
+
+        let sealed = dir.path().join("0_1_log.seg");
+        assert_eq!(
+            on_disk_data_end(&sealed),
+            0,
+            "滚转后、flush 前:封存段 header data_end 必须保持陈旧(延迟收敛)"
+        );
+
+        log.flush().unwrap();
+        assert_eq!(
+            on_disk_data_end(&sealed),
+            rec.len() as u64,
+            "flush() 收敛后:封存段 header data_end 必须追平"
+        );
+        log.close().unwrap();
+    }
+
+    /// 同步模式(`store.defer_seal_flush = false`):滚转点即落盘 —— 旧行为的回归保护。
+    #[test]
+    fn rollover_sync_seal_flush_keeps_legacy_behavior() {
+        let dir = temp_dir("syncseal");
+        let seg = seg_cap(2);
+        let log = Log::create(dir.path(), seg * 3, seg, 0x1234, 1).unwrap();
+        log.set_defer_seal_flush(false);
+        let rec = vec![5u8; BLOCK as usize + 100];
+
+        log.append(&rec).unwrap();
+        log.append(&rec).unwrap(); // 触发滚转:滚转点同步 fsync
+
+        let sealed = dir.path().join("0_1_log.seg");
+        assert_eq!(
+            on_disk_data_end(&sealed),
+            rec.len() as u64,
+            "同步模式:滚转后无需 flush,封存段即已落盘(旧行为)"
+        );
+        log.close().unwrap();
+    }
+
+    /// `close()` 兜底:滚转后从不显式 flush,直接 close —— 封存段也要落盘,
+    /// 重开后记录可读(recovery 只认 header data_end)。
+    #[test]
+    fn close_drains_pending_seals() {
+        let dir = temp_dir("closedrain");
+        let seg = seg_cap(2);
+        let (total, prefix, gen) = (seg * 3, 0x1234u32, 1u64);
+        let rec = vec![6u8; BLOCK as usize + 100];
+
+        {
+            let log = Log::create(dir.path(), total, seg, prefix, gen).unwrap();
+            log.append(&rec).unwrap();
+            log.append(&rec).unwrap(); // 滚转,不入 flush 直接关
+            log.close().unwrap();
+        }
+        let sealed = dir.path().join("0_1_log.seg");
+        assert_eq!(
+            on_disk_data_end(&sealed),
+            rec.len() as u64,
+            "close() 必须兜底收敛 pending 封存段"
+        );
+        let log = Log::open(dir.path(), total, seg).unwrap();
+        assert_eq!(
+            log.read(LogOffset::new(0, 0), rec.len()).unwrap(),
+            rec,
+            "重开后封存段记录可读(recovery 只认 header data_end)"
+        );
         log.close().unwrap();
     }
 

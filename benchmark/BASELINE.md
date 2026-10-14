@@ -73,10 +73,32 @@
 4. 各组均出现一次 max ~600-750 ms 的孤立长停顿(与滚转无关、跨形态同现):colima 虚拟盘(APFS 底层)写回收/首次大分配类环境毛刺,标注为 VM 环境噪声,不归引擎。
 5. bench-blob 新增 `--flush-interval-ms`(默认 0 关):把"生产 flush worker 形态"带进裸引擎压测的能力(A/B 证明本速率下它救不了滚转,但保留了形态对齐的实验口)。
 
-## 下一步真正值得打的靶(基于 4 GiB 复测修正)
+## 修复后决算(`log-rollover-off-critical` 落地)
 
-- **滚转异步化(移出写锁)**——4 GiB 段实测出低频秒级停摆,周期 flush 无效;立案
-  `openspec/changes/log-rollover-off-critical/`
+> 判别链:零滚转口径(1 MiB×2400@4 GiB)max 330 ms 干净 ⇒「秒级尾只在含滚转场景」;
+> 第二病灶揪出并修序 —— `LogSegment::create` 原为 preallocate→sync_all(满载下 4 GiB 段的
+> fallocate+fsync 秒级),现改「header 先 sync(64 B 级,快)→ fallocate 后置不强落盘」,
+> `Log::open` 对 0 字节半建段残骸(建段瞬窗)宽容跳过。
+> **决算口径取 64 MiB 段**(高频滚转、代码效应占比大、环境毛刺占比小):
+
+| 1 MiB × 2000 @ 64 MiB 段(4 线程,裸) | p99 | 吞吐 | 备注 |
+|---|---|---|---|
+| 修复前(= sync 档) | 11.8 ~ 17.5 ms | 1958 ops/s | 基线 / S64 两轮同量级 |
+| **修复默认(async,`defer_seal_flush=true`)** | **0.92 ms** | **2333 ops/s** | **p99 ×19、吞吐 +19%** |
+| `--sync-seal-flush`(`store.defer_seal_flush=false`) | 17.5 ms | 1958 ops/s | 旧行为一键回退保留 |
+
+- 4 KiB × 50k @ 4 GiB:172 269 ops/s / 673 MB/s,p99 223 µs(主场景无回归;较基线 140k→172k)。
+- **4 GiB 大段口径在 colima 不可判**(async/sync 的 max 同现 ~1.1-1.2 s):VM 虚拟盘容量级
+  毛刺(第二段 4 GiB 预分配触发盘映像扩容)主导;同族病灶移除的工程推断成立,但**标注
+  「真机复验」**。1 MiB × 2400 零滚转 max 330 ms 作参照。
+- 切换语义字节级钉子(引擎测试):`rollover_defers_seal_fsync_until_flush`(flush 前封存段
+  header data_end 陈旧 → flush 后追平)/`rollover_sync_seal_flush_keeps_legacy_behavior`
+  (滚点即落盘)/`close_drains_pending_seals`;持久性契约「flush 是边界」由既有 crash-consistency
+  属性面继续守护。
+
+## 下一步真正值得打的靶(修正后)
+
+- ~~滚转异步化~~ ✅ 已落地(上表;64 MiB 段 p99 ×19)
 - **frontend → router ~45% 吞吐折损**(HTTP 翻译 + 并发协调;先 flame 定位)
 - **冷读口径未测**(当前读数字全是热 page cache)
 

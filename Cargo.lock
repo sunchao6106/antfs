@@ -102,6 +102,7 @@ name = "antfs-bench-blob"
 version = "0.0.0"
 dependencies = [
  "antfs-blob",
+ "antfs-metric",
 ]
 
 [[package]]

@@ -17,6 +17,7 @@ fn store_config(segment_size_bytes: u64) -> antfs_blob::StoreConfig {
         segment_size_bytes,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
     }
 }
 

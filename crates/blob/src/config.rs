@@ -30,6 +30,14 @@ pub struct StoreConfig {
     /// 连续 IO 错误达此值则 store 自关(被动磁盘检测)。**0 = 禁用**(对齐 Ambry 默认
     /// `store.io.error.count.to.trigger.shutdown = MAX_VALUE` 的"默认不触发")。
     pub io_error_count_to_trigger_shutdown: u32,
+    /// 滚转时旧段 flush 是否**延迟**到既有 flush 通道收敛(默认 true)。
+    ///
+    /// `true`(默认):写路径临界区不做旧段 fsync —— 4 GiB 段实测同步 fsync 为 1.16~1.53 s
+    /// 全线停摆(fsync 大段 ≈ 盘写吞吐墙,周期 flush 分摊不掉总量)。持久性口径不变:
+    /// flush 仍是唯一持久化边界,封存段与活跃段的掉电窗口拉平(≤ flush 间隔)。
+    /// `false`(旧行为):滚转点同步 fsync 旧段 —— 封存段在 seal 时刻即落盘(略早于
+    /// 下次 flush),代价是写路径周期性承受满段 fsync 的秒级停摆。
+    pub defer_seal_flush: bool,
 }
 
 impl Default for StoreConfig {
@@ -39,6 +47,7 @@ impl Default for StoreConfig {
             segment_size_bytes: 4 * 1024 * 1024 * 1024,
             index_max_inmem_elements: 10_000,
             io_error_count_to_trigger_shutdown: 0,
+            defer_seal_flush: true,
         }
     }
 }

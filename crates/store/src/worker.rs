@@ -617,6 +617,7 @@ mod tests {
             segment_size_bytes: 1 << 20,
             index_max_inmem_elements: 1000,
             io_error_count_to_trigger_shutdown: 0,
+            defer_seal_flush: true,
         };
         let sm = StoreMetrics::new(&registry).unwrap();
         ReplicaManager::new(dm, sc, sm, 8 << 20)

@@ -121,6 +121,7 @@ async fn start_store(node_id: u64, dir: &std::path::Path) -> (StoreServer, Strin
             segment_size_bytes: 8 << 20,
             index_max_inmem_elements: 100_000,
             io_error_count_to_trigger_shutdown: 0,
+            defer_seal_flush: true,
         },
         &registry,
     )

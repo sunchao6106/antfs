@@ -18,6 +18,7 @@ fn small_config() -> StoreConfig {
         segment_size_bytes: 1 << 20,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
     }
 }
 
@@ -206,6 +207,7 @@ fn open_abandons_unresyncable_segment_but_recovers_later_segments() {
         segment_size_bytes: 256,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
     };
     {
         let registry = antfs_metric::Registry::new();

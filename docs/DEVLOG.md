@@ -1105,3 +1105,25 @@
   写锁停摆,风险藏 max/p99.9。**滚转异步化立案 `log-rollover-off-critical`**。另有真靶:
   frontend→router ~45% 折损(先 flame)+ 冷读口径。bench-blob 增 `--flush-interval-ms`
   形态对齐口(两轮 A/B 负结果一并入档 BASELINE.md)。
+
+## 步骤 45:滚转停摆根治(`log-rollover-off-critical`)—— 病灶两枚、开关可回、决算 19 倍(2026-10-14)
+
+- **案发**:4 GiB 段(生产默认)单次滚转=写锁全线 1-1.5s 停摆(fsync 满段=盘写吞吐墙,周期
+  flush 分摊不掉总量);步 44 的外推「不显形」被用户驳回强制实测推翻。
+- **病灶 1(主)**:滚转临界区内同步 `flush()` 写满段 → 延迟到既有 flush 通道:`pending_seals`
+  队列 + `BlobStore::flush` 分相(**锁外**做重头 drain,与写路径并发;锁内增量 drain 守
+  「log 全量持久先于 index flush」序不变量);`close` 兜底 drain;flush 成败接
+  `record_success`/`record_io_error`(EIO→自关链不断)。
+- **病灶 2(判别实验揪出)**:`LogSegment::create` 的 preallocate→sync_all 顺序 —— 满载下给
+  4 GiB 新段做 fallocate+fsync 同为秒级。修序:header 先 sync(64B,µs 级,绝zero头)→
+  fallocate 后置不强落盘(块分配崩溃丢失无害,段无数据恢复按目录实况);`Log::open` 对
+  0 字节半建段残骸宽容跳过。
+- **开关(用户拍板)**:`store.defer_seal_flush`(默认 `true`);`false` 完整保留旧行为,
+  经 `finish_di` 原子量注入(不穿透工厂签名);全仓 17 处 `StoreConfig` 字面量补字段。
+- **持久性红线核对(§3.3)**:flush 仍是唯一持久化边界(crash-consistency 属性面继续守护);
+  封存段与活跃段 at-risk 窗口拉平(≤ flush 间隔),无新契约;字节级钉子三枚测试锁死
+  (延迟/同步/关兜底),sync 档独立回归测试。
+- **VM 决算**(64 MiB 段口径):p99 17.5ms→**0.92ms(×19)**、吞吐 +19%;4 KiB 主场景
+  172k ops/s 无回归。4 GiB 口径在 colima 被虚拟盘容量毛刺遮蔽(同步/异步 max 同现
+  ~1.2s),标「真机复验」;判别链与全表入 `benchmark/BASELINE.md`「修复后决算」。
+- 归档:`openspec/changes/log-rollover-off-critical/`(proposal/design/specs/tasks 齐)。

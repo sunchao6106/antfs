@@ -120,7 +120,7 @@
 - 单条记录不超过一个段的数据容量(与 Ambry 一致);**总容量不必是段容量的整数倍** —— 末段为"残段"
   (容量 = `total − k × segment`),装不下记录时该部分空间按写满处理(`SegmentFull` → `StoreFull`),
   故配置项之间解耦(如 100 GiB 分区 + 3 GiB 段 = 33 整段 + 1 个 1 GiB 残段;段上限 4 GiB,见 §10.1),`total < segment` 亦退化为单段。
-- 活跃段放不下 → 先 flush 旧段 → **滚动到新段**(同目录新建,代次取当前最大 + 1);段文件名 `{position}_{generation}_log.seg`。
+- 活跃段放不下 → **滚动到新段**(同目录新建,代次取当前最大 + 1;段文件名 `{position}_{generation}_log.seg`)。**旧段 flush 不在滚转临界区做**:`store.defer_seal_flush`(默认开)将其延迟到既有 flush 通道(worker 周期/`flush()`/`close()`)收敛 —— 满段 fsync 在写锁内实测 4 GiB 段为秒级停摆;`false` 保留旧行为(滚点同步落盘)。见 `openspec/changes/log-rollover-off-critical/`(archive 前的工作目录)与 `benchmark/BASELINE.md`「修复后决算」。
 - `LogOffset { segment, offset }` 为跨段全局地址(PersistentIndex 引用它);`segment` 只是**位置序号**,
   **不含代次** —— 代次只活在**段名**与**复制游标**里(见 §3、§9.2),故索引值保持 21B 定长布局不变。
 - `open()` 扫描目录、按段名解析出段身份、按**位置**排序恢复所有段(代次只做身份,不参与排序);
@@ -400,6 +400,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store.index_max_memory_size_bytes` | u64 | 20971520 | ≥1 | 活跃索引常驻内存上限(触发封存) | `store.index.max.memory.size.bytes` |
 | `store.index_max_inmem_elements` | u64 | 10000 | ≥1 | 活跃索引内存条目上限 | `store.index.max.number.of.inmem.elements` |
 | `store.io_error_count_to_trigger_shutdown` | u32 | 0(=禁用) | 任意(0 禁用,≥1 阈值) | **已接入**:连续 IO 错误达此值则 store 自关(被动磁盘检测)+ 触发回调;0=禁用,对齐 Ambry 默认 `MAX_VALUE`。**上线建议显式打开(3–10)**:它是"设备层 EIO → 引擎自关 → replica `ERROR` → 心跳上报 → master 再复制"这条**被动**链路的唯一开关;默认关着时,盘 hang 只能靠主动探测与 IO 看门狗(见 §12.12 与 [cluster.md §9.2 部署前提](./cluster.md))观察 | `store.io.error.count.to.trigger.shutdown` |
+| `store.defer_seal_flush` | bool | `true` | — | **已接入**:滚转时旧段 flush 是否延迟到既有 flush 通道(worker 周期 `flush()`/`close()`)收敛。`true`(默认):写路径临界区不做旧段 fsync(4 GiB 满段 fsync 实测秒级停摆;64 MiB 段口径 p99 17.5 ms→0.92 ms、吞吐 +19%);持久性口径不变,flush 仍是唯一持久化边界,封存段与活跃段的掉电窗口拉平(≤ flush 间隔)。`false`:旧行为,滚点同步落盘(封存段即刻越出 at-risk 窗口,代价=写路承受满段 fsync)。flush 失败两模式都进 `io_error_count`(EIO 自关链路) | —(antfs 自有,Phase 2 滚转停摆修复) |
 | `store.max_journal_entries_to_return` | u32 | 5000 | 1–10000 | journal 单次返回上限 | `store.max.number.of.entries.to.return.from.journal` |
 | `store.index_persisted_entry_min_bytes` | u32 | 115 | ≥1 | 索引条目持久化最小字节(注:Rust 索引条目为 8B key + `IndexValue` 21B = **29B**,值需按实际布局重定) | `store.index.persisted.entry.min.bytes` |
 | `store.segment_size_bytes` | u64 | **4 GiB** | ≥1 且 **≤ 4 GiB** | 单 log 段大小(Ambry 默认 `Long.MAX`=单巨段;antfs 取段级定容)。**4 GiB 是格式不变量而非调优旋钮**:① 段内偏移要放进索引条目 u32 的偏移半区;② "单条记录 ≤ 段 − 64 < `u32::MAX`"使记录的 u32 `data_len` 结构性无法回绕(`record_data_len` 只是第二道保险)。上界由 `StoreConfig::validate`(`MAX_SEGMENT_SIZE_BYTES`)与 `log_segment::MAX_CAPACITY` 共同强制 | `store.segment.size.in.bytes` |

@@ -26,6 +26,7 @@ struct Args {
     segment_bytes: u64,
     dir: Option<PathBuf>,
     flush_interval_ms: u64,
+    sync_seal_flush: bool,
 }
 
 impl Default for Args {
@@ -43,6 +44,7 @@ impl Default for Args {
             segment_bytes: 64 * 1024 * 1024,
             dir: None,
             flush_interval_ms: 0,
+            sync_seal_flush: false,
         }
     }
 }
@@ -66,6 +68,7 @@ fn parse_args() -> Args {
             "--flush-interval-ms" => {
                 a.flush_interval_ms = val().parse::<u64>().expect("flush-interval-ms")
             }
+            "--sync-seal-flush" => a.sync_seal_flush = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -94,7 +97,8 @@ fn print_help() {
          --dir PATH        数据目录 (default 临时目录,跑完删除)\n\
          --flush-interval-ms N  周期 fsync 线程间隔 (default 0 = 关)。store 生产路径有 flush worker\n\
                             周期清脏页;裸引擎压不带上它会把段的 fsync 尾部整个甩到滚转点\n\
-                            (对齐生产形态请给 1000~5000)"
+                            (对齐生产形态请给 1000~5000)\n\
+         --sync-seal-flush        关闭 defer_seal_flush(滚转点同步 fsync 旧段=旧行为,作 A/B 对照)\n"
     );
 }
 
@@ -295,10 +299,21 @@ fn main() {
         dir.display(),
     );
 
-    let store = Arc::new(
+    let store = Arc::new(if args.sync_seal_flush {
+        let registry = antfs_metric::Registry::new();
+        let metrics = antfs_blob::StoreMetrics::new(&registry).expect("register store metrics");
+        let config = antfs_blob::StoreConfig {
+            segment_size_bytes: segment,
+            index_max_inmem_elements: args.index_max,
+            io_error_count_to_trigger_shutdown: 0,
+            defer_seal_flush: false,
+        };
+        BlobStore::create_with(&dir, total, &config, &metrics, "bench-sync-seal")
+            .expect("create BlobStore (increase --segment-mib if capacity too small)")
+    } else {
         BlobStore::create(&dir, total, segment, args.index_max)
-            .expect("create BlobStore (increase --segment-mib if capacity too small)"),
-    );
+            .expect("create BlobStore (increase --segment-mib if capacity too small)")
+    });
 
     let mut flush_thread = None;
     if args.flush_interval_ms > 0 {

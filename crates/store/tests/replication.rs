@@ -16,6 +16,7 @@ fn small_store_config() -> antfs_blob::StoreConfig {
         segment_size_bytes: 1 << 20,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
     }
 }
 
@@ -246,6 +247,7 @@ async fn hybrid_bootstrap_physical_then_logical() {
         segment_size_bytes: 1 << 20,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
     };
     let a = spawn_with(dir_a.path(), scfg.clone(), 8 << 20).await;
     let b = spawn_with(dir_b.path(), scfg, 8 << 20).await;

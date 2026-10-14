@@ -48,6 +48,7 @@ fn di_constructor_emits_metrics_on_injected_registry() {
         segment_size_bytes: 4096,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
     };
     let store = BlobStore::create_with(dir.path(), 4096 * 8, &cfg, &metrics, "p1").unwrap();
 
@@ -83,6 +84,7 @@ fn two_stores_share_registry_distinguished_by_label() {
         segment_size_bytes: 4096,
         index_max_inmem_elements: 1000,
         io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
     };
 
     let d1 = unique_dir();

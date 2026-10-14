@@ -102,6 +102,7 @@ async fn start_store_with(
             segment_size_bytes,
             index_max_inmem_elements: 100_000,
             io_error_count_to_trigger_shutdown: 0,
+            defer_seal_flush: true,
         },
         &registry,
     )

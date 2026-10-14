@@ -153,19 +153,24 @@ impl LogSegment {
             .truncate(true)
             .open(path)?;
 
-        preallocate(&file, capacity)?;
-
+        // 先写 header 并 sync(64 B、文件此刻为空 → 微秒级):崩溃后目录里要么没有该文件,
+        // 要么有一个 header 完好的可用段 —— 「半建段」不留 Corrupt 形态。preallocate 挪在
+        // sync 之后且不再强制落盘:满载写路径上给 4 GiB 段做 fallocate+fsync 实测可达秒级
+        // (与滚转 seal-fsync 同族病灶);块分配崩溃丢失无害 —— 段内尚无数据,且恢复按目录
+        // 实况(容量字段是声明性的,追加写命中稀疏区时内核即时分配)。
+        let created_ns = now_ns();
         let seg = Self {
             file,
             capacity,
             data_capacity: capacity - HEADER_SIZE as u64,
             data_end: AtomicU64::new(0),
-            created_ns: now_ns(),
+            created_ns,
             key_prefix,
             generation,
         };
         seg.write_header()?;
         seg.file.sync_all()?;
+        preallocate(&seg.file, capacity)?;
         Ok(seg)
     }
 

@@ -827,6 +827,10 @@ impl BlobStore {
         store
             .io_error_threshold
             .store(config.io_error_count_to_trigger_shutdown, Ordering::Relaxed);
+        store
+            .inner()
+            .log
+            .set_defer_seal_flush(config.defer_seal_flush);
         store.metrics = metrics.for_store(store_id);
         store.report_open_damage();
         store.refresh_gauges();
@@ -1572,14 +1576,29 @@ impl BlobStore {
     /// 持久化:先落数据(fsync)再落索引,最后写持久化水位(= 当前 log 末尾)。
     pub fn flush(&self) -> Result<()> {
         let _t = self.metrics.op_timer("flush");
+        // 分相一(**锁外**):收敛滚转延迟的封存段 fsync(重头,与写路径并发;段已封存不可变)。
+        // 若留在锁内,满段 fsync 的秒级停摆只是从滚转点挪到 flush tick,净效果为零。
+        if let Err(e) = self.inner().log.drain_pending() {
+            self.record_io_error();
+            return Err(e);
+        }
+        // 分相二(锁内):增量 drain(通常空)+ 活跃段/index/水位 —— 守「log 全量持久
+        // 先于 index flush」的顺序不变量(覆盖相一与相二之间发生的新滚转)。
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
-        self.flush_inner(&self.inner())?;
+        let r = self.flush_inner(&self.inner());
+        match &r {
+            Ok(_) => self.record_success(),
+            Err(_) => self.record_io_error(),
+        }
         self.refresh_gauges();
-        Ok(())
+        r
     }
 
     /// 持久化实现(调用方须已持 `write_lock`);compaction 内部复用,避免重入死锁。
     fn flush_inner(&self, inner: &Inner) -> Result<()> {
+        // 增量收敛(公开 flush 的相一已做重头,这里通常为空):必须先于 index flush,
+        // 保住「index 不引用 log 尚未持久的 offset」。
+        inner.log.drain_pending()?;
         inner.log.flush()?;
         inner.index.flush()?;
         let (_, index_dir) = sub_dirs(&self.dir);
@@ -4434,6 +4453,7 @@ mod tests {
             segment_size_bytes: seg,
             index_max_inmem_elements: 1000,
             io_error_count_to_trigger_shutdown: 0,
+            defer_seal_flush: true,
         };
         let reg = crate::StoreMetrics::new(&antfs_metric::Registry::new()).unwrap();
         let copied =
