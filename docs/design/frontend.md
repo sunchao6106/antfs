@@ -30,6 +30,9 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 | `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑;**删除不可逆**;重复删**幂等**,仍 204) | 404 / 503 / 400 |
 | `POST` | `/stitch` | body `{"signedChunkIds":["<16 hex>",…]}`;头 `x-antfs-session: <opaque>` 必填 | **201** + 同 `POST /blobs` 三个头 | 400(session 缺失/空列表/片数 >4096/非法 id/片不可读) |
 | `GET` | `/metrics` | — | **200** + Prometheus 文本 | — |
+| `GET` | `/healthCheck` | — | **200** + `text/plain` 正文 `GOOD` | — |
+
+> `/healthCheck` 是**进程级探活**(免鉴权、无副作用、不看集群):口径对齐 Ambry rest 的同名端点 —— 只代表 frontend 进程活着,后端(master/store)全挂时也回 200,**不要**当 readiness 用(那会「集群越病越被重启」);K8s readiness 语义将来另立端点。
 
 - **blobId 路径段**:必须能 `hex::decode` 成 **8 字节**,否则 400(文案含 `blob id must be 8 bytes (16 hex)`)。
 - **状态码映射**(统一一处):`NotFound → 404`;`StoreFull → 507`;`TooLarge → 413`;

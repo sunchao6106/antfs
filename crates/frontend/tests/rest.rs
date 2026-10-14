@@ -851,6 +851,62 @@ async fn metrics_endpoint_exposes_counters() {
     assert!(dumped.contains("frontend_in_flight_requests"), "{dumped}");
 }
 
+// ── 9.5:探活 ──────────────────────────────────────────────────────────────────────────────
+
+/// `GET /healthCheck` 免鉴权、恒 200 + `text/plain` `GOOD`;与对象读写并存互不干扰;
+/// 探活**不进业务指标**(LB 每秒打它也不稀释真实速率)—— 断言打在 frontend 实际接入的
+/// `Registry` 上(CLAUDE.md §6)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_check_returns_good_without_metrics_pollution() {
+    let fx = Fixture::quorum_cluster().await;
+    let data = pseudo_random(512);
+    let blob_id = fx.upload(&data).await;
+
+    let resp = fx
+        .http
+        .get(fx.url("/healthCheck"))
+        .send()
+        .await
+        .expect("health request");
+    assert_eq!(resp.status().as_u16(), 200, "探活必须 200");
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next()),
+        Some("text/plain"),
+        "探活必须是 text/plain"
+    );
+    let body = resp.text().await.expect("health body");
+    assert_eq!(body, "GOOD", "探活正文必须是 GOOD");
+
+    // 探活不得污染业务指标:连续打 3 次,gather 出来的 frontend_* 指标面逐字节不变。
+    let before = frontend_metric_lines(&fx);
+    for _ in 0..3 {
+        let resp = fx
+            .http
+            .get(fx.url("/healthCheck"))
+            .send()
+            .await
+            .expect("health probe");
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    let after = frontend_metric_lines(&fx);
+    assert_eq!(before, after, "探活不得改变任何 frontend_* 指标");
+
+    // 与对象读写并存互不干扰。
+    assert_eq!(fx.get_ok(&blob_id).await, data, "探活后对象读写必须仍正常");
+}
+
+/// 拉取 gather 文本里全部 `frontend_` 开头的行(探活零污染断言的取样面)。
+fn frontend_metric_lines(fx: &Fixture) -> String {
+    let text = antfs_metric::gather(&fx.registry).expect("gather frontend registry");
+    text.lines()
+        .filter(|l| l.starts_with("frontend_"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ── 10:CORS(白名单才挂)────────────────────────────────────────────────────────────────────
 
 /// `frontend.cors_allowed_origins` 非空才挂 CORS 层,且只放行**白名单内**的来源(不用 permissive)。

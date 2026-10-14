@@ -267,7 +267,8 @@ fn auto_chunk_total_limit(auto_chunk_bytes: u64) -> u64 {
     MAX_CHUNKS as u64 * auto_chunk_bytes
 }
 
-/// 建路由:`/blobs*` 与 `/stitch` 是对象接口,`/metrics` 是 Prometheus 抓取口(无鉴权,抓取惯例)。
+/// 建路由:`/blobs*` 与 `/stitch` 是对象接口,`/metrics` 是 Prometheus 抓取口(无鉴权,抓取惯例),
+/// `/healthCheck` 是进程探活(无鉴权,恒 200,见 [`health_check`])。
 ///
 /// body 上限**分路由挂**:`/blobs` 开自动分片后上限放大到分片总量上限(裸字节体由 handler
 /// 边收边计数,`DefaultBodyLimit` 只是流式读的兜底);`/stitch` 的 JSON 体重持 `max_body_bytes`
@@ -292,6 +293,7 @@ pub fn build_router(state: AppState) -> Router {
             post(stitch).layer(DefaultBodyLimit::max(body_limit(state.max_body_bytes))),
         )
         .route("/metrics", get(get_metrics))
+        .route("/healthCheck", get(health_check))
         .with_state(state.clone());
 
     match cors_layer(&state.cors_allowed_origins) {
@@ -791,6 +793,18 @@ async fn get_metrics(State(st): State<AppState>) -> Response {
         Ok(text) => (StatusCode::OK, text).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// 进程探活(免鉴权/无副作用/不看集群):恒 200 + `text/plain` 正文 `GOOD`,口径对齐
+/// Ambry rest 层同名端点 —— 只代表 frontend **进程**活着,不代表集群健康(后端全挂时
+/// 探针仍 200,避免「集群越病越被重启」的反向探针雪崩);readiness 语义将来另立端点,不与 liveness 混码。
+async fn health_check() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "GOOD",
+    )
+        .into_response()
 }
 
 // ── 拼装描述符编解码 ────────────────────────────────────────────────────────────────────────

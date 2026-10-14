@@ -1055,3 +1055,32 @@
   已实现(见 s3.md);cluster.md §9.1"待续"剔除已落地的 DROPPED 目录回收与 admin 真队列深度;store.md §12.11 残留
   风险 6(旧"未接真队列深度")标记已修;s3.md 补「启动形态」小节(独立二进制配置文件/env 形态,CLAUDE.md §7)。
 - 发布卫生:修复随 v0.0.3 发布,替换 v0.0.2 tarball 中的空壳二进制(v0.0.2 不撤,Release 页留全量历史)。
+
+## 步骤 42:frontend `/healthCheck` 进程探活(Phase 1 收官 A5 窄档)(2026-10-14)
+
+- **契约**:`GET /healthCheck` → 恒 200 + `text/plain` 正文 `GOOD`;免鉴权、无副作用、不触碰
+  router/master(不看集群)。口径对齐 Ambry rest 同名端点:
+  **liveness ≠ readiness** —— 后端全挂时探针仍 200,防「集群越病越被重启」的探针雪崩;
+  readiness 语义将来另立端点。不进任何业务指标(探活 QPS 不稀释真实速率)。
+- **验证**:frontend 集成测试 `health_check_returns_good_without_metrics_pollution`
+  (200/GOOD/text-plain;连打 3 次 frontend_* 指标面逐字节不变;与对象读写并存互不干扰),
+  断言打在 frontend 实际接入的 `Registry`(CLAUDE.md §6)。17 集成全绿。frontend.md 契约表补行。
+- **Phase 1 收官对表归档(本次转折记录)**:三方对表(antfs 实现面 ↔ 本地 Ambry v0.5.195 源码 ↔
+  锁死偏差清单)产出 A/B/C 矩阵:undelete、TTL 后置更新、multipart form-data 直传**拍板不移植**;
+  多租户 account/container 判**有意偏差**(租户归网关层);A1 对象元数据族裁决为**乙路线**
+  (仅 S3、基于 MetaStore、与 blob 隔离);后续项(C 类)见 `openspec/changes/phase1-exit-closeout/`。
+
+## 步骤 43:S3 对象元数据收口 —— 补证据 + 边界化(Phase 1 收官 A1 乙路线)(2026-10-14)
+
+- **审计纠错(重要)**:对表时曾误判「S3 GetObject 无 Content-Type」——实际乙路线的实现**早已完整**
+  (schema 列 + 双方言 SQL + put 采集/get·head 回吐 + multipart 传递)。真实缺口是**测试零覆盖**与
+  **三处边界缺陷**,本步收口,不重写实现。
+- **边界(采集时校验,PUT 与 CreateMultipart 共用 `capture_object_meta`)**:`x-amz-meta-*` 总量
+  (Σ 键+值 UTF-8 字节)超 2048 → `MetadataTooLarge`(400,S3 官方值,具名常量非配置);
+  `Content-Type` 超长 256(列宽 `VARCHAR(256)`)→ `InvalidArgument`(400,原来会打到 INSERT 才
+  500);不带 `Content-Type` → 存储默认 `binary/octet-stream`(AWS 同语义,旧行 NULL 不读取兜底,
+  明示差异)。multipart 只在 create 时校验(meta 已落库,complete 不重复校验)。
+- **验证(PG 真机,`--ignored` 集成)**:object 10 用例(新增 4:元数据往返 GET/HEAD、默认 content-type、
+  超限 400 且无对象落库 ×2)+ multipart 5 用例(新增 1:create 带 meta → part → complete → GET 回吐)
+  全绿;metastore 单测 32 全绿。s3.md 操作映射补「对象元数据」段。
+- 归档:`openspec/changes/s3-object-metadata/`(proposal/design/specs/tasks 全套)。
