@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+The MetaStore trait over PostgreSQL/MySQL: connection pooling, schema migration, object version ordering, and soft-delete with cleanup.
+
+## Requirements
 
 ### Requirement: MetaStore trait abstracts metadata backend
 The S3 gateway SHALL define a `MetaStore` async trait covering object CRUD, bucket CRUD, multipart session management, and credential lookup. All handlers interact only with the trait, never with a concrete database driver.

@@ -27,8 +27,8 @@
 
 设计参考了 [LinkedIn Ambry](https://github.com/linkedin/ambry)、[SeaweedFS](https://github.com/seaweedfs/seaweedfs) 与 [CubeFS](https://github.com/cubefs/cubefs):小文件追加进 log、索引定位,O(1) 次磁盘寻道完成读写;集群元数据由内建 Raft 的 master 管理,不依赖外部协调组件(ZooKeeper / etcd)。分阶段推进:
 
-- **现阶段:忠实的 Rust 翻译** —— 对齐 Ambry 的架构与语义,先把功能 1:1 搬到 Rust(仅在等价前提下用现代实现,如 Binary Fuse 过滤器替 Bloom)。
-- **后续:在 Rust 版本之上做优化** —— 待翻译完成、正确性锁定后,再针对性能 / 并发 / 存储密度做改进。
+- **阶段一(已完成 —— v0.0.4 收官):忠实的 Rust 翻译** —— 对齐 Ambry 的架构与语义,先把功能 1:1 搬到 Rust(仅在等价前提下用现代实现,如 Binary Fuse 过滤器替 Bloom)。取舍裁决(照搬 / 有意偏差 / 后续再做的)归档见 [`openspec/changes/`](openspec/changes/)。
+- **阶段二(现阶段):在 Rust 版本之上做优化** —— 翻译完成、正确性已锁定,针对性能 / 并发 / 存储密度做改进。
 
 ## 特性
 
@@ -96,7 +96,7 @@
 | router | 客户端 SDK(通用组件,`crates/common/router`):向 master 取号段、W 多数派写、R=1 读、流式大文件;frontend 与压测共用;对标 Ambry `NonBlockingRouter` | ✅ 已实现 |
 | frontend | HTTP REST 对象接口层(`/blobs` 读写/删/TTL/分片拼装 + `/metrics`);内嵌同一个 router SDK;对标 Ambry `ambry-frontend` | ✅ 已实现 |
 | admin | admin web:运维操作 + 控制面 dashboard(拓扑/节点/盘/分区/指标) | ✅ 已实现 |
-| s3 | S3 兼容网关:PutObject / GetObject / DeleteObject / HeadObject、multipart 上传、ListObjectsV2、桶管理、AWS SigV4 鉴权;网关无状态(元数据外接 PostgreSQL / MySQL);与 frontend 同层 | ✅ 已实现 |
+| s3 | S3 兼容网关:PutObject / GetObject / DeleteObject / HeadObject(含对象元数据:`Content-Type` + `x-amz-meta-*`)、multipart 上传、ListObjectsV2、桶管理、AWS SigV4 鉴权;网关无状态(元数据外接 PostgreSQL / MySQL);与 frontend 同层 | ✅ 已实现 |
 | S3 版本控制 / 多租户 ACL / 配额 | 网关层增强(与 frontend 同层) | 📋 规划中 |
 
 > 命名:`blob` = 单机 blob 存储引擎;`store` = 数据节点(store server)。
@@ -240,7 +240,7 @@ docker run --rm ghcr.io/sunchao6106/antfs:latest --run-bench router --bench-ops 
 - [x] router SDK + REST frontend
 - [x] admin web 控制台
 - [x] S3 兼容网关(对象 / multipart / SigV4 / 桶;MetaStore 外接 PostgreSQL / MySQL)
-- [ ] 完成 Ambry 忠实翻译、锁定正确性(第一阶段收官)
+- [x] 完成 Ambry 忠实翻译、锁定正确性(阶段一收官 —— v0.0.4;裁决归档于 `openspec/changes/`,PG 集成测试已进 CI 门)
 - [ ] 性能 / 并发 / 存储密度优化(第二阶段)
 - [ ] S3 版本控制、多租户 ACL 与配额
 

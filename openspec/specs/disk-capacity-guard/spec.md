@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Store engine logical-commitment hard limits and disk reserved-space protection.
+
+## Requirements
 
 ### Requirement: 逻辑承诺硬限制
 `select_disks` SHALL 拒绝将新分区放置到 `committed + partition_cap > usable_capacity` 的盘上，其中 `committed = 该盘上现有副本数 × partition_cap`，`usable_capacity = disk_capacity × (1 − disk_reserved_ratio)`。`committed` MUST 从 Raft partition table 计算，不依赖心跳软状态。

@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+SigV4 authentication (header and presigned URL) and credential management for the S3 gateway.
+
+## Requirements
 
 ### Requirement: SigV4 header authentication
 The S3 gateway SHALL parse the `Authorization` header with algorithm `AWS4-HMAC-SHA256`, extract access key / signed headers / signature, look up the secret key from MetaStore `s3_credentials`, compute the expected signature (canonical request → string-to-sign → signing key → HMAC-SHA256), and compare in constant time. Requests with invalid or missing credentials SHALL receive `AccessDenied` (403) or `InvalidAccessKeyId` (403).

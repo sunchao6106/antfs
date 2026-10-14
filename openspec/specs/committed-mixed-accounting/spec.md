@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Store engine accounting for mixed committed segments (mixed committed semantics plus safe fallback when used_bytes is unavailable).
+
+## Requirements
 
 ### Requirement: 混合 committed 口径
 `placement_usage()` 计算 committed 时 SHALL 按分区状态分流：RW 副本用 `partition.capacity_bytes`（逻辑上限），RO/SEALED 副本用心跳 `used_bytes`（实际占用，各副本最大值）。`used_bytes` 不可用（`None` 或 `0`）时 MUST 退回 `capacity_bytes`。

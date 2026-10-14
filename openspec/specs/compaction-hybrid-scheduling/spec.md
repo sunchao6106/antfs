@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Store worker compaction scheduling: configurable policies and hybrid cost-benefit/CompactAll alternation.
+
+## Requirements
 
 ### Requirement: Compaction policy is configurable
 The system SHALL support three compaction scheduling policies selectable via config key `compaction_policy`: `incremental`, `cost-benefit`, `hybrid`. The default SHALL be `hybrid`.

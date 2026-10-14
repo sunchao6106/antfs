@@ -27,8 +27,8 @@
 
 The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [SeaweedFS](https://github.com/seaweedfs/seaweedfs), and [CubeFS](https://github.com/cubefs/cubefs): small files are appended into a log and located by an index, so reads and writes each cost **O(1) disk seeks**. Cluster metadata is managed by a master with a **built-in Raft** group — no external coordination service (ZooKeeper / etcd) required. The project moves in two phases:
 
-- **Phase 1 (current): a faithful Rust port** — mirror Ambry's architecture and semantics 1:1 in Rust, substituting modern implementations only where strictly equivalent (e.g. Binary Fuse filters in place of Bloom filters).
-- **Phase 2: optimize on top of the Rust base** — once the port is complete and correctness is locked down, push on performance, concurrency, and storage density.
+- **Phase 1 (complete — exited at v0.0.4): a faithful Rust port** — mirror Ambry's architecture and semantics 1:1 in Rust, substituting modern implementations only where strictly equivalent (e.g. Binary Fuse filters in place of Bloom filters). Scope rulings (ported / deliberately diverged / deferred) are archived in [`openspec/changes/`](openspec/changes/).
+- **Phase 2 (current): optimize on top of the Rust base** — with the port complete and correctness locked down, push on performance, concurrency, and storage density.
 
 ## Features
 
@@ -95,7 +95,7 @@ Layered reading: **gateways** (Frontend / S3) are stateless translators — ever
 | `router` | Client SDK (`crates/common/router`): blobId range leasing, W-majority writes, R=1 reads, large-blob streaming; shared by frontend and benchmarks. Counterpart of Ambry's `NonBlockingRouter` | ✅ Implemented |
 | `frontend` | HTTP REST object layer (`/blobs` + `/metrics`). Counterpart of `ambry-frontend` | ✅ Implemented |
 | `admin` | Admin web: ops actions + control-plane dashboard (topology / nodes / disks / partitions / metrics) | ✅ Implemented |
-| `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject, multipart upload, ListObjectsV2, bucket management, AWS SigV4 auth. Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | ✅ Implemented |
+| `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject (incl. object metadata: `Content-Type` + `x-amz-meta-*`), multipart upload, ListObjectsV2, bucket management, AWS SigV4 auth. Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | ✅ Implemented |
 | S3 versioning, multi-tenant ACL, quota | Gateway-layer enhancements | 📋 Planned |
 
 > Naming: `blob` = the single-node blob storage engine; `store` = the data node server.
@@ -249,7 +249,7 @@ The production target is Linux ext4. For fidelity, large-data, or performance te
 - [x] Router SDK + REST frontend
 - [x] Admin web dashboard
 - [x] S3-compatible gateway (objects / multipart / SigV4 / buckets, external PostgreSQL or MySQL MetaStore)
-- [ ] Finish the faithful Ambry port and lock correctness (Phase 1 exit)
+- [x] Finish the faithful Ambry port and lock correctness (Phase 1 exit — v0.0.4; rulings archived under `openspec/changes/`, PG integration tests CI-gated)
 - [ ] Performance / concurrency / storage-density optimizations (Phase 2)
 - [ ] S3 versioning, multi-tenant ACL and quota
 

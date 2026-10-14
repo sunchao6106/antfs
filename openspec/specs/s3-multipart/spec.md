@@ -1,11 +1,21 @@
-## ADDED Requirements
+## Purpose
 
+Multipart upload sessions on the S3 gateway: create, upload part, complete, abort, list.
+## Requirements
 ### Requirement: CreateMultipartUpload initiates a multipart session
-The S3 gateway SHALL accept `POST /<bucket>/<key>?uploads`, generate a unique `upload_id`, insert a row into `multipart_uploads`, and return the upload_id in XML response.
+The S3 gateway SHALL accept `POST /<bucket>/<key>?uploads`, generate a unique `upload_id`, insert a row into `multipart_uploads` (carrying the request's `Content-Type` — defaulting to `binary/octet-stream` when absent — and `x-amz-meta-*` user metadata), and return the upload_id in XML response. Metadata validation is the same as PutObject: total user-metadata bytes over 2048 → `MetadataTooLarge` (400); `Content-Type` longer than 256 bytes → `InvalidArgument` (400).
 
 #### Scenario: Successful initiation
 - **WHEN** client sends `POST /mybucket/bigfile.bin?uploads`
 - **THEN** gateway returns 200 XML with `<UploadId>` and the upload appears in ListMultipartUploads
+
+#### Scenario: Initiation with metadata
+- **WHEN** client sends `POST /mybucket/bigfile.bin?uploads` with `Content-Type: video/mp4` and `x-amz-meta-project: demo`
+- **THEN** the multipart session stores both; after CompleteMultipartUpload, GetObject returns `Content-Type: video/mp4` and `x-amz-meta-project: demo`
+
+#### Scenario: Initiation with oversized metadata
+- **WHEN** client sends `POST /mybucket/bigfile.bin?uploads` with `x-amz-meta-*` headers totaling more than 2048 bytes
+- **THEN** gateway returns `MetadataTooLarge` (400), no session is created
 
 ### Requirement: UploadPart writes a part as an independent blob
 The S3 gateway SHALL accept `PUT /<bucket>/<key>?partNumber=N&uploadId=ID`, write the part body as a separate blob via `put_auto_with_ttl`, compute its MD5 ETag, and upsert a row in `multipart_parts`.
@@ -19,7 +29,7 @@ The S3 gateway SHALL accept `PUT /<bucket>/<key>?partNumber=N&uploadId=ID`, writ
 - **THEN** the second upload's blob_id and etag replace the first in `multipart_parts`; the old part blob becomes reclaimable
 
 ### Requirement: CompleteMultipartUpload assembles parts into a named object
-The S3 gateway SHALL accept `POST /<bucket>/<key>?uploadId=ID` with XML listing parts, validate ETags match, store a manifest (ordered part blob_ids + sizes) in `named_objects`, delete the multipart session, and return the final object's ETag.
+The S3 gateway SHALL accept `POST /<bucket>/<key>?uploadId=ID` with XML listing parts, validate ETags match, store a manifest (ordered part blob_ids + sizes) in `named_objects` — inheriting the `content_type`/`user_meta` captured at CreateMultipartUpload — delete the multipart session, and return the final object's ETag.
 
 #### Scenario: Successful completion
 - **WHEN** client sends CompleteMultipartUpload with 3 parts whose ETags match uploaded parts
@@ -53,3 +63,4 @@ The S3 gateway SHALL accept `GET /<bucket>?uploads` and return XML listing activ
 #### Scenario: List uploads with prefix
 - **WHEN** bucket has uploads for `logs/a.log`, `logs/b.log`, `data/c.bin` and client sends `prefix=logs/`
 - **THEN** response lists only the two `logs/` uploads
+

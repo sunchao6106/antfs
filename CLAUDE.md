@@ -1,7 +1,7 @@
 # CLAUDE.md — 蚂蚁文件系统 (antfs) 工程约定
 
-用 Rust 重写整个 Ambry。**现阶段:忠实的 Rust 翻译**(对齐 Ambry 架构与语义,仅在等价前提下用现代实现);
-后续再在 Rust 版本之上做优化。总原则:**整体照搬 Ambry 架构,局部替换为业界最新最佳实现**。
+用 Rust 重写整个 Ambry。**阶段一「忠实的 Rust 翻译」已于 v0.0.4 收官**(对齐 Ambry 架构与语义,仅在等价前提下用现代实现;取舍裁决归档于 `openspec/changes/`)。
+**阶段二(当前):在 Rust 版本之上做优化** —— 新改动仍须守住既有语义与持久性红线,偏离架构决策(D1-D5 等)的流程不变。总原则:**整体照搬 Ambry 架构,局部替换为业界最新最佳实现**。
 
 - 设计总览:[`docs/design/README.md`](docs/design/README.md);各模块设计见 `docs/design/*.md`。
 - 决策档案(含被否决方案):`openspec/changes/`。

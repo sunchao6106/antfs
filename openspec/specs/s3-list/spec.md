@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+ListObjectsV2 list objects (prefix/delimiter/CommonPrefixes/pagination) semantics for the S3 gateway.
+
+## Requirements
 
 ### Requirement: ListObjectsV2 lists objects in a bucket with prefix and delimiter
 The S3 gateway SHALL accept `GET /<bucket>?list-type=2` with optional `prefix`, `delimiter`, `max-keys`, `start-after`, `continuation-token` parameters. It SHALL query MetaStore for READY, non-deleted objects matching the prefix, apply delimiter logic to produce CommonPrefixes, and return S3-conformant XML.

@@ -57,3 +57,31 @@ jobs:
         run: cargo build --workspace --verbose
       - name: Run tests
         run: cargo test --workspace --verbose
+
+  s3-integration:
+    name: S3 integration (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: antfs_s3_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc (crates/master 的 build.rs 构建期需要)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run S3 gateway integration tests (PG-gated, --ignored)
+        env:
+          TEST_S3_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/antfs_s3_ci
+        run: cargo test -p antfs-s3 -- --ignored
