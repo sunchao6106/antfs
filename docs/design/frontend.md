@@ -24,7 +24,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 | 方法 | 路径 | 请求 | 成功 | 失败 |
 |---|---|---|---|---|
-| `POST` | `/blobs` | body = blob 裸字节;可选 `x-ambry-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405) | **201** + `Location: /blobs/{blobId}` + `x-ambry-blob-id: {16 hex}` + `x-ambry-blob-size: {n}` | 400(非法 id)/ 413(超 `max_body_bytes`)/ 507(分区写满)/ 503(未达多数派) |
+| `POST` | `/blobs` | body = blob 裸字节;可选 `x-ambry-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405)。body ≤ `max_body_bytes` 走单 blob;**超过且开启 `auto_chunk_enabled`(默认)时服务端自动分片**(见 §5,201 的 `x-ambry-blob-size` = 逻辑总量) | **201** + `Location: /blobs/{blobId}` + `x-ambry-blob-id: {16 hex}` + `x-ambry-blob-size: {n}` | 400(非法 id/非法 session 头)/ 413(超该路径上限:关自动分片 = `max_body_bytes`,开 = 片数 4096 × `auto_chunk_bytes`)/ 507(分区写满)/ 503(未达多数派) |
 | `GET` | `/blobs/{blobId}` | — | **200** + 原始字节 | 404(所有副本都没有)/ 400(非法 id)/ 502(分片描述符损坏或片缺失)/ 503(副本不可达) |
 | `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-ambry-blob-size`/`-deleted`/`-expired`/`-expiration-ms`。**拼装对象额外带 `x-ambry-blob-stitched: true` + `x-ambry-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
 | `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑;**删除不可逆**;重复删**幂等**,仍 204) | 404 / 503 / 400 |
@@ -51,7 +51,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 | 端点 | 内部动作 |
 |---|---|
-| `POST /blobs` | `allocate_one()` 取 blobId → 带 `x-ambry-ttl-ms` 时 `put_with_ttl(key, bytes, expiration_ms)`,否则 `put(key, bytes)`(**W = 副本数/2+1**,收满即返回,其余靠拉复制补) |
+| `POST /blobs` | 小 body(≤ 1 MiB):`put_auto_with_ttl(bytes, expiration_ms)`(**内部发号 + 分区满 507 自动换分区重试**,最多 2 次);大 body(> 1 MiB 或无 Content-Length):`put_file_with_ttl(path, expiration_ms)`(同样内部发号 + 507 重试)。**body > `max_body_bytes` 且开启自动分片**:`auto_chunk_store`(§5)。三条路径写行为对称(**W = 副本数/2+1**,收满即返回,其余靠拉复制补) |
 | `GET /blobs/{id}` | `get(&key)`(**R=1**,副本按 `up` 排序,首个 200 即返回) |
 | `HEAD /blobs/{id}` | `stat(&key)`(元数据不读数据体) |
 | `DELETE` | `delete`(多数派写墓碑,**不可逆**) |
@@ -88,23 +88,47 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
    代价可控:描述符按构造 ≤ 1 MiB(`DESCRIPTOR_MAX_BYTES`),故**只有小对象**需要多读一次数据体,
    更大的对象不可能是描述符、直接按 `stat` 的 size 回(不读数据体)。
 4. **`DELETE` 只删描述符本身,不递归删片**:一次删 N 个对象是危险动作(且片可能被多个 stitched blob 共享);
-   孤儿片靠 `x-ambry-ttl-ms` + store 本地 worker 回收。
+    孤儿片靠 `x-ambry-ttl-ms` + store 本地 worker 回收。自动分片(§5)产生的对象**删描述符后同样留下孤儿片**
+    —— 服务端知悉但故意不递归(无法从描述符区分"片是否被共享"是原因之一;将来若给描述符加 composed
+    类型位,可仅对"本服务端铸的片"递归删,挂在 §11 的嗅探待办上)。
 
 **相对 Ambry 的偏离(登记)**:无签名片 id、无服务端会话(不做"同 session 才可拼"的服务端强制)、不强制分片大小、
 不递归删片。
 
-## 5. 流式与 body 上限
+## 5. 流式、自动分片与 body 上限
 
-- 上传**分档**(阈值 `INLINE_BODY_MAX` = 1 MiB,常量):≤ 1 MiB 走**内存路径**(`Router::put(Bytes)`,内存上界 =
-  在途请求数 × 1 MiB);> 1 MiB(或未声明长度)才**落暂存文件 + `Router::put_file` 流式**,**内存不随文件大小涨**。
+- 上传**分档**(阈值 `INLINE_BODY_MAX` = 1 MiB,常量):≤ 1 MiB 走**内存路径**(`Router::put_auto_with_ttl(Bytes, ...)`,内部发号 + 507 换分区重试,内存上界 =
+  在途请求数 × 1 MiB);> 1 MiB(或未声明长度)才**落暂存文件 + `Router::put_file_with_ttl` 流式**,**内存不随文件大小涨**。
+  两条路径的 507 重试行为**完全对称**(最多 2 次换分区),不存在"小 body 不重试"的不一致。
   分档原因:每个小对象都落一个暂存文件会多出 `create/write/close/unlink` 的元数据开销,实测把 PUT p50 从 ~1ms
   拖到 ~9ms(release,4 KiB × 并发 32)。暂存文件放系统临时目录,成功/失败都删。
-- `frontend.max_body_bytes`:有 `Content-Length` 时先校验(超 → 413,不读 body);chunked(无 `Content-Length`)时边收边计数,
-  超了 → 413。**默认与 `store_server.max_body_bytes` 同值同因**(axum 默认 2 MiB;不擅自改默认,要收大文件显式调大)。
+- `frontend.max_body_bytes`:**单 blob 路径的上限**。有 `Content-Length` 时先校验;chunked(无 `Content-Length`)
+  时边收边计数,超了 → 413。未开自动分片时它就是 `/blobs` 的硬上限(超 → 413,不读 body);
+  开启后超过它的 body 转入自动分片(见下条)。**部署对齐要求**:单 blob 与片走同一条数据面 PUT,故
+  `store_server.max_body_bytes` 必须 ≥ `frontend.max_body_bytes`(单 blob 不被数据面 413)且
+  ≥ `frontend.auto_chunk_bytes`(片同理;devcluster 两侧同为 16 MiB)。
+- **服务端自动分片**(2026-10 起,默认开,`frontend.auto_chunk_enabled` / `auto_chunk_bytes`):
+  `POST /blobs` 的 body(声明或实收)超过 `max_body_bytes` 时:
+  1. **先整体落暂存并校验**(复用既有暂存路径,上限 = 片数 4096 × 单片,超 → 413)—— 客户端中途断流/谎报
+     长度时**一片都不写**就失败,不产生孤儿;
+  2. 从暂存文件**按 `auto_chunk_bytes` 顺序切片,逐片 `put_auto_with_ttl`**(顺序写:并发扇出会把
+     "单片内存"乘以片数在途,先不做);片与描述符**同 TTL**,整个逻辑对象一体过期(HEAD 可见
+     `expired` / `expiration-ms`);
+  3. 编**同 `/stitch` 的描述符**(session = 请求带的 `x-ambry-session`,缺省空)也当普通 blob 写入;
+  4. 201 返回**描述符的 blobId** + `x-ambry-blob-size: 逻辑总量`;`GET`/`HEAD` 走 §4 的既有透明拼装,
+     客户端不感知分片。
+  **中途失败**:对已 ack 的片逐个写墓碑**尽力回收**(best-effort:删失败只记日志 + 指标,不影响回报调用方的
+  原错误;片若已落少数副本,墓碑多数派 + 拉复制"墓碑恒胜"会盖掉)。**重试安全**:重试拿到一套全新 blobId,
+  与失败轮互不相扰。**内存**:单片(= `auto_chunk_bytes`,校验限 1..=1 GiB,顺序写同一块缓冲)+ 暂存期
+  一个 64 KiB 块,不随对象大小涨。**落盘**:暂存 1 份(先写满总量再切片读回)+ 每片各 1 次数据面写
+  (上一条"内存换磁盘"的代价,自动分片按片数放大)。
+  **已知取舍**:超大 body 会先整体占掉体量等大的系统临时目录空间,总量上限(默认 4096 × 4 MiB = 16 GiB)
+  同时也是暂存空间的界 —— 大 body 场景建议给临时目录单独的卷;另见 §4 末条(删描述符留孤儿片)。
 - **读方向**:大对象(> 1 MiB)先经 SDK 落到暂存文件再**流式**回给客户端,小对象才整体读以嗅探分片描述符的 MAGIC
   —— 故 **frontend 侧内存不随对象大小涨**。**但 store 侧的 `GET` 仍把数据体整个读进内存**(真流式 GET 是 store 的待办,
-  见 §11),所以端到端内存上界仍由 store 决定。
-- 一次上传的落盘量:frontend 暂存 1 份 + store 侧暂存 1 份 + log 1 份 —— 这是"内存换磁盘"的代价,记在 D5。
+  见 §11),所以端到端内存上界仍由 store 决定(自动分片的 `GET` 同样受此限:逐片 `get`、内存 = 单片)。
+- 一次上传的落盘量:frontend 暂存 1 份 + store 侧暂存 1 份 + log 1 份 —— 这是"内存换磁盘"的代价,记在 D5
+  (自动分片是"× N 片 + 描述符 1 份",且暂存文件例外地先写满总量再切片)。
 
 ## 6. CORS
 
@@ -120,7 +144,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | blobId 谁生成 | frontend 调 router,router **本地随机铸**(partition 从本地 clustermap 随机挑) | **向 master 申请号段**(`GetBlobIds`) |
 | 上传结果 | `Location: <blobId>` | `Location: /blobs/{blobId}` + `x-ambry-blob-id`/`-blob-size` |
 | 鉴权/配额 | `AccountService` + `AmbrySecurityService` + quota | **无**(多租户推后到网关期) |
-| 大对象 | chunked upload + `/stitch`(**签名片 id**) | `/stitch`(无签名片 id,描述符自描述) |
+| 大对象 | chunked upload + `/stitch`(**签名片 id**;分片在 router 做) | `/stitch`(无签名片 id,描述符自描述)+ **服务端自动分片**(§5,分片在 frontend 做) |
 | 元数据/HEAD | `GetBlobInfo`(blob 元数据在 id 内编码 account/container/ttl) | `HEAD /blobs/{id}` → store 的 `.../metadata`(无每对象元数据) |
 | CORS | `frontend.options.allow.methods` 等配置 | `frontend.cors_allowed_origins` 白名单 |
 | 指标 | Dropwizard `FrontendMetrics` | `FrontendMetrics`(Prometheus,见 §9) |
@@ -133,7 +157,9 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | key(TOML) | 类型 | 默认值 | 取值范围/校验 | 含义/影响 | 对齐的 Ambry 原配置 |
 |---|---|---|---|---|---|
 | `frontend.listen_addr` | String | `127.0.0.1:7400` | 非空 | HTTP 监听地址 | `frontend.http.port` 等 |
-| `frontend.max_body_bytes` | u64 | `2097152`(2 MiB) | ≥1 | 单请求 body 上限(超 → 413)。默认与 `store_server.max_body_bytes` 同因同值 | `frontend.max.json.request.size.bytes` 等(语义不同) |
+| `frontend.max_body_bytes` | u64 | `4194304`(4 MiB) | ≥1 | 单请求 body 上限(body ≤ 此值的仍是**单 blob**;关闭自动分片时即 413 硬上限,开启后是"转分片"的门槛,见 §5)。部署须与 `store_server.max_body_bytes` 对齐 | `frontend.max.json.request.size.bytes` 等(语义不同) |
+| `frontend.auto_chunk_enabled` | bool | `true` | — | 服务端自动分片开关:开 = body 超过 `max_body_bytes` 时自动切片多次上传并返回描述符的 blobId;关 = 恢复旧行为(超 `max_body_bytes` 一律 413,客户端手动走 `/stitch`) | 无(router 侧 chunking 在 Ambry 是另一层的事) |
+| `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | 自动分片单片大小:切片逐片入库的粒度,也是写路径单片驻留内存的读写缓冲大小;总量上限 = 4096 片 × 此值(默认 16 GiB) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层) |
 | `frontend.cors_allowed_origins` | Vec\<String\> | `[]` | 各项为非空且非 `*` 的合法 header 值(校验期就拒) | CORS 来源白名单(**空 = 不挂 CORS 层**;不接受 `*`) | `frontend.options.allow.methods` 等 |
 | `frontend.router.master_addr` | String | `127.0.0.1:7101` | 非空 | 内嵌 SDK 的 master 地址(见 [`router.md` §5](./router.md)) | 无 |
 | `frontend.router.cluster_secret` | String | `""` | — | 集群准入密钥 | 无 |
@@ -158,9 +184,12 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐的 Ambry 原指标 |
 |---|---|---|---|---|---|
 | `frontend_upload_total` | counter | `outcome` | 次 | 上传请求数(`ok` / 错误 `kind`) | `FrontendMetrics.postBlobRequestMetrics` |
-| `frontend_upload_bytes_total` | counter | — | 字节 | 上传字节数(成功) | 无 |
+| `frontend_upload_bytes_total` | counter | — | 字节 | 上传字节数(成功;自动分片按逻辑总量) | 无 |
+| `frontend_upload_auto_chunk_total` | counter | `outcome` | 次 | 走服务端自动分片路径的上传请求数(成功在 handler 记、失败在 upload 的分片出口记),`upload_total` 的子集 | 无(语义上 Ambry 把 chunk 计数放在 router 层) |
+| `frontend_upload_auto_chunk_chunks_total` | counter | — | 片 | **成功**的自动分片上传写入的数据片数(不含描述符) | 无 |
+| `frontend_upload_auto_chunk_orphan_deletes_total` | counter | — | 次 | 自动分片中途失败后发起的孤儿片回收删除**尝试**数(best-effort,可能未删成) | 无 |
 | `frontend_download_total` | counter | `outcome` | 次 | 下载请求数 | `FrontendMetrics.getBlobRequestMetrics` |
-| `frontend_download_bytes_total` | counter | — | 字节 | 下载字节数(成功) | 无 |
+| `frontend_download_bytes_total` | counter | — | 字节 | 下载字节数(成功;拼装对象按描述符里各片长度求和) | 无 |
 | `frontend_delete_total` | counter | `outcome` | 次 | 删除请求数 | `FrontendMetrics.deleteBlobRequestMetrics` |
 | `frontend_mutation_total` | counter | `op`, `outcome` | 次 | `head`/`stitch` 请求数 | `FrontendMetrics.*RequestMetrics` |
 | `frontend_request_duration_seconds` | histogram | `op` | 秒 | 请求延迟(含取号段与副本扇出) | `FrontendMetrics.*RequestTimeInMs` |
@@ -174,6 +203,9 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 - **`CorsLayer::permissive()`**:默认全开的跨域是安全问题;用显式白名单。
 - **服务端 session 表**(分片上传):引入每对象/会话元数据,与 D3 冲突且让 frontend 变有状态;描述符自描述已够。
 - **frontend 直接读写 store 字节、不走 SDK**:会把 W/R 语义复制成两份实现(必然漂移)。
+- **自动分片放在 router SDK 层**(Ambry `NonBlockingRouter` 的 composite-blob 路线):切片与描述符/拼装
+  读回强耦合,而 antfs 的描述符编解码、MAGIC 嗅探、透明拼装都判定在 frontend —— router 保持纯"恒等翻译
+  层"(W/R/发号);将来 S3 multipart 等网关需要同款能力时,再把描述符编解码下沉为公共 crate 复用即可。
 
 ## 11. 待办
 

@@ -180,12 +180,25 @@ struct Fixture {
 
 impl Fixture {
     /// 起集群并建一个分区:`replica_nodes` 是放置的节点清单,其中**真实存在**的节点会建出本地副本;
-    /// `max_body_bytes` 为 frontend 的 body 上限;`cors_origins` 空 = 不挂 CORS 层。
+    /// `max_body_bytes` 为 frontend 的 body 上限;`cors_origins` 空 = 不挂 CORS 层;
+    /// 自动分片走 `FrontendConfig` 默认(开启,4 MiB 片)。
     async fn start(
         max_body_bytes: u64,
         replica_nodes: &[u64],
         cors_origins: Vec<String>,
     ) -> Fixture {
+        let cfg = FrontendConfig {
+            listen_addr: addr(free_port()),
+            max_body_bytes,
+            cors_allowed_origins: cors_origins,
+            ..Default::default()
+        };
+        Fixture::start_with_frontend(cfg, replica_nodes).await
+    }
+
+    /// [`Fixture::start`] 的完全自定配置版(自动分片等边界用例用):`listen_addr` 与
+    /// `router.master_addr` 由夹具接管(端口/GRPC 地址只有它知道),其余按传入值。
+    async fn start_with_frontend(cfg: FrontendConfig, replica_nodes: &[u64]) -> Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (master, grpc_addr) = solo_master(&tmp.path().join("master")).await;
 
@@ -221,20 +234,16 @@ impl Fixture {
 
         // ---- frontend(真端口 + 真 SDK)----
         let registry = antfs_metric::Registry::new();
-        let frontend_addr = addr(free_port());
-        let cfg = FrontendConfig {
-            listen_addr: frontend_addr.clone(),
-            max_body_bytes,
-            cors_allowed_origins: cors_origins,
-            router: RouterConfig {
-                master_addr: grpc_addr,
-                cluster_secret: SECRET.to_string(),
-                request_timeout_secs: 10,
-                id_segment_size: 4,
-                partition_refresh_secs: 30,
-                // 其余走默认值(含读路由的延迟感知)。
-                ..Default::default()
-            },
+        let mut cfg = cfg;
+        cfg.listen_addr = addr(free_port());
+        cfg.router = RouterConfig {
+            master_addr: grpc_addr,
+            cluster_secret: SECRET.to_string(),
+            request_timeout_secs: 10,
+            id_segment_size: 4,
+            partition_refresh_secs: 30,
+            // 其余走默认值(含读路由的延迟感知)。
+            ..Default::default()
         };
         cfg.validate().expect("frontend config");
         let state = AppState::from_config(&cfg, &registry)
@@ -243,6 +252,7 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)
             .await
             .expect("bind frontend");
+        let frontend_addr = cfg.listen_addr.clone();
         let router = build_router(state);
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
@@ -691,16 +701,22 @@ async fn bad_requests_are_rejected_with_400() {
     );
 }
 
-// ── 7:body 上限(413)──────────────────────────────────────────────────────────────────────
+// ── 7:body 上限(413;自动分片**关闭**时的契约)──────────────────────────────────────────────
 
-/// 超过 `frontend.max_body_bytes` 的 body → 413:
+/// 自动分片关闭时,超过 `frontend.max_body_bytes` 的 body → 413:
 /// ① 有 `Content-Length` 时在读 body **之前**就拒(裸 socket 只发头,判定与客户端是否继续发体无关);
-/// ② chunked(无 `Content-Length`)时边收边计数,超限即停。
+/// ② chunked(无 `Content-Length`)时边收边计数,超了即停。
 /// 同时验证**恰好等于上限**能正常上传(边界不加不减)。
+/// (开启时的上限语义见 §13:转自动分片;非 413 的行为有一致性钉住用例。)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn body_limit_is_enforced_with_413() {
     const LIMIT: u64 = 1 << 20;
-    let fx = Fixture::start(LIMIT, &[101, 102], Vec::new()).await;
+    let cfg = FrontendConfig {
+        max_body_bytes: LIMIT,
+        auto_chunk_enabled: false,
+        ..Default::default()
+    };
+    let fx = Fixture::start_with_frontend(cfg, &[101, 102]).await;
 
     // ① 声明长度超限:server 不读 body 就回 413。
     assert_eq!(
@@ -973,4 +989,284 @@ async fn silenced_replica_is_passed_through_with_retry_after() {
         (590..=600).contains(&retry),
         "剩余静默时长应≈600 秒并透传(`Retry-After`),实际 {retry}"
     );
+}
+
+// ── 13:服务端自动分片(POST /blobs 的 body 超过 max_body_bytes 时)───────────────────────────
+
+/// 夹具:小区间配置 —— max 256 KiB、片 96 KiB(`> max` 的 body 会自动分片,片数好算)。
+async fn auto_chunk_fixture() -> Fixture {
+    let cfg = FrontendConfig {
+        max_body_bytes: 256 * 1024,
+        auto_chunk_bytes: 96 * 1024,
+        ..Default::default()
+    };
+    Fixture::start_with_frontend(cfg, &[101, 102]).await
+}
+
+/// 大 body(300 KiB > 256 KiB)一次 POST 搞定:201 + `x-ambry-blob-size` 是**逻辑总量**(不是描述符
+/// 那几百字节);GET 逐字节一致;HEAD 报拼装标记 + 片数(96+96+96+12 = 4 片)。
+/// 同时钉住边界:**恰等于 max_body_bytes 的 body 仍是单 blob**(HEAD 无 stitched 标记),自动分片
+/// 不改变小对象语义。指标断言打在实际接入的 `Registry` 上(CLAUDE.md §6)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn big_post_is_auto_chunked_and_transparent() {
+    let fx = auto_chunk_fixture().await;
+    let data = pseudo_random(300 * 1024);
+
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("big post");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "超过 max_body_bytes 的 POST 必须 201"
+    );
+    assert_eq!(
+        header(&resp, "x-ambry-blob-size"),
+        "307200",
+        "size 必须是逻辑总量"
+    );
+    let blob_id = header(&resp, "x-ambry-blob-id");
+
+    assert_eq!(
+        fx.get_ok(&blob_id).await,
+        data,
+        "拼装后的 GET 必须逐字节一致"
+    );
+
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{blob_id}")))
+        .send()
+        .await
+        .expect("head auto-chunked");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(header(&resp, "x-ambry-blob-size"), "307200");
+    assert_eq!(header(&resp, "x-ambry-blob-stitched"), "true");
+    assert_eq!(
+        header(&resp, "x-ambry-blob-stitch-chunks"),
+        "4",
+        "96×3 + 12 = 4 片"
+    );
+
+    // 恰等于上限:单 blob,无拼装标记(小对象语义原样)。
+    let small = pseudo_random(256 * 1024);
+    let plain_id = fx.upload(&small).await;
+    assert_eq!(fx.get_ok(&plain_id).await, small);
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{plain_id}")))
+        .send()
+        .await
+        .expect("head plain");
+    assert!(
+        resp.headers().get("x-ambry-blob-stitched").is_none(),
+        "恰在上限内不得拼装"
+    );
+
+    let dumped = antfs_metric::gather(&fx.registry).expect("gather frontend registry");
+    assert!(
+        dumped.contains("frontend_upload_auto_chunk_total{outcome=\"ok\"} 1"),
+        "自动分片成功计数:\n{dumped}"
+    );
+    assert!(
+        dumped.contains("frontend_upload_auto_chunk_chunks_total 4"),
+        "片数计数:\n{dumped}"
+    );
+}
+
+/// TTL 照常生效:描述符与片同 TTL,HEAD `expired: true`、GET 404(与单 blob 的 TTL 行为对称);
+/// 无 `Content-Length`(chunked TE)的大 body 同样自动分片(边收边计数决定大小,不依赖声明长度)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_chunk_honors_ttl_and_chunked_upload_without_length() {
+    let fx = auto_chunk_fixture().await;
+
+    // TTL:1970 年的过期时刻 = 早已过期。
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .header("x-ambry-ttl-ms", "1000")
+        .body(pencil(300 * 1024))
+        .send()
+        .await
+        .expect("auto-chunk with ttl");
+    assert_eq!(resp.status().as_u16(), 201, "带 TTL 的自动分片上传必须 201");
+    let blob_id = header(&resp, "x-ambry-blob-id");
+    assert_eq!(fx.get(&blob_id).await.status().as_u16(), 404, "整体已过期");
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{blob_id}")))
+        .send()
+        .await
+        .expect("head expired");
+    assert_eq!(resp.status().as_u16(), 200, "过期对象的元数据仍可读");
+    assert_eq!(header(&resp, "x-ambry-blob-expired"), "true");
+    assert_eq!(
+        header(&resp, "x-ambry-blob-expiration-ms"),
+        "1000",
+        "描述符带 TTL:整个逻辑对象的一体过期可见"
+    );
+    // 已知取舍:过期的拼装对象嗅不出逻辑大小(数据面拒读已过期体),HEAD 退回报描述符自身的
+    // stat —— 这里只钉住"过期可见",不钉大小。
+
+    // chunked TE:裸 socket 发块,无 Content-Length;总长 > max → 照样自动分片。
+    let data = pseudo_random(300 * 1024);
+    let raw = chunked_upload_raw(&fx.frontend, &data).await;
+    assert!(
+        raw.starts_with("HTTP/1.1 201"),
+        "无声明长度的大 POST 必须 201,实际:\n{raw}"
+    );
+    let id = header_from_raw(&raw, "x-ambry-blob-id");
+    assert_eq!(id.len(), 16, "blobId 必须 16 hex");
+    assert_eq!(
+        fx.get_ok(&id).await,
+        data,
+        "chunked 上传也必须逐字节拼装一致"
+    );
+}
+
+/// 自动分片的总量上限(片数上限 4096 × 单片)在 `Content-Length` 预检处就 413,不读 body
+/// (助手只发头不发体,能在超时内拿到响应本身就是"预检先拒"的证明)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_chunk_total_limit_is_enforced_with_413() {
+    // 片 1 KiB → 总量上限 = 4096 KiB = 4 MiB(比 max_body 更大的另一道闸)。
+    let cfg = FrontendConfig {
+        max_body_bytes: 1024,
+        auto_chunk_bytes: 1024,
+        ..Default::default()
+    };
+    let fx = Fixture::start_with_frontend(cfg, &[101, 102]).await;
+    assert_eq!(
+        declared_length_status(&fx.frontend, 4096 * 1024 + 1).await,
+        413,
+        "超过 4096 片 × 单片的总量必须 413"
+    );
+}
+
+/// 分片途中写不进集群(副本对 `put` 全部请求静默)→ 503、计失败指标;解除静默后**同一客户端重试**
+/// 成功且数据一致(重试语义:全新 blobId,与失败轮互不相扰)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_chunk_put_failure_returns_503_and_retry_recovers() {
+    let fx = auto_chunk_fixture().await;
+
+    // 本分区两副本([101,102],W=2)都静默 put → 每一片都写不进多数派。
+    for node in [101u64, 102u64] {
+        let store = fx.store_addrs.get(&node).expect("store 已启动").clone();
+        let resp = fx
+            .http
+            .post(format!("http://{store}/admin/request-control"))
+            .json(&serde_json::json!({
+                "op": "put",
+                "partition_id": fx.pid,
+                "enable": true,
+                "ttl_secs": 600,
+            }))
+            .send()
+            .await
+            .expect("silence put request");
+        assert_eq!(resp.status().as_u16(), 200, "静默 put 必须被 store 接受");
+    }
+
+    let data = pseudo_random(300 * 1024);
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("big post under silence");
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "片写不进多数派 → 未达多数派类统一 503"
+    );
+
+    // 失败必须计入自动分片的失败指标(成功侧的用例不带 `outcome=\"ok\"`)。
+    let dumped = antfs_metric::gather(&fx.registry).expect("gather frontend registry");
+    assert!(
+        dumped.contains("frontend_upload_auto_chunk_total{outcome=\""),
+        "失败也必须计入该 counter:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("frontend_upload_auto_chunk_total{outcome=\"ok\"}"),
+        "此时不该有成功样本:\n{dumped}"
+    );
+
+    // 解除静默(静默是运维动作,不是故障):同一客户端重试拿到一套全新 blobId → 201 + 数据一致。
+    for node in [101u64, 102u64] {
+        let store = fx.store_addrs.get(&node).expect("store 已启动").clone();
+        let resp = fx
+            .http
+            .post(format!("http://{store}/admin/request-control"))
+            .json(&serde_json::json!({
+                "op": "put",
+                "partition_id": fx.pid,
+                "enable": false,
+            }))
+            .send()
+            .await
+            .expect("unsilence put request");
+        assert_eq!(resp.status().as_u16(), 200, "解除静默必须成功");
+    }
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("big post retry");
+    assert_eq!(resp.status().as_u16(), 201, "重试必须成功");
+    let blob_id = header(&resp, "x-ambry-blob-id");
+    assert_eq!(
+        fx.get_ok(&blob_id).await,
+        data,
+        "重试结果的 GET 必须逐字节一致"
+    );
+}
+
+/// 用 chunked TE(无 `Content-Length`)把整段数据经裸 socket 发给 `/blobs`,返回响应全文
+/// (`Connection: close`,响应体为空,读到 EOF 即完整)。
+async fn chunked_upload_raw(frontend_addr: &str, data: &[u8]) -> String {
+    let mut sock = tokio::net::TcpStream::connect(frontend_addr)
+        .await
+        .expect("connect frontend");
+    sock.write_all(
+        format!(
+            "POST /blobs HTTP/1.1\r\nHost: {frontend_addr}\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write request head");
+    for piece in data.chunks(64 * 1024) {
+        sock.write_all(format!("{:x}\r\n", piece.len()).as_bytes())
+            .await
+            .expect("write chunk header");
+        sock.write_all(piece).await.expect("write chunk body");
+        sock.write_all(b"\r\n").await.expect("write chunk tail");
+    }
+    sock.write_all(b"0\r\n\r\n")
+        .await
+        .expect("write final chunk");
+    let mut out = Vec::new();
+    sock.read_to_end(&mut out)
+        .await
+        .expect("read response to EOF");
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 从裸 socket 的响应全文里取一个头(小写匹配;给 chunked TE 用例用)。
+fn header_from_raw(raw: &str, name: &str) -> String {
+    for line in raw.split("\r\n") {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return v.trim().to_string();
+            }
+        }
+    }
+    panic!("响应缺少头 {name}:\n{raw}");
 }

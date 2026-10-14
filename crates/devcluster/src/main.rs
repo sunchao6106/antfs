@@ -410,14 +410,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn start_frontend(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
     let cfg = antfs_frontend::config::FrontendConfig {
         listen_addr: format!("{}:{}", args.host, args.frontend_port),
-        // dev 环境放宽(默认 2 MiB);与 store 侧同因、同值。
+        // dev 环境放宽(默认 4 MiB);与 store 侧同因、同值。自动分片走默认(开启,4 MiB 片)。
         max_body_bytes: 16 << 20,
-        cors_allowed_origins: Vec::new(),
         router: antfs_router::RouterConfig {
             master_addr: grpc_addr.to_string(),
             cluster_secret: SECRET.to_string(),
             ..Default::default()
         },
+        ..Default::default()
     };
     let registry = antfs_metric::Registry::new();
     let state = match antfs_frontend::server::AppState::from_config(&cfg, &registry).await {

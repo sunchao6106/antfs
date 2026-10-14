@@ -958,3 +958,21 @@
   - `used_bytes`/`lag_bytes` **不量化**(冷分区值恒定;`lag==0` 是墓碑闸门判据,不能模糊)。
 - **验证**:master 全量测试(含新增 `tests/heartbeat_delta.rs`:增量合并/显式摘除/摘要造假自愈/
   增量下行/重连全量下行)、store lib 测试(新增 `diff_report` 三例)、`cargo test --workspace` 全绿。
+
+## 步骤 36:frontend 服务端自动分片(S3 前置)(2026-10-14)
+
+- **契约**:`POST /blobs` 的 body(声明或实收)超过 `frontend.max_body_bytes` 时,服务端先整体
+  暂存校验,再按 `frontend.auto_chunk_bytes`(默认 4 MiB)切片逐片 `put_auto_with_ttl`,最后写
+  `/stitch` 同款描述符(与片同 TTL,整体一体过期)并返回其 blobId + 逻辑总量;`GET`/`HEAD` 走既有
+  透明拼装。默认开(`frontend.auto_chunk_enabled`),关闭恢复旧 413 契约(客户端手动 stitch)。
+  分层拍板:分片放 frontend 不放 router(描述符编解码/嗅探/拼装都在这层,router 保持恒等翻译层;
+  登记于 frontend.md §10)。总量上限 = 4096 片 × 单片(默认 16 GiB),body 上限分路由挂。
+- **持久性**(CLAUDE.md §3.3):先暂存后切片(断流/谎报长度一片不写就失败,不产生孤儿);中途
+  失败对已 ack 片写墓碑 best-effort 回收;重试拿全新 blobId,幂等。
+- **指标**:`frontend_upload_auto_chunk_total{outcome}` / `..._chunks_total` / `..._orphan_deletes_total`
+  (§9 表同步)。
+- **验证**:新增 4 个 REST 集成用例(分片往返逐字节一致/HEAD 拼装标记与片数、TTL+chunked-TE、
+  总量上限 413、全副本静默 put → 503 + 失败指标 + 解除后重试成功)+ 单测(片数数学、session 校验);
+  `cargo test --workspace` 全绿、clippy 零告警。已知取舍与缺口(删描述符留孤儿片、失败回收路径无
+  确定性集成测试)记录在 frontend.md §4/§5。
+

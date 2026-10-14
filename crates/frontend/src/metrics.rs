@@ -32,6 +32,13 @@ pub struct FrontendMetrics {
     pub upload_total: IntCounterVec,
     /// 上传写入的字节数(counter,只计成功)。
     pub upload_bytes: IntCounter,
+    /// 走服务端自动分片路径的上传请求数(`POST /blobs` 且 body > `max_body_bytes`),label `outcome`;
+    /// 是 `upload_total` 的子集(成功在 handler 记、失败在 `upload()` 的分片出口记,两处合起来为全集)。
+    pub upload_auto_chunk_total: IntCounterVec,
+    /// 服务端自动分片**成功**上传写入的数据片数(不含描述符;失败路径不计)。
+    pub upload_auto_chunk_chunks_total: IntCounter,
+    /// 自动分片中途失败后发起的孤儿片回收删除**尝试**数(best-effort,删除本身可能未成功)。
+    pub upload_auto_chunk_orphan_deletes_total: IntCounter,
     /// 下载请求数(`GET /blobs/{blobId}`),label `outcome`。
     pub download_total: IntCounterVec,
     /// 下载返回的字节数(counter,只计成功;拼装对象按描述符里各片长度求和)。
@@ -61,6 +68,22 @@ impl FrontendMetrics {
                 registry,
                 "frontend_upload_bytes_total",
                 "bytes uploaded (successful uploads)",
+            )?,
+            upload_auto_chunk_total: counter_vec(
+                registry,
+                "frontend_upload_auto_chunk_total",
+                "uploads served by server-side auto-chunking (body exceeds max_body_bytes) by outcome",
+                &["outcome"],
+            )?,
+            upload_auto_chunk_chunks_total: counter(
+                registry,
+                "frontend_upload_auto_chunk_chunks_total",
+                "data chunks written by successful server-side auto-chunked uploads",
+            )?,
+            upload_auto_chunk_orphan_deletes_total: counter(
+                registry,
+                "frontend_upload_auto_chunk_orphan_deletes_total",
+                "best-effort orphan chunk deletes issued after failed auto-chunked uploads",
             )?,
             download_total: counter_vec(
                 registry,

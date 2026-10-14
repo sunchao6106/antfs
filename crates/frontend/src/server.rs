@@ -9,6 +9,10 @@
 //!   (见 [`encode_descriptor`]),片本身是普通 blob,`GET` 读到描述符即逐片流式拼装;
 //! - **上传先落暂存文件再提交**:SDK 的流式写口是 `put_file(path)`,代价是一次额外落盘(与 store
 //!   数据面同一取舍),换来 frontend 内存不随对象大小涨(CLAUDE.md §5.3)。
+//!
+//! **服务端自动分片**(`POST /blobs` body > `max_body_bytes` 且开启 `auto_chunk_enabled`):先
+//! 暂存整包校验,再按 `auto_chunk_bytes` 切片逐片入库存,最后写拼装描述符并返回其 blobId ——
+//! `GET`/`HEAD` 走既有的描述符透明拼装路径,客户端无感知(见 [`upload`])。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -109,8 +113,9 @@ pub enum Error {
     #[error("{0}")]
     Invalid(String),
 
-    /// 请求体超过 `frontend.max_body_bytes`。
-    #[error("body {len} exceeds frontend.max_body_bytes {max}")]
+    /// 请求体超过该路径的 body 上限:未开自动分片时即 `frontend.max_body_bytes`,开启后为
+    /// 自动分片总量上限(片数上限 × 单片大小,见 [`auto_chunk_total_limit`])。
+    #[error("body {len} exceeds limit {max}")]
     TooLarge { len: u64, max: u64 },
 
     /// 对象在所有副本上都不存在(R=1 试遍全部副本仍 404)。
@@ -227,8 +232,12 @@ pub struct AppState {
     pub metrics: Arc<FrontendMetrics>,
     /// `/metrics` 用的注册表(与 [`AppState::metrics`] 接入的是同一个)。
     pub registry: antfs_metric::Registry,
-    /// 单请求 body 上限(字节)。
+    /// 单请求 body 上限(字节);开启自动分片后,"单 blob 路径"仍以它为界,超过者转分片。
     pub max_body_bytes: u64,
+    /// 服务端自动分片开关(body > `max_body_bytes` 时切片;关则 413)。
+    pub auto_chunk_enabled: bool,
+    /// 自动分片单片大小(字节;配置校验保证 1..=1 GiB)。
+    pub auto_chunk_bytes: u64,
     /// CORS 允许来源;空 = 不挂 CORS 层。
     pub cors_allowed_origins: Vec<String>,
 }
@@ -245,25 +254,44 @@ impl AppState {
             metrics: Arc::new(FrontendMetrics::new(registry)?),
             registry: registry.clone(),
             max_body_bytes: cfg.max_body_bytes,
+            auto_chunk_enabled: cfg.auto_chunk_enabled,
+            auto_chunk_bytes: cfg.auto_chunk_bytes,
             cors_allowed_origins: cfg.cors_allowed_origins.clone(),
         })
     }
 }
 
+/// 自动分片路径收下的总量上限 = 片数上限(`MAX_CHUNKS`)× 单片大小(更大者描述符装不下;
+/// `Content-Length` 预检与暂存计数两处各拦一道)。配置已把单片限在 ≤1 GiB,乘积无 u64 溢出(≤4 TiB)。
+fn auto_chunk_total_limit(auto_chunk_bytes: u64) -> u64 {
+    MAX_CHUNKS as u64 * auto_chunk_bytes
+}
+
 /// 建路由:`/blobs*` 与 `/stitch` 是对象接口,`/metrics` 是 Prometheus 抓取口(无鉴权,抓取惯例)。
 ///
-/// body 上限两层:router 级 [`DefaultBodyLimit`] 兜住 JSON 抽取器(如 `/stitch`),`/blobs` 的裸字节
-/// 体由 handler 自己边收边计数(见 [`stage_body`])。
+/// body 上限**分路由挂**:`/blobs` 开自动分片后上限放大到分片总量上限(裸字节体由 handler
+/// 边收边计数,`DefaultBodyLimit` 只是流式读的兜底);`/stitch` 的 JSON 体重持 `max_body_bytes`
+/// (无分片路径,放大它只是让恶意请求能白写更多信息)。
 pub fn build_router(state: AppState) -> Router {
+    let blobs_limit = if state.auto_chunk_enabled {
+        auto_chunk_total_limit(state.auto_chunk_bytes)
+    } else {
+        state.max_body_bytes
+    };
     let router = Router::new()
-        .route("/blobs", post(post_blob))
+        .route(
+            "/blobs",
+            post(post_blob).layer(DefaultBodyLimit::max(body_limit(blobs_limit))),
+        )
         .route(
             "/blobs/{blob_id}",
             get(get_blob).head(head_blob).delete(delete_blob),
         )
-        .route("/stitch", post(stitch))
+        .route(
+            "/stitch",
+            post(stitch).layer(DefaultBodyLimit::max(body_limit(state.max_body_bytes))),
+        )
         .route("/metrics", get(get_metrics))
-        .layer(DefaultBodyLimit::max(body_limit(state.max_body_bytes)))
         .with_state(state.clone());
 
     match cors_layer(&state.cors_allowed_origins) {
@@ -299,22 +327,34 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 ///
 /// 分片上传的**片就是普通 blob**(带 `x-ambry-session` 也不改变写入路径),片清单由客户端自己记
 /// —— frontend 无状态(D3)。可选头 `x-ambry-ttl-ms` 见 [`upload`]。
+/// body 超过 `max_body_bytes` 且开启自动分片时,切片+描述符路径见 [`auto_chunk_store`]。
 async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_UPLOAD);
     match upload(&st, req).await {
-        Ok((key, len)) => {
+        Ok(done) => {
             st.metrics
                 .upload_total
                 .with_label_values(&[OUTCOME_OK])
                 .inc();
-            st.metrics.upload_bytes.inc_by(len);
+            st.metrics.upload_bytes.inc_by(done.len);
+            if let Some(n) = done.auto_chunks {
+                // 失败侧在 `upload()` 的分片出口记;两处合成 `upload_auto_chunk_total` 的全集。
+                st.metrics
+                    .upload_auto_chunk_total
+                    .with_label_values(&[OUTCOME_OK])
+                    .inc();
+                st.metrics
+                    .upload_auto_chunk_chunks_total
+                    .inc_by(u64::from(n));
+            }
             // 每请求成功的细节走 debug:压测下 2 万次上传会在 INFO 打出 2 万行,日志本身成为热点。
             tracing::debug!(
-                blob_id = %hex::encode(key.as_bytes()),
-                size = len,
+                blob_id = %hex::encode(done.key.as_bytes()),
+                size = done.len,
+                auto_chunks = done.auto_chunks.unwrap_or(0),
                 "blob stored"
             );
-            created_response(key, len)
+            created_response(done.key, done.len)
         }
         Err(e) => {
             fail(&st.metrics, &st.metrics.upload_total, &[], &e);
@@ -324,26 +364,45 @@ async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
     }
 }
 
-/// 上传实现:边界校验 → 小 body 进内存([`INLINE_BODY_MAX`] 内)/大 body 落暂存流式 → 写入时定 TTL
-/// (`x-ambry-ttl-ms`,缺省不过期)→ **一次**多数派写。
-async fn upload(st: &AppState, req: Request) -> Result<(StoreKey, u64), Error> {
+/// 一次成功上传的落点(handler 据此记指标 + 回响应)。
+struct Uploaded {
+    key: StoreKey,
+    /// 回报给 `x-ambry-blob-size` 的字节数:单 blob = 数据体;自动分片 = 逻辑总量(各片之和,
+    /// 与 GET/HEAD 的拼装口径一致)。
+    len: u64,
+    /// 走了自动分片路径时的数据片数;单 blob 路径为 `None`。
+    auto_chunks: Option<u32>,
+}
+
+/// 上传实现:边界校验 → body ≤ `max_body_bytes` 时走单 blob 路径(小进内存 / 大落暂存流式,行为
+/// 与自动分片之前完全一致);超过(且开启自动分片)→ 暂存整包后切片多次上传(见 [`auto_chunk_store`])
+/// → 写入时定 TTL(`x-ambry-ttl-ms`,缺省不过期)。
+async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
     // 先解析 TTL 头:非法立即 400,不白读一遍 body。
     let expiration_ms = ttl_header(req.headers())?.unwrap_or(NO_EXPIRATION);
+    // session 只有走分片路径才会写进描述符;提前取值(之后 req 被 into_body 消费)。
+    let session = req.headers().get(HEADER_SESSION).cloned();
     let declared = content_length(&req);
+    // 该路径收得下的总量:关自动分片 = `max_body_bytes`(超 → 413,旧契约);开 = 分片总量上限。
+    let total_limit = if st.auto_chunk_enabled {
+        auto_chunk_total_limit(st.auto_chunk_bytes)
+    } else {
+        st.max_body_bytes
+    };
     if let Some(len) = declared {
-        if len > st.max_body_bytes {
+        if len > total_limit {
             return Err(Error::TooLarge {
                 len,
-                max: st.max_body_bytes,
+                max: total_limit,
             });
         }
     }
-    // 小 body 直接进内存(有界):见 `INLINE_BODY_MAX` —— 每个小对象都落一个暂存文件在 macOS 上
-    // 代价过高(实测 PUT p50 ~1ms → ~9ms)。大 body(或未声明长度)才落盘 + 流式,内存不随大小涨。
+    // 单 blob 路径的判据是"长度确知 ≤ max_body_bytes":开了自动分片后,声明长度可以落在
+    // (max_body_bytes, total_limit] 区间,不能再只按 INLINE 档分派(否则超限体被当单 blob 写)。
     //
     // TTL 随**同一次**写请求下发(`PUT ?expiration_ms=`),故不存在"对象已创建但没带 TTL"的中间态。
-    let (key, written) = match declared {
-        Some(len) if len <= INLINE_BODY_MAX => {
+    let result = match declared {
+        Some(len) if len <= INLINE_BODY_MAX && len <= st.max_body_bytes => {
             let bytes = axum::body::to_bytes(req.into_body(), INLINE_BODY_MAX as usize)
                 .await
                 .map_err(|_| Error::Invalid("body shorter than Content-Length".into()))?;
@@ -354,22 +413,170 @@ async fn upload(st: &AppState, req: Request) -> Result<(StoreKey, u64), Error> {
                     bytes.len()
                 )));
             }
-            let key = st.router.allocate_one().await?;
-            st.router.put_with_ttl(key, bytes, expiration_ms).await?;
-            (key, len)
+            let (key, _report) = st.router.put_auto_with_ttl(bytes, expiration_ms).await?;
+            Uploaded {
+                key,
+                len,
+                auto_chunks: None,
+            }
         }
         _ => {
+            // 大 body(或未声明长度):先**整体**落暂存并校验长度,再决定单 blob 写或分片。
+            // 先暂存后切片是刻意取舍(与单 blob 大对象同一哲学):① 客户端中途断流/谎报长度时,
+            // 在写任何一片进集群**之前**就失败,不产生孤儿;② 暂存复用既有的边收边计路径。
             let staging = TempFile::create();
             let written =
-                stage_body(req.into_body(), staging.path(), declared, st.max_body_bytes).await?;
-            let (key, _report) = st
-                .router
-                .put_file_with_ttl(staging.path(), expiration_ms)
-                .await?;
-            (key, written)
+                stage_body(req.into_body(), staging.path(), declared, total_limit).await?;
+            if written <= st.max_body_bytes {
+                let (key, _report) = st
+                    .router
+                    .put_file_with_ttl(staging.path(), expiration_ms)
+                    .await?;
+                Uploaded {
+                    key,
+                    len: written,
+                    auto_chunks: None,
+                }
+            } else {
+                // written > max_body_bytes:自动分片开启才可能到这(关闭时暂存上限即 max,已 413)。
+                let session = session_of(session)?;
+                let done = match auto_chunk_store(
+                    st,
+                    staging.path(),
+                    written,
+                    expiration_ms,
+                    session.as_deref(),
+                )
+                .await
+                {
+                    Ok(done) => done,
+                    Err(e) => {
+                        // 成功侧在 handler 记;失败在此记,两处合成该 counter 的全集。
+                        fail(&st.metrics, &st.metrics.upload_auto_chunk_total, &[], &e);
+                        return Err(e);
+                    }
+                };
+                done
+            }
         }
     };
-    Ok((key, written))
+    Ok(result)
+}
+
+/// 分片路径的 session 头口径(与 `/stitch` 一致):给了就必须能作 header 文本读出、长度 ≤ 65535
+/// (描述符的 u16 长度域)。单 blob 路径不看这个头(分片上传的片就是普通 blob)。
+fn session_of(raw: Option<HeaderValue>) -> Result<Option<String>, Error> {
+    let raw = match raw {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    let text = raw
+        .to_str()
+        .map_err(|_| Error::Invalid("x-ambry-session must be valid text".into()))?
+        .to_string();
+    if text.len() > u16::MAX as usize {
+        return Err(Error::Invalid(
+            "x-ambry-session must be at most 65535 bytes".into(),
+        ));
+    }
+    Ok(Some(text))
+}
+
+/// 把已暂存的大对象(> `max_body_bytes`)按 `auto_chunk_bytes` 切片**逐片**入库,最后写拼装描述符
+/// (同 [`stitch_inner`] 的描述符,`GET`/`HEAD` 用既有的透明拼装路径读回),返回描述符的 key 与总量。
+///
+/// 持久性口径(CLAUDE.md §3.3):
+/// - 每片与描述符都是**一次多数派写**(`put_auto_with_ttl`,内部发号 + 507 换分区重试);
+/// - 中途失败(某片或描述符没写进去)→ 对**已 ack** 的片逐个写墓碑尽力回收(见 [`cleanup_acked_chunks`]),
+///   回报调用方原错误;调用方重试安全 —— 重试拿到一套全新 blobId,与本轮不相扰,不产生可见的重复对象;
+/// - 内存 = 单片(一个驻留的读写缓冲,大小 = `auto_chunk_bytes`,不随对象大小涨)。
+async fn auto_chunk_store(
+    st: &AppState,
+    staged: &Path,
+    total: u64,
+    expiration_ms: i64,
+    session: Option<&str>,
+) -> Result<Uploaded, Error> {
+    let chunk_count = match u32::try_from(total.div_ceil(st.auto_chunk_bytes)) {
+        Ok(n) if n as usize <= MAX_CHUNKS => n,
+        // 暂存上限已保证 ≤ MAX_CHUNKS;真到这(将来改上限口径)也走 413,不静默写装不下的描述符。
+        _ => {
+            return Err(Error::TooLarge {
+                len: total,
+                max: auto_chunk_total_limit(st.auto_chunk_bytes),
+            })
+        }
+    };
+    // 复读暂存:文件按构造恰好有 total 字节(stage_body 校验过长度),读不满/读超 = 本地 IO 错误。
+    let mut file = tokio::fs::File::open(staged).await?;
+    // 单片读写缓冲:配置校验保证 auto_chunk_bytes ∈ [1, 1 GiB](任何测试/生产平台可分配)。
+    let chunk_usize = usize::try_from(st.auto_chunk_bytes)
+        .expect("auto_chunk_bytes is validated to at most 1 GiB");
+    let mut buf = vec![0u8; chunk_usize];
+    let mut chunks: Vec<DescriptorChunk> = Vec::with_capacity(chunk_count as usize);
+    let mut acked: Vec<StoreKey> = Vec::with_capacity(chunk_count as usize);
+    let mut remaining = total;
+    while remaining > 0 {
+        let want = remaining.min(st.auto_chunk_bytes);
+        let want_usize = usize::try_from(want).expect("want ≤ auto_chunk_bytes ≤ 1 GiB");
+        file.read_exact(&mut buf[..want_usize]).await?;
+        let (key, _report) = match st
+            .router
+            .put_auto_with_ttl(Bytes::copy_from_slice(&buf[..want_usize]), expiration_ms)
+            .await
+        {
+            Ok(ok) => ok,
+            Err(e) => {
+                let e = Error::Router(e);
+                cleanup_acked_chunks(st, &acked).await;
+                return Err(e);
+            }
+        };
+        chunks.push(DescriptorChunk {
+            id: key,
+            size: want,
+            expiration_ms,
+        });
+        acked.push(key);
+        remaining -= want;
+    }
+    // 描述符与片同 TTL:整个逻辑对象一起过期(与单 blob 的 TTL 读行为对称)。
+    let result = async {
+        let descriptor = encode_descriptor(session.unwrap_or("").as_bytes(), &chunks)?;
+        let (key, _report) = st
+            .router
+            .put_auto_with_ttl(Bytes::from(descriptor), expiration_ms)
+            .await?;
+        Ok::<StoreKey, Error>(key)
+    }
+    .await;
+    match result {
+        Ok(key) => Ok(Uploaded {
+            key,
+            len: total,
+            auto_chunks: Some(chunk_count),
+        }),
+        Err(e) => {
+            cleanup_acked_chunks(st, &acked).await;
+            Err(e)
+        }
+    }
+}
+
+/// 中途失败后的孤儿片回收:对**本轮已 commit**(多数派 ack)的片逐个写墓碑,尽力而为 ——
+/// 删失败只记日志并计入指标,不影响回报给调用方的原错误;孤儿是垃圾、不是数据损坏。片若已写到
+/// 少数副本,墓碑多数派 + 拉复制"墓碑恒胜"会把它们盖掉。
+async fn cleanup_acked_chunks(st: &AppState, acked: &[StoreKey]) {
+    for key in acked {
+        st.metrics.upload_auto_chunk_orphan_deletes_total.inc();
+        if let Err(e) = st.router.delete(key).await {
+            tracing::warn!(
+                blob_id = %hex::encode(key.as_bytes()),
+                error = %e,
+                "auto-chunk orphan cleanup failed"
+            );
+        }
+    }
 }
 
 /// `GET /blobs/{blobId}`:200 + 原始字节(R=1 首个成功)。全副本 404 → 404;不可达/未达多数派类 → 503。
@@ -431,6 +638,8 @@ async fn head_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<Strin
         // 故这里做与 `download` 同样的 MAGIC 嗅探,把 size 换成各片之和,并回 `x-ambry-blob-stitched`。
         // 代价可控:描述符按构造 ≤ DESCRIPTOR_MAX_BYTES,故**只有小对象**才需要多读一次数据体(≤1 MiB);
         // size 更大者不可能是描述符,直接按原 size 回(不读数据体,保持 HEAD 的语义)。
+        // 已删/已过期的拼装对象嗅不出逻辑大小(数据面拒读已过期体,下面 `get` 的失败被静默忽略)
+        // —— 退回描述符自身的 stat 是已知取舍;过期的对象本就不再是"取内容"的语义。
         let mut stitched_chunks = None;
         if !meta.deleted && !meta.expired && meta.size <= DESCRIPTOR_MAX_BYTES {
             if let Ok(body) = st.router.get(&key).await {
@@ -1185,5 +1394,43 @@ mod tests {
             cors_layer(&["https://a.example".into()]).is_some(),
             "显式来源才挂"
         );
+    }
+
+    /// 自动分片的数学口径:片数向上取整;总量上限 = 片数上限 × 单片;两者都无溢出。
+    #[test]
+    fn auto_chunk_math() {
+        let chunk = 4 * 1024 * 1024;
+        assert_eq!(1u64.div_ceil(chunk), 1);
+        assert_eq!(u64::from(chunk).div_ceil(chunk), 1);
+        assert_eq!(
+            (u64::from(chunk) + 1).div_ceil(chunk),
+            2,
+            "300 KiB / 96 KiB 类边界:恰整除不加片"
+        );
+        assert_eq!(
+            auto_chunk_total_limit(chunk),
+            MAX_CHUNKS as u64 * chunk,
+            "默认片大小下总量上限 = 16 GiB(4096 × 4 MiB)"
+        );
+        // 配置上限内的单片,乘积必须在 u64 内(校验层防溢出的回归护栏)。
+        assert!(auto_chunk_total_limit(crate::config::AUTO_CHUNK_MAX_ALLOWED_BYTES) < u64::MAX);
+    }
+
+    /// 分片路径的 session 头:缺省/正常通过;非文本、超 65535 都必须 400(且不往集群写任何片)。
+    #[test]
+    fn session_validation_for_auto_chunk() {
+        assert_eq!(session_of(None).unwrap(), None);
+        assert_eq!(
+            session_of(HeaderValue::from_str("sess-abc").ok()).unwrap(),
+            Some("sess-abc".to_string())
+        );
+
+        let err =
+            session_of(HeaderValue::from_bytes(&[0xff, 0xfe]).ok()).expect_err("非文本必须拒");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+        let long = "x".repeat(u16::MAX as usize + 1);
+        let err = session_of(HeaderValue::from_str(&long).ok()).expect_err("超长必须拒");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 }
