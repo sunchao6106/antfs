@@ -1084,3 +1084,20 @@
   超限 400 且无对象落库 ×2)+ multipart 5 用例(新增 1:create 带 meta → part → complete → GET 回吐)
   全绿;metastore 单测 32 全绿。s3.md 操作映射补「对象元数据」段。
 - 归档:`openspec/changes/s3-object-metadata/`(proposal/design/specs/tasks 全套)。
+
+## 步骤 44:Phase 2 A1 —— colima(ext4)分层基线压测 + devcluster 容量参数(2026-10-14)
+
+- **动机**:Phase 2 的第一个动作是把"优化"钉在数字上(无基线的优化都是玄学)。
+  四层口径:L1 引擎直压 / L2 router 直连(W=2/3)/ L3 frontend REST / 大对象 auto-chunk。
+- **结果(colima aarch64 4C/8G,VM 原生 ext4,详见 `benchmark/BASELINE.md`)**:
+  4 KiB:引擎层写 14 万 ops/s(548 MB/s)、热读 105 万 ops/s;router e2e 写 2.2 万 ops/s
+  (p50 1.33 ms);frontend REST 写 1.24 万 ops/s(p50 2.45 ms,err 0.005%);大对象
+  5 MiB auto-chunk 31 ops/s / 153 MB/s(2 片+描述符,verify 全对)。
+- **过程发现(入档,防踩坑)**:devcluster 每分区默认 64 MiB 是刻意小值 —— 5 MiB × n 场景
+  ≈120 MiB 后打穿,`store_full×2 → quorum 0/2 → 大面积 503`,表象"全挂"实为容量红线按设计
+  降级。为此给 devcluster 加 `--partition-capacity-bytes`(默认 64 MiB 不变,TOML
+  `partition_capacity_bytes` 同名),大对象按 4 GiB/分区跑通。**前端 503≠意外:先查容量口径。**
+- **顺修**:`vm-cargo.sh` 硬编码旧机器路径 → 改为随脚本目录解析(colima 以同路径 virtiofs 挂载);
+  VM 侧缺 protoc 已补装。
+- **后续可打的靶(A 组)**:1 MiB p99 20 ms / 64 KiB max 236 ms 的段滚转+fsync 台阶;frontend
+  对 router 的 ~45% 吞吐折损(HTTP 翻译+并发协调);冷读口径未测。

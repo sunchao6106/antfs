@@ -38,6 +38,11 @@ host = "127.0.0.1"
 # 本地盘比较满时把它提到 0.95;想复现"盘将满 → 分区转 RO"就调小(例如 0.5)。
 disk_near_full_ratio = 0.8
 
+# 每分区容量字节数(master 放置口径 + store 本地引擎同值)。
+# 默认 64 MiB 是**刻意小**:本地很快写满 → 便于验证「写满 507 / 转 RO」路径。
+# 压大对象吞吐、或想把数据在本地集群里攒久一点,请调大(例:4 GiB = 4294967296)。
+# partition_capacity_bytes = 4294967296
+
 # 磁盘预留空间比例:逻辑承诺上限 = disk_capacity × (1 − ratio)。
 # 预留覆盖 index/filter/tmp/FS 元数据/compaction 临时空间。默认 5%。
 # disk_reserved_ratio = 0.05

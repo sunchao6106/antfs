@@ -40,6 +40,11 @@ pub struct DevClusterConfig {
     pub disk_near_full_ratio: f64,
     /// store 是否开启主动盘探测(`disk_health_enabled`;开启后心跳带 HEALTHY/... 健康值)。
     pub disk_health: bool,
+    /// 每分区容量上限(字节;master 放置口径 + store 本地引擎同值)。
+    ///
+    /// 默认 64 MiB 是**刻意小**:本地很快写满 → 便于验证「写满 507 / 转只读」路径。
+    /// 压大对象吞吐或长时间积数据时调大(例:`--partition-capacity-bytes 4294967296`)。
+    pub partition_capacity_bytes: u64,
     /// frontend REST 端口。
     pub frontend_port: u16,
     /// S3 gateway 端口 (default 7500)。仅当 [`s3_metastore_url`](Self::s3_metastore_url) 设置时使用。
@@ -77,6 +82,7 @@ impl Default for DevClusterConfig {
             store_count: 3,
             disk_near_full_ratio: 0.8,
             disk_health: false,
+            partition_capacity_bytes: 64 << 20,
             frontend_port: 7400,
             s3_port: 7500,
             s3_metastore_url: None,

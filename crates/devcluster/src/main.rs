@@ -65,6 +65,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<(DevClusterConfig, Option<
             "--admin-port" => a.admin_port = num(flag, val()?)?,
             "--store-count" => a.store_count = num(flag, val()?)?,
             "--disk-near-full-ratio" => a.disk_near_full_ratio = num(flag, val()?)?,
+            "--partition-capacity-bytes" => a.partition_capacity_bytes = num(flag, val()?)?,
             "--disk-health" => a.disk_health = true,
             "--frontend-port" => a.frontend_port = num(flag, val()?)?,
             "--s3-port" => a.s3_port = num(flag, val()?)?,
@@ -113,6 +114,8 @@ fn print_help() {
          --store-count N        store 节点数 (default 3;≥4 才能验证 RF=3 下的 move/均衡与删源)\n\
          --disk-near-full-ratio F  master 盘将满阈值 (default 0.8;口径是宿主机整盘,调小可在本地复现\n\
                                 「分区转 RO」;本地盘偏满以致建不出分区时提到 0.95)\n\
+         --partition-capacity-bytes B  每分区容量字节数 (default 64MiB,刻意小:本地易写满,\n\
+                                便于验证写满 507 / 转 RO;压大对象吞吐或长期积数据请调大)\n\
          --disk-health          开启 store 主动盘探测(心跳带健康值,用于验证健康回填与避让)\n\
          --frontend-port P      frontend REST 端口 (default 7400)\n\
          --host ADDR            对外服务(master gRPC / admin / frontend)的监听 host\n\
@@ -169,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         initial_members: vec![1],
         cluster_secret: SECRET.to_string(),
         heartbeat_timeout_secs: 15,
-        partition_capacity_bytes: 64 << 20,
+        partition_capacity_bytes: args.partition_capacity_bytes,
         segment_capacity_bytes: 8 << 20,
         disk_near_full_ratio: args.disk_near_full_ratio,
         auto_grow_enabled: false,
@@ -206,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             node_id: *node_id,
             data_dirs: vec![data_dir.to_string_lossy().into_owned().into()],
             http_addr: http_addr.clone(),
-            partition_capacity_bytes: 64 << 20,
+            partition_capacity_bytes: args.partition_capacity_bytes,
             master_addr: grpc_addr.clone(),
             cluster_secret: SECRET.to_string(),
             heartbeat_interval_secs: 1,

@@ -4,7 +4,8 @@
 # - cargo target 放 VM 原生 ext4(避免 virtiofs 慢/O_DIRECT 问题)
 set -euo pipefail
 
-PROJECT_DIR="/Users/sunchao/source_code/antfs"
+# 脚本随仓库走(勿硬编码机器路径:colima 以同路径 virtiofs 挂载宿主仓库)。
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VM_TARGET_DIR="/var/tmp/antfs-target"
 
 colima ssh -- sh -c "
