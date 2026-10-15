@@ -97,7 +97,7 @@
 | frontend | HTTP REST 对象接口层(`/blobs` 读写/删/TTL/分片拼装 + `/metrics`);内嵌同一个 router SDK;对标 Ambry `ambry-frontend` | ✅ 已实现 |
 | admin | admin web:运维操作 + 控制面 dashboard(拓扑/节点/盘/分区/指标) | ✅ 已实现 |
 | s3 | S3 兼容网关:PutObject / GetObject / DeleteObject / HeadObject(含对象元数据:`Content-Type` + `x-amz-meta-*`)、multipart 上传、ListObjectsV2、桶管理、AWS SigV4 鉴权;网关无状态(元数据外接 PostgreSQL / MySQL);与 frontend 同层 | ✅ 已实现 |
-| S3 版本控制 / 多租户 ACL / 配额 | 网关层增强(与 frontend 同层) | 📋 规划中 |
+| S3 多租户 ACL(桶级配额已上线) | 网关层增强(与 frontend 同层) | 📋 规划中 |
 
 > 命名:`blob` = 单机 blob 存储引擎;`store` = 数据节点(store server)。
 
@@ -242,7 +242,7 @@ docker run --rm ghcr.io/sunchao6106/antfs:latest --run-bench router --bench-ops 
 - [x] S3 兼容网关(对象 / multipart / SigV4 / 桶;MetaStore 外接 PostgreSQL / MySQL)
 - [x] 完成 Ambry 忠实翻译、锁定正确性(阶段一收官 —— v0.0.4;裁决归档于 `openspec/changes/`,PG 集成测试已进 CI 门)
 - [ ] 性能 / 并发 / 存储密度优化(第二阶段)
-- [ ] S3 版本控制、多租户 ACL 与配额
+- [ ] S3 多租户 ACL(桶级配额已上线;版本控制、删除复活、虚拟主机与计费永久不做,见 docs/design/s3.md 支持矩阵)
 
 ## 参与贡献
 
