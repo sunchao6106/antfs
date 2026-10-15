@@ -162,6 +162,21 @@ impl Validate for MasterConfig {
             self.partition_capacity_bytes,
             1,
         )?;
+        // 跨字段守卫:段容量 ≥ 分区默认容量时,写满阈值 `容量 − 段容量`(饱和减法)落到 0,
+        // 首个 reconcile 拍就会把每个**空**分区自动翻 RO。这类错配必须启动即拒,不能静默退化
+        // (frontend 集成夹具 503 偶发的根因,见 DEVLOG 步骤 48)。
+        if self.segment_capacity_bytes >= self.partition_capacity_bytes {
+            return Err(antfs_config::ConfigError::invalid(
+                "master.segment_capacity_bytes",
+                format!(
+                    "value {} must be less than master.partition_capacity_bytes {} — \
+                     otherwise the partition-full threshold (capacity − segment_capacity) \
+                     saturates to zero and the reconciler flips every empty partition \
+                     read-only on its first tick",
+                    self.segment_capacity_bytes, self.partition_capacity_bytes
+                ),
+            ));
+        }
         if !(self.disk_near_full_ratio > 0.0 && self.disk_near_full_ratio <= 1.0) {
             return Err(antfs_config::ConfigError::invalid(
                 "master.disk_near_full_ratio",
@@ -266,6 +281,19 @@ impl Validate for MasterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_capacity_must_be_below_partition_capacity() {
+        let c = MasterConfig::default();
+        assert!(c.validate().is_ok(), "默认值合法(4 GiB < 100 GiB)");
+        let mut bad = c;
+        bad.segment_capacity_bytes = bad.partition_capacity_bytes;
+        assert!(bad.validate().is_err(), "相等即拒(阈值饱和为 0)");
+        bad.segment_capacity_bytes = bad.partition_capacity_bytes + 1;
+        assert!(bad.validate().is_err(), "超过更拒");
+        bad.segment_capacity_bytes = bad.partition_capacity_bytes - 1;
+        assert!(bad.validate().is_ok(), "恰小于容量:合法");
+    }
 
     /// 本批(盘故障处置 D4/D5/D6)新增配置项的**默认值闸门**:改任何一个都必须显式改本测试。
     ///

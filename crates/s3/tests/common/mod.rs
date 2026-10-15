@@ -80,6 +80,8 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         initial_members: vec![1],
         cluster_secret: SECRET.to_string(),
         partition_capacity_bytes: 64 << 20,
+        // 与 store 段一致(段 ≥ 容量会被守卫拒启动;503 偶发根因,见 DEVLOG 步骤 48)
+        segment_capacity_bytes: 8 << 20,
         id_alloc_segment_size: 4,
         id_alloc_raft_batch_multiple: 2,
         reconcile_startup_grace_secs: 0,

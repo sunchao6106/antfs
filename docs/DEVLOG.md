@@ -1177,4 +1177,26 @@
   `put_part`(PG/MySQL)先 SELECT 被替换行 blob_id 再 UPSERT 返回之,handler 同请求墓碑
   (de5f123 起如此;`put_part_overwrite` 单测双份,净库重跑 2 passed)。误判成因:只扫
   ON CONFLICT 单行,未读前置 SELECT 与返回值。真留观:并发同 part 重传的 SELECT→UPSERT
-  非原子可孤儿化中间 blob(顺次重传无碍;修法 PG CTE 单语句化,独立 change)。 
+  非原子可孤儿化中间 blob(顺次重传无碍;修法 PG CTE 单语句化,独立 change)。
+
+## 步骤 48:CI「Build & Test (ubuntu)」反复偶发 503 —— 根因定位与根治(2026-10-15)
+
+- **现象**:ubuntu Build&Test 偶发红(`delete_is_irreversible` 首上传 503);macOS 同码绿、CI 重跑绿。
+- **普查**(50 次 run):失败=三类独立偶发 —— 首 PUT 503(本轮处理)/ disk_pool 判活有界等待
+  (留观)/ blob 压缩清理断言(留观);另 3 次为已知 S3 断言与 clippy 历史问题。
+- **复现**:本地 24 份并行 rest 二进制(每份 17 套夹具 × 4 线程)复刻 4 vCPU 饱和 → 17/24、24/24
+  挂;错误体统一 21 字节 `no writable partition`。
+- **根因链**(四探针实锤日志序列):master 状态机里测试分区被 reconcile 的 **D4 分区级写满策略**
+  自动翻 RO(只置不回)→ `list_writable` 空列表 → router `sync_segments` 裸 `NoWritablePartition`
+  → 503。触发是纯算术:夹具 master `partition_capacity_bytes=64MiB` **漏配**
+  `segment_capacity_count` → 4 GiB 默认段容量 ≥ 分区容量 → 阈值 `cap.saturating_sub(seg)` 饱和
+  成 0 → `used >= 0` 恒真 → 首个 reconcile 拍就把空分区翻 RO(单测明文钉死的语义:设计如此)。
+  快测试赶在 tick 落地前跑完;慢机撞上即红。devcluster 配了该键;frontend/s3/router-e2e/
+  cluster_join 四处夹具漏配(cluster_join 此前靠 60s 慢 reconcile 侥幸)。
+- **修复**:① 四夹具补 `segment_capacity_bytes`(与各自 store 段一致);② `MasterConfig::validate()`
+  新增跨字段守卫 —— 段容量 ≥ 分区容量**启动即拒**(防饱和成 0 的静默全分区秒 RO),单测 + cluster.md
+  配置行同步(§7);③ rest.rs `upload` 助手断言携带响应体(下跳偶发自诊断,错误映射直接点名)。
+- **回归证据**:同强度压测 48 份(≈816 套夹具)**0 挂**(修复前 17/24、24/24 挂);workspace 68
+  测试目标全绿;fmt/clippy 干净。
+- **留观**:disk_pool 判活 10s 等待边界、blob 压缩清理断言(各一次偶发,低频独立);生产部署侧
+  此后同类错配从「神秘分区秒 RO」变成「起不来 + 人话报错」。 

@@ -63,6 +63,8 @@ async fn store_server_joins_master_and_serves_directed_replica() {
         cluster_secret: SECRET.to_string(),
         heartbeat_timeout_secs: 60,
         partition_capacity_bytes: 4 << 20,
+        // 与 small_store_config 的段一致(段 ≥ 容量会被守卫拒启动;见 DEVLOG 步骤 48)
+        segment_capacity_bytes: 1 << 20,
         disk_near_full_ratio: 0.95,
         auto_grow_enabled: false,
         auto_grow_min_writable: 4,

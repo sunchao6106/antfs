@@ -387,7 +387,7 @@ message MasterDirective {
 | `master.disk_evac_min_bad_secs` | u64 | 300 | ≥1 | **持续证据门槛**:某盘为 `UNAVAILABLE` 需**持续**这么久才允许撤离它上面的副本。为什么单轮故障枚举不够 —— 一次抖动就搬 GB 级数据,代价不对称(判坏 3 轮/30s,撤离默认 300s)。**健康值一变就重置计时**,故反复跳动的盘永远攒不满 |
 | `master.disk_evac_max_in_flight` | u64 | 1 | ≥1 | **在途撤离预算**:同时在途的撤离分区数上限。在途 = "已为它开过撤离,且坏盘上那份副本还在硬放置里"。撤离是真搬 GB 数据,风格对齐 `balance_max_in_flight = 1` |
 | `master.partition_capacity_bytes` | u64 | 100 GiB | ≥1 | 分区容量上界;选盘时盘可用容量须 ≥ 它(M2,§7.3) |
-| `master.segment_capacity_bytes` | u64 | 4 GiB | ≥1 | 段容量上界。**分区级写满阈值**用它留出一个段的余量:分区已用 ≥ `容量 − 段容量` → reconciler 自动转 RO(见 `master_partitions_full_ro_total`) |
+| `master.segment_capacity_bytes` | u64 | 4 GiB | ≥1,且必须 < `master.partition_capacity_bytes`(违反拒绝启动:阈值 `容量 − 段容量` 是饱和减法,段 ≥ 容量时落 0,首拍就把空分区全翻 RO) | 段容量上界。**分区级写满阈值**用它留出一个段的余量:分区已用 ≥ `容量 − 段容量` → reconciler 自动转 RO(见 `master_partitions_full_ro_total`) |
 | `master.disk_reserved_ratio` | f64 | 0.05 | [0.0,1.0) | 磁盘预留空间比例:可用容量上限 `usable = disk_capacity × (1 − ratio)`。预留覆盖 index/filter/tmp/FS 元数据/compaction 临时空间;逻辑承诺检查和物理空间检查均用 `usable` |
 | `master.adjusted_free_timeout_secs` | u64 | 120 | ≥1 | `adjusted_free` 单调递减守卫超时:心跳 `free_bytes > adjusted_free` 且距上次心跳不超过此值则不覆盖(防滞后心跳回滚建分区扣减);超时后接受心跳值 |
 | `master.disk_near_full_ratio` | f64 | 0.8 | (0,1] | 盘用量超此比例:① 不再放新分区/新副本(选盘跳过);② 其上 RW 分区被 reconciler 自动转 RO(**只置不回**,恢复靠运维)(本项目默认 0.8,较 Ambry ≈95% 更保守) |

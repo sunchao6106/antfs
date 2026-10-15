@@ -48,6 +48,8 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         initial_members: vec![1],
         cluster_secret: SECRET.to_string(),
         partition_capacity_bytes: 64 << 20,
+        // 与 store 段一致(段 ≥ 容量会让守卫拒启动;503 偶发根因,见 DEVLOG 步骤 48)
+        segment_capacity_bytes: 8 << 20,
         id_alloc_segment_size: 4,
         id_alloc_raft_batch_multiple: 2,
         // 测试不要失败驱动的再复制(会引入噪声指令),关掉选主宽限。
@@ -300,7 +302,13 @@ impl Fixture {
             .send()
             .await
             .expect("upload request");
-        assert_eq!(resp.status().as_u16(), 201, "上传必须返回 201");
+        let status = resp.status().as_u16();
+        if status != 201 {
+            // 失败响应体携带 RouterError 的 Display(错误映射表的唯一文本出口)——
+            // 偶发失败时断言直接点名错误类,不再需要事后猜。
+            let body = resp.text().await.unwrap_or_default();
+            panic!("上传必须返回 201(实际 {status}),body: {body}");
+        }
         let blob_id = header(&resp, "x-antfs-blob-id");
         assert_eq!(
             header(&resp, "location"),
