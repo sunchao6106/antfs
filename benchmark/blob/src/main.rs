@@ -28,6 +28,8 @@ struct Args {
     flush_interval_ms: u64,
     sync_seal_flush: bool,
     evict_before_read: bool,
+    total_mib: Option<u64>,
+    reopen: bool,
 }
 
 impl Default for Args {
@@ -47,6 +49,8 @@ impl Default for Args {
             flush_interval_ms: 0,
             sync_seal_flush: false,
             evict_before_read: false,
+            total_mib: None,
+            reopen: false,
         }
     }
 }
@@ -72,6 +76,8 @@ fn parse_args() -> Args {
             }
             "--sync-seal-flush" => a.sync_seal_flush = true,
             "--evict-before-read" => a.evict_before_read = true,
+            "--total-mib" => a.total_mib = Some(val().parse::<u64>().expect("total-mib")),
+            "--reopen" => a.reopen = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -98,6 +104,8 @@ fn print_help() {
          --index-max N     活跃索引封存阈值 (default 100000)\n\
          --segment-mib M   单段大小 MiB (default 64)\n\
          --dir PATH        数据目录 (default 临时目录,跑完删除)\n\
+         --total-mib M     显式覆盖容量口径 MiB (--reopen 对齐建库参数用)\n\
+         --reopen          重开既有库(BlobStore::open;配 --ops 0 做纯读复测)\n\
          --flush-interval-ms N  周期 fsync 线程间隔 (default 0 = 关)。store 生产路径有 flush worker\n\
                             周期清脏页;裸引擎压不带上它会把段的 fsync 尾部整个甩到滚转点\n\
                             (对齐生产形态请给 1000~5000)\n\
@@ -228,7 +236,13 @@ fn run_get(store: &Arc<BlobStore>, args: &Args) -> Summary {
             .enumerate()
             .map(|(i, &(lo, hi))| {
                 let store = Arc::clone(store);
-                let total_keys = args.ops;
+                // 只读复测(--ops 0,重开既有库测冷/暖读):PUT 键空间未知,
+                // 调用方用 --read-ops 对齐上轮 PUT 数。
+                let total_keys = if args.ops == 0 {
+                    args.read_ops.max(1)
+                } else {
+                    args.ops
+                };
                 scope.spawn(move || {
                     let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (i as u64).wrapping_add(1);
                     let mut lats = Vec::with_capacity((hi - lo) as usize);
@@ -301,7 +315,10 @@ fn main() {
     let record = args.value_size as u64 + 64;
     let segment = args.segment_bytes.max(record + 1024 * 1024);
     let needed = (args.ops.saturating_mul(record)).saturating_mul(5) / 4;
-    let total = needed.div_ceil(segment).max(1) * segment;
+    let total = args
+        .total_mib
+        .map(|m| m * 1024 * 1024)
+        .unwrap_or_else(|| needed.div_ceil(segment).max(1) * segment);
 
     let (dir, temp) = match &args.dir {
         Some(p) => (p.clone(), false),
@@ -328,7 +345,10 @@ fn main() {
         dir.display(),
     );
 
-    let store = Arc::new(if args.sync_seal_flush {
+    let store = Arc::new(if args.reopen {
+        BlobStore::open(&dir, total, segment, args.index_max)
+            .expect("open existing store (保持建库时的 --segment-mib/--index-max/--total-mib 一致)")
+    } else if args.sync_seal_flush {
         let registry = antfs_metric::Registry::new();
         let metrics = antfs_blob::StoreMetrics::new(&registry).expect("register store metrics");
         let config = antfs_blob::StoreConfig {

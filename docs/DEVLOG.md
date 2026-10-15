@@ -1199,4 +1199,21 @@
 - **回归证据**:同强度压测 48 份(≈816 套夹具)**0 挂**(修复前 17/24、24/24 挂);workspace 68
   测试目标全绿;fmt/clippy 干净。
 - **留观**:disk_pool 判活 10s 等待边界、blob 压缩清理断言(各一次偶发,低频独立);生产部署侧
-  此后同类错配从「神秘分区秒 RO」变成「起不来 + 人话报错」。 
+  此后同类错配从「神秘分区秒 RO」变成「起不来 + 人话报错」。
+
+## 步骤 49:真机复验三项(原生 macOS 真铁;BASELINE「真机复验」段落落地)(2026-10-15)
+
+- **① 4 GiB 滚转判读反转**:colima 的~1.2 s 滚转停顿**不是虚影盘毛刺**——原生真铁四模式
+  max 一致 1.1-1.6 s = 多 GB 脏积压单次 fsync 的真实代价;VM 遮的只是模式差。裸 A/B 铁证:
+  异步 p99 4.1 ms vs 同步 210 ms(~50×)——发版 defer_seal_flush 修复成立;另发现 flush worker
+  在 GB/s 写入下的 p99 污染(APFS 限流耦合),列 P2 留观(bounded dirty window)。
+- **② frontend 折损**:colima 的 45% 在原生缩到 **12-23%**(中并发)——「VM 单进程挤核」失真
+  证实。连扫期间 router 直连的 err 窗口(与 auto-grow/bootstrap/容量转 RO 共窗、单发即愈、
+  store 无 503 记录)归因为引导变更窗「首写快失败」族(与步骤 48 同根),提示:客户端上线
+  窗需 5xx 重试语义。
+- **③ 掉电冷读**:macOS 无 root `purge` 不可达;「垃圾写清缓存」方法**实测作废**(写回≠驱逐,
+  记入 BASELINE 防重蹈);`--reopen` 重启窗读代价极小(p99 118→388 µs)。真掉电口径留 Linux 裸机。
+- **工具**:`antfs-bench-blob` 补 `--reopen` / `--total-mib` / `--ops 0`(纯读)——冷/重启复测
+  常备口径;`docker`/VM 口径的既有结论保持引用。
+- 本机真铁锚(供后引):engine 1 MiB 裸写 2.9 GB/s、64 KiB 28.4k ops/s、暖读 10-24 GB/s、
+  dd 顺序写 7.4 GB/s;frontend 稳态 12.6-14.5k ops/s concurrent、router 直连 14-15.6k。 
