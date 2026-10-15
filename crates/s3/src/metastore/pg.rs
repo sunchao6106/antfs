@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use antfs_blob::StoreKey;
 
@@ -372,21 +372,28 @@ impl MetaStore for PgMetaStore {
     }
 
     async fn put_part(&self, upload_id: &str, part: PartMeta) -> Result<Option<BlobId>> {
+        let mut tx = self.pool.begin().await?;
+
+        // 会话行锁:与会话生命周期操作(abort/complete)全序 —— 不会"先验后插队"
+        // (否则 part 行会落在 abort/complete 的 DELETE 之后,成为无人回收的孤儿行)。
         let exists: Option<(i32,)> =
-            sqlx::query_as("SELECT 1 FROM multipart_uploads WHERE upload_id = $1")
+            sqlx::query_as("SELECT 1 FROM multipart_uploads WHERE upload_id = $1 FOR UPDATE")
                 .bind(upload_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         if exists.is_none() {
             return Err(S3Error::NoSuchUpload);
         }
 
+        // part 行锁读(锁读 = latest committed,且阻到在途持有者提交):并发重传同一 part 时,
+        // 后到者拿到的必须是**前驱提交后的**行,否则返回的 old 是过时快照——被换下的中间
+        // blob 无人删、无墓碑,GC 永不收(重传孤儿泄漏)。
         let old: Option<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT blob_id FROM multipart_parts WHERE upload_id = $1 AND part_number = $2",
+            "SELECT blob_id FROM multipart_parts WHERE upload_id = $1 AND part_number = $2 FOR UPDATE",
         )
         .bind(upload_id)
         .bind(part.part_number)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         sqlx::query(
@@ -400,8 +407,10 @@ impl MetaStore for PgMetaStore {
         .bind(part.blob_id.as_bytes().as_slice())
         .bind(part.size as i64)
         .bind(&part.etag)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(old.map(|(b,)| blob_id_from_bytes(&b)))
     }
@@ -411,11 +420,15 @@ impl MetaStore for PgMetaStore {
         upload_id: &str,
         parts: &[CompletePart],
     ) -> Result<CompleteMultipartResult> {
+        let mut tx = self.pool.begin().await?;
+
+        // 会话行锁:与 put_part / abort 全序( 会话所有权不变量;锁内快照即终版)。
         let upload: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT bucket, key, content_type, user_meta FROM multipart_uploads WHERE upload_id = $1",
+            "SELECT bucket, key, content_type, user_meta FROM multipart_uploads
+             WHERE upload_id = $1 FOR UPDATE",
         )
         .bind(upload_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let (bucket, key, content_type, user_meta_json) = upload.ok_or(S3Error::NoSuchUpload)?;
 
@@ -424,8 +437,17 @@ impl MetaStore for PgMetaStore {
              WHERE upload_id = $1 ORDER BY part_number",
         )
         .bind(upload_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+
+        // 已上传但未列入 manifest 的 part(S3 语义:complete 即丢弃)——上报给 handler 回收,
+        // 否则这些 blob 无墓碑、GC 永不收(确定性泄漏)。
+        let listed: HashSet<i32> = parts.iter().map(|cp| cp.part_number).collect();
+        let discarded_part_blobs: Vec<BlobId> = stored
+            .iter()
+            .filter(|(pn, ..)| !listed.contains(pn))
+            .map(|(_, bid, ..)| blob_id_from_bytes(bid))
+            .collect();
 
         let stored_map: HashMap<i32, (Vec<u8>, i64, String)> = stored
             .into_iter()
@@ -495,16 +517,20 @@ impl MetaStore for PgMetaStore {
             user_meta,
             parts_manifest: Some(manifest_json.clone()),
         };
+        // put_object 自持事务(objects/buckets 行)与本会话锁互不相交、加锁单向
+        // (会话锁 ↔ 对象行,无环),无死锁;会话锁握过整个 put_object 窗口,期间新的
+        // put_part/abort 无法插队落孤儿行。
         let outcome = self.put_object(put_req).await?;
 
         sqlx::query("DELETE FROM multipart_parts WHERE upload_id = $1")
             .bind(upload_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = $1")
             .bind(upload_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         Ok(CompleteMultipartResult {
             bucket,
@@ -514,14 +540,19 @@ impl MetaStore for PgMetaStore {
             size: total_size,
             parts_manifest: manifest_json,
             shadowed_blobs: outcome.shadowed_blobs,
+            discarded_part_blobs,
         })
     }
 
     async fn abort_multipart(&self, upload_id: &str) -> Result<Vec<BlobId>> {
+        let mut tx = self.pool.begin().await?;
+
+        // 会话行锁:与 put_part / complete 全序 —— 锁内读到的一定是终版 part 集,
+        // 不会出现"读完后 put 插队、其 part 行被删而其 blob 无人负责"。
         let exists: Option<(i32,)> =
-            sqlx::query_as("SELECT 1 FROM multipart_uploads WHERE upload_id = $1")
+            sqlx::query_as("SELECT 1 FROM multipart_uploads WHERE upload_id = $1 FOR UPDATE")
                 .bind(upload_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         if exists.is_none() {
             return Err(S3Error::NoSuchUpload);
@@ -530,17 +561,18 @@ impl MetaStore for PgMetaStore {
         let parts: Vec<(Vec<u8>,)> =
             sqlx::query_as("SELECT blob_id FROM multipart_parts WHERE upload_id = $1")
                 .bind(upload_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
 
         sqlx::query("DELETE FROM multipart_parts WHERE upload_id = $1")
             .bind(upload_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = $1")
             .bind(upload_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         Ok(parts.iter().map(|(b,)| blob_id_from_bytes(b)).collect())
     }
@@ -1192,6 +1224,172 @@ mod tests {
         assert!(!res.parts_manifest.is_empty());
         let got = store.get_object(&bucket, &key).await.unwrap().unwrap();
         assert_eq!(got.parts_manifest, Some(res.parts_manifest.clone()));
+    }
+
+    // ── multipart 会话生命周期:所有权恰一次(重传孤儿/abort 插队/unlisted 泄漏)──
+
+    #[tokio::test]
+    #[ignore]
+    async fn put_part_concurrent_retransmit_exactly_once() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = PgMetaStore::new(pool.clone());
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let key = format!("key-{}", Uuid::new_v4());
+        let upload_id = store
+            .create_multipart(&bucket, &key, None, &UserMeta::default())
+            .await
+            .unwrap();
+
+        // 8 并发重传同一 part。不变量:每个上传的 blob 恰一人负责——要么成为终版行,
+        // 要么恰一次作为 old 交还给上传方(handler 据此 router.delete)。漏一人 = 孤儿
+        // (无墓碑,GC 永不收);重一人 = 二次删(幂等但说明语义破了)。
+        const N: u32 = 8;
+        let mut handles = Vec::new();
+        for i in 1..=N {
+            let pool_i = pool.clone();
+            let uid = upload_id.clone();
+            handles.push(tokio::spawn(async move {
+                let store = PgMetaStore::new(pool_i);
+                store
+                    .put_part(
+                        &uid,
+                        PartMeta {
+                            part_number: 1,
+                            blob_id: StoreKey::from_parts(9, i),
+                            size: 1,
+                            etag: format!("{i:032}"),
+                        },
+                    )
+                    .await
+            }));
+        }
+        let mut owned: Vec<Vec<u8>> = Vec::new();
+        for h in handles {
+            if let Some(old) = h.await.unwrap().unwrap() {
+                owned.push(old.as_bytes().to_vec());
+            }
+        }
+
+        let final_blob: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT blob_id FROM multipart_parts WHERE upload_id = $1 AND part_number = 1",
+        )
+        .bind(&upload_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        owned.push(final_blob.expect("终版 part 行必须存在").0);
+
+        let mut expected: Vec<Vec<u8>> = (1..=N)
+            .map(|i| StoreKey::from_parts(9, i).as_bytes().to_vec())
+            .collect();
+        owned.sort();
+        expected.sort();
+        assert_eq!(owned, expected, "每个 blob 的回收所有权必须恰一次");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn complete_multipart_discards_unlisted_parts() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = PgMetaStore::new(pool);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let key = format!("key-{}", Uuid::new_v4());
+        let upload_id = store
+            .create_multipart(&bucket, &key, None, &UserMeta::default())
+            .await
+            .unwrap();
+        for (pn, oid) in [(1, 1), (2, 2), (3, 3)] {
+            store
+                .put_part(
+                    &upload_id,
+                    PartMeta {
+                        part_number: pn,
+                        blob_id: StoreKey::from_parts(4, oid),
+                        size: 2,
+                        etag: format!("{oid:032}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // 只 finalize part 1/2:part 3 未列入 manifest(S3 语义:complete 即丢弃,须上报回收)。
+        let parts = vec![
+            CompletePart {
+                part_number: 1,
+                etag: format!("{:032}", 1),
+            },
+            CompletePart {
+                part_number: 2,
+                etag: format!("{:032}", 2),
+            },
+        ];
+        let res = store.complete_multipart(&upload_id, &parts).await.unwrap();
+        assert_eq!(res.discarded_part_blobs.len(), 1);
+        assert_eq!(
+            res.discarded_part_blobs[0].as_bytes().to_vec(),
+            StoreKey::from_parts(4, 3).as_bytes().to_vec()
+        );
+        assert!(store
+            .list_parts(&upload_id, ListPartsOpts::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn abort_vs_put_part_never_leaves_orphan_row() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = PgMetaStore::new(pool.clone());
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let key = format!("key-{}", Uuid::new_v4());
+        let upload_id = store
+            .create_multipart(&bucket, &key, None, &UserMeta::default())
+            .await
+            .unwrap();
+
+        let pool_i = pool.clone();
+        let uid = upload_id.clone();
+        let putter = tokio::spawn(async move {
+            let store = PgMetaStore::new(pool_i);
+            store
+                .put_part(
+                    &uid,
+                    PartMeta {
+                        part_number: 1,
+                        blob_id: StoreKey::from_parts(5, 7),
+                        size: 1,
+                        etag: "etag".to_string(),
+                    },
+                )
+                .await
+        });
+        let aborted = store.abort_multipart(&upload_id).await;
+        let put_res = putter.await.unwrap();
+
+        // 两种合法终局:abort 先 → put 拿 NoSuchUpload;put 先 → abort 在锁内看到该
+        // part 并交还其 blob。任一终局,终态必须"会话行不存在、part 行不存在"。
+        if let Ok(()) = put_res.as_ref().map(|_| ()) {
+            // put 成功 ⇒ abort 必在其后执行且恰带回该 part 的 blob。
+            let blobs = aborted.as_ref().expect("put 先行 ⇒ abort 必成功");
+            assert!(blobs
+                .iter()
+                .any(|b| b.as_bytes().to_vec() == StoreKey::from_parts(5, 7).as_bytes().to_vec()));
+        } else {
+            aborted.expect("put 失败 ⇒ abort 必已先清理");
+        }
+        assert!(store
+            .list_parts(&upload_id, ListPartsOpts::default())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

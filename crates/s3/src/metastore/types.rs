@@ -98,6 +98,10 @@ pub struct CompleteMultipartResult {
     pub parts_manifest: String,
     /// 同 key 被 complete 遮蔽的旧版本 blob(handler 需逐一 `router.delete`,见 `PutObjectOutcome`)。
     pub shadowed_blobs: Vec<BlobId>,
+    /// 已上传但**未列入 manifest** 的 part blob(S3 语义:complete 即丢弃)——会话行删除竞态下
+    /// 被顶替换下的旧 part blob 不在此列(put_part 已把 old 恰一次交还给上传方回收)。
+    /// handler 需逐一 `router.delete`,否则这些 blob 无墓碑、GC 永不收。
+    pub discarded_part_blobs: Vec<BlobId>,
 }
 
 #[derive(Debug, Clone)]

@@ -97,10 +97,15 @@ pub async fn complete_multipart_upload(
         Err(e) => return Err(e),
     };
 
-    // 被本次 complete 遮蔽的旧版本即刻回收(同 put_object 语义,幂等)。
-    for old in &result.shadowed_blobs {
+    // 被本次 complete 遮蔽的旧版本 + **未列入 manifest** 的 part blob(S3 语义:complete 即
+    // 丢弃)→ 即刻回收(幂等;不回收则无墓碑、GC 永不收)。
+    for old in result
+        .shadowed_blobs
+        .iter()
+        .chain(result.discarded_part_blobs.iter())
+    {
         if let Err(e) = st.router.delete(old).await {
-            tracing::warn!(error = %e, "s3 gc: shadowed blob delete failed after multipart complete");
+            tracing::warn!(error = %e, "s3 gc: blob reclaim failed after multipart complete");
         }
     }
 

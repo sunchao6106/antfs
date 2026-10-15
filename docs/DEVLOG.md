@@ -1276,4 +1276,21 @@
 - **验证**:PG 真机净/脏两连跑全绿(新用例 `private_buckets_reject_cross_tenant_access`
   六操作 403 矩阵/无行落/owner 照旧/ListBuckets 隔离/未知桶 404);fmt/clippy 0。
 - 伴生:计费否决追认(L0 计量导出亦不做,`s3-scope-rulings` 档补记);docs:s3.md
-  「多租户访问控制」节 + 矩阵行更新(私有桶 ✅);归档 `2026-10-15-s3-bucket-acl`。 
+  「多租户访问控制」节 + 矩阵行更新(私有桶 ✅);归档 `2026-10-15-s3-bucket-acl`。
+
+## 步骤 54:multipart 会话生命周期原子化(`s3-multipart-lifecycle`)(2026-10-15)
+
+- **根因三泄漏口**:`put_part`/`abort`/`complete` 均为「先读后写 + 自动提交」多语句形状:
+  ①并发重传同 part,后到者读到过时 old 快照 → 中间 blob 无墓碑 GC 永不收;② abort/
+  complete 与 put 插队 → 无主 part 行;③ complete 删未列入 manifest 的 part 行却不回收
+  其 blob(S3 丢弃语义未兑现,确定性泄漏)。
+- **修法(双方言同构)**:三个操作收进单事务 + `multipart_uploads` 行锁(`FOR UPDATE`,
+  PG/InnoDB 锁读均 latest)会话全序;`put_part` 另以 parts 行锁读拿真旧值;`complete`
+  的会话锁跨越 `put_object`(加锁单向,无死锁环);`CompleteMultipartResult` 新增
+  `discarded_part_blobs` 上报未列举 part,handler 与 `shadowed_blobs` 同路径回收。
+- **验收**:内联单测双方言真机绿(并发重传恰一次 N=8 不变量 / unlisted 恰一回收 /
+  abort×put 双向终局无孤儿行);e2e 并发重传 → ListParts 权威 etag → complete → GET
+  自洽;净/脏双跑;fmt/clippy 0。
+- **留观(既有类,未扩大)**:commit 后回收下发前的崩溃窗(同 `shadowed_blobs`);part
+  回收并入 GC 死点留独立 change。归档 `2026-10-15-s3-multipart-lifecycle`
+ 

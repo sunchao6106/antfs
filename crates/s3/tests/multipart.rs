@@ -385,3 +385,68 @@ async fn multipart_complete_respects_quota_and_retries() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.bytes().await.expect("body"), &b"aaaabbbb"[..]);
 }
+
+/// 并发重传同一 part(会话所有权恰一次的事务路径真机过):8 路并发 UploadPart
+/// partNumber=1 全 200;终版 etag 事后从 ListParts 权威读回 → complete 200 →
+/// GET 体为 8 个版本之一(终版 nondeterministic,但必须自洽可读)。
+/// 「每个被顶替 blob 恰一人回收」的元数据不变量由双方言内联单测断言
+/// (put_part_concurrent_retransmit_exactly_once),e2e 断用户可见面不被竞态破坏。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn concurrent_retransmit_completes_and_reads() {
+    use std::sync::Arc;
+
+    let fx = Arc::new(S3Fixture::start().await);
+    let bucket = fx.create_unique_bucket("mp").await;
+    let key = "concurrent.bin";
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+
+    let bodies: Vec<Vec<u8>> = (0u8..8).map(|i| vec![i; 64]).collect();
+    let mut tasks = Vec::new();
+    for body in bodies.clone() {
+        let fx = fx.clone();
+        let bucket = bucket.clone();
+        let key = key.to_string();
+        let upload_id = upload_id.clone();
+        tasks.push(tokio::spawn(async move {
+            fx.upload_part(&bucket, &key, &upload_id, 1, &body).await
+        }));
+    }
+    for t in tasks {
+        assert_eq!(
+            t.await.expect("upload task").status().as_u16(),
+            200,
+            "每个并发重传都必须 200"
+        );
+    }
+
+    let resp = fx.list_parts(&bucket, key, &upload_id).await;
+    assert_eq!(resp.status().as_u16(), 200, "ListParts must 200");
+    let xml = resp.text().await.expect("list parts body");
+    let etag = xml_tag(&xml, "ETag").replace("&quot;", "\"");
+    assert!(!etag.is_empty(), "part etag must be present: {xml}");
+
+    let resp = fx
+        .complete_multipart(
+            &bucket,
+            key,
+            &upload_id,
+            complete_xml(&[(1, etag)]).as_bytes(),
+        )
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "complete with authoritative etag"
+    );
+
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let data = resp.bytes().await.expect("final body").to_vec();
+    assert_eq!(data.len(), 64);
+    assert!(
+        bodies.contains(&data),
+        "final body must be one of the 8 retransmitted versions"
+    );
+}
