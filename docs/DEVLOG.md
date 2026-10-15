@@ -1325,4 +1325,26 @@
   expect 消息)。
 - **验证**:devcluster 真起整套集群(自定义端口)42 秒输出流 `rg Han` 断言为零;
   三个 bench `--help` 与 smoke 真跑全英;fmt/clippy 0;受影响四 crate 测试绿。
+
+## 步骤 57:桶级 canned ACL + 公开桶匿名读(`s3-canned-acl`)(2026-10-15)
+
+- **语义**:桶级 `acl ∈ {private, public-read}`(默认 private = 首轮 ACL 语义逐字
+  保留);public-read 把读面三件(GET/HEAD object、ListObjectsV2)开放给**任何人**
+  (匿名 / 任意签名租户 / owner),写与一切 owner 面(含 `?acl` 管理与 multipart 会话
+  目录)不动。
+- **主语模型**:`Principal = Signed | Anonymous` —— 匿名 = 请求上**完全没有**凭证;
+  **验签失败绝不降级为匿名**(带坏凭证一律 403,安全红线)。auth 中间件从「无签即拒」
+  改为「无签注入 Anonymous,由路由层按桶 ACL 闸门裁决」。
+- **API 面**:CreateBucket `x-amz-acl` 头(默认 private);`PUT /{bucket}?acl`
+  (owner-only,canned 头形式;XML body 形式 → **501 NotImplemented**,新错误变体);
+  `GET /{bucket}?acl`(owner-only,AccessControlPolicy XML,public 时带 AllUsers READ
+  grant);非法值 400;切换即时生效。
+- **MetaStore**:迁移 003 双方言(`buckets.acl` 默认 'private' 回填,存量零变化)+
+  `set_bucket_acl`(UPDATE 0 行 → NoSuchBucket)+ head/list 携带真值;CreateBucket 带
+  x-amz-acl 走 create 恒 private → set(间隙方向由宽收严,fail-safe)。
+- **验收**:内联单测双言真机(bucket_acl_set_and_head:默认 private / set 往返 /
+  list 携带真值 / 未知桶 NoSuchBucket);e2e 全矩阵(匿名私有 403 → 公开读三件 200 →
+  匿名写/删/会话目录 403 → 未知桶 404 → 坏凭证不匿名化 → 跨租户读 200 → GetBucketAcl
+  XML → 切回私有即效 → CreateBucket 带头即公开 → 非法值 400 → XML body 501);
+  PG/MySQL × 净/脏四跑全绿;fmt/clippy 0;workspace 全绿;首轮私有用例原样全绿。
  

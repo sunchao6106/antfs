@@ -568,3 +568,284 @@ async fn private_buckets_reject_cross_tenant_access() {
         .await;
     assert_eq!(resp.status().as_u16(), 404);
 }
+
+/// canned ACL 桶级读写面(s3-canned-acl):public-read 开匿名/跨租户**读**
+/// (GET/HEAD object、ListObjectsV2),写与 owner 面不动;切换即时生效;坏凭证
+/// 绝不匿名化;XML body 形式显式 501。私有桶行为 = 上一测试的逐字不变量。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn canned_acl_public_read_grants_reads_but_not_writes() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("acl-pub").await;
+    let body = pseudo_random(128);
+    assert_eq!(
+        fx.put_object(&bucket, "pub.bin", &body)
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    let url_obj = fx.url(&format!("/{bucket}/pub.bin"));
+
+    // 私有默认:匿名 GET/HEAD/ListV2 全 403(首轮语义,拒绝点从中间件挪到闸门)。
+    assert_eq!(
+        fx.http
+            .get(&url_obj)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "anonymous GET on private bucket"
+    );
+    assert_eq!(
+        fx.http
+            .head(&url_obj)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "anonymous HEAD on private bucket"
+    );
+    assert_eq!(
+        fx.http
+            .get(fx.url(&format!("/{bucket}?list-type=2")))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "anonymous ListObjectsV2 on private bucket"
+    );
+
+    // owner 开公开(canned 头未列入签名集,SigV4 只验已列头 —— 同真 S3 口径)。
+    let mut headers = fx.signed_headers("PUT", &format!("/{bucket}?acl"), b"");
+    headers.insert("x-amz-acl", "public-read".parse().unwrap());
+    let resp = fx
+        .http
+        .put(fx.url(&format!("/{bucket}?acl")))
+        .headers(headers)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "PutBucketAcl public-read");
+
+    // 匿名读三件全开,数据与列举为真。
+    let resp = fx.http.get(&url_obj).send().await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "anonymous GET on public bucket"
+    );
+    assert_eq!(resp.bytes().await.unwrap().to_vec(), body);
+    assert_eq!(
+        fx.http
+            .head(&url_obj)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "anonymous HEAD on public bucket"
+    );
+    let resp = fx
+        .http
+        .get(fx.url(&format!("/{bucket}?list-type=2")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "anonymous ListObjectsV2 on public bucket"
+    );
+    let listing = resp.text().await.unwrap();
+    assert!(listing.contains("<Key>pub.bin</Key>"), "listing: {listing}");
+
+    // 匿名写/删/会话目录依旧拒。
+    assert_eq!(
+        fx.http
+            .put(&url_obj)
+            .body("x")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "anonymous PUT stays owner-only"
+    );
+    assert_eq!(
+        fx.http
+            .delete(&url_obj)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "anonymous DELETE stays owner-only"
+    );
+    assert_eq!(
+        fx.http
+            .get(fx.url(&format!("/{bucket}?uploads")))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "anonymous ListMultipartUploads stays owner-only"
+    );
+
+    // 匿名未知桶 → 404(存在性判定先于 ACL)。
+    assert_eq!(
+        fx.http
+            .get(fx.url("/no-such-bucket-aa/k"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404,
+        "unknown bucket is 404 regardless of ACL"
+    );
+
+    // 坏凭证 ≠ 匿名(public 桶上乱 Authorization 头仍 403,无降级通道)。
+    let resp = fx
+        .http
+        .get(&url_obj)
+        .header("authorization", "definitely-not-sigv4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "malformed credential is never treated as anonymous"
+    );
+
+    // 跨租户签名读:public → 200。
+    let (bob_ak, bob_sk) = fx.issue_credential("bob").await;
+    let resp = fx
+        .request_as(&bob_ak, &bob_sk, "GET", &format!("/{bucket}/pub.bin"), &[])
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "cross-tenant signed read granted on public-read"
+    );
+
+    // owner GetBucketAcl:XML 含 AllUsers READ grant 与 owner FULL_CONTROL。
+    let headers = fx.signed_headers("GET", &format!("/{bucket}?acl"), b"");
+    let resp = fx
+        .http
+        .get(fx.url(&format!("/{bucket}?acl")))
+        .headers(headers)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GetBucketAcl");
+    let acl_xml = resp.text().await.unwrap();
+    assert!(acl_xml.contains("AllUsers"), "public ACL XML: {acl_xml}");
+    assert!(
+        acl_xml.contains("<Permission>FULL_CONTROL</Permission>"),
+        "owner grant present: {acl_xml}"
+    );
+
+    // 切回私有,即时生效;ACL XML 不再含 AllUsers。
+    let mut headers = fx.signed_headers("PUT", &format!("/{bucket}?acl"), b"");
+    headers.insert("x-amz-acl", "private".parse().unwrap());
+    let resp = fx
+        .http
+        .put(fx.url(&format!("/{bucket}?acl")))
+        .headers(headers)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "PutBucketAcl back to private");
+    assert_eq!(
+        fx.http
+            .get(&url_obj)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "flip back to private is immediate"
+    );
+    let headers = fx.signed_headers("GET", &format!("/{bucket}?acl"), b"");
+    let resp = fx
+        .http
+        .get(fx.url(&format!("/{bucket}?acl")))
+        .headers(headers)
+        .send()
+        .await
+        .unwrap();
+    let acl_xml = resp.text().await.unwrap();
+    assert!(!acl_xml.contains("AllUsers"), "private ACL XML: {acl_xml}");
+
+    // CreateBucket 即带 x-amz-acl:public-read → 匿名列举立即可读。
+    let bucket2 = fx.unique("acl-pub2");
+    let mut headers = fx.signed_headers("PUT", &format!("/{bucket2}"), b"");
+    headers.insert("x-amz-acl", "public-read".parse().unwrap());
+    let resp = fx
+        .http
+        .put(fx.url(&format!("/{bucket2}")))
+        .headers(headers)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "CreateBucket with canned ACL");
+    assert_eq!(
+        fx.http
+            .get(fx.url(&format!("/{bucket2}?list-type=2")))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "bucket created public is anonymously listable"
+    );
+
+    // 非法 canned 值 → 400 InvalidArgument。
+    let bucket3 = fx.unique("acl-bad");
+    let mut headers = fx.signed_headers("PUT", &format!("/{bucket3}"), b"");
+    headers.insert("x-amz-acl", "public-read-write".parse().unwrap());
+    let resp = fx
+        .http
+        .put(fx.url(&format!("/{bucket3}")))
+        .headers(headers)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "unsupported x-amz-acl value is InvalidArgument"
+    );
+
+    // PUT ?acl 的 XML body 形式 → 501 NotImplemented(显式出界,不静默不误导)。
+    let xml_body = "<AccessControlPolicy></AccessControlPolicy>";
+    let headers = fx.signed_headers("PUT", &format!("/{bucket}?acl"), xml_body.as_bytes());
+    let resp = fx
+        .http
+        .put(fx.url(&format!("/{bucket}?acl")))
+        .headers(headers)
+        .body(xml_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        501,
+        "XML-body PutBucketAcl is explicitly out of scope"
+    );
+}

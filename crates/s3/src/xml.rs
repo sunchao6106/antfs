@@ -14,6 +14,30 @@ pub fn serialize_list_all_my_buckets(buckets: &[BucketMeta]) -> String {
     xml
 }
 
+/// GetBucketAcl 的 AccessControlPolicy 视图(owner FULL_CONTROL 恒在;public-read 时
+/// 追加 AllUsers READ grant,对齐真 S3 canned ACL 的可视形态)。
+pub fn serialize_access_control_policy(owner: &str, acl: BucketAcl) -> String {
+    let o = quick_xml::escape::escape(owner);
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Owner><ID>{o}</ID><DisplayName>{o}</DisplayName></Owner>\
+         <AccessControlList>\
+         <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+         <ID>{o}</ID><DisplayName>{o}</DisplayName></Grantee>\
+         <Permission>FULL_CONTROL</Permission></Grant>"
+    );
+    if matches!(acl, BucketAcl::PublicRead) {
+        xml.push_str(
+            "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\">\
+             <URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee>\
+             <Permission>READ</Permission></Grant>",
+        );
+    }
+    xml.push_str("</AccessControlList></AccessControlPolicy>");
+    xml
+}
+
 pub fn serialize_list_bucket_result(
     bucket: &str,
     prefix: Option<&str>,
@@ -294,11 +318,13 @@ mod tests {
                 name: "alpha".into(),
                 owner: "o".into(),
                 created_at: 1700000000000,
+                acl: BucketAcl::Private,
             },
             BucketMeta {
                 name: "beta".into(),
                 owner: "o".into(),
                 created_at: 1700000001000,
+                acl: BucketAcl::Private,
             },
         ];
         let xml = serialize_list_all_my_buckets(&buckets);
@@ -308,11 +334,25 @@ mod tests {
     }
 
     #[test]
+    fn serialize_access_control_policy_all_users_grant_iff_public() {
+        let private = serialize_access_control_policy("alice", BucketAcl::Private);
+        assert!(private.contains("<Permission>FULL_CONTROL</Permission>"));
+        assert!(!private.contains("AllUsers"), "private: {private}");
+        assert_valid_xml(&private);
+
+        let public = serialize_access_control_policy("alice", BucketAcl::PublicRead);
+        assert!(public.contains("AllUsers"));
+        assert!(public.contains("<Permission>READ</Permission>"));
+        assert_valid_xml(&public);
+    }
+
+    #[test]
     fn serialize_list_buckets_special_chars() {
         let buckets = vec![BucketMeta {
             name: "a&b<c>".into(),
             owner: "o".into(),
             created_at: 0,
+            acl: BucketAcl::Private,
         }];
         let xml = serialize_list_all_my_buckets(&buckets);
         assert!(
@@ -556,6 +596,7 @@ mod tests {
             name: "test<&>".into(),
             owner: "o".into(),
             created_at: 0,
+            acl: BucketAcl::Private,
         }]));
 
         let resp = ListObjectsResp {

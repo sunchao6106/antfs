@@ -1,9 +1,13 @@
 //! Axum middleware that authenticates S3 requests with AWS Signature V4.
 //!
-//! Requests carrying an `Authorization` header are verified as header-signed;
-//! requests carrying `X-Amz-Algorithm` query parameters are verified as
-//! presigned URLs. `/metrics` and `/admin/*` are served without auth (the
-//! admin surface carries its own operator-token auth).
+//! Each request is resolved into a [`Principal`]: *Signed* (a verified
+//! credential, from the `Authorization` header or a presigned `X-Amz-Algorithm`
+//! URL) or *Anonymous* — no credential attached at all; the anonymous request
+//! is carried through to the route layer, where per-bucket ACL gates decide.
+//! **Failed verification is never downgraded to Anonymous** — a request
+//! carrying a bad credential is rejected here.
+//! `/metrics` and `/admin/*` are served without auth (the admin surface
+//! carries its own operator-token auth).
 
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
@@ -16,11 +20,21 @@ use crate::server::AppState;
 
 use super::sigv4::{self, AuthInfo, CanonicalRequest, EMPTY_BODY_SHA256, UNSIGNED_PAYLOAD};
 
-/// Authenticated caller, inserted into request extensions on success.
+/// Authenticated caller (verified SigV4 credential).
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     pub owner: String,
     pub access_key: String,
+}
+
+/// Requester identity as resolved by the middleware: a verified credential, or
+/// an anonymous caller (**no credential attached at all**). Requests carrying a
+/// credential that fails verification are rejected by the middleware — never
+/// downgraded to `Anonymous`.
+#[derive(Debug, Clone)]
+pub enum Principal {
+    Signed(AuthContext),
+    Anonymous,
 }
 
 /// Axum middleware entry point. Applied to the S3 router in [`crate::server`].
@@ -43,7 +57,9 @@ pub async fn auth_middleware(
         .unwrap_or_else(|| "/".to_string());
     let headers = req.headers().clone();
 
-    match authenticate(
+    // 无凭证完全缺席 = 匿名(Anonymous)注入放行,由路由层各闸门裁决;一旦有凭证
+    // 附着(Authorization 头或预签 query),严格验证,失败即 403 —— 绝不降级为匿名。
+    let principal = match authenticate(
         state.metastore.as_ref(),
         &state.config.region,
         &method,
@@ -52,26 +68,29 @@ pub async fn auth_middleware(
     )
     .await
     {
-        Ok(context) => {
-            req.extensions_mut().insert(context);
-            next.run(req).await
-        }
-        Err(error) => error.into_response(),
-    }
+        Ok(Some(context)) => Principal::Signed(context),
+        Ok(None) => Principal::Anonymous,
+        Err(error) => return error.into_response(),
+    };
+    req.extensions_mut().insert(principal);
+    next.run(req).await
 }
 
 fn is_public_path(path: &str) -> bool {
     path == "/metrics" || path.starts_with("/admin")
 }
 
+/// 验证附着的凭证;`Ok(None)` = 完全无凭证(匿名),`Err` = 凭证存在但验证失败。
 async fn authenticate(
     metastore: &dyn MetaStore,
     expected_region: &str,
     method: &str,
     uri: &str,
     headers: &HeaderMap,
-) -> Result<AuthContext, S3Error> {
-    let info = extract_auth_info(uri, headers)?;
+) -> Result<Option<AuthContext>, S3Error> {
+    let Some(info) = extract_auth_info(uri, headers)? else {
+        return Ok(None);
+    };
 
     let timestamp = resolve_timestamp(&info, headers)?;
     sigv4::check_time(&info, &timestamp)?;
@@ -105,25 +124,26 @@ async fn authenticate(
     };
     sigv4::verify_signature(&credential.secret_key, &timestamp, &info, &request)?;
 
-    Ok(AuthContext {
+    Ok(Some(AuthContext {
         owner: credential.owner,
         access_key: credential.access_key,
-    })
+    }))
 }
 
-fn extract_auth_info(uri: &str, headers: &HeaderMap) -> Result<AuthInfo, S3Error> {
+/// 提取凭证形状;`Ok(None)` = 完全无凭证(匿名);`Err` = 凭证存在但形状坏(仍 403)。
+fn extract_auth_info(uri: &str, headers: &HeaderMap) -> Result<Option<AuthInfo>, S3Error> {
     if let Some(header) = headers.get(axum::http::header::AUTHORIZATION) {
         let header = header
             .to_str()
             .map_err(|_| S3Error::AccessDenied("malformed authorization header".into()))?;
-        return sigv4::parse_authorization_header(header);
+        return Ok(Some(sigv4::parse_authorization_header(header)?));
     }
     if let Some((_, query)) = uri.split_once('?') {
         if query.contains("X-Amz-Algorithm") {
-            return sigv4::parse_presigned(query);
+            return Ok(Some(sigv4::parse_presigned(query)?));
         }
     }
-    Err(S3Error::AccessDenied("Missing authentication".into()))
+    Ok(None)
 }
 
 fn resolve_timestamp(info: &AuthInfo, headers: &HeaderMap) -> Result<String, S3Error> {
@@ -211,6 +231,9 @@ mod tests {
             Err(not_implemented())
         }
         async fn set_bucket_quota(&self, _bucket: &str, _quota_bytes: u64) -> MetaResult<()> {
+            Err(not_implemented())
+        }
+        async fn set_bucket_acl(&self, _bucket: &str, _acl: BucketAcl) -> MetaResult<()> {
             Err(not_implemented())
         }
         async fn create_multipart(
@@ -338,7 +361,8 @@ mod tests {
         let headers = signed_get("/bucket/key", &timestamp);
         let context = authenticate(&known_store(), "us-east-1", "GET", "/bucket/key", &headers)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("signed request yields a context");
         assert_eq!(context.owner, OWNER);
         assert_eq!(context.access_key, ACCESS_KEY);
     }
@@ -362,12 +386,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_missing_authentication() {
+    async fn unsigned_request_resolves_to_anonymous() {
         let mut headers = HeaderMap::new();
         headers.insert("host", "s3.example.com".parse().unwrap());
+        let resolved =
+            authenticate(&known_store(), "us-east-1", "GET", "/bucket/key", &headers).await;
+        // 无凭证完全缺席 = 匿名(Ok(None)),不再由中间件拒绝(s3-canned-acl 起:
+        // 匿名是合法主语,由路由层按桶 ACL 闸门裁决)。
+        assert!(matches!(&resolved, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn malformed_authorization_is_rejected_not_anonymous() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "s3.example.com".parse().unwrap());
+        headers.insert("authorization", "definitely-not-sigv4".parse().unwrap());
         let error = authenticate(&known_store(), "us-east-1", "GET", "/bucket/key", &headers)
             .await
             .unwrap_err();
+        // 安全红线:带坏凭证 ≠ 匿名;必须拒绝,不存在降级路径。
         assert!(matches!(error, S3Error::AccessDenied(_)));
     }
 
@@ -440,7 +477,8 @@ mod tests {
 
         let context = authenticate(&known_store(), "us-east-1", "GET", &uri, &headers)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("presigned request yields a context");
         assert_eq!(context.owner, OWNER);
     }
 }

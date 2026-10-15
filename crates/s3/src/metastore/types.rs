@@ -67,11 +67,40 @@ pub struct BucketQuota {
     pub used_bytes: u64,
 }
 
+/// 桶级 canned ACL(s3-canned-acl 一期档):`private` = owner 独占(默认,首轮 ACL 语义);
+/// `public-read` = 读面(GET/HEAD object + ListObjectsV2)对任何人开放(含匿名),
+/// 写面仍 owner 独占。object ACL / 桶策略 JSON / 跨 owner 授权不在一期(见 change 档)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketAcl {
+    Private,
+    PublicRead,
+}
+
+impl BucketAcl {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::PublicRead => "public-read",
+        }
+    }
+
+    /// 白名单解析;未知值 `None`(调用方决定 400/兜底口径,见 `BucketMeta::acl` 读入兜底)。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "private" => Some(Self::Private),
+            "public-read" => Some(Self::PublicRead),
+            _ => None,
+        }
+    }
+}
+
+/// 桶元数据。`acl` 从 DB 读出;未知值兜底 `Private`(写路径白名单保证不出现,兜底取严侧)。
 #[derive(Debug, Clone)]
 pub struct BucketMeta {
     pub name: String,
     pub owner: String,
     pub created_at: i64,
+    pub acl: BucketAcl,
 }
 
 #[derive(Debug, Clone)]

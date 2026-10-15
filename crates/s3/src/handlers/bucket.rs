@@ -1,13 +1,24 @@
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::error::S3Error;
 use crate::metastore::types::*;
 use crate::server::{AppState, S3QueryParams};
 
-pub async fn create_bucket(st: AppState, bucket: &str, owner: &str) -> Result<Response, S3Error> {
+pub async fn create_bucket(
+    st: AppState,
+    bucket: &str,
+    owner: &str,
+    canned_acl: Option<&str>,
+) -> Result<Response, S3Error> {
     validate_bucket_name(bucket)?;
+    // create 恒 private;显式公开在 create 后追加 set —— 间隙方向由宽收严,fail-safe
+    //(间隙窗口内桶仍是 private,不存在先公开后回退的危险窗口)。
+    let acl = parse_canned_acl(canned_acl)?;
     st.metastore.create_bucket(bucket, owner).await?;
+    if acl != BucketAcl::Private {
+        st.metastore.set_bucket_acl(bucket, acl).await?;
+    }
     Ok(StatusCode::OK.into_response())
 }
 
@@ -79,4 +90,45 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
         ));
     }
     Ok(())
+}
+
+/// PUT /{bucket}?acl(PutBucketAcl,owner 专属 —— owner 闸在 server.rs 包装层)。
+/// 一期只接 canned 头形式;AccessControlPolicy XML body 形式显式 501(不静默、不误导)。
+pub async fn put_bucket_acl(
+    st: AppState,
+    bucket: &str,
+    headers: &HeaderMap,
+) -> Result<Response, S3Error> {
+    let Some(raw) = headers.get("x-amz-acl").and_then(|v| v.to_str().ok()) else {
+        return Err(S3Error::NotImplemented(
+            "PutBucketAcl supports only the x-amz-acl canned form (private | public-read); \
+             AccessControlPolicy XML bodies are out of scope"
+                .into(),
+        ));
+    };
+    let acl = parse_canned_acl(Some(raw))?;
+    st.metastore.set_bucket_acl(bucket, acl).await?;
+    Ok(StatusCode::OK.into_response())
+}
+
+/// GET /{bucket}?acl(GetBucketAcl,owner 专属 —— owner 闸在 server.rs 包装层)。
+/// public-read 时多一条 AllUsers READ grant,与真 S3 canned ACL 的可视形态一致。
+pub async fn get_bucket_acl(st: AppState, bucket: &str) -> Result<Response, S3Error> {
+    let meta = st
+        .metastore
+        .head_bucket(bucket)
+        .await?
+        .ok_or(S3Error::NoSuchBucket)?;
+    let xml = crate::xml::serialize_access_control_policy(&meta.owner, meta.acl);
+    Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())
+}
+
+fn parse_canned_acl(raw: Option<&str>) -> Result<BucketAcl, S3Error> {
+    match raw {
+        None | Some("private") => Ok(BucketAcl::Private),
+        Some("public-read") => Ok(BucketAcl::PublicRead),
+        Some(other) => Err(S3Error::InvalidArgument(format!(
+            "unsupported x-amz-acl value `{other}` (supported: private | public-read)"
+        ))),
+    }
 }

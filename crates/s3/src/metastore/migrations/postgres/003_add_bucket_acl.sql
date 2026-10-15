@@ -1,0 +1,1 @@
+ALTER TABLE buckets ADD COLUMN acl VARCHAR(16) NOT NULL DEFAULT 'private';

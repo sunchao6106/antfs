@@ -352,31 +352,45 @@ impl MetaStore for MysqlMetaStore {
     }
 
     async fn head_bucket(&self, name: &str) -> Result<Option<BucketMeta>> {
-        let row: Option<(String, String, i64)> =
-            sqlx::query_as("SELECT name, owner, created_at FROM buckets WHERE name = ?")
+        let row: Option<(String, String, i64, String)> =
+            sqlx::query_as("SELECT name, owner, created_at, acl FROM buckets WHERE name = ?")
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(row.map(|(n, o, c)| BucketMeta {
+        Ok(row.map(|(n, o, c, a)| BucketMeta {
             name: n,
             owner: o,
             created_at: c,
+            acl: BucketAcl::parse(&a).unwrap_or(BucketAcl::Private),
         }))
     }
 
+    async fn set_bucket_acl(&self, bucket: &str, acl: BucketAcl) -> Result<()> {
+        let result = sqlx::query("UPDATE buckets SET acl = ? WHERE name = ?")
+            .bind(acl.as_str())
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(S3Error::NoSuchBucket);
+        }
+        Ok(())
+    }
+
     async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketMeta>> {
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT name, owner, created_at FROM buckets WHERE owner = ? ORDER BY name",
+        let rows: Vec<(String, String, i64, String)> = sqlx::query_as(
+            "SELECT name, owner, created_at, acl FROM buckets WHERE owner = ? ORDER BY name",
         )
         .bind(owner)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(n, o, c)| BucketMeta {
+            .map(|(n, o, c, a)| BucketMeta {
                 name: n,
                 owner: o,
                 created_at: c,
+                acl: BucketAcl::parse(&a).unwrap_or(BucketAcl::Private),
             })
             .collect())
     }
@@ -1198,6 +1212,46 @@ mod tests {
         store.delete_bucket(&bucket).await.unwrap();
         let head = store.head_bucket(&bucket).await.unwrap();
         assert!(head.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn bucket_acl_set_and_head() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = MysqlMetaStore::new(pool);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        // 新桶默认 private(首轮 ACL 语义逐字保留)。
+        assert_eq!(
+            store.head_bucket(&bucket).await.unwrap().unwrap().acl,
+            BucketAcl::Private
+        );
+        // 开公开 → 立即可见;ListBuckets 同样携带真值(不静默回默认)。
+        store
+            .set_bucket_acl(&bucket, BucketAcl::PublicRead)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.head_bucket(&bucket).await.unwrap().unwrap().acl,
+            BucketAcl::PublicRead
+        );
+        let listed = store.list_buckets("owner").await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|b| b.name == bucket)
+                .expect("bucket must be listed")
+                .acl,
+            BucketAcl::PublicRead
+        );
+        // 未知桶 set → NoSuchBucket(UPDATE 0 行命中)。
+        let err = store
+            .set_bucket_acl("no-such-bucket-xyz", BucketAcl::PublicRead)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket));
     }
 
     #[tokio::test]

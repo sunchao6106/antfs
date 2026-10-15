@@ -25,6 +25,7 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketMeta>>;
     async fn get_bucket_quota(&self, bucket: &str) -> Result<Option<BucketQuota>>;
     async fn set_bucket_quota(&self, bucket: &str, quota_bytes: u64) -> Result<()>;
+    async fn set_bucket_acl(&self, bucket: &str, acl: BucketAcl) -> Result<()>;
 
     // Multipart
     async fn create_multipart(

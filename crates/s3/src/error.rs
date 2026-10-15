@@ -27,6 +27,8 @@ pub enum S3Error {
         used: u64,
     },
     InvalidArgument(String),
+    /// 能力显式出界(未实现的面,如 PutBucketAcl 的 XML body 形式)——不静默也不 400 误导。
+    NotImplemented(String),
 }
 
 impl S3Error {
@@ -52,6 +54,7 @@ impl S3Error {
             Self::MetadataTooLarge => "MetadataTooLarge",
             Self::QuotaExceeded { .. } => "QuotaExceeded",
             Self::InvalidArgument(_) => "InvalidArgument",
+            Self::NotImplemented(_) => "NotImplemented",
         }
     }
 
@@ -65,6 +68,7 @@ impl S3Error {
             }
             Self::MalformedXML(_) | Self::MissingContentLength => StatusCode::BAD_REQUEST,
             Self::MetadataTooLarge | Self::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+            Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::QuotaExceeded { .. } => StatusCode::from_u16(507).unwrap(),
             Self::AccessDenied(_)
             | Self::SignatureDoesNotMatch
@@ -127,6 +131,11 @@ impl S3Error {
             ),
             Self::InvalidArgument(detail) => {
                 format!("Invalid argument: {detail}")
+            }
+            Self::NotImplemented(detail) => {
+                format!(
+                    "A header or query you provided implies functionality that is not implemented: {detail}"
+                )
             }
         }
     }
