@@ -24,8 +24,12 @@ live spec(`s3-metastore`「Soft-delete with cleanup」)承诺的后台 GC 从未
 
 ### Modified Capabilities
 - `s3-metastore`:「Soft-delete with cleanup」requirement 修正 — GC 清行、blob 在删除/遮蔽时已即刻删除(实现与 spec 漂移回写);`put_object` 增加遮蔽行回标记与返回值。
-- `s3-core`:PutObject overwrite 场景补「旧版本即刻进入回收」的语义(不再是"reclaimable by GC"的空话)。
-- `s3-multipart`:Complete 后遗留遮蔽行同 put_object 语义;孤儿 session 有 TTL 回收。
+- `s3-core`:PutObject overwrite 场景补「旧版本即刻进入回收」的语义(不再是"reclaimable by GC"的空话);requirement 正文补遮蔽事务语义。
+- `s3-multipart`:其语义(Complete 遮蔽即刻回收、孤儿 session TTL)以场景固化在新能力 spec `s3-gc` 中,live spec 无漂移不改。
+
+## 已知缺口(留观,超出本 change 范围)
+
+- **UploadPart 同 part-number 重传**:`INSERT ... ON CONFLICT (upload_id, part_number) DO UPDATE` 覆盖旧行 blob_id,旧 part blob 无人回收(历史遗留,非本 change 引入)。修法方向:CTE `DELETE ... RETURNING` 取旧 blob 后 handler 删。留待独立 change。
 
 ## Impact
 

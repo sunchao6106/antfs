@@ -1168,5 +1168,10 @@
   同改 `--test-threads=1`(注释理由入 ci.yml)。
 - **验证**:PG 真机 `--ignored` 全绿(新 5 用例:overwrite 回收/GC 周期(PG 直查行数/
   指标落真 Registry)/orphan TTL 两沿/并发取件恰一次);fmt/clippy/workspace 全绿。
-- 归档:`openspec/changes/s3-gc/`(4/4);s3.md 配置 +4 行、监控 +6 项、
-  「后台 GC」段;live spec 漂移(blob 死点)待归档时以 MODIFIED 回写。
+- 归档:`openspec/changes/archive/2026-10-15-s3-gc/`;MODIFIED 回写落盘:`s3-metastore.Soft-delete with cleanup`
+  (blob 死点=语义动作时刻,GC 只清行/孤儿 parts;多实例取件恰一次)、`s3-core.PutObject`(遮蔽事务语义)。
+- 集成测试共享库事故(CI 红两轮):GC 语句全库语义 × 断言仍全域计数 → 跨测试互相可见;
+  一次桶域化改阵中一段 replace 与 fmt 后实文不符静默失手。修法:断言全部入本 fixture bucket 域、
+  改用 edit 工具硬改(失手会吵)。验证升级为净/脏两连跑。
+- 留观:UploadPart 同 part-number 重传覆盖旧行 blob_id,旧 part blob 无人回收(历史遗留;
+  见 change proposal 缺口段,CTE RETURNING 可修,独立 change)。 
