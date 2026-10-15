@@ -828,6 +828,43 @@ impl S3Fixture {
             v["used_bytes"].as_u64().expect("used_bytes field"),
         )
     }
+
+    /// 签发第二租户凭证(经 admin 端点;跨租户 ACL 测试用),返回 (access_key, secret_key)。
+    pub async fn issue_credential(&self, owner: &str) -> (String, String) {
+        let resp = self
+            .http
+            .post(format!("http://{}/admin/credentials", self.s3_addr))
+            .json(&serde_json::json!({ "owner": owner }))
+            .send()
+            .await
+            .expect("issue credential request");
+        assert_eq!(resp.status().as_u16(), 200, "issue credential for {owner}");
+        let v: serde_json::Value = resp.json().await.expect("credential json");
+        (
+            v["access_key"].as_str().expect("access_key").to_string(),
+            v["secret_key"].as_str().expect("secret_key").to_string(),
+        )
+    }
+
+    /// 以指定凭证签发一次签名请求(默认凭证之外的租户;跨租户 ACL 测试)。
+    pub async fn request_as(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        method: &str,
+        uri: &str,
+        body: &[u8],
+    ) -> reqwest::Response {
+        let headers = signed_headers_for(&self.s3_addr, access_key, secret_key, method, uri, body);
+        let method: reqwest::Method = method.parse().expect("valid method");
+        self.http
+            .request(method, self.url(uri))
+            .headers(headers)
+            .body(body.to_vec())
+            .send()
+            .await
+            .expect("signed request send")
+    }
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────────────────────

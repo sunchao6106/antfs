@@ -1262,4 +1262,18 @@
   变为真机执行;e2e 夹具方言硬编码 postgres,不受影响(方言层覆盖即 C1 目标)。
   job 更名 "S3 integration (PostgreSQL + MySQL)"。
 - **局限如实**:全量 e2e(对象/桶/SigV4 层)在 MySQL 上的矩阵跑尚未开启——方言层已由
-  内联单测盖住,e2e 属集群语义,矩阵价值待定(需要时给夹具加 driver 参数即可)。 
+  内联单测盖住,e2e 属集群语义,矩阵价值待定(需要时给夹具加 driver 参数即可)。
+
+## 步骤 53:S3 多租户 ACL 首轮(`s3-bucket-acl`,私有桶语义)(2026-10-15)
+
+- **实现**:server.rs 包装器层单闸门 `require_bucket_owner`(head_bucket PK 查询;跨租户
+  403 `AccessDenied` / 未知桶 404 `NoSuchBucket`)接入九个 bucket-scoped 包装器(对象
+  PUT/GET/HEAD/DELETE/batch、ListV2/桶 HEAD/DELETE、multipart 全家族);CreateBucket 不
+  设闸(创建即认领)、ListBuckets 本就按 owner、`/admin`+`/metrics` 独立域不动。
+- **语义**:凭证即租户(owner 标识);presigned 随签发凭证。此前任意有效凭证可访问
+  任意桶——多租户的隔离缺口就此关闭。
+- **代价与留观**:每请求一记 `buckets` PK 查询(亚毫秒池化);缓存留独立 change。
+- **验证**:PG 真机净/脏两连跑全绿(新用例 `private_buckets_reject_cross_tenant_access`
+  六操作 403 矩阵/无行落/owner 照旧/ListBuckets 隔离/未知桶 404);fmt/clippy 0。
+- 伴生:计费否决追认(L0 计量导出亦不做,`s3-scope-rulings` 档补记);docs:s3.md
+  「多租户访问控制」节 + 矩阵行更新(私有桶 ✅);归档 `2026-10-15-s3-bucket-acl`。 

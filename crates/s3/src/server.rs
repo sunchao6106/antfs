@@ -90,11 +90,32 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 私有桶门(s3-bucket-acl):bucket-scoped 操作要求请求凭证 owner == 桶 owner;
+/// 跨租户 403 AccessDenied,未知桶 404 NoSuchBucket。CreateBucket/ListBuckets 不设闸
+/// (创建即按凭证 owner 认领名字;列举本就按 owner 过滤)。
+async fn require_bucket_owner(
+    st: &AppState,
+    ctx: &AuthContext,
+    bucket: &str,
+) -> Result<(), S3Error> {
+    match st.metastore.head_bucket(bucket).await? {
+        Some(meta) if meta.owner == ctx.owner => Ok(()),
+        Some(_) => Err(S3Error::AccessDenied(
+            "bucket belongs to another tenant".into(),
+        )),
+        None => Err(S3Error::NoSuchBucket),
+    }
+}
+
 async fn bucket_get_handler(
     State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(bucket): Path<String>,
     Query(q): Query<S3QueryParams>,
 ) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     let is_uploads = q.uploads.is_some();
     if is_uploads {
         return crate::handlers::multipart::list_multipart_uploads(st, &bucket, q)
@@ -108,10 +129,14 @@ async fn bucket_get_handler(
 
 async fn bucket_post_handler(
     State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(bucket): Path<String>,
     Query(q): Query<S3QueryParams>,
     req: Request,
 ) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     if q.delete.is_some() {
         return crate::handlers::batch::delete_objects(st, &bucket, req)
             .await
@@ -122,10 +147,14 @@ async fn bucket_post_handler(
 
 async fn object_put_handler(
     State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<S3QueryParams>,
     req: Request,
 ) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     if let (Some(upload_id), Some(part_number)) = (&q.upload_id, q.part_number) {
         return crate::handlers::multipart::upload_part(
             st,
@@ -145,9 +174,13 @@ async fn object_put_handler(
 
 async fn object_get_handler(
     State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<S3QueryParams>,
 ) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     let upload_id = q.upload_id.clone();
     if let Some(uid) = &upload_id {
         return crate::handlers::multipart::list_parts(st, uid, q)
@@ -161,8 +194,12 @@ async fn object_get_handler(
 
 async fn object_head_handler(
     State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     crate::handlers::object::head_object(st, &bucket, &key)
         .await
         .into_response()
@@ -170,9 +207,13 @@ async fn object_head_handler(
 
 async fn object_delete_handler(
     State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<S3QueryParams>,
 ) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     if let Some(upload_id) = &q.upload_id {
         return crate::handlers::multipart::abort_multipart_upload(st, upload_id)
             .await
@@ -185,10 +226,14 @@ async fn object_delete_handler(
 
 async fn object_post_handler(
     State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<S3QueryParams>,
     req: Request,
 ) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     if q.uploads.is_some() {
         return crate::handlers::multipart::create_multipart_upload(st, &bucket, &key, req)
             .await
@@ -228,13 +273,27 @@ async fn create_bucket_handler(
         .into_response()
 }
 
-async fn delete_bucket_handler(State(st): State<AppState>, Path(bucket): Path<String>) -> Response {
+async fn delete_bucket_handler(
+    State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     crate::handlers::bucket::delete_bucket(st, &bucket)
         .await
         .into_response()
 }
 
-async fn head_bucket_handler(State(st): State<AppState>, Path(bucket): Path<String>) -> Response {
+async fn head_bucket_handler(
+    State(st): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(e) = require_bucket_owner(&st, &ctx, &bucket).await {
+        return e.into_response();
+    }
     crate::handlers::bucket::head_bucket(st, &bucket)
         .await
         .into_response()

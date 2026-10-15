@@ -526,3 +526,70 @@ async fn quota_guard_exactly_one_passes_under_race() {
     );
     assert_eq!(fx.bucket_quota(&bucket).await, (10, 10));
 }
+
+/// 多租户私有桶(s3-bucket-acl):跨租户对象/列举/批量/multipart 全家族 403;
+/// owner 一切照旧;ListBuckets 隔离;未知桶 404 NoSuchBucket。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn private_buckets_reject_cross_tenant_access() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("acl").await;
+    assert_eq!(
+        fx.put_object(&bucket, "a.bin", b"tenant-data")
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+
+    let (bob_ak, bob_sk) = fx.issue_credential("bob").await;
+
+    let body = b"x".to_vec();
+    let cases: Vec<(&str, String)> = vec![
+        ("PUT", format!("/{bucket}/bob.bin")),
+        ("GET", format!("/{bucket}/a.bin")),
+        ("HEAD", format!("/{bucket}/a.bin")),
+        ("DELETE", format!("/{bucket}/a.bin")),
+        ("GET", format!("/{bucket}?list-type=2")),
+        ("POST", format!("/{bucket}/m.bin?uploads=")),
+    ];
+    for (method, uri) in cases {
+        let resp = fx.request_as(&bob_ak, &bob_sk, method, &uri, &body).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "跨租户 {method} {uri} 必须 403"
+        );
+    }
+
+    // 跨租户写未落任何行。
+    assert!(fx
+        .state
+        .metastore
+        .get_object(&bucket, "bob.bin")
+        .await
+        .expect("get bob.bin")
+        .is_none());
+
+    // owner(默认凭证)一切照旧。
+    assert_eq!(fx.get_object(&bucket, "a.bin").await.status().as_u16(), 200);
+    assert_eq!(
+        fx.delete_object(&bucket, "a.bin").await.status().as_u16(),
+        204
+    );
+
+    // ListBuckets 隔离:bob 看不到 default 的桶。
+    let resp = fx.request_as(&bob_ak, &bob_sk, "GET", "/", &[]).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.expect("list buckets body");
+    assert!(
+        !text.contains(&bucket),
+        "bob 不得看见 default 的桶:\n{text}"
+    );
+
+    // 未知桶 → 404 NoSuchBucket(不存在优先于租户判定)。
+    let resp = fx
+        .request_as(&bob_ak, &bob_sk, "GET", "/no-such-xyz-42/k", &[])
+        .await;
+    assert_eq!(resp.status().as_u16(), 404);
+}
