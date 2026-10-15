@@ -242,7 +242,7 @@ docker run --rm ghcr.io/sunchao6106/antfs:latest --run-bench router --bench-ops 
 - [x] S3 兼容网关(对象 / multipart / SigV4 / 桶;MetaStore 外接 PostgreSQL / MySQL)
 - [x] 完成 Ambry 忠实翻译、锁定正确性(阶段一收官 —— v0.0.4;裁决归档于 `openspec/changes/`,PG 集成测试已进 CI 门)
 - [ ] 性能 / 并发 / 存储密度优化(第二阶段)
-- [x] S3 多租户 ACL(私有桶跨租户 403 + 桶级存储配额已上线;版本控制、删除复活、虚拟主机与计费永久不做,见 docs/design/s3.md 支持矩阵)
+- [x] S3 多租户 ACL(私有桶跨租户 403 + 桶级存储配额已上线;版本控制、删除复活、计费与外部凭证源(LDAP/AD/OIDC/IAM 联邦)永久不做;虚拟主机路由 2026-10-15 翻案、转后续队列,见 docs/design/s3.md 支持矩阵)
 
 ## 参与贡献
 

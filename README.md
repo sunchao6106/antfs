@@ -251,7 +251,7 @@ The production target is Linux ext4. For fidelity, large-data, or performance te
 - [x] S3-compatible gateway (objects / multipart / SigV4 / buckets, external PostgreSQL or MySQL MetaStore)
 - [x] Finish the faithful Ambry port and lock correctness (Phase 1 exit — v0.0.4; rulings archived under `openspec/changes/`, PG integration tests CI-gated)
 - [ ] Performance / concurrency / storage-density optimizations (Phase 2)
-- [x] Multi-tenant S3 ACL — private-bucket semantics (cross-tenant 403) + bucket-level storage quota shipped; versioning, undelete, virtual-host routing and billing permanently out of scope (see docs/design/s3.md support matrix)
+- [x] Multi-tenant S3 ACL — private-bucket semantics (cross-tenant 403) + bucket-level storage quota shipped; versioning, undelete and billing permanently out of scope, and external credential sources (LDAP/AD/OIDC/IAM federation) are out too; virtual-host-style routing was re-queued for a later round (reversal 2026-10-15) (see docs/design/s3.md support matrix)
 
 ## Contributing
 
