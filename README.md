@@ -96,7 +96,7 @@ Layered reading: **gateways** (Frontend / S3) are stateless translators — ever
 | `frontend` | HTTP REST object layer (`/blobs` + `/metrics`). Counterpart of `ambry-frontend` | ✅ Implemented |
 | `admin` | Admin web: ops actions + control-plane dashboard (topology / nodes / disks / partitions / metrics) | ✅ Implemented |
 | `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject (incl. object metadata: `Content-Type` + `x-amz-meta-*`), multipart upload, ListObjectsV2, bucket management, AWS SigV4 auth. Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | ✅ Implemented |
-| Multi-tenant S3 ACL (bucket quota shipped) | Gateway-layer enhancements | 📋 Planned |
+| Multi-tenant S3 ACL (private-bucket semantics + bucket quota) | Gateway-layer enhancements | ✅ Implemented |
 
 > Naming: `blob` = the single-node blob storage engine; `store` = the data node server.
 
@@ -251,7 +251,7 @@ The production target is Linux ext4. For fidelity, large-data, or performance te
 - [x] S3-compatible gateway (objects / multipart / SigV4 / buckets, external PostgreSQL or MySQL MetaStore)
 - [x] Finish the faithful Ambry port and lock correctness (Phase 1 exit — v0.0.4; rulings archived under `openspec/changes/`, PG integration tests CI-gated)
 - [ ] Performance / concurrency / storage-density optimizations (Phase 2)
-- [ ] Multi-tenant S3 ACL — bucket storage quota shipped; versioning, undelete, virtual-host routing and billing permanently out of scope (see docs/design/s3.md support matrix)
+- [x] Multi-tenant S3 ACL — private-bucket semantics (cross-tenant 403) + bucket-level storage quota shipped; versioning, undelete, virtual-host routing and billing permanently out of scope (see docs/design/s3.md support matrix)
 
 ## Contributing
 
