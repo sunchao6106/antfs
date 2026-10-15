@@ -289,21 +289,43 @@ async fn overwrite_shadow_reclaims_old_blob() {
     // 旧 blob 在集群被删(墓碑 W=2 即回;R=1 可能先读到无墓碑副本 → 有界轮询等收敛)。
     poll_tombstoned(&fx, &v1.blob_id).await;
 
-    // 遮蔽行进保留期:cutoff=0(远古)清不动;未来时刻一口气清 1 行。
-    let kept = fx
-        .state
-        .metastore
-        .purge_expired_deletions(0, 100)
-        .await
-        .expect("purge within retention");
-    assert_eq!(kept, 0, "row inside retention must not be purged");
-    let purged = fx
-        .state
+    // 共享测试库:GC 是全库语义,断言一律限本 fixture 的 bucket 域。
+    let pool = fx.pg_pool().await;
+    let shadowed_in_bucket = |pool: &sqlx::PgPool, bucket: &str| {
+        let pool = pool.clone();
+        let bucket = bucket.to_string();
+        async move {
+            let r: (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM named_objects WHERE bucket = $1 AND state = 0",
+            )
+            .bind(&bucket)
+            .fetch_one(&pool)
+            .await
+            .expect("count query");
+            r.0
+        }
+    };
+    {
+        let pool = pool.clone();
+        let bucket = bucket.clone();
+        let kept = fx
+            .state
+            .metastore
+            .purge_expired_deletions(0, 100)
+            .await
+            .expect("purge within retention");
+        // 远古 cutoff 不清任何行(语义边界);桶域行仍在。
+        assert_eq!(kept, 0, "no row is older than the epoch cutoff");
+        let n = shadowed_in_bucket(&pool, &bucket).await;
+        assert_eq!(n, 1, "shadowed row inside retention must stay");
+    }
+    fx.state
         .metastore
         .purge_expired_deletions(i64::MAX, 100)
         .await
         .expect("purge past retention");
-    assert_eq!(purged, 1, "shadowed row past retention must be purged");
+    let n = shadowed_in_bucket(&pool, &bucket).await;
+    assert_eq!(n, 0, "shadowed row past retention must be purged");
 }
 
 /// GC 循环:`run_once_at` 时间注入驱动保留期(免 sleep)—— 保留期内行不动,
@@ -336,15 +358,18 @@ async fn gc_cycle_purges_deleted_rows_after_retention() {
         .is_none());
 
     let pool = fx.pg_pool().await;
-    let count = |pool: &sqlx::PgPool, cond: &str| {
+    // 共享测试库:GC 的 purge 语句是全库语义,行数断言必须限本 fixture 的 bucket 域。
+    let count = |pool: &sqlx::PgPool| {
         let pool = pool.clone();
-        let cond = cond.to_string();
+        let bucket = bucket.clone();
         async move {
-            let r: (i64,) =
-                sqlx::query_as(&format!("SELECT count(*) FROM named_objects WHERE {cond}"))
-                    .fetch_one(&pool)
-                    .await
-                    .expect("count query");
+            let r: (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM named_objects WHERE bucket = $1 AND state = 0",
+            )
+            .bind(&bucket)
+            .fetch_one(&pool)
+            .await
+            .expect("count query");
             r.0
         }
     };
@@ -359,18 +384,14 @@ async fn gc_cycle_purges_deleted_rows_after_retention() {
 
     antfs_s3::gc::run_once_at(&fx.state, &cfg, now).await;
     assert_eq!(
-        count(&pool, "state = 0").await,
+        count(&pool).await,
         1,
         "deleted row must survive its retention"
     );
 
     let after = now + 3601 * 1000;
     antfs_s3::gc::run_once_at(&fx.state, &cfg, after).await;
-    assert_eq!(
-        count(&pool, "state = 0").await,
-        0,
-        "row past retention must be purged"
-    );
+    assert_eq!(count(&pool).await, 0, "row past retention must be purged");
     let exported = antfs_metric::gather(&fx.state.registry).expect("gather");
     assert!(
         exported.contains("s3_gc_purged_rows_total"),
