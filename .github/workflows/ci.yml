@@ -59,7 +59,7 @@ jobs:
         run: cargo test --workspace --verbose
 
   s3-integration:
-    name: S3 integration (PostgreSQL)
+    name: S3 integration (PostgreSQL + MySQL)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -75,15 +75,30 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: antfs_s3_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc (crates/master 的 build.rs 构建期需要)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Run S3 gateway integration tests (PG-gated, --ignored)
+      - name: Run S3 gateway integration tests (PG + MySQL, --ignored)
         env:
           TEST_S3_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/antfs_s3_ci
+          # mysql 方言内联单测从「DSN 缺省早退」变为真机执行(001/002 迁移 + 全部 SQL,
+          # 含配额守卫);e2e 夹具方言硬编码 postgres,不受影响。
+          TEST_S3_MYSQL_URL: mysql://root:root@127.0.0.1:3306/antfs_s3_ci
         # --test-threads=1:每个用例起新整套 1 master + 3 stores(fixture 内存/端口量大),
         # 并行在本机与 runner 上都会资源失真偶发超时 —— 集成单线程 ~20s,换稳定性。
         run: cargo test -p antfs-s3 -- --ignored --test-threads=1

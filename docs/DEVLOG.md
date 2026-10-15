@@ -1250,4 +1250,16 @@
   覆盖净扣/调大恢复/删除释放/quota=0 解除/指标行值)、并发守卫恰一次、complete
   拒后可重试;fmt/clippy/workspace 全绿。
 - 文档:s3.md buckets 表 +2 列、监控表 +1 行、「桶级存储配额」节;归档
-  `openspec/changes/archive/2026-10-15-s3-bucket-quota/`。 
+  `openspec/changes/archive/2026-10-15-s3-bucket-quota/`。
+
+## 步骤 52:C1 MySQL CI 门 —— mysql 方言首次真机验证(2026-10-15)
+
+- **本地先行**:colima + `mysql:8` 容器,`TEST_S3_MYSQL_URL` 一接,整个 mysql.rs 方言层
+  **首次真机执行**(001/002 迁移 + 全部 SQL,含步骤 51 的配额守卫/记账事务/两步遮蔽):
+  32 项内联单测全绿——此前只过代码评审的方言层一击通过,双方言平价从口头变为实证。
+- **CI**:s3-integration job 增 `mysql:8` service(`mysqladmin ping` 健康门)+
+  `TEST_S3_MYSQL_URL`;同一条 `--ignored` 调用里 mysql 内联单测从「DSN 缺省早退」
+  变为真机执行;e2e 夹具方言硬编码 postgres,不受影响(方言层覆盖即 C1 目标)。
+  job 更名 "S3 integration (PostgreSQL + MySQL)"。
+- **局限如实**:全量 e2e(对象/桶/SigV4 层)在 MySQL 上的矩阵跑尚未开启——方言层已由
+  内联单测盖住,e2e 属集群语义,矩阵价值待定(需要时给夹具加 driver 参数即可)。 
