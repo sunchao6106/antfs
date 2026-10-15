@@ -44,6 +44,61 @@ pub async fn delete_credential(st: AppState, access_key: &str) -> Result<Respons
     }
 }
 
+pub async fn get_bucket_quota(
+    st: AppState,
+    bucket: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    check_operator_token(&st, req.headers())?;
+
+    let Some(quota) = st.metastore.get_bucket_quota(bucket).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let json = serde_json::json!({
+        "bucket": quota.name,
+        "quota_bytes": quota.quota_bytes,
+        "used_bytes": quota.used_bytes,
+    });
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        json.to_string(),
+    )
+        .into_response())
+}
+
+pub async fn set_bucket_quota(
+    st: AppState,
+    bucket: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    check_operator_token(&st, req.headers())?;
+
+    let body = axum::body::to_bytes(req.into_body(), 4096)
+        .await
+        .map_err(|_| S3Error::InternalError("body read failed".into()))?;
+    #[derive(serde::Deserialize)]
+    struct SetReq {
+        quota_bytes: u64,
+    }
+    let parsed: SetReq = serde_json::from_slice(&body)
+        .map_err(|e| S3Error::InternalError(format!("invalid json: {e}")))?;
+    st.metastore
+        .set_bucket_quota(bucket, parsed.quota_bytes)
+        .await?;
+
+    let json = serde_json::json!({
+        "bucket": bucket,
+        "quota_bytes": parsed.quota_bytes,
+    });
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        json.to_string(),
+    )
+        .into_response())
+}
+
 fn check_operator_token(st: &AppState, headers: &axum::http::HeaderMap) -> Result<(), S3Error> {
     let configured = &st.config.operator_token;
     if configured.is_empty() {

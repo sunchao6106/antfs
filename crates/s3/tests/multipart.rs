@@ -328,3 +328,60 @@ async fn concurrent_purge_claims_rows_exactly_once() {
         "each row claimed exactly once"
     );
 }
+
+/// complete 计入总量(Σ part size)并受配额守卫;被拒时 session 保留(可调大后重试),
+/// 原样重发即成功;used 记账闭环,GET 拼装数据一致。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_complete_respects_quota_and_retries() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("quota-mp").await;
+    let key = "quota-m.bin";
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let part_bodies: [&[u8]; 2] = [b"aaaa", b"bbbb"];
+    let mut etags = Vec::new();
+    for (idx, chunk) in part_bodies.iter().enumerate() {
+        let number = i32::try_from(idx + 1).expect("small index");
+        let resp = fx
+            .upload_part(&bucket, key, &upload_id, number, chunk)
+            .await;
+        assert_eq!(resp.status().as_u16(), 200, "UploadPart must 200");
+        etags.push((number, header(&resp, "etag")));
+    }
+    // parts 不计账(仅 complete 的 manifest 行计入)。
+    assert_eq!(fx.bucket_quota(&bucket).await, (0, 0));
+
+    fx.set_bucket_quota(&bucket, 4).await;
+    let resp = fx
+        .complete_multipart(&bucket, key, &upload_id, complete_xml(&etags).as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 507, "8 > 4 配额必须被拒");
+    let body = resp.text().await.expect("error body");
+    assert!(
+        body.contains("QuotaExceeded"),
+        "错误体必须点名配额错误码: {body}"
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (4, 0));
+
+    // 被拒后 session 保留(ListMultipartUploads 仍可重试)。
+    let list = fx.list_multipart_uploads(&bucket).await;
+    assert_eq!(list.status().as_u16(), 200, "list uploads");
+    let list_body = list.text().await.expect("list body");
+    assert!(
+        list_body.contains(upload_id.as_str()),
+        "被拒后 session 必须保留: {list_body}"
+    );
+
+    // 调大到 8 → 原样重发即成功;used = 8(manifest 逻辑总量)。
+    fx.set_bucket_quota(&bucket, 8).await;
+    let resp = fx
+        .complete_multipart(&bucket, key, &upload_id, complete_xml(&etags).as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "调大配额后重发必须成功");
+    assert_eq!(fx.bucket_quota(&bucket).await, (8, 8));
+
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.bytes().await.expect("body"), &b"aaaabbbb"[..]);
+}

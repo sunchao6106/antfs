@@ -23,6 +23,8 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn delete_bucket(&self, name: &str) -> Result<()>;
     async fn head_bucket(&self, name: &str) -> Result<Option<BucketMeta>>;
     async fn list_buckets(&self, owner: &str) -> Result<Vec<BucketMeta>>;
+    async fn get_bucket_quota(&self, bucket: &str) -> Result<Option<BucketQuota>>;
+    async fn set_bucket_quota(&self, bucket: &str, quota_bytes: u64) -> Result<()>;
 
     // Multipart
     async fn create_multipart(

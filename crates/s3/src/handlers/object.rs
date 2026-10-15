@@ -89,7 +89,7 @@ pub async fn put_object(
         .put_auto_with_ttl(body_bytes, NO_EXPIRATION)
         .await?;
 
-    let outcome = st
+    let outcome = match st
         .metastore
         .put_object(PutObjectMeta {
             bucket: bucket.to_string(),
@@ -101,7 +101,22 @@ pub async fn put_object(
             user_meta,
             parts_manifest: None,
         })
-        .await?;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e @ S3Error::QuotaExceeded { .. }) => {
+            // 死点模型:配额拒绝 → 本次已写的 blob 同请求墓碑(幂等),再回 507。
+            if let Err(de) = st.router.delete(&blob_key).await {
+                tracing::warn!(error = %de, "s3 quota: tombstone of rejected write failed (blob leaked until manual cleanup)");
+            }
+            st.metrics
+                .quota_rejected_total
+                .with_label_values(&[bucket])
+                .inc();
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
     // overwrite 遮蔽的旧版本即刻回收(引擎 delete 幂等;失败只降级为泄漏计数,不回滚新版本)。
     for old in &outcome.shadowed_blobs {

@@ -84,7 +84,18 @@ pub async fn complete_multipart_upload(
 
     let parts = crate::xml::parse_complete_multipart(xml_str)?;
 
-    let result = st.metastore.complete_multipart(upload_id, &parts).await?;
+    let result = match st.metastore.complete_multipart(upload_id, &parts).await {
+        Ok(result) => result,
+        Err(e @ S3Error::QuotaExceeded { .. }) => {
+            // parts 不计账、session 未清:调大配额后客户端原样重发 complete 即可重试。
+            st.metrics
+                .quota_rejected_total
+                .with_label_values(&[bucket])
+                .inc();
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
     // 被本次 complete 遮蔽的旧版本即刻回收(同 put_object 语义,幂等)。
     for old in &result.shadowed_blobs {

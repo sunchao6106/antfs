@@ -38,34 +38,21 @@ impl MetaStore for MysqlMetaStore {
         } else {
             Some(serde_json::to_string(&req.user_meta).unwrap_or_default())
         };
-        sqlx::query(
-            "INSERT INTO named_objects (bucket, `key`, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest)
-             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&req.bucket)
-        .bind(&req.key)
-        .bind(version)
-        .bind(req.blob_id.as_bytes().as_slice())
-        .bind(req.size as i64)
-        .bind(&req.etag)
-        .bind(&req.content_type)
-        .bind(now)
-        .bind(&meta_json)
-        .bind(&req.parts_manifest)
-        .execute(&self.pool)
-        .await?;
-        // 遮蔽同 key 旧活行(overwrite 语义,PG 版同段注释)。MySQL 无 RETURNING,两步:
-        // 先圈定将被遮蔽的 blob_id,再同条件 UPDATE。两步间隙被并发遮蔽的行会重复置位
-        // (幂等,deleted_at 重写无语义损伤);被拿到的 blob 重复删除由引擎墓碑兜底 —— 收敛正确。
-        let shadowed: Vec<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT blob_id FROM named_objects
+        // 记账事务(PG 版同构):遮蔽(两步)→ 配额净增量守卫(单语句原子)→ INSERT。
+        let mut tx = self.pool.begin().await?;
+
+        // MySQL 无 RETURNING,两步:先圈定将被遮蔽的 blob_id + size,再同条件 UPDATE。
+        // 两步间隙的并发遮蔽使记账偏保守(竞态口径见 change 的 design.md)。
+        let shadowed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT blob_id, size FROM named_objects
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL AND version < ?",
         )
         .bind(&req.bucket)
         .bind(&req.key)
         .bind(version)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        let shadow_bytes: i64 = shadowed.iter().map(|(_, s)| *s).sum();
         sqlx::query(
             "UPDATE named_objects SET state = 0, deleted_at = ?
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL AND version < ?",
@@ -74,13 +61,62 @@ impl MetaStore for MysqlMetaStore {
         .bind(&req.bucket)
         .bind(&req.key)
         .bind(version)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        // 配额守卫,净增量口径(used + 新写 − 遮蔽 ≤ quota;quota=0 不限)。
+        let new_size = req.size as i64;
+        let guard = sqlx::query(
+            "UPDATE buckets SET used_bytes = used_bytes + ? - ?
+             WHERE name = ? AND (quota_bytes = 0 OR used_bytes + ? - ? <= quota_bytes)",
+        )
+        .bind(new_size)
+        .bind(shadow_bytes)
+        .bind(&req.bucket)
+        .bind(new_size)
+        .bind(shadow_bytes)
+        .execute(&mut *tx)
+        .await?;
+        if guard.rows_affected() == 0 {
+            tx.rollback().await?;
+            let quota: Option<(i64, i64)> =
+                sqlx::query_as("SELECT quota_bytes, used_bytes FROM buckets WHERE name = ?")
+                    .bind(&req.bucket)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            return match quota {
+                None => Err(S3Error::NoSuchBucket),
+                Some((q, u)) => Err(S3Error::QuotaExceeded {
+                    bucket: req.bucket.clone(),
+                    quota: q.max(0) as u64,
+                    used: u.max(0) as u64,
+                }),
+            };
+        }
+
+        sqlx::query(
+            "INSERT INTO named_objects (bucket, `key`, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest)
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&req.bucket)
+        .bind(&req.key)
+        .bind(version)
+        .bind(req.blob_id.as_bytes().as_slice())
+        .bind(new_size)
+        .bind(&req.etag)
+        .bind(&req.content_type)
+        .bind(now)
+        .bind(&meta_json)
+        .bind(&req.parts_manifest)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
         Ok(PutObjectOutcome {
             version,
             shadowed_blobs: shadowed
                 .into_iter()
-                .map(|(b,)| blob_id_from_bytes(&b))
+                .map(|(b, _)| blob_id_from_bytes(&b))
                 .collect(),
         })
     }
@@ -101,18 +137,21 @@ impl MetaStore for MysqlMetaStore {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<DeletedObject>> {
         let now = Self::now_ms();
-        // MySQL has no `UPDATE ... RETURNING`; select the current latest version and its
-        // blob_id first, then soft-delete exactly that version.
-        let latest: Option<(i64, Vec<u8>)> = sqlx::query_as(
-            "SELECT version, blob_id FROM named_objects
+        // 记账事务:墓碑与 used_bytes 扣减同事务(PG 版同构)。
+        // MySQL has no `UPDATE ... RETURNING`; select the current latest version, its
+        // blob_id and size first, then soft-delete exactly that version.
+        let mut tx = self.pool.begin().await?;
+        let latest: Option<(i64, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT version, blob_id, size FROM named_objects
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL
              ORDER BY version DESC LIMIT 1",
         )
         .bind(bucket)
         .bind(key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        let Some((version, blob_id)) = latest else {
+        let Some((version, blob_id, size)) = latest else {
+            tx.commit().await?;
             return Ok(None);
         };
 
@@ -124,11 +163,18 @@ impl MetaStore for MysqlMetaStore {
         .bind(bucket)
         .bind(key)
         .bind(version)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
+            tx.commit().await?;
             return Ok(None);
         }
+        sqlx::query("UPDATE buckets SET used_bytes = used_bytes - ? WHERE name = ?")
+            .bind(size)
+            .bind(bucket)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
 
         Ok(Some(DeletedObject {
             blob_id: blob_id_from_bytes(&blob_id),
@@ -147,6 +193,31 @@ impl MetaStore for MysqlMetaStore {
             });
         }
         Ok(results)
+    }
+
+    async fn get_bucket_quota(&self, bucket: &str) -> Result<Option<BucketQuota>> {
+        let row: Option<(i64, i64)> =
+            sqlx::query_as("SELECT quota_bytes, used_bytes FROM buckets WHERE name = ?")
+                .bind(bucket)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(q, u)| BucketQuota {
+            name: bucket.to_string(),
+            quota_bytes: q.max(0) as u64,
+            used_bytes: u.max(0) as u64,
+        }))
+    }
+
+    async fn set_bucket_quota(&self, bucket: &str, quota_bytes: u64) -> Result<()> {
+        let res = sqlx::query("UPDATE buckets SET quota_bytes = ? WHERE name = ?")
+            .bind(quota_bytes as i64)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(S3Error::NoSuchBucket);
+        }
+        Ok(())
     }
 
     async fn list_objects(&self, req: ListObjectsReq) -> Result<ListObjectsResp> {
@@ -791,6 +862,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let blob_id = StoreKey::from_parts(1, 123);
         let user_meta = UserMeta::from([("k".to_string(), "v".to_string())]);
@@ -839,6 +911,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let req1 = PutObjectMeta {
             bucket: bucket.clone(),
@@ -876,6 +949,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let req = PutObjectMeta {
             bucket: bucket.clone(),
@@ -915,6 +989,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let keys: Vec<String> = (0..3).map(|i| format!("k{}", i)).collect();
         for (i, k) in keys.iter().enumerate() {
             let req = PutObjectMeta {
@@ -949,6 +1024,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let keys = [
             "logs/a".to_string(),
             "logs/b".to_string(),
@@ -988,6 +1064,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let keys = [
             "logs/2024/a".to_string(),
             "logs/2025/b".to_string(),
@@ -1029,6 +1106,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         for i in 0..5 {
             let req = PutObjectMeta {
                 bucket: bucket.clone(),
@@ -1117,6 +1195,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let upload_id = store
             .create_multipart(&bucket, &key, Some("text/plain"), &UserMeta::default())
@@ -1188,6 +1267,7 @@ mod tests {
         };
         let store = MysqlMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let upload_id = store
             .create_multipart(&bucket, &key, None, &UserMeta::default())

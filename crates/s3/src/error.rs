@@ -21,6 +21,11 @@ pub enum S3Error {
     EntityTooLarge,
     MissingContentLength,
     MetadataTooLarge,
+    QuotaExceeded {
+        bucket: String,
+        quota: u64,
+        used: u64,
+    },
     InvalidArgument(String),
 }
 
@@ -45,6 +50,7 @@ impl S3Error {
             Self::EntityTooLarge => "EntityTooLarge",
             Self::MissingContentLength => "MissingContentLength",
             Self::MetadataTooLarge => "MetadataTooLarge",
+            Self::QuotaExceeded { .. } => "QuotaExceeded",
             Self::InvalidArgument(_) => "InvalidArgument",
         }
     }
@@ -59,6 +65,7 @@ impl S3Error {
             }
             Self::MalformedXML(_) | Self::MissingContentLength => StatusCode::BAD_REQUEST,
             Self::MetadataTooLarge | Self::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+            Self::QuotaExceeded { .. } => StatusCode::from_u16(507).unwrap(),
             Self::AccessDenied(_)
             | Self::SignatureDoesNotMatch
             | Self::InvalidAccessKeyId
@@ -115,6 +122,9 @@ impl S3Error {
             Self::MetadataTooLarge => {
                 "Your metadata headers exceed the maximum allowed metadata size.".into()
             }
+            Self::QuotaExceeded { bucket, quota, used } => format!(
+                "The bucket storage quota is exceeded (bucket: {bucket}, quota: {quota} bytes, in use: {used} bytes)."
+            ),
             Self::InvalidArgument(detail) => {
                 format!("Invalid argument: {detail}")
             }

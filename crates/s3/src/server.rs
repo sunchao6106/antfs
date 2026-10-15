@@ -78,6 +78,10 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/credentials/{access_key}",
             delete(delete_credential_handler),
         )
+        .route(
+            "/admin/buckets/{bucket}/quota",
+            get(get_bucket_quota_handler).put(set_bucket_quota_handler),
+        )
         .route("/metrics", get(metrics_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -247,6 +251,26 @@ async fn delete_credential_handler(
     Path(access_key): Path<String>,
 ) -> Response {
     crate::handlers::admin::delete_credential(st, &access_key)
+        .await
+        .into_response()
+}
+
+async fn get_bucket_quota_handler(
+    State(st): State<AppState>,
+    Path(bucket): Path<String>,
+    req: Request,
+) -> Response {
+    crate::handlers::admin::get_bucket_quota(st, &bucket, req)
+        .await
+        .into_response()
+}
+
+async fn set_bucket_quota_handler(
+    State(st): State<AppState>,
+    Path(bucket): Path<String>,
+    req: Request,
+) -> Response {
+    crate::handlers::admin::set_bucket_quota(st, &bucket, req)
         .await
         .into_response()
 }

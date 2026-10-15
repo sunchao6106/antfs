@@ -207,6 +207,12 @@ mod tests {
         async fn list_buckets(&self, _owner: &str) -> MetaResult<Vec<BucketMeta>> {
             Err(not_implemented())
         }
+        async fn get_bucket_quota(&self, _bucket: &str) -> MetaResult<Option<BucketQuota>> {
+            Err(not_implemented())
+        }
+        async fn set_bucket_quota(&self, _bucket: &str, _quota_bytes: u64) -> MetaResult<()> {
+            Err(not_implemented())
+        }
         async fn create_multipart(
             &self,
             _bucket: &str,

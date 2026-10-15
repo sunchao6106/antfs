@@ -5,6 +5,7 @@ use antfs_metric::{
 
 pub struct S3Metrics {
     pub requests_total: IntCounterVec,
+    pub quota_rejected_total: IntCounterVec,
     pub request_duration_seconds: HistogramVec,
     pub metastore_queries_total: IntCounterVec,
     pub metastore_errors_total: IntCounterVec,
@@ -24,6 +25,12 @@ impl S3Metrics {
                 "s3_requests_total",
                 "S3 API requests",
                 &["op", "status"],
+            )?,
+            quota_rejected_total: counter_vec(
+                registry,
+                "s3_quota_rejected_total",
+                "Write requests rejected by bucket storage quota (HTTP 507)",
+                &["bucket"],
             )?,
             request_duration_seconds: latency_seconds_vec(
                 registry,

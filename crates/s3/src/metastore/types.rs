@@ -58,6 +58,15 @@ pub struct DeleteResult {
     pub error: Option<String>,
 }
 
+/// 桶级存储配额与占用记账的交接视图(字节;quota 0 = 不限)。守卫/扣减在 put/delete/
+/// complete 的记账事务里维护,GC purge 不触碰(state=0 行不在计数集合)。
+#[derive(Debug, Clone)]
+pub struct BucketQuota {
+    pub name: String,
+    pub quota_bytes: u64,
+    pub used_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BucketMeta {
     pub name: String,

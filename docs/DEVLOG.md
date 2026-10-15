@@ -1233,4 +1233,21 @@
 - **实现弯路(记档)**:`from_std` 要求 socket 先非阻塞(否则 tokio panic「Registering a
   blocking socket」),以及 `parse::<SocketAddr>` 显式类型(原推断由 tonic `serve(addr)` 撑着)。
 - **验证**:frontend rest 套件连跑 3×17 全绿;48 份×17 夹具并行压测 0 挂 0 ConnectionRefused;
-  master/frontend/workspace 测试绿。CI 待绿(3857cba 红 = 本根因命中时诊断体立功)。 
+  master/frontend/workspace 测试绿。CI 绿(186d334;3857cba 的红即本根因被响应体诊断当场点名)。
+
+## 步骤 51:桶级存储配额(`s3-bucket-quota`,S3 门面族首轮)(2026-10-15)
+
+- **实现**:buckets 表 + `quota_bytes`/`used_bytes`(双方言 002 迁移 + 存量回填:used =
+  Σ state=1 行 size);put/complete 写入事务内**净增量守卫**(单语句条件 UPDATE:
+  `used + 新写 − 遮蔽 ≤ quota`)→ 被拒 **507 `QuotaExceeded`**(XML 带 bucket/quota/used;
+  PUT 已写 blob 同请求 router.delete 墓碑 = s3-gc 死点模型)。delete/遮蔽同事务扣减;
+  admin 端点 GET/PUT `/admin/buckets/{bucket}/quota`;multipart complete 被拒时 session
+  保留、调大后原样重发即重试;指标 `s3_quota_rejected_total{bucket}`。
+- **语义连带修正(有意)**:守卫 0 行命中同时兜住「PUT 到不存在的桶 → 404
+  `NoSuchBucket`」(对齐真 S3)。9 个 pg + 9 个 mysql 内联单测据此补 `create_bucket`
+  (原裸桶名写法在新语义下即应失败);FakeMetaStore(auth 单测)补两桩。
+- **验证**:PG 真机 `--ignored` 净/脏两连跑全绿;新 3 用例:全链路记账(拒/放/
+  覆盖净扣/调大恢复/删除释放/quota=0 解除/指标行值)、并发守卫恰一次、complete
+  拒后可重试;fmt/clippy/workspace 全绿。
+- 文档:s3.md buckets 表 +2 列、监控表 +1 行、「桶级存储配额」节;归档
+  `openspec/changes/archive/2026-10-15-s3-bucket-quota/`。 

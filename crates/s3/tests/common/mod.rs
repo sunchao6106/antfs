@@ -792,6 +792,42 @@ impl S3Fixture {
         self.request(Method::GET, &format!("/{bucket}?uploads="), Vec::new())
             .await
     }
+
+    // ── admin: bucket quota(/admin 路径无 SigV4;fixture 未配 operator_token = 开放)──
+
+    /// Set the bucket's storage quota (bytes; 0 = unlimited) via the admin endpoint.
+    pub async fn set_bucket_quota(&self, bucket: &str, quota_bytes: u64) {
+        let resp = self
+            .http
+            .put(format!(
+                "http://{}/admin/buckets/{bucket}/quota",
+                self.s3_addr
+            ))
+            .json(&serde_json::json!({ "quota_bytes": quota_bytes }))
+            .send()
+            .await
+            .expect("set quota request");
+        assert_eq!(resp.status().as_u16(), 200, "set quota on {bucket}");
+    }
+
+    /// Read quota accounting via the admin endpoint → (quota_bytes, used_bytes)。
+    pub async fn bucket_quota(&self, bucket: &str) -> (u64, u64) {
+        let resp = self
+            .http
+            .get(format!(
+                "http://{}/admin/buckets/{bucket}/quota",
+                self.s3_addr
+            ))
+            .send()
+            .await
+            .expect("get quota request");
+        assert_eq!(resp.status().as_u16(), 200, "quota on {bucket}");
+        let v: serde_json::Value = resp.json().await.expect("quota json");
+        (
+            v["quota_bytes"].as_u64().expect("quota_bytes field"),
+            v["used_bytes"].as_u64().expect("used_bytes field"),
+        )
+    }
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────────────────────

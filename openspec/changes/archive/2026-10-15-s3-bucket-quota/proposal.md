@@ -25,8 +25,8 @@ proposal 末尾——须用户拍板后另立 change)。
 - **扣减维护**(与标记同事务):delete_object / overwrite-shadow 置 state=0 时按行 size 扣
   `used_bytes`;GC purge 只删已扣过的行(state=0),无需再动。complete_multipart 的行 size=
   各 part size 之和(manifest 逻辑量)。
-- **管理端点**(admin token 域,对齐 creds 管理形态):`GET /_admin/buckets/{name}/quota`、
-  `PUT /_admin/buckets/{name}/quota`(body: `{"quota_bytes": N}`,0=解除)。
+- **管理端点**(admin token 域,对齐 creds 管理形态):`GET /admin/buckets/{name}/quota`、
+  `PUT /admin/buckets/{name}/quota`(body: `{"quota_bytes": N}`,0=解除)。
 - **指标**:`s3_quota_rejected_total{bucket}` counter(§7 同步 s3.md 监控表)。
 - **竞态口径(如实入 spec)**:守卫与计数是**单语句原子**(PG/InnoDB 短行锁);不做跨语句长锁。
   热桶吞吐上限 ≈ 单行 UPDATE 串行率(千级 ops/s/bucket),记为已知上界;跨语句竞态仅存在于

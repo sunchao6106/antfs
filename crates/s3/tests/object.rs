@@ -414,3 +414,115 @@ async fn poll_tombstoned(fx: &S3Fixture, blob: &antfs_blob::StoreKey) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// 桶级配额全链路:守卫拒写(507 + QuotaExceeded + 死点墓碑)、净增量覆盖释放、
+/// 调大恢复、删除释放、quota=0 解除;used 记账经 admin 闭环核对;拒绝计数落真 Registry。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn quota_gates_writes_and_accounts() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("quota").await;
+
+    fx.set_bucket_quota(&bucket, 12).await;
+
+    assert_eq!(
+        fx.put_object(&bucket, "a.bin", &[1u8; 8])
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (12, 8));
+
+    let resp = fx.put_object(&bucket, "b.bin", &[2u8; 5]).await;
+    assert_eq!(resp.status().as_u16(), 507, "13 > 12 必须被配额拒绝");
+    let body = resp.text().await.expect("error body");
+    assert!(
+        body.contains("QuotaExceeded"),
+        "错误体必须点名配额错误码: {body}"
+    );
+    assert!(
+        fx.state
+            .metastore
+            .get_object(&bucket, "b.bin")
+            .await
+            .expect("get b")
+            .is_none(),
+        "被拒写不能落行(blob 已同请求墓碑)"
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (12, 8));
+
+    // 覆盖大→小:净增量 4−8 = −4 次 → 放行,used 4。
+    assert_eq!(
+        fx.put_object(&bucket, "a.bin", &[3u8; 4])
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (12, 4));
+
+    // 调大恢复:同尺寸 5B 放行(used 9)。
+    fx.set_bucket_quota(&bucket, 100).await;
+    assert_eq!(
+        fx.put_object(&bucket, "b.bin", &[4u8; 5])
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (100, 9));
+
+    // 删除释放(used 4)。
+    assert_eq!(
+        fx.delete_object(&bucket, "b.bin").await.status().as_u16(),
+        204
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (100, 4));
+
+    let dumped = antfs_metric::gather(&fx.state.registry).expect("gather");
+    let want = format!("s3_quota_rejected_total{{bucket=\"{bucket}\"}}");
+    let line = dumped
+        .lines()
+        .find(|l| l.starts_with(&want))
+        .unwrap_or_else(|| panic!("配额拒绝指标必须落真 Registry:\n{dumped}"));
+    assert!(line.ends_with(" 1"), "本桶拒绝计数应为 1: {line}");
+
+    // quota=0 解除限制。
+    fx.set_bucket_quota(&bucket, 0).await;
+    assert_eq!(
+        fx.put_object(&bucket, "c.bin", &[5u8; 200])
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (0, 204));
+}
+
+/// 守卫原子性:并发同抢最后余量,恰一只成功(单语句条件 UPDATE 的行锁保证)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn quota_guard_exactly_one_passes_under_race() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("quota-race").await;
+
+    fx.set_bucket_quota(&bucket, 10).await;
+    assert_eq!(
+        fx.put_object(&bucket, "setup.bin", &[1u8; 8])
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+
+    let f1 = fx.put_object(&bucket, "r1.bin", &[2u8; 2]);
+    let f2 = fx.put_object(&bucket, "r2.bin", &[2u8; 2]);
+    let (r1, r2) = tokio::join!(f1, f2);
+    let (c1, c2) = (r1.status().as_u16(), r2.status().as_u16());
+    assert!(
+        (c1 == 200 && c2 == 507) || (c1 == 507 && c2 == 200),
+        "恰一只成功、另一只被拒: {c1}/{c2}"
+    );
+    assert_eq!(fx.bucket_quota(&bucket).await, (10, 10));
+}

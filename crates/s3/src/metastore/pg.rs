@@ -38,6 +38,52 @@ impl MetaStore for PgMetaStore {
         } else {
             Some(serde_json::to_string(&req.user_meta).unwrap_or_default())
         };
+        // 记账事务:遮蔽(先圈出字节)→ 配额净增量守卫(单语句原子)→ INSERT,一并提交。
+        let mut tx = self.pool.begin().await?;
+
+        // 遮蔽同 key 旧活行(overwrite 语义:旧数据立即可弃)。紧邻 INSERT;
+        // 并发 overwrite 自然满足 last-writer-wins(version 单调)。
+        let shadowed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "UPDATE named_objects SET state = 0, deleted_at = $3
+             WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL AND version < $4
+             RETURNING blob_id, size",
+        )
+        .bind(&req.bucket)
+        .bind(&req.key)
+        .bind(now)
+        .bind(version)
+        .fetch_all(&mut *tx)
+        .await?;
+        let shadow_bytes: i64 = shadowed.iter().map(|(_, s)| *s).sum();
+
+        // 配额守卫,净增量口径(used + 新写 − 遮蔽 ≤ quota;quota=0 不限)。
+        let new_size = req.size as i64;
+        let guard = sqlx::query(
+            "UPDATE buckets SET used_bytes = used_bytes + $2 - $3
+             WHERE name = $1 AND (quota_bytes = 0 OR used_bytes + $2 - $3 <= quota_bytes)",
+        )
+        .bind(&req.bucket)
+        .bind(new_size)
+        .bind(shadow_bytes)
+        .execute(&mut *tx)
+        .await?;
+        if guard.rows_affected() == 0 {
+            tx.rollback().await?;
+            let quota: Option<(i64, i64)> =
+                sqlx::query_as("SELECT quota_bytes, used_bytes FROM buckets WHERE name = $1")
+                    .bind(&req.bucket)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            return match quota {
+                None => Err(S3Error::NoSuchBucket),
+                Some((q, u)) => Err(S3Error::QuotaExceeded {
+                    bucket: req.bucket.clone(),
+                    quota: q.max(0) as u64,
+                    used: u.max(0) as u64,
+                }),
+            };
+        }
+
         sqlx::query(
             "INSERT INTO named_objects (bucket, key, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest)
              VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8, $9, $10)",
@@ -46,32 +92,21 @@ impl MetaStore for PgMetaStore {
         .bind(&req.key)
         .bind(version)
         .bind(req.blob_id.as_bytes().as_slice())
-        .bind(req.size as i64)
+        .bind(new_size)
         .bind(&req.etag)
         .bind(&req.content_type)
         .bind(now)
         .bind(&meta_json)
         .bind(&req.parts_manifest)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        // 遮蔽同 key 旧活行(overwrite 语义:旧数据立即可弃)。紧邻 INSERT;
-        // 并发 overwrite 自然满足 last-writer-wins(version 单调)。
-        let shadowed: Vec<(Vec<u8>,)> = sqlx::query_as(
-            "UPDATE named_objects SET state = 0, deleted_at = $3
-             WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL AND version < $4
-             RETURNING blob_id",
-        )
-        .bind(&req.bucket)
-        .bind(&req.key)
-        .bind(now)
-        .bind(version)
-        .fetch_all(&self.pool)
-        .await?;
+        tx.commit().await?;
+
         Ok(PutObjectOutcome {
             version,
             shadowed_blobs: shadowed
                 .into_iter()
-                .map(|(b,)| blob_id_from_bytes(&b))
+                .map(|(b, _)| blob_id_from_bytes(&b))
                 .collect(),
         })
     }
@@ -92,7 +127,9 @@ impl MetaStore for PgMetaStore {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<DeletedObject>> {
         let now = Self::now_ms();
-        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        // 记账事务:墓碑与 used_bytes 扣减同事务(不变量:used = Σ state=1 行 size)。
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
             "UPDATE named_objects SET state = 0, deleted_at = $3
              WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL
              AND version = (
@@ -100,14 +137,22 @@ impl MetaStore for PgMetaStore {
                  WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL
                  ORDER BY version DESC LIMIT 1
              )
-             RETURNING blob_id",
+             RETURNING blob_id, size",
         )
         .bind(bucket)
         .bind(key)
         .bind(now)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(row.map(|(blob_id,)| DeletedObject {
+        if let Some((_, size)) = &row {
+            sqlx::query("UPDATE buckets SET used_bytes = used_bytes - $2 WHERE name = $1")
+                .bind(bucket)
+                .bind(*size)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(row.map(|(blob_id, _)| DeletedObject {
             blob_id: blob_id_from_bytes(&blob_id),
             key: key.to_string(),
         }))
@@ -124,6 +169,31 @@ impl MetaStore for PgMetaStore {
             });
         }
         Ok(results)
+    }
+
+    async fn get_bucket_quota(&self, bucket: &str) -> Result<Option<BucketQuota>> {
+        let row: Option<(i64, i64)> =
+            sqlx::query_as("SELECT quota_bytes, used_bytes FROM buckets WHERE name = $1")
+                .bind(bucket)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(q, u)| BucketQuota {
+            name: bucket.to_string(),
+            quota_bytes: q.max(0) as u64,
+            used_bytes: u.max(0) as u64,
+        }))
+    }
+
+    async fn set_bucket_quota(&self, bucket: &str, quota_bytes: u64) -> Result<()> {
+        let res = sqlx::query("UPDATE buckets SET quota_bytes = $2 WHERE name = $1")
+            .bind(bucket)
+            .bind(quota_bytes as i64)
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(S3Error::NoSuchBucket);
+        }
+        Ok(())
     }
 
     async fn list_objects(&self, req: ListObjectsReq) -> Result<ListObjectsResp> {
@@ -753,6 +823,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let blob_id = StoreKey::from_parts(1, 123);
         let user_meta = UserMeta::from([("k".to_string(), "v".to_string())]);
@@ -801,6 +872,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let req1 = PutObjectMeta {
             bucket: bucket.clone(),
@@ -838,6 +910,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let req = PutObjectMeta {
             bucket: bucket.clone(),
@@ -877,6 +950,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let keys: Vec<String> = (0..3).map(|i| format!("k{}", i)).collect();
         for (i, k) in keys.iter().enumerate() {
             let req = PutObjectMeta {
@@ -911,6 +985,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let keys = [
             "logs/a".to_string(),
             "logs/b".to_string(),
@@ -950,6 +1025,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let keys = [
             "logs/2024/a".to_string(),
             "logs/2025/b".to_string(),
@@ -991,6 +1067,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         for i in 0..5 {
             let req = PutObjectMeta {
                 bucket: bucket.clone(),
@@ -1079,6 +1156,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let upload_id = store
             .create_multipart(&bucket, &key, Some("text/plain"), &UserMeta::default())
@@ -1150,6 +1228,7 @@ mod tests {
         };
         let store = PgMetaStore::new(pool);
         let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
         let upload_id = store
             .create_multipart(&bucket, &key, None, &UserMeta::default())
