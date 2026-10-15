@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use axum::ServiceExt;
+
 use antfs_s3::config::S3GatewayToml;
 
 #[tokio::main]
@@ -38,7 +40,7 @@ async fn main() {
     };
     // 后台 GC(软删行保留期清理 + 孤儿 multipart TTL;受 antfs-s3.toml [s3.gc] 控制,默认开)。
     antfs_s3::gc::spawn(state.clone(), cfg.gc.clone());
-    let app = antfs_s3::server::build_router(state);
+    let app = antfs_s3::server::build_app(state);
 
     tracing::info!(
         listen = %cfg.listen_addr,
@@ -51,7 +53,7 @@ async fn main() {
         .await
         .expect("bind");
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("serve");

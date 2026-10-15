@@ -1,22 +1,19 @@
-//! Axum middleware that authenticates S3 requests with AWS Signature V4.
+//! S3 request authentication with AWS Signature V4, invoked by the gateway's
+//! service-level pipeline ([`crate::server::build_app`]) **before routing**.
 //!
 //! Each request is resolved into a [`Principal`]: *Signed* (a verified
 //! credential, from the `Authorization` header or a presigned `X-Amz-Algorithm`
 //! URL) or *Anonymous* — no credential attached at all; the anonymous request
 //! is carried through to the route layer, where per-bucket ACL gates decide.
 //! **Failed verification is never downgraded to Anonymous** — a request
-//! carrying a bad credential is rejected here.
-//! `/metrics` and `/admin/*` are served without auth (the admin surface
-//! carries its own operator-token auth).
+//! carrying a bad credential is rejected before dispatch.
+//! `/metrics` and `/admin/*` are served without credentialed auth (the admin
+//! surface carries its own operator-token auth).
 
-use axum::extract::{Request, State};
 use axum::http::HeaderMap;
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
 
 use crate::error::S3Error;
 use crate::metastore::MetaStore;
-use crate::server::AppState;
 
 use super::sigv4::{self, AuthInfo, CanonicalRequest, EMPTY_BODY_SHA256, UNSIGNED_PAYLOAD};
 
@@ -37,51 +34,16 @@ pub enum Principal {
     Anonymous,
 }
 
-/// Axum middleware entry point. Applied to the S3 router in [`crate::server`].
-pub async fn auth_middleware(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    if is_public_path(req.uri().path()) {
-        return next.run(req).await;
-    }
-
-    // Copy the request parts the verifier needs before the first `.await`;
-    // `&Request` is not `Sync`, so it must not be held across an await point.
-    let method = req.method().as_str().to_string();
-    let uri = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let headers = req.headers().clone();
-
-    // 无凭证完全缺席 = 匿名(Anonymous)注入放行,由路由层各闸门裁决;一旦有凭证
-    // 附着(Authorization 头或预签 query),严格验证,失败即 403 —— 绝不降级为匿名。
-    let principal = match authenticate(
-        state.metastore.as_ref(),
-        &state.config.region,
-        &method,
-        &uri,
-        &headers,
-    )
-    .await
-    {
-        Ok(Some(context)) => Principal::Signed(context),
-        Ok(None) => Principal::Anonymous,
-        Err(error) => return error.into_response(),
-    };
-    req.extensions_mut().insert(principal);
-    next.run(req).await
-}
-
-fn is_public_path(path: &str) -> bool {
+/// 公共面(`/metrics`、`/admin/*`)不要求凭证鉴权 —— admin 面自带 operator token。
+pub(crate) fn is_public_path(path: &str) -> bool {
     path == "/metrics" || path.starts_with("/admin")
 }
 
 /// 验证附着的凭证;`Ok(None)` = 完全无凭证(匿名),`Err` = 凭证存在但验证失败。
-async fn authenticate(
+/// 由服务级管线(`crate::server::build_app`)在路由分发**之前**调用 —— 验签视角
+/// 恒为**客户端原请求**(path 不含桶 + Host 含桶的 vhost 口径,与路径风格口径
+/// 各自天然成立)。
+pub(crate) async fn authenticate(
     metastore: &dyn MetaStore,
     expected_region: &str,
     method: &str,

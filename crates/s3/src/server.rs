@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use serde::Deserialize;
 
+use tower::ServiceExt;
+
 use antfs_router::Router as BlobRouter;
 
-use crate::auth::middleware::{auth_middleware, Principal};
+use crate::auth::middleware::Principal;
 use crate::config::S3GatewayConfig;
 use crate::error::S3Error;
 use crate::metastore::types::BucketAcl;
@@ -56,6 +58,144 @@ pub struct S3QueryParams {
     pub acl: Option<String>,
 }
 
+/// vhost Host → 改写后的 path+query;`None` = 放行(路径风格路由兜底)。
+///
+/// 规则(产物与等价路径风格请求逐字节同形,验签不受影响 —— 见中间件注释):
+/// - Host 剥离可选 `:port` 后须为 `{bucket}.{suffix}`;**裸基础域名(= suffix 本身)
+///   不命中**(那是路径风格端点);空/非法桶标(要求小写字母/数字/`-`/`.`)放行;
+/// - `/` → `/{bucket}`(根去尾斜杠恰命中桶路由);`/k` → `/{bucket}/k`;深 key 与
+///   尾斜杠逐字保留;query 原样重挂。
+fn vhost_rewrite(host: &str, path_and_query: &str, suffix: &str) -> Option<String> {
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    let bucket = host.strip_suffix(suffix)?.strip_suffix('.')?;
+    if bucket.is_empty()
+        || !bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return None;
+    }
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
+    let rel = path.strip_prefix('/')?;
+    let new_path = if rel.is_empty() {
+        format!("/{bucket}")
+    } else {
+        format!("/{bucket}/{rel}")
+    };
+    Some(match query {
+        Some(q) => format!("{new_path}?{q}"),
+        None => new_path,
+    })
+}
+
+/// vhost 改写(纯同步助手,由服务级管线 [`build_app`] 在验签后调用):后缀未配置
+/// = 关;Host 匹配 `{bucket}.{suffix}` 则把 URI 改写为 `/{bucket}{path}`(规则见
+/// [`vhost_rewrite`])。只影响**后续路由分发** —— 调用点保证 auth 已按原
+/// URI/原 Host 验签完毕。
+fn apply_vhost_rewrite(state: &AppState, req: &mut Request) {
+    let suffix = state.config.virtual_host_domain.as_str();
+    if suffix.is_empty() {
+        return;
+    }
+    let Some(host) = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(pq) = req.uri().path_and_query().map(|pq| pq.as_str().to_string()) else {
+        return;
+    };
+    if let Some(rewritten) = vhost_rewrite(&host, &pq, suffix) {
+        match rewritten.parse::<Uri>() {
+            Ok(uri) => {
+                tracing::debug!(host = %host, to = %rewritten, "vhost path rewrite");
+                *req.uri_mut() = uri;
+            }
+            Err(e) => {
+                // 理论不可达(桶字符白名单 + 其余逐字透传);防御位:放行原请求。
+                tracing::warn!(host = %host, error = %e, "vhost rewrite parse failed");
+            }
+        }
+    }
+}
+
+/// 服务级管线(替 route_layer 版本 —— **axum 的路由匹配先于层执行**,URI 改写必须
+/// 发生在分发之前才能改命中,route_layer 中改写只对 handler 视图生效、改不了路由):
+/// ① `/metrics`、`/admin/*` 公共面直发(路径风格裸域端点,设计语义);② auth 按
+/// **原 path/原 Host** 验签(vhost 客户端签名 host 含桶、路径不含桶,与路径风格
+/// 两种口径**各自天然成立**),Principal 注入 extensions,验签失败在此回绝;③
+/// vhost 改写(配置门控);④ Router 分发 —— handler 提取 `Extension<Principal>`
+/// 的方式不变。
+#[derive(Clone)]
+pub struct GatewayPipeline {
+    state: AppState,
+    /// `Router<()>`:Clone + Service + Send + Sync(axum 0.8 自带断言);每请求
+    /// 克隆一份用 `ServiceExt::oneshot` 分发,poll_ready 恒就绪,无共享可变状态。
+    router: Router,
+}
+
+impl tower::Service<Request> for GatewayPipeline {
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response, std::convert::Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: Request) -> Self::Future {
+        let dispatch = self.router.clone();
+        let st = self.state.clone();
+        Box::pin(async move {
+            if crate::auth::middleware::is_public_path(req.uri().path()) {
+                return dispatch.oneshot(req).await;
+            }
+            let method = req.method().as_str().to_string();
+            let uri = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let headers = req.headers().clone();
+
+            let principal = match crate::auth::middleware::authenticate(
+                st.metastore.as_ref(),
+                &st.config.region,
+                &method,
+                &uri,
+                &headers,
+            )
+            .await
+            {
+                Ok(Some(ctx)) => Principal::Signed(ctx),
+                Ok(None) => Principal::Anonymous,
+                Err(error) => return Ok(error.into_response()),
+            };
+            req.extensions_mut().insert(principal);
+            apply_vhost_rewrite(&st, &mut req);
+            dispatch.oneshot(req).await
+        })
+    }
+}
+
+pub fn build_app(state: AppState) -> GatewayPipeline {
+    GatewayPipeline {
+        state: state.clone(),
+        router: build_router(state),
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(list_buckets_handler))
@@ -85,10 +225,9 @@ pub fn build_router(state: AppState) -> Router {
             get(get_bucket_quota_handler).put(set_bucket_quota_handler),
         )
         .route("/metrics", get(metrics_handler))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
+        // 鉴权与 vhost 改写在服务级管线 [`build_app`] 完成(必须先于本 Router 的
+        // 路由匹配 —— axum 的层在匹配之后执行);此处是纯路由 + handler
+        // (`Extension<Principal>` 提取方式不变)。
         .with_state(state)
 }
 
@@ -412,5 +551,42 @@ async fn metrics_handler(State(st): State<AppState>) -> Response {
         )
             .into_response(),
         Err(e) => S3Error::InternalError(format!("metrics: {e}")).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vhost_rewrite;
+
+    #[test]
+    fn vhost_rewrite_matrix() {
+        let s = "s3.example.test";
+        // 命中:基本形态 / 端口 / 根路径(去尾斜杠)/ ListV2 根 query / 深 key 尾斜杠。
+        assert_eq!(
+            vhost_rewrite("b.s3.example.test", "/k", s).as_deref(),
+            Some("/b/k")
+        );
+        assert_eq!(
+            vhost_rewrite("b.s3.example.test:7500", "/k?uploads", s).as_deref(),
+            Some("/b/k?uploads")
+        );
+        assert_eq!(
+            vhost_rewrite("b.s3.example.test", "/", s).as_deref(),
+            Some("/b")
+        );
+        assert_eq!(
+            vhost_rewrite("b.s3.example.test", "/?list-type=2", s).as_deref(),
+            Some("/b?list-type=2")
+        );
+        assert_eq!(
+            vhost_rewrite("b.s3.example.test", "/a/b/c/", s).as_deref(),
+            Some("/b/a/b/c/")
+        );
+        // 放行:裸基础域名 / 无关 Host / 空桶标 / 非法桶标 / 后缀未配置。
+        assert_eq!(vhost_rewrite("s3.example.test", "/k", s), None);
+        assert_eq!(vhost_rewrite("other.example.com", "/k", s), None);
+        assert_eq!(vhost_rewrite(".s3.example.test", "/k", s), None);
+        assert_eq!(vhost_rewrite("Bad_Bucket.s3.example.test", "/k", s), None);
+        assert_eq!(vhost_rewrite("b.s3.example.test", "/k", ""), None);
     }
 }

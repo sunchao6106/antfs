@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::ServiceExt;
+
 use antfs_config::Validate;
 use antfs_master::config::MasterConfig;
 use antfs_master::types::{DiskSpec, MasterCommand, MasterResponse, NodeInfo, ReplicaPlacement};
@@ -29,7 +31,7 @@ use antfs_master::MasterNode;
 use antfs_router::RouterConfig;
 use antfs_s3::config::{MetaStoreConfig, S3GatewayConfig};
 use antfs_s3::metrics::S3Metrics;
-use antfs_s3::server::{build_router, AppState};
+use antfs_s3::server::{build_app, AppState};
 use antfs_store::{StoreServer, StoreServerConfig};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -564,6 +566,9 @@ impl S3Fixture {
             operator_token: String::new(),
             metastore: metastore_cfg,
             router: router_cfg,
+            // vhost e2e(tests/vhost.rs)设 TEST_S3_VHOST_DOMAIN 起「后缀开」夹具;
+            // 其余二进制不设 → 默认空 = 关 —— 它们就是「默认关零变化」的回归。
+            virtual_host_domain: std::env::var("TEST_S3_VHOST_DOMAIN").unwrap_or_default(),
             ..Default::default()
         };
         cfg.validate().expect("s3 gateway config");
@@ -578,9 +583,9 @@ impl S3Fixture {
         let listener = tokio::net::TcpListener::bind(&s3_addr)
             .await
             .expect("bind s3 gateway");
-        let app = build_router(state.clone());
+        let app = build_app(state.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, app.into_make_service()).await;
         });
 
         // Create the fixture credential through the public admin endpoint (no signing needed).

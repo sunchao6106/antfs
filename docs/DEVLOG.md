@@ -1373,3 +1373,22 @@
 - 归档 `flush-bounded-dirty-window`(新 capability:store-flush-window,ADDED
   「Bounded dirty window for background flush」,场景:阈值触发早醒/0=纯周期/
   持久化边界不变/失败不风暴/两径计数与复位)。
+
+## 步骤 59:虚拟主机风格路由(`s3-vhost-routing`,翻案落地)(2026-10-15)
+
+- **实现(终形:服务级管线)**:`GatewayPipeline`(#[derive(Clone)],tower Service,
+  Future = Pin<Box<dyn Future + Send>>)—— ①公共面直发 ②authenticate 按原 path/原
+  Host 验签(两种签名口径天然成立,坏凭证绝不降级匿名)→ Principal 注入 ③vhost 改写
+  (`Host = {bucket}.{s3.virtual_host_domain}` → 路径前挂桶名,`:port` 剥离,非法桶标
+  放行)④Router 分发;`build_router` 摘除全部 route_layer;main/夹具换
+  `build_app().into_make_service()` 风格接线(into_make_service 桥 serve)。
+- **两课记档**:(a) axum `route_layer` 在**路由匹配之后**执行,URI 改写改不了既定
+  匹配 —— 改写必须发生在服务级(裸 TCP 探针实证后将初版 route_layer 方案整体替换);
+  (b) reqwest `.header()` 是 **append 语义**:HeaderMap 已带 host 再追加 → 双 Host
+  出线 → 服务器按 SigV4 规范把多值头逗号连接 → 验签必败(canonical-diff 双探针实证,
+  修法 = 删冗余追加,Host 签名口径逐字一致)。
+- **验收**:vhost 三测(全矩阵 e2e / 匿名探针 / 裸 TCP 双签名 SIGNED-RAW 断言)净/脏
+  双跑绿;既有全套 e2e fresh/dirty 零变化(默认关 = 部署行为不变直证);fmt/clippy 0;
+  lib 51 绿。
+- docs:s3.md 矩阵行翻转 ✅ + 配置表行 + 「虚拟主机寻址」节 + D5/后续方向重排;
+  README 双语;归档 `s3-vhost-routing`。
