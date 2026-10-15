@@ -1216,4 +1216,21 @@
 - **工具**:`antfs-bench-blob` 补 `--reopen` / `--total-mib` / `--ops 0`(纯读)——冷/重启复测
   常备口径;`docker`/VM 口径的既有结论保持引用。
 - 本机真铁锚(供后引):engine 1 MiB 裸写 2.9 GB/s、64 KiB 28.4k ops/s、暖读 10-24 GB/s、
-  dd 顺序写 7.4 GB/s;frontend 稳态 12.6-14.5k ops/s concurrent、router 直连 14-15.6k。 
+  dd 顺序写 7.4 GB/s;frontend 稳态 12.6-14.5k ops/s concurrent、router 直连 14-15.6k。
+
+## 步骤 50:CI 偶发 503 第二族根因 —— master `serve()` spawn 后才 bind 的「已启动未监听」窗口(2026-10-15)
+
+- **捕获**:步骤 49 给 rest.rs `upload` 断言携带响应体的投资当场回本 —— 3857cba 的 CI 失败
+  直接点名:`master rpc: tcp connect error, Connection refused (127.0.0.1:33513)` —— router
+  首个懒连接 RPC 撞上 master gRPC 监听未 bind 的窗口。
+- **根因**:`MasterNode::serve()` 两个 `tokio::spawn(Server::serve(addr))`:bind 发生在被
+  spawn 的任务里,`serve()` 返回 ≠ 端口在监听。17 套夹具并行起栈时调度差拉宽窗口;此前
+  bind 失败还是被 `let _ =` 静默吞掉的。
+- **修复**(生产语义):std `TcpListener::bind` + `set_nonblocking(true)` 在 `serve()` 返回前
+  同步完成,accept 循环 spawn(`serve_with_incoming` + `TcpListenerStream`)。契约变强:
+  **serve() 返回 = 两端口已监听**;bind 失败由函数显式报错。与步骤 48 同族收口:「首写失败
+  窗口」的传输层一员。
+- **实现弯路(记档)**:`from_std` 要求 socket 先非阻塞(否则 tokio panic「Registering a
+  blocking socket」),以及 `parse::<SocketAddr>` 显式类型(原推断由 tonic `serve(addr)` 撑着)。
+- **验证**:frontend rest 套件连跑 3×17 全绿;48 份×17 夹具并行压测 0 挂 0 ConnectionRefused;
+  master/frontend/workspace 测试绿。CI 待绿(3857cba 红 = 本根因命中时诊断体立功)。 

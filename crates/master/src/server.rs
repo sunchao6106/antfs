@@ -276,8 +276,8 @@ impl MasterNode {
 
     /// 绑定并后台运行两个 gRPC 服务:`RaftInternal`(raft_addr)与 `Master`(grpc_addr)。
     pub fn serve(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let raft_addr = self.config.raft_addr.parse()?;
-        let grpc_addr = self.config.grpc_addr.parse()?;
+        let raft_addr: std::net::SocketAddr = self.config.raft_addr.parse()?;
+        let grpc_addr: std::net::SocketAddr = self.config.grpc_addr.parse()?;
 
         let raft_svc = RaftInternalServer::new(RaftInternalService {
             raft: self.raft.clone(),
@@ -294,16 +294,30 @@ impl MasterNode {
             placement_index: self.placement_index.clone(),
         });
 
+        // 绑定端口必须在 serve() 返回前完成:spawn 后再 bind 曾留下「服务已启动但端口未监听」
+        // 窗口,客户端首个懒连接 RPC 撞 ConnectionRefused → 503(CI 偶发第二族根因,DEVLOG 50)。
+        let raft_listener = std::net::TcpListener::bind(raft_addr)?;
+        raft_listener.set_nonblocking(true)?;
+        let grpc_listener = std::net::TcpListener::bind(grpc_addr)?;
+        grpc_listener.set_nonblocking(true)?;
         tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(
+                tokio::net::TcpListener::from_std(raft_listener)
+                    .expect("serve() 须在 tokio runtime 上下文中调用"),
+            );
             let _ = Server::builder()
                 .add_service(raft_svc)
-                .serve(raft_addr)
+                .serve_with_incoming(incoming)
                 .await;
         });
         tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(
+                tokio::net::TcpListener::from_std(grpc_listener)
+                    .expect("serve() 须在 tokio runtime 上下文中调用"),
+            );
             let _ = Server::builder()
                 .add_service(master_svc)
-                .serve(grpc_addr)
+                .serve_with_incoming(incoming)
                 .await;
         });
 
