@@ -94,24 +94,26 @@ fn parse_args() -> Args {
 
 fn print_help() {
     eprintln!(
-        "antfs-bench-blob — BlobStore 层压测\n\
+        "antfs-bench-blob — BlobStore-layer benchmark\n\
          \n\
-         --ops N           PUT 次数 (default 100000)\n\
-         --value-size B    每个 blob 字节数 (default 4096)\n\
-         --threads T       PUT 并发线程 (default = CPU 数)\n\
-         --read-ops N      GET 次数 (default 100000)\n\
-         --read-threads T  GET 并发线程 (default = CPU 数)\n\
-         --index-max N     活跃索引封存阈值 (default 100000)\n\
-         --segment-mib M   单段大小 MiB (default 64)\n\
-         --dir PATH        数据目录 (default 临时目录,跑完删除)\n\
-         --total-mib M     显式覆盖容量口径 MiB (--reopen 对齐建库参数用)\n\
-         --reopen          重开既有库(BlobStore::open;配 --ops 0 做纯读复测)\n\
-         --flush-interval-ms N  周期 fsync 线程间隔 (default 0 = 关)。store 生产路径有 flush worker\n\
-                            周期清脏页;裸引擎压不带上它会把段的 fsync 尾部整个甩到滚转点\n\
-                            (对齐生产形态请给 1000~5000)\n\
-         --sync-seal-flush        关闭 defer_seal_flush(滚转点同步 fsync 旧段=旧行为,作 A/B 对照)\n\
-         --evict-before-read      GET 阶段前对数据段 fadvise DONTNEED 驱逐 page cache:\n\
-                            冷读口径(「冷数据·暖索引」——索引 mmap 页未驱逐)\n"
+         --ops N           PUT count (default 100000)\n\
+         --value-size B    blob size in bytes (default 4096)\n\
+         --threads T       PUT concurrency (default = CPU count)\n\
+         --read-ops N      GET count (default 100000)\n\
+         --read-threads T  GET concurrency (default = CPU count)\n\
+         --index-max N     active-index seal threshold (default 100000)\n\
+         --segment-mib M   segment size in MiB (default 64)\n\
+         --dir PATH        data directory (default: a temp dir, removed after the run)\n\
+         --total-mib M     explicit capacity in MiB (let --reopen match the init-time params)\n\
+         --reopen          reopen an existing store (BlobStore::open; pair --ops 0 for a pure read re-test)\n\
+         --flush-interval-ms N  periodic fsync thread interval (default 0 = off). The production store path has\n\
+                            a flush worker that periodically cleans dirty pages; benchmarking the bare engine\n\
+                            without it dumps each segment's whole fsync tail onto the rollover point\n\
+                            (pass 1000-5000 to match the production shape)\n\
+         --sync-seal-flush        disable defer_seal_flush (sync fsync of the old segment at rollover = the old\n\
+                            behavior, for A/B comparison)\n\
+         --evict-before-read      fadvise DONTNEED the data segments before the GET phase for a cold-read\n\
+                            profile (\"cold data, warm index\" — index mmap pages are not evicted)\n"
     );
 }
 
@@ -347,7 +349,7 @@ fn main() {
 
     let store = Arc::new(if args.reopen {
         BlobStore::open(&dir, total, segment, args.index_max)
-            .expect("open existing store (保持建库时的 --segment-mib/--index-max/--total-mib 一致)")
+            .expect("open existing store (keep --segment-mib/--index-max/--total-mib consistent with the values used at init)")
     } else if args.sync_seal_flush {
         let registry = antfs_metric::Registry::new();
         let metrics = antfs_blob::StoreMetrics::new(&registry).expect("register store metrics");
@@ -405,7 +407,7 @@ fn main() {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         handle
             .join()
-            .expect("join flush thread (最长再等一个 interval)");
+            .expect("join flush thread (waits at most one more interval)");
     }
     Arc::into_inner(store)
         .expect("no dangling refs")

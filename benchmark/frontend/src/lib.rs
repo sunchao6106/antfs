@@ -40,7 +40,7 @@ impl Default for Cfg {
 /// (单次操作失败只计入报表的 `err`,不中断)。
 pub async fn run(cfg: Cfg) -> Result<(), String> {
     let base = cfg.base.trim_end_matches('/').to_string();
-    println!("target: {base}/blobs (REST 网关)");
+    println!("target: {base}/blobs (REST gateway)");
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.timeout_secs))
         .build()

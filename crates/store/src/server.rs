@@ -103,10 +103,12 @@ impl StoreServer {
             tracing::warn!(
                 io_error_shutdown_at = store_config.io_error_count_to_trigger_shutdown,
                 active_probing = config.disk_health_enabled,
-                "启动自检:两条被动输入未开齐 —— 设备层 EIO 不会让引擎自关(建议 \
-                 store.io_error_count_to_trigger_shutdown 显式开 3~10),主动盘探测也没开 \
-                 (store_server.disk_health_enabled);此时只有 IO 看门狗能产出 UNAVAILABLE。\
-                 见 docs/design/cluster.md §9.2 与 §9.5"
+                "startup self-check: both passive disk-failure inputs are off — device-level \
+                 EIO will not shut the engine down (recommend enabling \
+                 store.io_error_count_to_trigger_shutdown, 3-10), and active disk probing is \
+                 off too (store_server.disk_health_enabled); only the IO watchdog can produce \
+                 UNAVAILABLE in this state. \
+                 See docs/design/cluster.md §9.2 and §9.5"
             );
         }
         let disks = DiskManager::mount_with(&config.data_dirs, staging_dir(&config))?;

@@ -187,7 +187,7 @@ pub fn compare(replicas: &[ReplicaFacts]) -> Verdict {
     if key_comparison_usable && key_divergences > MAX_KEY_DIVERGENCES {
         divergences.push(Divergence::Summary {
             field: "key_divergences_truncated".to_string(),
-            detail: format!("key 级差异共 {key_divergences} 条,仅列出前 {MAX_KEY_DIVERGENCES} 条"),
+            detail: format!("key-level divergences total {key_divergences}; listing only the first {MAX_KEY_DIVERGENCES}"),
         });
     }
 

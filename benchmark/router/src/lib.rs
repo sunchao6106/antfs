@@ -59,7 +59,7 @@ fn err_label(e: &antfs_router::Error) -> String {
 /// 跑一轮:PUT(必须)+ GET(可选)+ verify(可选)。返回 Err = 连不上 master 等致命问题
 /// (单次操作失败只计入报表的 `err`,不中断)。
 pub async fn run(cfg: Cfg) -> Result<(), String> {
-    println!("target: master {} (直连 router SDK)", cfg.master_addr);
+    println!("target: master {} (direct router SDK)", cfg.master_addr);
     let registry = antfs_metric::Registry::new();
     let router = Router::connect(
         RouterConfig {
@@ -199,7 +199,7 @@ fn report_partition_spread(keys: &[StoreKey], weights: &[(u32, u32)]) {
     let sum_w: u64 = weights.iter().map(|(_, w)| u64::from(*w)).sum();
     let total = keys.len() as u64;
     println!(
-        "分配分布: {total} 个号落在 {} 个分区(本地可写分区 {} 个,权重合计 {sum_w})",
+        "distribution: {total} keys across {} partitions ({} locally writable, total weight {sum_w})",
         by_pid.len(),
         weights.len()
     );
@@ -207,12 +207,12 @@ fn report_partition_spread(keys: &[StoreKey], weights: &[(u32, u32)]) {
         let pct = *n as f64 * 100.0 / total as f64;
         match weight_of.get(pid).filter(|_| sum_w > 0) {
             Some(w) => println!(
-                "  partition {pid:<6} {n:>8} 个 ({pct:>5.1}%)  权重 {w:>4} → 期望 {:>5.1}%",
+                "  partition {pid:<6} {n:>8} keys ({pct:>5.1}%)  weight {w:>4} -> expected {:>5.1}%",
                 f64::from(*w) * 100.0 / sum_w as f64
             ),
             // 写过的分区此刻不在本地可写集合里(转 RO/封存后被丢掉):不猜权重,直说。
             None => println!(
-                "  partition {pid:<6} {n:>8} 个 ({pct:>5.1}%)  权重未知(已不在本地可写集合)"
+                "  partition {pid:<6} {n:>8} keys ({pct:>5.1}%)  weight unknown (no longer in the locally writable set)"
             ),
         }
     }

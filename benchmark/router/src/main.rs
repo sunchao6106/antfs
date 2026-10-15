@@ -13,17 +13,17 @@
 use antfs_bench_common::Args;
 use antfs_bench_router::Cfg;
 
-const USAGE: &str = "antfs-bench-router — 直连 router SDK 的端到端压测\n\
+const USAGE: &str = "antfs-bench-router — end-to-end benchmark via the direct router SDK\n\
 \n\
---master ADDR       master 控制面 gRPC 地址 (default 127.0.0.1:7101)\n\
---secret S          集群准入密钥 (空 = 不校验)\n\
---timeout-secs N    单请求超时秒数 (default 10)\n\
---segment-size N    一次向 master 申请的 blobId 个数 (default 1024)\n\
---ops N             写操作数 (default 10000)\n\
---concurrency C     并发任务数 (default 32)\n\
---size B            每个对象字节数 (default 4096)\n\
---read-ratio P      读阶段规模 = 写成功数 × P% (default 0 = 不读)\n\
---verify            抽前 64 个对象回读对拍\n";
+--master ADDR       master control-plane gRPC address (default 127.0.0.1:7101)\n\
+--secret S          cluster admission secret (empty = no check)\n\
+--timeout-secs N    per-request timeout in seconds (default 10)\n\
+--segment-size N    blobId count leased from master per request (default 1024)\n\
+--ops N             write ops (default 10000)\n\
+--concurrency C     concurrent tasks (default 32)\n\
+--size B            object size in bytes (default 4096)\n\
+--read-ratio P      read phase = successful writes x P% (default 0 = no reads)\n\
+--verify            read back the first 64 objects and compare byte-for-byte\n";
 
 #[tokio::main]
 async fn main() {

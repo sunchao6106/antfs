@@ -37,7 +37,7 @@ fn main() {
         String::from_utf8_lossy(&buf[..m]).trim_end()
     );
     assert_eq!(&buf[..m], &payload[..m]);
-    println!("[ok] 同步 buffered IO 读写闭环验证通过");
+    println!("[ok] synchronous buffered IO read/write round-trip verified");
 
     let _ = std::fs::remove_file(&path);
 }

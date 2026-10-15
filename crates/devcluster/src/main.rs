@@ -41,16 +41,17 @@ fn parse_args(argv: &[String]) -> std::result::Result<(DevClusterConfig, Option<
     while let Some(a) = scan.next() {
         if a == "--config" {
             explicit = Some(PathBuf::from(
-                scan.next().ok_or_else(|| "--config 缺参数".to_string())?,
+                scan.next()
+                    .ok_or_else(|| "--config requires a value".to_string())?,
             ));
         }
     }
     let (mut a, file) =
-        config::load(explicit.as_deref()).map_err(|e| format!("读取配置失败: {e}"))?;
+        config::load(explicit.as_deref()).map_err(|e| format!("failed to load config: {e}"))?;
 
     let mut it = argv.iter();
     while let Some(flag) = it.next() {
-        let mut val = || it.next().ok_or_else(|| format!("{flag} 缺参数"));
+        let mut val = || it.next().ok_or_else(|| format!("{flag} requires a value"));
         match flag.as_str() {
             // 已在上面读过并铺底,这里只吃掉它的值。
             "--config" => {
@@ -93,42 +94,45 @@ fn parse_args(argv: &[String]) -> std::result::Result<(DevClusterConfig, Option<
 /// 数值解析:报错要指出哪个 flag、给的是什么值(配置文件与命令行走同一条报错口径)。
 fn num<T: std::str::FromStr>(flag: &str, raw: &str) -> std::result::Result<T, String> {
     raw.parse()
-        .map_err(|_| format!("{flag} 的值 `{raw}` 不合法"))
+        .map_err(|_| format!("invalid value `{raw}` for {flag}"))
 }
 
 fn print_help() {
     eprintln!(
-        "devcluster — 本地 master + 3×store + admin 一键起集群\n\
+        "devcluster — one-command local cluster: master + 3x store + admin web\n\
          \n\
-         参数来源(后覆盖前):内置默认 < 配置文件 < 环境变量 AMBRY_* < 命令行。\n\
-         样例配置见仓库根 `devcluster.toml.example`。\n\
+         Config sources (later overrides earlier): built-in defaults < config file < AMBRY_* env vars < command line.\n\
+         See `devcluster.toml.example` at the repo root for a sample.\n\
          \n\
-         --config PATH          配置文件路径 (default:当前目录的 ./devcluster.toml,存在才读)\n\
-         --dir PATH             数据/日志根目录 (default ./.localcluster,退出不删)\n\
-         --partitions N         目标分区总数 (default 3;幂等 —— 已有不少于它就不再建,复跑不会叠加)\n\
-         --rf N                 每分区副本数 (default 3;不得大于 store 节点数)\n\
-         --master-grpc-port P   master 控制面 gRPC 端口 (default 7101)\n\
-         --master-raft-port P   master Raft 内部 RPC 端口 (default 7100)\n\
-         --store-base-port P    store 节点 HTTP 起始端口,依次 +0/+1/+2 (default 7200)\n\
-         --admin-port P         admin web 端口 (default 7300)\n\
-         --store-count N        store 节点数 (default 3;≥4 才能验证 RF=3 下的 move/均衡与删源)\n\
-         --disk-near-full-ratio F  master 盘将满阈值 (default 0.8;口径是宿主机整盘,调小可在本地复现\n\
-                                「分区转 RO」;本地盘偏满以致建不出分区时提到 0.95)\n\
-         --partition-capacity-bytes B  每分区容量字节数 (default 64MiB,刻意小:本地易写满,\n\
-                                便于验证写满 507 / 转 RO;压大对象吞吐或长期积数据请调大)\n\
-         --disk-health          开启 store 主动盘探测(心跳带健康值,用于验证健康回填与避让)\n\
-         --frontend-port P      frontend REST 端口 (default 7400)\n\
-         --host ADDR            对外服务(master gRPC / admin / frontend)的监听 host\n\
-                                (default 127.0.0.1;容器里传 0.0.0.0 才能被 -p 发布的端口访问)\n\
+         --config PATH          config file path (default: ./devcluster.toml in the current dir, read if present)\n\
+         --dir PATH             data/log root directory (default ./.localcluster, kept after exit)\n\
+         --partitions N         target partition count (default 3; idempotent — no new partitions once at least that many exist)\n\
+         --rf N                 replicas per partition (default 3; must not exceed the store node count)\n\
+         --master-grpc-port P   master control-plane gRPC port (default 7101)\n\
+         --master-raft-port P   master Raft internal RPC port (default 7100)\n\
+         --store-base-port P    first store node HTTP port, then +0/+1/+2 (default 7200)\n\
+         --admin-port P         admin web port (default 7300)\n\
+         --store-count N        store node count (default 3; >=4 to exercise move/balance and source removal under RF=3)\n\
+         --disk-near-full-ratio F  master near-full threshold (default 0.8; measured on the host's whole disk; lower it\n\
+                                to locally reproduce partition-turns-RO; raise to 0.95 if the local disk is too full\n\
+                                to place new partitions)\n\
+         --partition-capacity-bytes B  partition capacity in bytes (default 64MiB, deliberately small so it fills up\n\
+                                locally, handy for verifying 507 / RO transition; raise it for large-object throughput\n\
+                                or long-lived data)\n\
+         --disk-health          enable store active disk probing (health values in heartbeats, to verify backfill and avoidance)\n\
+         --frontend-port P      frontend REST port (default 7400)\n\
+         --host ADDR            listen host for the public endpoints (master gRPC / admin / frontend)\n\
+                                (default 127.0.0.1; pass 0.0.0.0 inside a container for the -p published ports to reach it)\n\
          --s3-port P            S3 gateway port (default 7500; only when --s3-metastore-url is set)\n\
          --s3-metastore-url U   MetaStore URL (e.g. postgres://user:pass@localhost/antfs_s3)\n\
                                 When set, starts the S3 gateway; otherwise S3 is not started\n\
-         --run-bench MODE       起完集群(等就绪)后跑一轮压测并退出:MODE = router | frontend\n\
-                                (同进程压测,数字只作冒烟参考;正式压测请跑 antfs-bench-* 二进制)\n\
-         --bench-ops N          压测写操作数 (default 20000;仅 --run-bench 时用)\n\
-         --bench-concurrency C  压测并发数 (default 32)\n\
-         --bench-size B         压测对象字节数 (default 4096)\n\
-         --bench-read-ratio P   压测读阶段占比 % (default 20)"
+         --run-bench MODE       once the cluster is ready, run one bench round and exit: MODE = router | frontend\n\
+                                (in-process bench; numbers are smoke-level only — for real benchmarks run the\n\
+                                antfs-bench-* binaries)\n\
+         --bench-ops N          bench write ops (default 20000; only with --run-bench)\n\
+         --bench-concurrency C  bench concurrency (default 32)\n\
+         --bench-size B         bench object size in bytes (default 4096)\n\
+         --bench-read-ratio P   bench read-phase ratio in % (default 20)"
     );
 }
 
@@ -398,16 +402,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     })
                     .await
                 }
-                None => Err("frontend 未启动(端口被占?),无法跑 frontend 压测".to_string()),
+                None => Err(
+                    "frontend not started (port busy?); cannot run the frontend bench".to_string(),
+                ),
             },
         };
         match result {
             Ok(()) => {
-                println!("  --run-bench {mode} 完成,退出(集群随本进程结束)");
+                println!("  --run-bench {mode} finished, exiting (cluster ends with this process)");
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("  --run-bench {mode} 失败: {e}");
+                eprintln!("  --run-bench {mode} failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -591,18 +597,21 @@ fn print_summary(args: &DevClusterConfig, banner: &Banner) {
         config_file,
     } = *banner;
     println!("\n========================================================");
-    println!("  antfs 本地集群已就绪 (数据目录 {})", args.dir.display());
     println!(
-        "  参数来源      : {}",
+        "  antfs local cluster ready (data dir {})",
+        args.dir.display()
+    );
+    println!(
+        "  config source  : {}",
         match config_file {
-            Some(p) => format!("{} (+ 命令行覆盖)", p.display()),
-            None => "内置默认(无 devcluster.toml)".to_string(),
+            Some(p) => format!("{} (plus command-line overrides)", p.display()),
+            None => "built-in defaults (no devcluster.toml)".to_string(),
         }
     );
     println!("--------------------------------------------------------");
     println!("  admin web     : http://{admin_addr}");
-    println!("                  operator token = {OPERATOR_TOKEN} (读写)");
-    println!("                  viewer   token = {VIEWER_TOKEN} (只读)");
+    println!("                  operator token = {OPERATOR_TOKEN} (read-write)");
+    println!("                  viewer   token = {VIEWER_TOKEN} (read-only)");
     println!("  master gRPC   : {grpc_addr}");
     if let Some(fa) = frontend_addr {
         println!("  frontend REST : http://{fa}");
@@ -618,31 +627,33 @@ fn print_summary(args: &DevClusterConfig, banner: &Banner) {
         );
     }
     println!(
-        "  partitions    : {} 个 (RF={}) {partitions:?}",
+        "  partitions    : {} (RF={}) {partitions:?}",
         partitions.len(),
         args.replication_factor
     );
     println!("--------------------------------------------------------");
-    println!("  端到端联调(直连 router SDK:自己向 master 取号段再直连 store)");
+    println!("  end-to-end test (direct router SDK: lease id ranges from master, then talk to stores directly)");
     println!("    cargo run -p antfs-bench-router --release -- --master {grpc_addr} --secret {SECRET} \\");
     println!("      --ops 20000 --concurrency 32 --size 4096 --read-ratio 20 --verify");
-    println!("    # 单对象冒烟:--ops 1 --size 1048576");
+    println!("    # single-object smoke: --ops 1 --size 1048576");
     if let Some(fa) = frontend_addr {
-        println!("  REST 路径(经 frontend;任何 HTTP 客户端都能用)");
+        println!("  REST path (via frontend; any HTTP client works)");
         println!(
-            "    # 注意:`curl -T` 发的是 PUT,上传要用 POST(见 docs/design/frontend.md 的契约表)"
+            "    # note: `curl -T` sends PUT; uploads must use POST (see the contract table in docs/design/frontend.md)"
         );
         println!("    curl -X POST --data-binary @/tmp/a.bin http://{fa}/blobs -i   # 201 + Location: /blobs/<blobId>");
         println!("    curl http://{fa}/blobs/<blobId> -o /tmp/b.bin && cmp /tmp/a.bin /tmp/b.bin");
-        println!("    curl -I http://{fa}/blobs/<blobId>             # 元数据头(不读数据体)");
+        println!(
+            "    curl -I http://{fa}/blobs/<blobId>             # metadata headers (no body read)"
+        );
         println!("    curl -X DELETE http://{fa}/blobs/<blobId> -i   # 204");
-        println!("    curl -X POST --data-binary @/tmp/a.bin -H 'x-antfs-ttl-ms: 1780000000000' http://{fa}/blobs -i   # 201;TTL 只能在写入时定");
+        println!("    curl -X POST --data-binary @/tmp/a.bin -H 'x-antfs-ttl-ms: 1780000000000' http://{fa}/blobs -i   # 201; TTL is write-time only");
         println!("    cargo run -p antfs-bench-frontend --release -- --frontend http://{fa} \\");
         println!("      --ops 20000 --concurrency 32 --size 4096 --read-ratio 20");
     }
     if let Some(pid) = partitions.first() {
         let key = "0f".repeat(8); // key 为 8 字节 → 16 hex
-        println!("  裸数据面示例(绕过 router 只打单个 store;W/R 由 client 负责,**别当生产用法**)");
+        println!("  raw data-plane example (bypasses the router, hits a single store; W/R is the client's job — **not for production use**)");
         println!(
             "    curl -X PUT --data-binary hello http://{}/partitions/{pid}/blobs/{key}",
             store_addrs[0]
@@ -652,10 +663,10 @@ fn print_summary(args: &DevClusterConfig, banner: &Banner) {
             store_addrs[0]
         );
     }
-    println!("  引擎层压测(独立跑,不压本集群):");
+    println!("  engine-level bench (standalone; does not stress this cluster):");
     println!("    cargo run -p antfs-bench-blob --release -- --ops 100000 --value-size 4096");
     println!("========================================================");
-    println!("  Ctrl-C 停止。\n");
+    println!("  Ctrl-C to stop.\n");
 }
 
 #[cfg(test)]

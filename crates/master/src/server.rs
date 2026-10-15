@@ -806,7 +806,7 @@ impl MasterNode {
                 // 后台照常每周期重算,有新节点/盘加入即自动补齐。
                 if unsatisfiable != last_unsatisfiable {
                     if unsatisfiable.is_empty() {
-                        tracing::info!("reconcile: 之前无法补的欠副本已全部满足");
+                        tracing::info!("reconcile: previously unsatisfiable under-replicated partitions are now all satisfied");
                     } else {
                         tracing::warn!(
                             count = unsatisfiable.len(),

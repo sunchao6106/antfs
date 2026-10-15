@@ -9,15 +9,15 @@
 use antfs_bench_common::Args;
 use antfs_bench_frontend::Cfg;
 
-const USAGE: &str = "antfs-bench-frontend — 经 frontend(HTTP REST)的端到端压测\n\
+const USAGE: &str = "antfs-bench-frontend — end-to-end benchmark via frontend (HTTP REST)\n\
 \n\
---frontend URL      frontend 基地址 (default http://127.0.0.1:7400)\n\
---timeout-secs N    单请求超时秒数 (default 30)\n\
---ops N             写操作数 (default 10000)\n\
---concurrency C     并发任务数 (default 32)\n\
---size B            每个对象字节数 (default 4096)\n\
---read-ratio P      读阶段规模 = 写成功数 × P% (default 0 = 不读)\n\
---verify            抽前 64 个对象回读对拍\n";
+--frontend URL      frontend base URL (default http://127.0.0.1:7400)\n\
+--timeout-secs N    per-request timeout in seconds (default 30)\n\
+--ops N             write ops (default 10000)\n\
+--concurrency C     concurrent tasks (default 32)\n\
+--size B            object size in bytes (default 4096)\n\
+--read-ratio P      read phase = successful writes x P% (default 0 = no reads)\n\
+--verify            read back the first 64 objects and compare byte-for-byte\n";
 
 #[tokio::main]
 async fn main() {

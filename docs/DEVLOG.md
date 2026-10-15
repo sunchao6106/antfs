@@ -1314,4 +1314,15 @@
   MySQL 真机」实为撞本地库被拒 → `test_pool` 的 `.ok()?` 静默空跑(假绿;含步骤 52
   本地证据的口径)。本地矩阵凡真机一律走 mysql-c1 容器 @**13306**(host 侧 TCP 鉴权
   实检过);真凭证主渠道 = CI services 网络,无此坑。
+
+## 步骤 56:运行期输出统一英文化(2026-10-15)
+
+- **范围**:所有输出面 —— tracing 日志、println/eprintln、CLI `--help`/USAGE 文本、
+  启动横幅、报错 format! —— 全部转英文;**代码注释与测试断言消息维持中文不动**
+  (非输出面)。覆盖:store 启动自检 WARN(盘故障双输入状态通报)、master reconcile
+  info、admin scrub 汇总行、smoke、devcluster(参数解析报错/`--help`/启动横幅/bench
+  结果消息)、antfs-bench-router/frontend/blob(用法文本、target 行、分配分布报告、
+  expect 消息)。
+- **验证**:devcluster 真起整套集群(自定义端口)42 秒输出流 `rg Han` 断言为零;
+  三个 bench `--help` 与 smoke 真跑全英;fmt/clippy 0;受影响四 crate 测试绿。
  
