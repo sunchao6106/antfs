@@ -27,9 +27,17 @@ live spec(`s3-metastore`「Soft-delete with cleanup」)承诺的后台 GC 从未
 - `s3-core`:PutObject overwrite 场景补「旧版本即刻进入回收」的语义(不再是"reclaimable by GC"的空话);requirement 正文补遮蔽事务语义。
 - `s3-multipart`:其语义(Complete 遮蔽即刻回收、孤儿 session TTL)以场景固化在新能力 spec `s3-gc` 中,live spec 无漂移不改。
 
-## 已知缺口(留观,超出本 change 范围)
+## 已知缺口(留观,超出本 change 范围)【2026-10-15 更正:下段撤回】
 
-- **UploadPart 同 part-number 重传**:`INSERT ... ON CONFLICT (upload_id, part_number) DO UPDATE` 覆盖旧行 blob_id,旧 part blob 无人回收(历史遗留,非本 change 引入)。修法方向:CTE `DELETE ... RETURNING` 取旧 blob 后 handler 删。留待独立 change。
+> **更正**(`s3-uploadpart-reclaim-retraction`):下述「重传泄漏」为**误判**。`put_part`(双方言)
+> 一直先 SELECT 被替换行 blob_id 再 UPSERT 并返回之,handler 同请求 `router.delete`(de5f123
+> 起如此;`put_part_overwrite` 单测 PG/MySQL 双份在册)。误判成因:只扫了 INSERT 的 `ON
+> CONFLICT` 单行,未读前置 SELECT 与返回值。
+>
+> 真留观(已核实):并发同 part-number 重传的 SELECT→UPSERT 非原子,先提交者的新 blob 可被
+> 后提交者覆盖行而孤儿化(顺次重传无碍);修法 PG CTE 单语句化。见修正 change。
+
+~~- **UploadPart 同 part-number 重传**:`INSERT ... ON CONFLICT (upload_id, part_number) DO UPDATE` 覆盖旧行 blob_id,旧 part blob 无人回收(历史遗留,非本 change 引入)。修法方向:CTE `DELETE ... RETURNING` 取旧 blob 后 handler 删。留待独立 change。~~
 
 ## Impact
 

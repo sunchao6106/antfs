@@ -1173,5 +1173,8 @@
 - 集成测试共享库事故(CI 红两轮):GC 语句全库语义 × 断言仍全域计数 → 跨测试互相可见;
   一次桶域化改阵中一段 replace 与 fmt 后实文不符静默失手。修法:断言全部入本 fixture bucket 域、
   改用 edit 工具硬改(失手会吵)。验证升级为净/脏两连跑。
-- 留观:UploadPart 同 part-number 重传覆盖旧行 blob_id,旧 part blob 无人回收(历史遗留;
-  见 change proposal 缺口段,CTE RETURNING 可修,独立 change)。 
+- 留观更正(s3-uploadpart-reclaim-retraction):原记「UploadPart 重传泄漏」为误判,撤回 ——
+  `put_part`(PG/MySQL)先 SELECT 被替换行 blob_id 再 UPSERT 返回之,handler 同请求墓碑
+  (de5f123 起如此;`put_part_overwrite` 单测双份,净库重跑 2 passed)。误判成因:只扫
+  ON CONFLICT 单行,未读前置 SELECT 与返回值。真留观:并发同 part 重传的 SELECT→UPSERT
+  非原子可孤儿化中间 blob(顺次重传无碍;修法 PG CTE 单语句化,独立 change)。 

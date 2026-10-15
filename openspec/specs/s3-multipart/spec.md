@@ -18,7 +18,7 @@ The S3 gateway SHALL accept `POST /<bucket>/<key>?uploads`, generate a unique `u
 - **THEN** gateway returns `MetadataTooLarge` (400), no session is created
 
 ### Requirement: UploadPart writes a part as an independent blob
-The S3 gateway SHALL accept `PUT /<bucket>/<key>?partNumber=N&uploadId=ID`, write the part body as a separate blob via `put_auto_with_ttl`, compute its MD5 ETag, and upsert a row in `multipart_parts`.
+The S3 gateway SHALL accept `PUT /<bucket>/<key>?partNumber=N&uploadId=ID`, write the part body as a separate blob via `put_auto_with_ttl`, compute its MD5 ETag, and upsert a row in `multipart_parts`. On re-upload of the same part number the metastore upsert SHALL return the replaced part's `blob_id`, and the handler SHALL tombstone it (`router.delete`) within the same request (idempotent).
 
 #### Scenario: Successful part upload
 - **WHEN** client sends `PUT /mybucket/bigfile.bin?partNumber=1&uploadId=abc` with 5 MiB body
@@ -26,7 +26,7 @@ The S3 gateway SHALL accept `PUT /<bucket>/<key>?partNumber=N&uploadId=ID`, writ
 
 #### Scenario: Re-upload overwrites previous part
 - **WHEN** client uploads partNumber=1 twice with different data
-- **THEN** the second upload's blob_id and etag replace the first in `multipart_parts`; the old part blob becomes reclaimable
+- **THEN** the second upload's blob_id and etag replace the first in `multipart_parts`; the old part blob is tombstoned (`router.delete`) within the same request
 
 ### Requirement: CompleteMultipartUpload assembles parts into a named object
 The S3 gateway SHALL accept `POST /<bucket>/<key>?uploadId=ID` with XML listing parts, validate ETags match, store a manifest (ordered part blob_ids + sizes) in `named_objects` — inheriting the `content_type`/`user_meta` captured at CreateMultipartUpload — delete the multipart session, and return the final object's ETag.
