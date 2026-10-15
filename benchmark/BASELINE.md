@@ -143,7 +143,7 @@
 
 - **max ≈ 1.1-1.6 s 四模式皆在** → colima「VM 虚影盘毛刺」理论**修正**:不是虚拟盘虚构,是**多 GB 脏积压一次 fsync 的真实代价**;VM 遮住的是模式间差异、量级本来就真实。生产含义:4 GiB 段的滚转尾随一次秒级 fsync,**defer seam 不能缩量只能挪位**。
 - **裸 A/B 是发版修复的铁证**:异步 p99 4.1 ms vs 同步 210 ms(**≈50×**,colima 64 MiB 口径为 19×)——`defer_seal_flush` 在真铁成立。
-- **flush worker 在 GB/s 级写入下污染 p99**(~100-200 ms 摆动,异步带 flush 两轮 p99 全劣化):APFS 上周期全量 fsync 与并发写互相限流。生产单位写入低(≈百 MB/s 级)不受此形状影响;**P2 留观:bounded dirty window(fsync 拆窗)**。
+- **flush worker 在 GB/s 级写入下污染 p99**(~100-200 ms 摆动,异步带 flush 两轮 p99 全劣化):APFS 上周期全量 fsync 与并发写互相限流。生产单位写入低(≈百 MB/s 级)不受此形状影响;**P2 已试并反转(2026-10-15 同日)**:机制落地 `flush-bounded-dirty-window`(引擎脏计数 + worker 水位早醒,`store_server.flush_dirty_threshold_bytes`),**默认 0 = 关** —— 20 GB/4 线程口径真机 A/B:周期臂 max 1.14-2.07 s(本病理如实复现);水位 256 MiB 臂吞吐 −60%(1347-1403 vs 3229-3521 ops/s)、max 反至 1.65-5.5 s —— APFS 上「fsync×并发写互踩」随频数放大,小拆窗把巨停摆换成一串中停摆,净亏;生产百 MB/s 级两态等价;ext4 未测。详见 change 档「真机证据」。
 - 64 MiB 段(1 MiB × 6000,80 滚转)带 flush:async p99 105 ms / sync 28 ms——同为 flush 窗口噪声,单模式下难分优劣(与 colima 19× 判读差异 = I/O 栈不同,**横移差以裸 A/B 为准**)。
 - 64 KiB × 50k @ 4 GiB(零滚转锚):28.4k ops/s,p50 21.8 µs,p99 4.8 ms,GET 暖 10.1 GB/s——无回归。
 

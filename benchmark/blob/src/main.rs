@@ -26,6 +26,7 @@ struct Args {
     segment_bytes: u64,
     dir: Option<PathBuf>,
     flush_interval_ms: u64,
+    dirty_threshold_mib: u64,
     sync_seal_flush: bool,
     evict_before_read: bool,
     total_mib: Option<u64>,
@@ -47,6 +48,7 @@ impl Default for Args {
             segment_bytes: 64 * 1024 * 1024,
             dir: None,
             flush_interval_ms: 0,
+            dirty_threshold_mib: 0,
             sync_seal_flush: false,
             evict_before_read: false,
             total_mib: None,
@@ -73,6 +75,9 @@ fn parse_args() -> Args {
             "--dir" => a.dir = Some(PathBuf::from(val())),
             "--flush-interval-ms" => {
                 a.flush_interval_ms = val().parse::<u64>().expect("flush-interval-ms")
+            }
+            "--dirty-threshold-mib" => {
+                a.dirty_threshold_mib = val().parse::<u64>().expect("dirty-threshold-mib")
             }
             "--sync-seal-flush" => a.sync_seal_flush = true,
             "--evict-before-read" => a.evict_before_read = true,
@@ -110,6 +115,9 @@ fn print_help() {
                             a flush worker that periodically cleans dirty pages; benchmarking the bare engine\n\
                             without it dumps each segment's whole fsync tail onto the rollover point\n\
                             (pass 1000-5000 to match the production shape)\n\
+         --dirty-threshold-mib M  bounded-dirty-window watermark (default 0 = off): the flush thread wakes every\n\
+                            100ms and flushes once dirty bytes reach this many MiB, amortizing GB-scale fsync\n\
+                            stalls into bounded small ones (same shape as the store-server local worker)\n\
          --sync-seal-flush        disable defer_seal_flush (sync fsync of the old segment at rollover = the old\n\
                             behavior, for A/B comparison)\n\
          --evict-before-read      fadvise DONTNEED the data segments before the GET phase for a cold-read\n\
@@ -370,14 +378,26 @@ fn main() {
     if args.flush_interval_ms > 0 {
         let store = store.clone();
         let interval = std::time::Duration::from_millis(args.flush_interval_ms);
+        let threshold = args.dirty_threshold_mib * 1024 * 1024;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_flag = stop.clone();
         flush_thread = Some((
             std::thread::spawn(move || {
+                // 有界脏窗口(与 store-server 的 spawn_flush_loop 同构):100ms 检查节拍;
+                // 周期到点做全量,否则脏水位达阈即刷 —— 均摊脏回积,不出秒级巨 fsync。
+                // 首个全量沿旧口径(起跑后满一个 interval 才发生),阈值 0 = 态同旧线程。
+                let check_tick = std::time::Duration::from_millis(100);
+                let mut last_full = std::time::Instant::now();
                 while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(interval);
-                    if let Err(e) = store.flush() {
-                        eprintln!("flush loop error: {e}");
+                    std::thread::sleep(check_tick);
+                    let fire_full = last_full.elapsed() >= interval;
+                    if fire_full || (threshold > 0 && store.dirty_bytes() >= threshold) {
+                        if let Err(e) = store.flush() {
+                            eprintln!("flush loop error: {e}");
+                        }
+                        if fire_full {
+                            last_full = std::time::Instant::now();
+                        }
                     }
                 }
             }),

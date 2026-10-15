@@ -142,6 +142,9 @@ pub struct StoreServerMetrics {
     pub bootstrap_segments: IntCounter,
     pub bootstrap_bytes: IntCounter,
     pub flushes: IntCounter,
+    /// 有界脏水位早醒轮中完成 flush 的副本数(观测早醒机制是否在工作;口径与
+    /// `flushes` 同族,见 `flush-bounded-dirty-window`)。
+    pub flush_early_wakes: IntCounter,
     pub compactions: IntCounter,
     pub compaction_policy_used: IntCounterVec,
 }
@@ -381,6 +384,11 @@ impl StoreServerMetrics {
                 registry,
                 "store_server_flushes_total",
                 "local-worker flushes run",
+            )?,
+            flush_early_wakes: counter(
+                registry,
+                "store_server_flush_early_wakes_total",
+                "local-worker replicas flushed by dirty-watermark early rounds",
             )?,
             compactions: counter(
                 registry,

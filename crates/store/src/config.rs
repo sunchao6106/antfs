@@ -125,6 +125,13 @@ pub struct StoreServerConfig {
     pub local_worker_enabled: bool,
     /// 本地 worker flush 周期(秒):推进持久化边界,缩小 W=2 page-cache 掉电窗口。
     pub flush_interval_secs: u64,
+    /// flush **早醒水位**(字节):某副本自上次 flush 尝试以来未持久化字节 ≥ 此值时,
+    /// 本地 worker 在周期 tick 之外**立即只 flush 该副本**(有界脏窗口,fsync 拆窗)。
+    /// **默认 0 = 关**:真机 APFS/GB-s 口径证据为反例(水位臂吞吐 −60%、max 反劣,见
+    /// `flush-bounded-dirty-window` 档「真机证据」),生产低写入速率(百 MB/s 级)两态
+    /// 行为等价,ext4 未测 —— 开启与否交由 Operator 按部署实测。过小值自限(复位后需
+    /// 等新字节重新武装),建议 ≥ 1 MiB。
+    pub flush_dirty_threshold_bytes: u64,
     /// 本地 worker compaction 的**周期**(秒):跑一次之后隔多久再跑;默认 86400 = 一天一次。
     pub compaction_interval_secs: u64,
     /// compaction 的**首跑钟点**(本地时间,`HH:MM`):首次触发对齐到下一个该钟点(今天没过就是今天,
@@ -273,6 +280,7 @@ impl Default for StoreServerConfig {
             bootstrap_copy_enabled: true,
             local_worker_enabled: true,
             flush_interval_secs: 30,
+            flush_dirty_threshold_bytes: 0,
             compaction_interval_secs: 86400,
             compaction_start_time: "01:00".to_string(),
             compaction_dead_ratio: 0.3,

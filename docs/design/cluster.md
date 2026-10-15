@@ -631,6 +631,7 @@ store server(一个进程 / 一台数据节点)
 | `store_server.bootstrap_copy_enabled` | bool | true | — | 封存段物理拷贝加速 bootstrap(S3b);随 `replication_enabled` 生效 |
 | `store_server.local_worker_enabled` | bool | true | — | 本地维护 worker 开关(S4:周期 flush/compaction) |
 | `store_server.flush_interval_secs` | u64 | 30 | ≥1 | 本地 worker flush 周期(推进持久化边界)(S4) |
+| `store_server.flush_dirty_threshold_bytes` | u64 | 0 | 任意正字节(典型 128-512 MiB;过小 = 近乎逐写 fsync) | flush 早醒水位(有界脏窗口):单副本自上次 flush 尝试以来脏量达阈即早醒只 flush 它;**默认 0 = 关**(APFS 反例证据与 ext4 待测,见 `openspec/changes/archive` 的 flush-bounded-dirty-window 档) | 
 | `store_server.compaction_interval_secs` | u64 | 86400 | ≥1 | 本地 worker **compaction 周期**:跑一次之后隔多久再跑(默认一天一次)(S4) |
 | `store_server.compaction_start_time` | String | `"01:00"` | 严格 `HH:MM`(本地时间) | compaction **首跑钟点**:首次对齐到下一个该钟点(今天没过即今天,过了即明天),之后每 `compaction_interval_secs` 一次(S4) |
 | `store_server.compaction_dead_ratio` | f64 | 0.3 | (0,1] | **可回收**字节占比 ≥ 此值才压缩(partition 级闸门与段级选择同一阈值);可回收 = 被取代的旧记录 + TTL 过期对象 + 墓碑过保留期(S4) |
@@ -681,6 +682,7 @@ store server(一个进程 / 一台数据节点)
 | `store_server_bootstrap_segments_total` | counter | 个 | bootstrap 物理拷贝的封存段数(S3b) |
 | `store_server_bootstrap_bytes_total` | counter | 字节 | bootstrap 物理拷贝字节数(S3b) |
 | `store_server_flushes_total` | counter | 次 | 本地 worker flush 次数(S4) |
+| `store_server_flush_early_wakes_total` | counter | 次 | 早醒水位轮中完成 flush 的副本数(观测早醒是否在工作;默认关时恒 0) | 
 | `store_server_compactions_total` | counter | 次 | 本地 worker 发生压缩的 replica 次数(S4) |
 | `store_server_compaction_policy_used_total` | counter | 次 | 按**实际使用的调度策略**计数的 compaction 执行次数,label `policy`(`incremental` / `cost_benefit` / `compact_all`);混合策略默认下用于观测策略分布(S4 策略) |
 | `store_server_blob_request_duration_seconds` | histogram | 秒 | **成功** blob 请求延迟,label `op`(put/get)× `size`(small/medium/large,分桶边界 50 KiB / 1 MiB);错误/早退路径不 observe(批 1) |

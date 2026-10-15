@@ -9,7 +9,7 @@
 //!   (100 GiB 分区 + 3 GiB 段 = 33 整段 + 1 个 1 GiB 残段),`total < segment` 也退化为单段。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::{Error, Result};
@@ -41,6 +41,8 @@ pub struct Reserved {
     start: u64,
     total: u64,
     segment: Arc<LogSegment>,
+    /// Log 的脏字节水位句柄(见 [`Log::dirty_bytes`]):commit 发布成功才计数。
+    dirty: Arc<AtomicU64>,
 }
 
 impl Reserved {
@@ -52,6 +54,8 @@ impl Reserved {
     /// 发布整段(一次性推进 `data_end`),返回该记录的全局 [`LogOffset`]。
     pub fn commit(self) -> Result<LogOffset> {
         self.segment.commit_reserved(self.start, self.total)?;
+        // 发布成功才计入脏水位(reserve/分块写期间不计 —— 尚未可见、也未承诺)。
+        self.dirty.fetch_add(self.total, Ordering::Relaxed);
         Ok(LogOffset::new(self.position, self.start))
     }
 }
@@ -77,6 +81,12 @@ pub struct Log {
     /// 同名字段)。原子量而非构造参数:config 经 `finish_di` 在装配尾注入,避免穿透
     /// `BlobStore` 三层工厂签名;构造缺省 true(新行为),`false` 回到同步滚转 flush。
     defer_seal_flush: AtomicBool,
+    /// 自上次 flush 尝试以来的未持久化字节数(早醒水位,**纯咨询**:不参与任何正确性
+    /// 判定,Relaxed 不建立 happens-before)。append / `Reserved::commit` 两发布径递增;
+    /// `flush` / `flush_all` **尝试即复位**(成败同口径 —— 失败窗放弃计数,退回周期
+    /// 语义兜底,杜绝重试风暴)。compaction 重写径与 bootstrap 物理拷贝径不计(各自
+    /// 收敛,计少只会晚醒,方向安全)。
+    dirty_bytes: Arc<AtomicU64>,
 }
 
 impl Log {
@@ -165,6 +175,7 @@ impl Log {
             }]),
             pending_seals: Mutex::new(Vec::new()),
             defer_seal_flush: AtomicBool::new(true),
+            dirty_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -250,6 +261,7 @@ impl Log {
             entries: RwLock::new(entries),
             pending_seals: Mutex::new(Vec::new()),
             defer_seal_flush: AtomicBool::new(true),
+            dirty_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -283,6 +295,7 @@ impl Log {
             (position, segment)
         };
         let offset = segment.append(record)?;
+        self.dirty_bytes.fetch_add(need, Ordering::Relaxed);
         Ok(LogOffset::new(position, offset))
     }
 
@@ -314,6 +327,7 @@ impl Log {
             start,
             total,
             segment,
+            dirty: self.dirty_bytes.clone(),
         })
     }
 
@@ -336,6 +350,14 @@ impl Log {
     /// 持久化所有段(硬删除擦除多段后统一 fsync)。先 drain 延迟封存段,再遍历 entries
     ///(`Arc::ptr_eq` 跳过刚 drain 过的段,避免秒级重复 fsync)。
     pub fn flush_all(&self) -> Result<()> {
+        let r = self.flush_all_attempt();
+        // 尝试即复位(成败同口径):水位只是唤醒建议,失败窗由周期轮兜底。
+        self.dirty_bytes.store(0, Ordering::Relaxed);
+        r
+    }
+
+    /// [`flush_all`](Self::flush_all) 的本体(不含水位复位)。
+    fn flush_all_attempt(&self) -> Result<()> {
         let drained = self.drain_pending()?;
         let segments: Vec<Arc<LogSegment>> = {
             let entries = self.entries.read().expect("log entries poisoned");
@@ -353,6 +375,14 @@ impl Log {
     /// 持久化收敛:活跃段 + 所有滚转时延迟 flush 的封存段。返回后,调用时刻之前的
     /// 全部已写记录均已落盘(`flush` 是持久化边界,含封存段)。
     pub fn flush(&self) -> Result<()> {
+        let r = self.flush_attempt();
+        // 尝试即复位(成败同口径):水位只是唤醒建议,失败窗由周期轮兜底。
+        self.dirty_bytes.store(0, Ordering::Relaxed);
+        r
+    }
+
+    /// [`flush`](Self::flush) 的本体(不含水位复位)。
+    fn flush_attempt(&self) -> Result<()> {
         self.drain_pending()?;
         let (_, segment) = self.active_segment();
         segment.flush()
@@ -377,6 +407,11 @@ impl Log {
     pub fn end_offset(&self) -> LogOffset {
         let (position, segment) = self.active_segment();
         LogOffset::new(position, segment.data_end())
+    }
+
+    /// 自上次 flush 尝试以来的未持久化字节(早醒水位,纯咨询 —— 见字段注释)。
+    pub fn dirty_bytes(&self) -> u64 {
+        self.dirty_bytes.load(Ordering::Relaxed)
     }
 
     pub fn segment_count(&self) -> usize {
@@ -558,6 +593,69 @@ mod tests {
         log.flush().unwrap();
         assert_eq!(log.read(o1, rec.len()).unwrap(), rec);
         assert_eq!(log.read(o2, rec.len()).unwrap(), rec);
+
+        log.close().unwrap();
+    }
+
+    /// 脏水位与复位(早醒水位用):两发布径都计数(append 即计;reserve 只在 commit 计),
+    /// `flush` / `flush_all` 尝试即复位 —— 纯咨询量,崩溃契约不受影响(既有边界测试即回归)。
+    #[test]
+    fn dirty_bytes_counts_both_publish_paths_and_resets_on_flush() {
+        let dir = temp_dir("dirty");
+        let seg = seg_cap(10);
+        let log = Log::create(dir.path(), seg * 3, seg, 0x1234, 1).unwrap();
+        assert_eq!(log.dirty_bytes(), 0, "fresh log is clean");
+
+        // append 径:记录物理长度全额计数。
+        let rec = vec![7u8; BLOCK as usize + 40];
+        log.append(&rec).unwrap();
+        assert_eq!(log.dirty_bytes(), rec.len() as u64, "append counts");
+
+        // 预留径:reserve/分块写不计数,commit 发布才计数。
+        let total = 2 * BLOCK + 8;
+        let reserved = log.reserve(total).unwrap();
+        assert_eq!(
+            log.dirty_bytes(),
+            rec.len() as u64,
+            "reserved-but-uncommitted is excluded"
+        );
+        reserved.write(0, &[1u8; 16]).unwrap();
+        assert_eq!(
+            log.dirty_bytes(),
+            rec.len() as u64,
+            "partial writes are excluded"
+        );
+        let off = reserved.commit().unwrap();
+        assert_eq!(off.segment, 0, "still on segment 0");
+        assert_eq!(
+            log.dirty_bytes(),
+            rec.len() as u64 + total,
+            "commit counts the reserved record"
+        );
+
+        // flush 尝试即复位(成功路径)。
+        log.flush().unwrap();
+        assert_eq!(log.dirty_bytes(), 0, "flush resets the watermark");
+
+        // 滚转(封存段遗留脏量)后 flush 同样复位 —— 早醒把封存遗留压在阈值内。
+        let filler = vec![3u8; (10 * BLOCK) as usize];
+        let off = log.append(&filler).unwrap();
+        assert_eq!(off.segment, 1, "filler rolls to a new segment");
+        let off = log.append(&rec).unwrap();
+        assert_eq!(off.segment, 2, "second roll");
+        assert!(log.dirty_bytes() >= filler.len() as u64 + rec.len() as u64);
+        log.flush().unwrap();
+        assert_eq!(
+            log.dirty_bytes(),
+            0,
+            "flush after rollovers resets (seals drained)"
+        );
+
+        // flush_all 同口径复位(硬删除擦除径用的全段 fsync)。
+        log.append(&rec).unwrap();
+        assert!(log.dirty_bytes() >= rec.len() as u64);
+        log.flush_all().unwrap();
+        assert_eq!(log.dirty_bytes(), 0, "flush_all resets too");
 
         log.close().unwrap();
     }

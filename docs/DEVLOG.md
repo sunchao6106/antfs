@@ -1348,3 +1348,28 @@
   XML → 切回私有即效 → CreateBucket 带头即公开 → 非法值 400 → XML body 501);
   PG/MySQL × 净/脏四跑全绿;fmt/clippy 0;workspace 全绿;首轮私有用例原样全绿。
  
+
+## 步骤 58:flush 有界脏窗口(`flush-bounded-dirty-window`)—— 机制落地 + 证据反转默认关(2026-10-15)
+
+- **机制(全保留)**:引擎 `Log` 脏字节计数(`Arc<AtomicU64>`;append /
+  `Reserved::commit` 两发布径递增,预留未 commit 不计;`flush`/`flush_all`
+  **尝试即复位**,失败窗放弃计数退回周期兜底 —— 纯咨询量,不进正确性面;
+  compaction 重写径与 bootstrap 拷贝径不计,计少只会晚醒);`BlobStore::dirty_bytes()`
+  透出。store-server flush loop 由纯周期(通用 `spawn_loop` 已删)改**混合 tick**
+  (100ms):interval 到点 → 全量轮(兜底/首拍语义保持);阈值非零且单副本脏量达阈
+  → 早醒轮只 flush 该副本(与全量轮同一执行核心 `flush_replicas`)。bench-blob 增
+  `--dirty-threshold-mib`(自建线程同构)。
+- **验证**:blob 93(双发布径计数/未 commit 不计/flush 与滚转后复位/flush_all 复位)+
+  store 139(早醒只动达阈副本/阈值 0 空手/复位语义)全绿;cluster.md 配置/指标表
+  插行;`store_server_flush_early_wakes_total` 注册。
+- **证据反转(默认取值的裁决依据,诚实记档)**:5000-op 旧口径失效(相位 < 间隔,
+  病理不触发);**20 GB / 4 线程 / 4 GiB 段 / flush 2s 口径**:裸 4269-6042 ops/s;
+  周期臂(现默认)**3229-3521 ops/s,max 1.14-2.07 s(BASELINE 病理如实复现)**;
+  水位 256 MB 臂 **1347-1403 ops/s( throughput −60%),max 反至 1.65-5.51 s**。
+  归因:APFS 上「fsync × 并发写」互踩随 **fsync 频数**放大 —— 拆窗把一次巨停摆
+  换成一串中停摆,本机净亏;生产写入(百 MB/s 级)两态行为等价。**裁决:默认 0
+  (关),不改生产行为;Linux/ext4 待真测再议开启。** BASELINE P2 行已反转记档,
+  完整数据见 change 档「真机证据」。
+- 归档 `flush-bounded-dirty-window`(新 capability:store-flush-window,ADDED
+  「Bounded dirty window for background flush」,场景:阈值触发早醒/0=纯周期/
+  持久化边界不变/失败不风暴/两径计数与复位)。

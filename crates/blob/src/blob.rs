@@ -1573,6 +1573,12 @@ impl BlobStore {
         Ok(())
     }
 
+    /// 自上次 flush 尝试以来的未持久化字节(store-server 的水位早醒轮取数;纯咨询量,
+    /// 见 `Log::dirty_bytes`)。
+    pub fn dirty_bytes(&self) -> u64 {
+        self.inner().log.dirty_bytes()
+    }
+
     /// 持久化:先落数据(fsync)再落索引,最后写持久化水位(= 当前 log 末尾)。
     pub fn flush(&self) -> Result<()> {
         let _t = self.metrics.op_timer("flush");

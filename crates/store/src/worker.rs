@@ -39,8 +39,43 @@ pub async fn flush_all(
     health: &DiskHealthMap,
     metrics: &StoreServerMetrics,
 ) -> usize {
+    flush_replicas(pool, replicas.handles(), health, metrics).await
+}
+
+/// 有界脏窗口的**早醒轮**(flush-bounded-dirty-window):只 flush「自上次 flush 尝试
+/// 以来脏量 ≥ `threshold_bytes`」的副本(其余不动);`threshold = 0` 一律空手(关)。
+/// 执行口径与 [`flush_all`] 完全一致(同一核心),只是更小批、更频繁。
+pub async fn flush_dirty(
+    pool: &Arc<DiskPools>,
+    replicas: &ReplicaManager,
+    health: &DiskHealthMap,
+    metrics: &StoreServerMetrics,
+    threshold_bytes: u64,
+) -> usize {
+    if threshold_bytes == 0 {
+        return 0;
+    }
+    let picked: Vec<(u32, ReplicaHandle)> = replicas
+        .handles()
+        .into_iter()
+        .filter(|(_, h)| h.store.dirty_bytes() >= threshold_bytes)
+        .collect();
+    if picked.is_empty() {
+        return 0;
+    }
+    flush_replicas(pool, picked, health, metrics).await
+}
+
+/// 副本集 flush 执行核心(全量轮与早醒轮共用;语义与口径见 [`flush_all`] 文档):
+/// 并发逐副本提交到各自盘的池,D2 坏盘跳过,失败只 warn 不拖垮其它副本。
+async fn flush_replicas(
+    pool: &Arc<DiskPools>,
+    handles: Vec<(u32, ReplicaHandle)>,
+    health: &DiskHealthMap,
+    metrics: &StoreServerMetrics,
+) -> usize {
     let mut tasks = Vec::new();
-    for (pid, h) in replicas.handles() {
+    for (pid, h) in handles {
         if !crate::disk_health::is_available(health, &h.disk_id) {
             metrics
                 .disk_worker_skipped
@@ -244,18 +279,53 @@ pub fn spawn_local_worker(
     pool: Arc<DiskPools>,
     health: DiskHealthMap,
 ) {
-    spawn_loop(
+    spawn_flush_loop(
         Duration::from_secs(config.flush_interval_secs),
+        config.flush_dirty_threshold_bytes,
         replicas.clone(),
         metrics.clone(),
         pool.clone(),
         health.clone(),
-        |r, m, p, h| async move {
-            let n = flush_all(&p, &r, &h, &m).await;
-            m.flushes.inc_by(n as u64);
-        },
     );
     spawn_compaction_loop(config, replicas, metrics, pool, health);
+}
+
+/// 早醒水位检查节拍。溢出预算 = 阈值 + 写速 × 本值:GB/s 级突发写入下为百 ms 量级,
+/// 生产百 MB/s 级磁盘 ≤ ~30 MB(推理与实测见 BASELINE「真机复验」)。
+const FLUSH_CHECK_TICK: Duration = Duration::from_millis(100);
+
+/// flush 混合 loop(有界脏窗口,flush-bounded-dirty-window):每 [`FLUSH_CHECK_TICK`]
+/// 醒一次 —— 距上次全量 ≥ `flush_interval_secs` 扫**全量**(兜底恒存;首拍即全量,
+/// 对齐旧 interval 首拍语义);`flush_dirty_threshold_bytes` 非 0 时,单副本脏量达标
+/// 即**早醒**(只 flush 超阈副本,见 [`flush_dirty`])。水位取数是无锁 atomic 读,
+/// 不碰盘、不阻塞写者;计数口径:全量轮进 `flushes`,早醒轮进 `flush_early_wakes`。
+fn spawn_flush_loop(
+    interval: Duration,
+    threshold: u64,
+    replicas: Arc<ReplicaManager>,
+    metrics: Arc<StoreServerMetrics>,
+    pool: Arc<DiskPools>,
+    health: DiskHealthMap,
+) {
+    tokio::spawn(async move {
+        // `None` = 进程启动后的第一拍立刻做全量(旧 `tokio::time::interval` 首拍语义)。
+        let mut last_full: Option<std::time::Instant> = None;
+        loop {
+            tokio::time::sleep(FLUSH_CHECK_TICK).await;
+            let fire_full = match last_full {
+                None => true,
+                Some(t) => t.elapsed() >= interval,
+            };
+            if fire_full {
+                let n = flush_all(&pool, &replicas, &health, &metrics).await;
+                metrics.flushes.inc_by(n as u64);
+                last_full = Some(std::time::Instant::now());
+                continue;
+            }
+            let n = flush_dirty(&pool, &replicas, &health, &metrics, threshold).await;
+            metrics.flush_early_wakes.inc_by(n as u64);
+        }
+    });
 }
 
 /// compaction loop:首跑对齐本地 `compaction_start_time`,之后每 `compaction_interval_secs` 一次。
@@ -474,38 +544,6 @@ impl LocalClock for SystemLocalClock {
     }
 }
 
-/// 通用维护 loop:按 `period` 节拍,把同步维护动作 offload 到阻塞线程池执行。
-fn spawn_loop<F, Fut>(
-    period: Duration,
-    replicas: Arc<ReplicaManager>,
-    metrics: Arc<StoreServerMetrics>,
-    pool: Arc<DiskPools>,
-    health: DiskHealthMap,
-    action: F,
-) where
-    F: Fn(Arc<ReplicaManager>, Arc<StoreServerMetrics>, Arc<DiskPools>, DiskHealthMap) -> Fut
-        + Send
-        + Sync
-        + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    tokio::spawn(async move {
-        let action = Arc::new(action);
-        let mut tick = tokio::time::interval(period);
-        loop {
-            tick.tick().await;
-            let (r, m, p, h) = (
-                replicas.clone(),
-                metrics.clone(),
-                pool.clone(),
-                health.clone(),
-            );
-            let action = action.clone();
-            action(r, m, p, h).await;
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +711,47 @@ mod tests {
         assert_eq!(
             h2.store.get(&key(1)).unwrap().as_slice(),
             b"durable payload"
+        );
+    }
+
+    /// 有界脏窗口早醒:只 flush 达阈副本;flush 尝试即复位(复位后再不达阈);
+    /// 阈值 0 = 关;干净副本不被早醒轮打扰。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_watermark_flushes_only_overdue_replicas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rm = manager(tmp.path());
+        let pool = pool_for(tmp.path());
+        let (health, metrics) = health_and_metrics();
+
+        // pid=1 写入使其脏;pid=2 保持干净。
+        let h1 = rm.ensure_replica(1).unwrap();
+        h1.mark_active();
+        h1.store.put(key(1), &[0xABu8; 8192]).unwrap();
+        let _h2 = rm.ensure_replica(2).unwrap();
+
+        // 阈值 0 = 关:早醒轮空手。
+        assert_eq!(flush_dirty(&pool, &rm, &health, &metrics, 0).await, 0);
+        // 阈值高于任何副本现有脏量:同样空手(干净副本不被打扰)。
+        assert_eq!(
+            flush_dirty(&pool, &rm, &health, &metrics, u64::MAX).await,
+            0
+        );
+
+        // 小阈值:只有脏副本(pid=1)被 flush;flush 尝试即复位,再查不达阈。
+        assert_eq!(
+            flush_dirty(&pool, &rm, &health, &metrics, 1).await,
+            1,
+            "only the dirty replica is flushed"
+        );
+        assert_eq!(
+            h1.store.dirty_bytes(),
+            0,
+            "flush attempt resets the watermark"
+        );
+        assert_eq!(
+            flush_dirty(&pool, &rm, &health, &metrics, 1).await,
+            0,
+            "no early wake after reset"
         );
     }
 
