@@ -24,7 +24,7 @@
 | **router**(客户端 SDK / 通用组件) | Router 逻辑做成**库**(`crates/common/router`):号段缓存、选分区、拼 blobId、直连 store server 做 W/R、切副本;**frontend 与压测二进制共用同一份实现** | 已实现(见 [`router.md`](./router.md)) |
 | **frontend**(HTTP REST 入口) | `POST/GET/HEAD/DELETE /blobs`、写入时定 TTL(`x-antfs-ttl-ms`)、分片拼装、`/metrics`;**内嵌同一 router SDK**,不重复实现 W/R | 已实现(见 [`frontend.md`](./frontend.md)) |
 | **S3 网关** | S3 协议翻译 + SigV4 鉴权(凭证管理);与 frontend 同层,复用同一 SDK;quota 仍规划(见 s3.md 后续方向) | 已实现(见 [`s3.md`](./s3.md)) |
-| **scheduler**(待定 P1) | 集群级 compaction 编排 / 再复制 / 均衡 / EC 调度 | 待定(见 §4) |
+| **scheduler**(P1 已锁 2026-10-15) | 再复制/跨节点再平衡/EC 转换与修复的**执行宿主 = store 内后台 worker**;master 只决策下发 | 已锁(见 §4) |
 | **admin web**(独立服务) | 运维操作(经 master admin gRPC)+ 控制面状态 dashboard(拓扑/节点/盘/分区/副本);指标时序复用 Prometheus+Grafana;需 operator 鉴权 | 已实现(见 §11) |
 | **EC 冷层**(D5) | 老数据纠删码降本 | 已锁(见 §5) |
 
@@ -89,9 +89,18 @@ SeaweedFS/CubeFS 则**内建 Raft master**,自包含。故本项目 master 用 R
 - 寻址→**id 自带定位**(四家全票:blobId/fid/docid + Ambry)→ D3 锁死。
 - 数据一致性→**异步 + 拉**(取 Ambry);disk-pair(SDFS)/每分区 Raft(CubeFS)均不采纳,但 SDFS 的"热备盘 + 整盘恢复"运维思路可借鉴。
 
-## 4. 待定(parked,未锁)
+## 4. P1 scheduler(已锁 2026-10-15 拍板 = A:master 决策 + store 执行)
 
-- **P1. 独立 scheduler 角色**:把 compaction/修复/均衡/GC 独立成角色/节点(CubeFS blobstore `scheduler` 蓝本;呼应 store.md 路线图"后台调度器移出 store 层")。EC 转换/修复也归它(见 D5)。
+- **决策**:不设独立 scheduler 角色。再复制编排 / 跨节点再平衡 / **EC 转换与修复**(D5)的**执行宿主
+  = 各 store server 的后台 worker**;master 只做决策与任务下发(选段/选节点/配额/验收,复用 reconcile
+  拍与心跳上报的任务态势)。compaction/flush 维持本地 worker 不变(§6 分工澄清)。
+- **依据**:EC 编码单元 = 封存段,数据天然在段 owner 节点本地,跨节点的只有校验分片散写(走既有
+  HTTP 数据面);再复制/均衡的执行本就是拉式(BOOTSTRAP 自拉);对齐 D1(master 只决策不搬数据)
+  与阶段一 Ambry 架构总原则;零新增运维面与新故障域。
+- **带宽口径**:集群级限速以「master 任务配额 + 节点本地自律」近似,无集中仲裁器。
+- **重开条件(运维观察)**:多节点部署后实测出现后台任务×前台吞吐的带宽争抢、且任务配额机制不够用
+  → 立项独立 scheduler(单独 change;届时按真实需求重设计任务协议,**不预建抽象接缝**)。
+  拍板与三方案论证记档:`openspec/changes/archive/…-p1-scheduler-lock`。
 
 ## 5. EC 冷层(封存段级,已锁 = D5)
 
@@ -118,7 +127,7 @@ active(副本) ──写满 rollover──▶ sealed(副本) ──静默 ≥ ec
 - 分片丢失:后台 repair 读 k 个重构缺失分片,补回冗余。
 
 ### 5.4 归属
-转换/修复是后台重活 → 归 **P1 scheduler 角色**(P1 的节点独立性仍待锁;在此之前可先落成 server 内后台 worker)。**不塞进 store 热路径**。
+转换/修复是后台重活 → 归**段 owner 节点的后台 worker**(P1 已锁:master 决策下发、store 执行,见 §4)。**不塞进 store 热路径**。
 
 ### 5.5 配置项清单(遵 CLAUDE.md §7)
 | key | 类型 | 默认 | 取值/校验 | 含义 |
@@ -132,7 +141,7 @@ active(副本) ──写满 rollover──▶ sealed(副本) ──静默 ≥ ec
 
 ## 6. 目标 TODO(实现必须紧跟)
 
-> **约束**:集群/服务层的任何实现 **必须**符合下列已锁目标(D1–D5);偏离需先在本文改决策 + 记 `openspec/changes/`,不得在代码里"就地另选"。P1 未锁,实现前先定。
+> **约束**:集群/服务层的任何实现 **必须**符合下列已锁目标(D1–D5 + P1);偏离需先在本文改决策 + 记 `openspec/changes/`,不得在代码里"就地另选"。
 
 **已锁目标(binding)**:
 - [ ] **D1 master 内建 Raft(`openraft`)取代 Helix/ZK** —— 只管集群元数据(partition→replica 放置、节点/副本状态机),不碰数据副本一致性。
@@ -142,7 +151,7 @@ active(副本) ──写满 rollover──▶ sealed(副本) ──静默 ≥ ec
 - [ ] **D5 EC 冷层 = 封存段级**:热副本 / 冷 EC,`ec.auto_convert` 后台转换;**编码单元是封存段,不做 blob 级 EC**;先落够 EC 冗余再删副本(见 §5)。
 
 **待锁目标(P,实现前先定)**:
-- [ ] **P1 独立 scheduler 角色**(compaction/修复/均衡/GC + EC 转换/修复)。
+- [ ] **P1 执行宿主落地**:store 内后台 worker 承接 master 下发的跨节点任务(先冲 EC 转换/修复;见 §4)。
 
 ## 7. master 细化设计(D1 展开,探索产出;实现前随 change proposal 定案)
 
@@ -517,11 +526,12 @@ store server(一个进程 / 一台数据节点)
 | OFFLINE→DROPPED | `BlobStore::close` + 删目录回收 | DROPPED |
 | 分区 RW→RO/SEALED | 该 replica 只读,拒 PUT | — |
 | task 再复制 | = OFFLINE→BOOTSTRAP(选空盘建店 + 拉全量) | — |
-| task EC 转换(D5) | 交 P1 scheduler / 本地 worker 做段级 EC | — |
+| task EC 转换(D5) | master 下发给段 owner 节点,后台 worker 做段级 EC | — |
 
 **本地 worker vs P1 scheduler 分工(澄清)**:
 - **本地 worker(store server 常驻,永远要有)**:flush / 单店 compaction —— 都是"单 BlobStore 内、本地、轻"(对齐 Ambry CompactionManager 跑在 StorageManager 里)。
-- **P1 独立 scheduler(集群级、跨节点、重)**:再复制编排 / 跨节点再平衡 / EC 转换调度(master 决策 + 跨节点搬数据)。
+- **集群级跨节点任务(P1 已锁 A 形态)**:再复制编排 / 跨节点再平衡 / EC 转换——**决策在 master,
+  执行在 store 后台 worker**(不设独立角色;带宽以任务配额近似;重开条件见 §4)。
 - → compaction/flush 是本地事,**不等 P1**。
 
 **store 连接点**:
