@@ -12,6 +12,7 @@ pub struct S3GatewayConfig {
     pub operator_token: String,
     pub metastore: MetaStoreConfig,
     pub router: RouterConfig,
+    pub gc: GcConfig,
 }
 
 impl Default for S3GatewayConfig {
@@ -24,6 +25,7 @@ impl Default for S3GatewayConfig {
             operator_token: String::new(),
             metastore: MetaStoreConfig::default(),
             router: RouterConfig::default(),
+            gc: GcConfig::default(),
         }
     }
 }
@@ -46,6 +48,43 @@ impl Validate for S3GatewayConfig {
         }
         self.metastore.validate()?;
         self.router.validate()?;
+        self.gc.validate()?;
+        Ok(())
+    }
+}
+
+/// S3 网关后台 GC(短删行保留期清理 + 孤儿 multipart TTL 回收)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct GcConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    /// 软删/遮蔽行保留期(防误删缓冲;**最小 1s**,不为 0 —— 误配零保留立即清行不可接受)。
+    pub deletion_retention_secs: u64,
+    /// 未 Complete multipart session 的 TTL。
+    pub upload_ttl_secs: u64,
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            deletion_retention_secs: 86_400,
+            upload_ttl_secs: 259_200,
+        }
+    }
+}
+
+impl Validate for GcConfig {
+    fn validate(&self) -> Result<()> {
+        at_least("s3.gc.interval_secs", self.interval_secs, 1)?;
+        at_least(
+            "s3.gc.deletion_retention_secs",
+            self.deletion_retention_secs,
+            1,
+        )?;
+        at_least("s3.gc.upload_ttl_secs", self.upload_ttl_secs, 1)?;
         Ok(())
     }
 }

@@ -22,6 +22,15 @@ pub struct ObjectVersion {
     pub version: i64,
 }
 
+/// `put_object` / `complete_multipart` 的结果:新版本号 + 同语句序列里**被遮蔽**的旧版本
+/// blob_id 集(state 置 0)。handler 须对每个 shadowed blob 调 `router.delete` 兜底删除
+/// (overwrite 无版本化 = 旧数据立即可弃;引擎 delete 幂等,重复删安全)。
+#[derive(Debug, Clone)]
+pub struct PutObjectOutcome {
+    pub version: i64,
+    pub shadowed_blobs: Vec<BlobId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     pub bucket: String,
@@ -78,6 +87,8 @@ pub struct CompleteMultipartResult {
     pub blob_id: BlobId,
     pub size: u64,
     pub parts_manifest: String,
+    /// 同 key 被 complete 遮蔽的旧版本 blob(handler 需逐一 `router.delete`,见 `PutObjectOutcome`)。
+    pub shadowed_blobs: Vec<BlobId>,
 }
 
 #[derive(Debug, Clone)]

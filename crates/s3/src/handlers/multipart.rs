@@ -86,6 +86,13 @@ pub async fn complete_multipart_upload(
 
     let result = st.metastore.complete_multipart(upload_id, &parts).await?;
 
+    // 被本次 complete 遮蔽的旧版本即刻回收(同 put_object 语义,幂等)。
+    for old in &result.shadowed_blobs {
+        if let Err(e) = st.router.delete(old).await {
+            tracing::warn!(error = %e, "s3 gc: shadowed blob delete failed after multipart complete");
+        }
+    }
+
     let xml = crate::xml::serialize_complete_multipart(bucket, key, &result.etag);
     Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())
 }

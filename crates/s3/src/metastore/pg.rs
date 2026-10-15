@@ -30,7 +30,7 @@ impl PgMetaStore {
 
 #[async_trait]
 impl MetaStore for PgMetaStore {
-    async fn put_object(&self, req: PutObjectMeta) -> Result<ObjectVersion> {
+    async fn put_object(&self, req: PutObjectMeta) -> Result<PutObjectOutcome> {
         let version = Self::gen_version();
         let now = Self::now_ms();
         let meta_json = if req.user_meta.is_empty() {
@@ -54,7 +54,26 @@ impl MetaStore for PgMetaStore {
         .bind(&req.parts_manifest)
         .execute(&self.pool)
         .await?;
-        Ok(ObjectVersion { version })
+        // 遮蔽同 key 旧活行(overwrite 语义:旧数据立即可弃)。紧邻 INSERT;
+        // 并发 overwrite 自然满足 last-writer-wins(version 单调)。
+        let shadowed: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "UPDATE named_objects SET state = 0, deleted_at = $3
+             WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL AND version < $4
+             RETURNING blob_id",
+        )
+        .bind(&req.bucket)
+        .bind(&req.key)
+        .bind(now)
+        .bind(version)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(PutObjectOutcome {
+            version,
+            shadowed_blobs: shadowed
+                .into_iter()
+                .map(|(b,)| blob_id_from_bytes(&b))
+                .collect(),
+        })
     }
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
@@ -74,7 +93,7 @@ impl MetaStore for PgMetaStore {
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<DeletedObject>> {
         let now = Self::now_ms();
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            "UPDATE named_objects SET deleted_at = $3
+            "UPDATE named_objects SET state = 0, deleted_at = $3
              WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL
              AND version = (
                  SELECT version FROM named_objects
@@ -406,7 +425,7 @@ impl MetaStore for PgMetaStore {
             user_meta,
             parts_manifest: Some(manifest_json.clone()),
         };
-        self.put_object(put_req).await?;
+        let outcome = self.put_object(put_req).await?;
 
         sqlx::query("DELETE FROM multipart_parts WHERE upload_id = $1")
             .bind(upload_id)
@@ -424,6 +443,7 @@ impl MetaStore for PgMetaStore {
             blob_id: primary_blob_id,
             size: total_size,
             parts_manifest: manifest_json,
+            shadowed_blobs: outcome.shadowed_blobs,
         })
     }
 
@@ -602,6 +622,57 @@ impl MetaStore for PgMetaStore {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn purge_expired_deletions(&self, cutoff_ms: i64, limit: u64) -> Result<u64> {
+        // ctid 子查询限批;单语句原子取件 —— 并发实例互不重复计数(行锁)。
+        let result = sqlx::query(
+            "DELETE FROM named_objects
+             WHERE ctid IN (
+                 SELECT ctid FROM named_objects
+                 WHERE state = 0 AND deleted_at IS NOT NULL AND deleted_at < $1
+                 ORDER BY deleted_at
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             )",
+        )
+        .bind(cutoff_ms)
+        .bind(limit as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn take_expired_uploads(&self, cutoff_ms: i64, limit: u64) -> Result<Vec<String>> {
+        // 取件即删除(原子):拿到 upload_id 的实例独占该 session 的孤儿清理。
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "DELETE FROM multipart_uploads
+             WHERE ctid IN (
+                 SELECT ctid FROM multipart_uploads
+                 WHERE created_at < $1
+                 ORDER BY created_at
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING upload_id",
+        )
+        .bind(cutoff_ms)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn delete_parts_of_session(&self, upload_id: &str) -> Result<Vec<BlobId>> {
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx::query_as("DELETE FROM multipart_parts WHERE upload_id = $1 RETURNING blob_id")
+                .bind(upload_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(b,)| blob_id_from_bytes(&b))
+            .collect())
     }
 }
 

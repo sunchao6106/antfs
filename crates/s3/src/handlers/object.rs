@@ -89,7 +89,8 @@ pub async fn put_object(
         .put_auto_with_ttl(body_bytes, NO_EXPIRATION)
         .await?;
 
-    st.metastore
+    let outcome = st
+        .metastore
         .put_object(PutObjectMeta {
             bucket: bucket.to_string(),
             key: key.to_string(),
@@ -101,6 +102,13 @@ pub async fn put_object(
             parts_manifest: None,
         })
         .await?;
+
+    // overwrite 遮蔽的旧版本即刻回收(引擎 delete 幂等;失败只降级为泄漏计数,不回滚新版本)。
+    for old in &outcome.shadowed_blobs {
+        if let Err(e) = st.router.delete(old).await {
+            tracing::warn!(error = %e, "s3 gc: shadowed blob delete failed(old version leaked until manual cleanup)");
+        }
+    }
 
     Ok((StatusCode::OK, [(header::ETAG, format!("\"{etag}\""))], "").into_response())
 }

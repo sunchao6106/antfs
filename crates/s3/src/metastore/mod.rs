@@ -12,7 +12,7 @@ pub type Result<T> = std::result::Result<T, S3Error>;
 #[async_trait]
 pub trait MetaStore: Send + Sync + 'static {
     // Object CRUD
-    async fn put_object(&self, req: PutObjectMeta) -> Result<ObjectVersion>;
+    async fn put_object(&self, req: PutObjectMeta) -> Result<PutObjectOutcome>;
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>>;
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<DeletedObject>>;
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> Result<Vec<DeleteResult>>;
@@ -52,6 +52,17 @@ pub trait MetaStore: Send + Sync + 'static {
     // Credential management
     async fn create_credential(&self, owner: &str) -> Result<S3Credential>;
     async fn delete_credential(&self, access_key: &str) -> Result<bool>;
+
+    // Garbage collection
+    /// 清理已过保留期的遮蔽/软删行(state=0 且 `deleted_at < cutoff`),返回清掉的**行数**。
+    /// blob 已在删除/遮蔽时被 handler 删掉,此处不碰 blob。单语句原子取件(并发实例不双删)。
+    async fn purge_expired_deletions(&self, cutoff_ms: i64, limit: u64) -> Result<u64>;
+    /// 取走过期未 complete 的 multipart session(`created_at < cutoff`),返回 upload_id 集。
+    /// 调用方拿到者对这些 session 做孤儿清理(parts 行删 + 逐 blob 墓碑)。
+    async fn take_expired_uploads(&self, cutoff_ms: i64, limit: u64) -> Result<Vec<String>>;
+    /// 删除某 session 的全部 parts 行,返回 blob_id 集(孤儿回收专用;`take_expired_uploads`
+    /// 已删 session 行,`abort_multipart` 的存在性前置不成立,故给独立原语)。
+    async fn delete_parts_of_session(&self, upload_id: &str) -> Result<Vec<BlobId>>;
 }
 
 pub async fn connect(cfg: &MetaStoreConfig) -> std::result::Result<Arc<dyn MetaStore>, S3Error> {

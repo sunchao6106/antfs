@@ -172,7 +172,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MetaStore for FakeMetaStore {
-        async fn put_object(&self, _req: PutObjectMeta) -> MetaResult<ObjectVersion> {
+        async fn put_object(&self, _req: PutObjectMeta) -> MetaResult<PutObjectOutcome> {
             Err(not_implemented())
         }
         async fn get_object(&self, _bucket: &str, _key: &str) -> MetaResult<Option<ObjectMeta>> {
@@ -254,6 +254,22 @@ mod tests {
             Err(not_implemented())
         }
         async fn delete_credential(&self, _access_key: &str) -> MetaResult<bool> {
+            Err(not_implemented())
+        }
+
+        async fn purge_expired_deletions(&self, _cutoff_ms: i64, _limit: u64) -> MetaResult<u64> {
+            Err(not_implemented())
+        }
+
+        async fn take_expired_uploads(
+            &self,
+            _cutoff_ms: i64,
+            _limit: u64,
+        ) -> MetaResult<Vec<String>> {
+            Err(not_implemented())
+        }
+
+        async fn delete_parts_of_session(&self, _upload_id: &str) -> MetaResult<Vec<BlobId>> {
             Err(not_implemented())
         }
     }

@@ -36,6 +36,8 @@ async fn main() {
         registry: registry.clone(),
         config: Arc::new(cfg.clone()),
     };
+    // 后台 GC(软删行保留期清理 + 孤儿 multipart TTL;受 antfs-s3.toml [s3.gc] 控制,默认开)。
+    antfs_s3::gc::spawn(state.clone(), cfg.gc.clone());
     let app = antfs_s3::server::build_router(state);
 
     tracing::info!(

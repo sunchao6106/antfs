@@ -30,7 +30,7 @@ impl MysqlMetaStore {
 
 #[async_trait]
 impl MetaStore for MysqlMetaStore {
-    async fn put_object(&self, req: PutObjectMeta) -> Result<ObjectVersion> {
+    async fn put_object(&self, req: PutObjectMeta) -> Result<PutObjectOutcome> {
         let version = Self::gen_version();
         let now = Self::now_ms();
         let meta_json = if req.user_meta.is_empty() {
@@ -54,7 +54,35 @@ impl MetaStore for MysqlMetaStore {
         .bind(&req.parts_manifest)
         .execute(&self.pool)
         .await?;
-        Ok(ObjectVersion { version })
+        // 遮蔽同 key 旧活行(overwrite 语义,PG 版同段注释)。MySQL 无 RETURNING,两步:
+        // 先圈定将被遮蔽的 blob_id,再同条件 UPDATE。两步间隙被并发遮蔽的行会重复置位
+        // (幂等,deleted_at 重写无语义损伤);被拿到的 blob 重复删除由引擎墓碑兜底 —— 收敛正确。
+        let shadowed: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT blob_id FROM named_objects
+             WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL AND version < ?",
+        )
+        .bind(&req.bucket)
+        .bind(&req.key)
+        .bind(version)
+        .fetch_all(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE named_objects SET state = 0, deleted_at = ?
+             WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL AND version < ?",
+        )
+        .bind(now)
+        .bind(&req.bucket)
+        .bind(&req.key)
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        Ok(PutObjectOutcome {
+            version,
+            shadowed_blobs: shadowed
+                .into_iter()
+                .map(|(b,)| blob_id_from_bytes(&b))
+                .collect(),
+        })
     }
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
@@ -89,7 +117,7 @@ impl MetaStore for MysqlMetaStore {
         };
 
         let result = sqlx::query(
-            "UPDATE named_objects SET deleted_at = ?
+            "UPDATE named_objects SET state = 0, deleted_at = ?
              WHERE bucket = ? AND `key` = ? AND version = ? AND state = 1 AND deleted_at IS NULL",
         )
         .bind(now)
@@ -429,7 +457,7 @@ impl MetaStore for MysqlMetaStore {
             user_meta,
             parts_manifest: Some(manifest_json.clone()),
         };
-        self.put_object(put_req).await?;
+        let outcome = self.put_object(put_req).await?;
 
         sqlx::query("DELETE FROM multipart_parts WHERE upload_id = ?")
             .bind(upload_id)
@@ -445,6 +473,7 @@ impl MetaStore for MysqlMetaStore {
             key,
             etag: composite_etag,
             blob_id: primary_blob_id,
+            shadowed_blobs: outcome.shadowed_blobs,
             size: total_size,
             parts_manifest: manifest_json,
         })
@@ -626,6 +655,62 @@ impl MetaStore for MysqlMetaStore {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn purge_expired_deletions(&self, cutoff_ms: i64, limit: u64) -> Result<u64> {
+        // MySQL 支持 DELETE ... ORDER BY ... LIMIT,单语句原子取件(行锁下并发实例不重复)。
+        // 无 RETURNING:GC 清行不需要拿回内容,rows_affected 即计数。
+        let result = sqlx::query(
+            "DELETE FROM named_objects
+             WHERE state = 0 AND deleted_at IS NOT NULL AND deleted_at < ?
+             ORDER BY deleted_at
+             LIMIT ?",
+        )
+        .bind(cutoff_ms)
+        .bind(limit as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn take_expired_uploads(&self, cutoff_ms: i64, limit: u64) -> Result<Vec<String>> {
+        // MySQL 无 RETURNING:两步 —— 圈定候选再按主键删除,删除语句的 affected 集即"实际取到"。
+        // 交叠窗下另一实例可能先取,主键 DELETE 只影响现存行;漏取者下一轮再来(循环语义收敛)。
+        let candidates: Vec<(String,)> = sqlx::query_as(
+            "SELECT upload_id FROM multipart_uploads WHERE created_at < ? ORDER BY created_at LIMIT ?",
+        )
+        .bind(cutoff_ms)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut taken = Vec::with_capacity(candidates.len());
+        for (upload_id,) in candidates {
+            let res = sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
+                .bind(&upload_id)
+                .execute(&self.pool)
+                .await?;
+            if res.rows_affected() > 0 {
+                taken.push(upload_id);
+            }
+        }
+        Ok(taken)
+    }
+
+    async fn delete_parts_of_session(&self, upload_id: &str) -> Result<Vec<BlobId>> {
+        // MySQL 无 RETURNING:先圈后删(同仓方言先例;交叠窗由删除幂等收敛)。
+        let blobs: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT blob_id FROM multipart_parts WHERE upload_id = ?")
+                .bind(upload_id)
+                .fetch_all(&self.pool)
+                .await?;
+        sqlx::query("DELETE FROM multipart_parts WHERE upload_id = ?")
+            .bind(upload_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(blobs
+            .into_iter()
+            .map(|(b,)| blob_id_from_bytes(&b))
+            .collect())
     }
 }
 

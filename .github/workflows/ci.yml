@@ -84,4 +84,6 @@ jobs:
       - name: Run S3 gateway integration tests (PG-gated, --ignored)
         env:
           TEST_S3_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/antfs_s3_ci
-        run: cargo test -p antfs-s3 -- --ignored
+        # --test-threads=1:每个用例起新整套 1 master + 3 stores(fixture 内存/端口量大),
+        # 并行在本机与 runner 上都会资源失真偶发超时 —— 集成单线程 ~20s,换稳定性。
+        run: cargo test -p antfs-s3 -- --ignored --test-threads=1

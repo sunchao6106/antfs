@@ -1143,3 +1143,30 @@
 - **真机复验清单三项合一**:4 GiB 滚转(虚拟盘毛刺遮蔽)/ frontend 折损形状 / 掉电冷读。
 - 过程教训(工程面):colima 后台长脚本务必走 `bash -s < 文件`(SSH 传内联多行会被吞换行
   成僵尸卡死,本轮踩过一次并留下残留进程);VM 侧无 `rg`,一律 `grep`。
+
+## 步骤 47:S3 网关后台 GC(`s3-gc`)—— 三面泄漏关闭 + overwrite 即刻回收 + 取件原子(2026-10-14)
+
+- **三面泄漏(核真身后入案)**:① 软删行永不清(`s3-metastore` spec 的 SHALL 承诺悬空);
+  ② 孤儿 multipart(session+blobs)永久滞留;③ **overwrite 陈版遮蔽泄漏(最重,新发现)**
+  —— `put_object` 纯 INSERT + `ORDER BY version DESC` 遮蔽取新,旧 blob 无删除路径,
+  频繁 overwrite 场景泄漏速度按写入速率增长。
+- **语义**:overwrite/complete 落行时同语句序列遮蔽旧活行(`state=0, deleted_at=now`),
+  handler 即刻对 shadowed blob `router.delete`(S3 无版本化语义, AWS 同;墓碑幂等)——
+  **blob 死点前移,GC 只清行和孤儿 session**。
+- **GC 循环**(网关进程内,每实例各自周期):行清理(过 `deletion_retention`,默认 24h)、
+  孤儿 multipart(过 `upload_ttl`,默认 72h,含 parts 行清 + 逐 blob 墓碑);单轮
+  1000 行/100 session 背压;条目级失败记 `s3_gc_errors_total{kind}` 继续,循环永 panic-free。
+- **多实例并发取件(实测打出的真坑)**:PG `ctid IN (SELECT ctid ... LIMIT)` 取件在同一
+  快照下**选中同一批 ctid**→ 并发第二实例空手(SQL 诊断:a/b 被一方删,c/d 幸存)。
+  修为子查询 `FOR UPDATE SKIP LOCKED`(互让且不重复);MySQL 用 `DELETE ORDER BY LIMIT`
+  (InnoDB 当前读,无此问题)+ 无 RETURNING 的两步取件(幂等收敛)。集成测试
+  `concurrent_purge_claims_rows_exactly_once` 钉死(双连接 purge 恰好分账)。
+- **坑 2**:take 删 session 行后不能复用 `abort_multipart`(前置存在性检查反咬)——
+  加独立原语 `delete_parts_of_session`(PG RETURNING/MySQL 两步)。
+- **坑 3**:墓碑断言要**有界轮询**(W=2 删除后 R=1 首跳可读到滞后副本 —— 合法竞态,
+  10s/50ms 轮询收敛);集成测试并发挤爆(每 fixture 起整套 1m+3s)→ CI job 与本地
+  同改 `--test-threads=1`(注释理由入 ci.yml)。
+- **验证**:PG 真机 `--ignored` 全绿(新 5 用例:overwrite 回收/GC 周期(PG 直查行数/
+  指标落真 Registry)/orphan TTL 两沿/并发取件恰一次);fmt/clippy/workspace 全绿。
+- 归档:`openspec/changes/s3-gc/`(4/4);s3.md 配置 +4 行、监控 +6 项、
+  「后台 GC」段;live spec 漂移(blob 死点)待归档时以 MODIFIED 回写。

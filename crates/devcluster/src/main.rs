@@ -513,6 +513,8 @@ async fn start_s3(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
         registry,
         config: Arc::new(cfg),
     };
+    // 后台 GC(软删行保留期清理 + 孤儿 multipart TTL;默认 config 即启用)。
+    antfs_s3::gc::spawn(state.clone(), antfs_s3::config::GcConfig::default());
     let app = antfs_s3::server::build_router(state);
     let addr = format!("{}:{}", args.host, args.s3_port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {

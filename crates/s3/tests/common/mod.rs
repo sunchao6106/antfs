@@ -443,11 +443,23 @@ pub struct S3Fixture {
     pub http: reqwest::Client,
     /// Short random suffix used to keep bucket names unique across runs (the metastore persists).
     pub run_id: String,
+    /// The gateway's live `AppState` — lets tests drive metastore / router / GC directly.
+    pub state: antfs_s3::server::AppState,
     /// Kept last so the data directories outlive master/store on drop.
     pub _tmp: tempfile::TempDir,
 }
 
 impl S3Fixture {
+    /// 集成测试直连 MetaStore 的 PG 池(行级断言;schema/bucket 同库)。
+    pub async fn pg_pool(&self) -> sqlx::PgPool {
+        let url = std::env::var("TEST_S3_POSTGRES_URL").expect("TEST_S3_POSTGRES_URL");
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("direct pg connect")
+    }
+
     pub async fn start() -> S3Fixture {
         let pg_url = std::env::var("TEST_S3_POSTGRES_URL").expect(
             "TEST_S3_POSTGRES_URL must be set to run S3 integration tests \
@@ -523,7 +535,7 @@ impl S3Fixture {
         let listener = tokio::net::TcpListener::bind(&s3_addr)
             .await
             .expect("bind s3 gateway");
-        let app = build_router(state);
+        let app = build_router(state.clone());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -566,6 +578,7 @@ impl S3Fixture {
             secret_key,
             http,
             run_id,
+            state,
             _tmp: tmp,
         }
     }

@@ -196,3 +196,135 @@ async fn multipart_metadata_roundtrip() {
     assert_eq!(header(&resp, "content-type"), "video/mp4");
     assert_eq!(header(&resp, "x-amz-meta-project"), "demo");
 }
+
+/// 孤儿 multipart TTL 回收:create 后放一片(**已知** blob 直写 metastore)但不 complete →
+/// TTL 外被 `run_once_at` 整体回收(session 行、parts 行、part blob 墓碑化),
+/// TTL 内原封不动;指标落 `s3_gc_orphan_uploads_total`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn orphan_upload_expires_via_gc() {
+    use antfs_s3::config::GcConfig;
+    use antfs_s3::metastore::types::{ListUploadsOpts, PartMeta};
+
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("gc").await;
+    let key = "orphan.bin";
+
+    // 真实 blob(router 写活),blob_id 已知 → 墓碑断言可判。
+    let (blob, _) = fx
+        .state
+        .router
+        .put_auto(bytes::Bytes::from_static(b"orphan-part"))
+        .await
+        .expect("router put part blob");
+    let create = fx.create_multipart(&bucket, key).await;
+    assert_eq!(create.status().as_u16(), 200, "initiate must 200");
+    let xml = create.text().await.expect("initiate body");
+    let upload_id = xml_tag(&xml, "UploadId");
+    fx.state
+        .metastore
+        .put_part(
+            &upload_id,
+            PartMeta {
+                part_number: 1,
+                blob_id: blob,
+                size: 12,
+                etag: "\"x\"".to_string(),
+            },
+        )
+        .await
+        .expect("put part row");
+    assert!(
+        fx.state.router.get(&blob).await.is_ok(),
+        "part blob alive before GC"
+    );
+
+    fn list_opts() -> ListUploadsOpts {
+        ListUploadsOpts {
+            prefix: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: 100,
+        }
+    }
+
+    let cfg = GcConfig {
+        enabled: false,
+        interval_secs: 1,
+        deletion_retention_secs: 3600,
+        upload_ttl_secs: 3600,
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+
+    antfs_s3::gc::run_once_at(&fx.state, &cfg, now).await;
+    let in_flight = fx
+        .state
+        .metastore
+        .list_multipart_uploads(&bucket, list_opts())
+        .await
+        .expect("list");
+    assert_eq!(
+        in_flight.uploads.len(),
+        1,
+        "in-flight session must survive TTL"
+    );
+
+    let after = now + 3601 * 1000;
+    antfs_s3::gc::run_once_at(&fx.state, &cfg, after).await;
+    let reclaimed = fx
+        .state
+        .metastore
+        .list_multipart_uploads(&bucket, list_opts())
+        .await
+        .expect("list");
+    assert_eq!(reclaimed.uploads.len(), 0, "expired session reclaimed");
+    // 墓碑收敛有界轮询(W=2 删除 + R=1 首跳可能读到滞后副本)。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if fx.state.router.get(&blob).await.is_err() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "part blob must converge to tombstoned"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let exported = antfs_metric::gather(&fx.state.registry).expect("gather");
+    assert!(
+        exported.contains("s3_gc_orphan_uploads_total"),
+        "metric must land:\n{exported}"
+    );
+}
+
+/// 并发取件:两个连接并发 `purge_expired_deletions` 同批候选,总和恰 4(行级取件互斥)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn concurrent_purge_claims_rows_exactly_once() {
+    use futures::future::join;
+
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("gc").await;
+
+    for k in ["a", "b", "c", "d"] {
+        let resp = fx.put_object(&bucket, k, b"gone").await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    for k in ["a", "b", "c", "d"] {
+        let resp = fx.delete_object(&bucket, k).await;
+        assert_eq!(resp.status().as_u16(), 204);
+    }
+
+    let ms = fx.state.metastore.clone();
+    let ms2 = fx.state.metastore.clone();
+    let (r1, r2) = join(
+        ms.purge_expired_deletions(i64::MAX, 2),
+        ms2.purge_expired_deletions(i64::MAX, 2),
+    )
+    .await;
+    assert_eq!(
+        r1.expect("purge 1") + r2.expect("purge 2"),
+        4,
+        "each row claimed exactly once"
+    );
+}
