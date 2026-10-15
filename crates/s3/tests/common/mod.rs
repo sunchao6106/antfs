@@ -3,13 +3,15 @@
 //! Follows the layout of `crates/frontend/tests/rest.rs`: a real in-process cluster (1 Raft master +
 //! 3 store nodes) plus a real S3 gateway bound to a real port, driven over real HTTP with a full
 //! AWS SigV4 signature on every request (no auth bypass). The blob data path goes through the real
-//! router SDK; only the per-object metadata lives in PostgreSQL (`TEST_S3_POSTGRES_URL`).
+//! router SDK; only the per-object metadata lives in a relational MetaStore —— PostgreSQL by
+//! default (`TEST_S3_POSTGRES_URL`), or MySQL with `TEST_S3_DRIVER=mysql` (`TEST_S3_MYSQL_URL`).
 //!
 //! The cluster is bootstrapped purely through Raft commits and the store data-plane admin endpoint,
 //! so there is no heartbeat wait and no `sleep` (CLAUDE.md §5.6).
 //!
-//! Every test is `#[ignore]`d because it needs a live PostgreSQL: run with
-//! `TEST_S3_POSTGRES_URL=postgres://... cargo test -p antfs-s3 -- --ignored`.
+//! Every test is `#[ignore]`d because it needs a live database: run with
+//! `TEST_S3_POSTGRES_URL=postgres://... cargo test -p antfs-s3 -- --ignored`
+//! or `TEST_S3_DRIVER=mysql TEST_S3_MYSQL_URL=mysql://... cargo test -p antfs-s3 -- --ignored`.
 
 // Each integration-test binary includes this module but only touches a subset of it, so the
 // shared scaffolding legitimately has items unused by some binaries. `dead_code` would fire
@@ -445,6 +447,10 @@ pub struct S3Fixture {
     pub http: reqwest::Client,
     /// Short random suffix used to keep bucket names unique across runs (the metastore persists).
     pub run_id: String,
+    /// MetaStore dialect of this fixture("postgres" | "mysql")—— 行级断言助手按它分言。
+    pub driver: String,
+    /// The MetaStore URL the fixture connected to(row-level assertion helper 直连用)。
+    pub metastore_url: String,
     /// The gateway's live `AppState` — lets tests drive metastore / router / GC directly.
     pub state: antfs_s3::server::AppState,
     /// Kept last so the data directories outlive master/store on drop.
@@ -452,21 +458,56 @@ pub struct S3Fixture {
 }
 
 impl S3Fixture {
-    /// 集成测试直连 MetaStore 的 PG 池(行级断言;schema/bucket 同库)。
-    pub async fn pg_pool(&self) -> sqlx::PgPool {
-        let url = std::env::var("TEST_S3_POSTGRES_URL").expect("TEST_S3_POSTGRES_URL");
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .expect("direct pg connect")
+    /// 本 fixture 桶内遮蔽行(`state=0`)的行数 —— 方言中性行级断言(PG `$1` / MySQL `?`)。
+    /// 共享测试库:GC 是全库语义,断言一律限本 fixture 的 bucket 域。
+    pub async fn shadowed_rows_in_bucket(&self, bucket: &str) -> i64 {
+        match self.driver.as_str() {
+            "mysql" => {
+                let pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&self.metastore_url)
+                    .await
+                    .expect("direct mysql connect");
+                let r: (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM named_objects WHERE bucket = ? AND state = 0",
+                )
+                .bind(bucket)
+                .fetch_one(&pool)
+                .await
+                .expect("count query");
+                r.0
+            }
+            _ => {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&self.metastore_url)
+                    .await
+                    .expect("direct pg connect");
+                let r: (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM named_objects WHERE bucket = $1 AND state = 0",
+                )
+                .bind(bucket)
+                .fetch_one(&pool)
+                .await
+                .expect("count query");
+                r.0
+            }
+        }
     }
 
     pub async fn start() -> S3Fixture {
-        let pg_url = std::env::var("TEST_S3_POSTGRES_URL").expect(
-            "TEST_S3_POSTGRES_URL must be set to run S3 integration tests \
-             (they are #[ignore]d by default)",
-        );
+        let driver = std::env::var("TEST_S3_DRIVER").unwrap_or_else(|_| "postgres".to_string());
+        let db_url = match driver.as_str() {
+            "postgres" => std::env::var("TEST_S3_POSTGRES_URL").expect(
+                "TEST_S3_POSTGRES_URL must be set to run S3 integration tests \
+                 (they are #[ignore]d by default)",
+            ),
+            "mysql" => std::env::var("TEST_S3_MYSQL_URL").expect(
+                "TEST_S3_MYSQL_URL must be set to run S3 integration tests \
+                 (they are #[ignore]d by default)",
+            ),
+            other => panic!("unknown TEST_S3_DRIVER {other:?} (expected postgres|mysql)"),
+        };
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let (master, grpc_addr) = solo_master(&tmp.path().join("master")).await;
@@ -508,8 +549,8 @@ impl S3Fixture {
             .expect("connect router");
 
         let metastore_cfg = MetaStoreConfig {
-            driver: "postgres".to_string(),
-            url: pg_url,
+            driver: driver.clone(),
+            url: db_url.clone(),
             max_connections: 5,
         };
         let metastore = antfs_s3::metastore::connect(&metastore_cfg)
@@ -580,6 +621,8 @@ impl S3Fixture {
             secret_key,
             http,
             run_id,
+            driver,
+            metastore_url: db_url,
             state,
             _tmp: tmp,
         }

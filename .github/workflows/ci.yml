@@ -97,8 +97,18 @@ jobs:
         env:
           TEST_S3_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/antfs_s3_ci
           # mysql 方言内联单测从「DSN 缺省早退」变为真机执行(001/002 迁移 + 全部 SQL,
-          # 含配额守卫);e2e 夹具方言硬编码 postgres,不受影响。
+          # 含配额守卫);e2e 夹具方言由 TEST_S3_DRIVER 决定,缺省 postgres。
           TEST_S3_MYSQL_URL: mysql://root:root@127.0.0.1:3306/antfs_s3_ci
         # --test-threads=1:每个用例起新整套 1 master + 3 stores(fixture 内存/端口量大),
         # 并行在本机与 runner 上都会资源失真偶发超时 —— 集成单线程 ~20s,换稳定性。
+        run: cargo test -p antfs-s3 -- --ignored --test-threads=1
+
+      - name: Run S3 gateway e2e on MySQL (TEST_S3_DRIVER=mysql)
+        env:
+          TEST_S3_DRIVER: mysql
+          # 全量 e2e(对象/桶/SigV4/multipart 家族)在 MySQL 方言重放:夹具按 TEST_S3_DRIVER
+          # 选 store;不设 PG URL → 本步内联 pg 单测空跑(已由上一步覆盖)。复用 antfs_s3_ci
+          # 库:夹具 run_id 桶域隔离即脏库安全(净库维度由上一步 services 初始态覆盖)。
+          # 本步曾实杀 InnoDB 配额守卫锁序分叉(e2e race 用例 500/200),矩阵价值实证。
+          TEST_S3_MYSQL_URL: mysql://root:root@127.0.0.1:3306/antfs_s3_ci
         run: cargo test -p antfs-s3 -- --ignored --test-threads=1

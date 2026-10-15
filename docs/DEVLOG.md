@@ -1293,4 +1293,25 @@
   自洽;净/脏双跑;fmt/clippy 0。
 - **留观(既有类,未扩大)**:commit 后回收下发前的崩溃窗(同 `shadowed_blobs`);part
   回收并入 GC 死点留独立 change。归档 `2026-10-15-s3-multipart-lifecycle`
+
+## 步骤 55:e2e MySQL 矩阵 + 配额守卫 InnoDB 锁序修复(2026-10-15)
+
+- **矩阵落地**:e2e 夹具方言化——`TEST_S3_DRIVER`(缺省 postgres)+ 对应 URL env 选
+  store;PG 专用 `pg_pool` 行级断言收敛为夹具的方言中性助手 `shadowed_rows_in_bucket`
+  (PG `$1` / MySQL `?`,顺带消两处闭包重复)。CI `S3 integration` 增 MySQL e2e 步
+  (全量 e2e 在 MySQL 重放;同库 `run_id` 桶域隔离即脏库安全;不设 PG URL → 该步内联
+  pg 单测空跑,由原步覆盖)——步骤 52 的「MySQL e2e 矩阵未开」局限就此销账。
+- **矩阵首猎 = 真分叉**:`quota_guard_exactly_one_passes_under_race` 在 MySQL 可复现
+  失败(单跑约 2/3 败),PG 全绿;失败对 `500/200`。根因(InnoDB `LATEST DETECTED
+  DEADLOCK` 现场实证):put_object 原锁序「先 named_objects 阴影 UPDATE/INSERT
+  (next-key + 插入意向锁)→ 后 buckets 守卫行锁」在并发同桶写下构成「A 持 buckets 行
+  等 INSERT、B 持 gap 等 buckets 行」的死锁环 → 1213 → 牺牲者 500,恰一只断言被打破。
+- **修法(InnoDB 特有,PG 版不动)**:守卫 UPDATE 提为记账事务的**第一把写锁**——
+  同桶写者在配额守卫上单一串行化,gap 锁段内不再存在交错窗口;结构消环,不靠重试
+  粉饰;守卫语义(单语句条件 UPDATE、恰一只过、净增量)与 PG 完全同构。验证:race
+  单测 ×5 全绿(修前 2/3 败);MySQL e2e 净/脏双跑全绿;PG 回归全绿;fmt/clippy 0。
+- **工具链坑位(诚实记档)**:本机 Homebrew mysqld 监听 127.0.0.1:3306,历次「本地
+  MySQL 真机」实为撞本地库被拒 → `test_pool` 的 `.ok()?` 静默空跑(假绿;含步骤 52
+  本地证据的口径)。本地矩阵凡真机一律走 mysql-c1 容器 @**13306**(host 侧 TCP 鉴权
+  实检过);真凭证主渠道 = CI services 网络,无此坑。
  

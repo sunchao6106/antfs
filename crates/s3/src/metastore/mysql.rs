@@ -53,18 +53,12 @@ impl MetaStore for MysqlMetaStore {
         .fetch_all(&mut *tx)
         .await?;
         let shadow_bytes: i64 = shadowed.iter().map(|(_, s)| *s).sum();
-        sqlx::query(
-            "UPDATE named_objects SET state = 0, deleted_at = ?
-             WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL AND version < ?",
-        )
-        .bind(now)
-        .bind(&req.bucket)
-        .bind(&req.key)
-        .bind(version)
-        .execute(&mut *tx)
-        .await?;
 
-        // 配额守卫,净增量口径(used + 新写 − 遮蔽 ≤ quota;quota=0 不限)。
+        // 锁序铁律(与 PG 版唯一不同之处,InnoDB 特有):守卫的 buckets 行锁必须是本事务
+        // 拿到的**第一把写锁**。named_objects 的 UPDATE/INSERT 在 RR 下会取 next-key/插入
+        // 意向锁;若先碰 named_objects,并发同桶写之间构成「A 持 buckets 行等 INSERT、
+        // B 持 gap 锁等 buckets 行」的环 → 1213 死锁(实测:e2e quota race 用例 500/200)。
+        // 守卫先行 = 同桶写者在 buckets 行上单一串行化,gap 锁段无可插入的交错。
         let new_size = req.size as i64;
         let guard = sqlx::query(
             "UPDATE buckets SET used_bytes = used_bytes + ? - ?
@@ -93,6 +87,17 @@ impl MetaStore for MysqlMetaStore {
                 }),
             };
         }
+
+        sqlx::query(
+            "UPDATE named_objects SET state = 0, deleted_at = ?
+             WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL AND version < ?",
+        )
+        .bind(now)
+        .bind(&req.bucket)
+        .bind(&req.key)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(
             "INSERT INTO named_objects (bucket, `key`, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest)
