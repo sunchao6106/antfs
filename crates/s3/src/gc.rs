@@ -11,11 +11,14 @@
 //! 循环体永不 panic(后台线程,panic 即服务面缺环)。
 
 use crate::config::GcConfig;
+use crate::metastore::types::BlobId;
 use crate::server::AppState;
 
-/// 单轮至多清的行数 / 回收的 session 数 —— 背压常量,防长事务与一次海量 delete 打爆盘池。
+/// 单轮至多清的行数 / 回收的 session 数 / 补删的 WAL 行数 —— 背压常量,
+/// 防长事务与一次海量 delete 打爆盘池。
 const GC_BATCH_ROWS: i64 = 1000;
 const GC_BATCH_UPLOADS: i64 = 100;
+const GC_BATCH_RECLAIMS: u64 = 200;
 
 /// 起后台 GC 循环(spawn;调用方持有 AppState 的 clone 即可,返回 JoinHandle 供测试/关停)。
 pub fn spawn(state: AppState, cfg: GcConfig) -> tokio::task::JoinHandle<()> {
@@ -132,6 +135,55 @@ pub async fn run_once_at(state: &AppState, cfg: &GcConfig, now_ms: i64) {
                 tracing::warn!(error = %e, "s3 gc: take_expired_uploads failed");
                 break;
             }
+        }
+    }
+
+    // ---- 3. 回收 WAL 补删(崩窗/墓碑失败残行;非破坏读,成功才 resolve)----
+    match state
+        .metastore
+        .pending_reclaims_batch(GC_BATCH_RECLAIMS)
+        .await
+    {
+        Ok(pending) => {
+            let mut resolved: Vec<BlobId> = Vec::with_capacity(pending.len());
+            for bid in &pending {
+                if state.router.delete(bid).await.is_ok() {
+                    resolved.push(*bid);
+                } else {
+                    // 行留,下轮重试;交叠双删幂等安全。
+                    state
+                        .metrics
+                        .gc_errors_total
+                        .with_label_values(&["pending"])
+                        .inc();
+                    tracing::warn!(blob = ?bid, "s3 gc: pending reclaim tombstone failed (row kept for retry)");
+                }
+            }
+            let n = resolved.len() as u64;
+            if let Err(e) = state.metastore.resolve_pending_reclaims(&resolved).await {
+                state
+                    .metrics
+                    .gc_errors_total
+                    .with_label_values(&["pending-resolve"])
+                    .inc();
+                tracing::warn!(error = %e, "s3 gc: pending reclaim resolve failed (rows kept)");
+            } else if n > 0 {
+                state.metrics.gc_pending_resolved_total.inc_by(n);
+            }
+        }
+        Err(e) => {
+            state
+                .metrics
+                .gc_errors_total
+                .with_label_values(&["pending-take"])
+                .inc();
+            tracing::warn!(error = %e, "s3 gc: pending_reclaims_batch failed");
+        }
+    }
+    match state.metastore.pending_reclaims_count().await {
+        Ok(backlog) => state.metrics.gc_pending_backlog.set(backlog as i64),
+        Err(e) => {
+            tracing::warn!(error = %e, "s3 gc: pending_reclaims_count failed (gauge skipped)");
         }
     }
 

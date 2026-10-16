@@ -91,7 +91,7 @@ pub async fn upload_part(
         .await?;
 
     if let Some(old) = old_blob {
-        let _ = st.router.delete(&old).await;
+        let _ = crate::handlers::tombstone_and_resolve(&st, &old).await;
     }
 
     let mut response =
@@ -142,14 +142,14 @@ pub async fn complete_multipart_upload(
     };
 
     // 被本次 complete 遮蔽的旧版本 + **未列入 manifest** 的 part blob(S3 语义:complete 即
-    // 丢弃)→ 即刻回收(幂等;不回收则无墓碑、GC 永不收)。
+    // 丢弃)→ 即刻回收(幂等;失败留 WAL 行,GC 周期补删)。
     for old in result
         .shadowed_blobs
         .iter()
         .chain(result.discarded_part_blobs.iter())
     {
-        if let Err(e) = st.router.delete(old).await {
-            tracing::warn!(error = %e, "s3 gc: blob reclaim failed after multipart complete");
+        if let Err(e) = crate::handlers::tombstone_and_resolve(&st, old).await {
+            tracing::warn!(error = %e, "s3 gc: blob reclaim failed after multipart complete (WAL row kept)");
         }
     }
 
@@ -160,7 +160,7 @@ pub async fn complete_multipart_upload(
 pub async fn abort_multipart_upload(st: AppState, upload_id: &str) -> Result<Response, S3Error> {
     let blob_ids = st.metastore.abort_multipart(upload_id).await?;
     for bid in blob_ids {
-        let _ = st.router.delete(&bid).await;
+        let _ = crate::handlers::tombstone_and_resolve(&st, &bid).await;
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

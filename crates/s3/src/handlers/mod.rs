@@ -16,6 +16,23 @@ use crate::server::AppState;
 /// 经 `axum::Error::downcast` 精确回放;其余读体错误保持既有 EntityTooLarge
 /// 宽语义。分帧请求长度对账 `x-amz-decoded-content-length`(分帧线上
 /// Content-Length = 帧字号,不用于对账);非分帧保持逐字节既有语义。
+/// 墓碑 + 回收 WAL 消账(单点封装,五语义面共用;对应 gc.rs 的 WAL 兜底面):
+/// `router.delete` 成功 → 删 pending 行(常态表趋空);失败 → 行留,GC 周期补删。
+pub(crate) async fn tombstone_and_resolve(
+    st: &AppState,
+    blob_id: &crate::metastore::types::BlobId,
+) -> Result<(), antfs_router::Error> {
+    let result = st.router.delete(blob_id).await;
+    if result.is_ok() {
+        if let Err(e) = st.metastore.resolve_pending_reclaims(&[*blob_id]).await {
+            tracing::warn!(error = %e, "s3 gc: pending reclaim resolve after tombstone failed (row left for GC)");
+        }
+    } else if let Err(e) = &result {
+        tracing::warn!(error = %e, "s3 reclaim: tombstone failed (WAL row kept; GC will retry)");
+    }
+    result.map(|_| ())
+}
+
 pub(crate) async fn read_bounded_body(st: &AppState, req: Request) -> Result<Bytes, S3Error> {
     let (parts, body) = req.into_parts();
     let decoded_header = parts

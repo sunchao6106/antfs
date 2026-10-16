@@ -152,11 +152,9 @@ pub async fn put_object(
         Err(e) => return Err(e),
     };
 
-    // overwrite 遮蔽的旧版本即刻回收(引擎 delete 幂等;失败只降级为泄漏计数,不回滚新版本)。
+    // overwrite 遮蔽的旧版本即刻回收(引擎 delete 幂等;失败留 WAL 行,GC 周期补删)。
     for old in &outcome.shadowed_blobs {
-        if let Err(e) = st.router.delete(old).await {
-            tracing::warn!(error = %e, "s3 gc: shadowed blob delete failed(old version leaked until manual cleanup)");
-        }
+        let _ = crate::handlers::tombstone_and_resolve(&st, old).await;
     }
 
     let mut response =
@@ -530,7 +528,7 @@ pub async fn head_object(
 
 pub async fn delete_object(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
     if let Some(deleted) = st.metastore.delete_object(bucket, key).await? {
-        let _ = st.router.delete(&deleted.blob_id).await;
+        let _ = crate::handlers::tombstone_and_resolve(&st, &deleted.blob_id).await;
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -822,8 +820,8 @@ async fn copy_single_part(
     match outcome {
         Ok(outcome) => {
             for old in &outcome.shadowed_blobs {
-                if let Err(e) = st.router.delete(old).await {
-                    tracing::warn!(error = %e, "s3 gc: shadowed blob delete failed after copy");
+                if let Err(e) = crate::handlers::tombstone_and_resolve(&st, old).await {
+                    tracing::warn!(error = %e, "s3 gc: shadowed blob delete failed after copy (WAL row kept)");
                 }
             }
             Ok(etag)
@@ -902,8 +900,8 @@ async fn copy_via_multipart(
         .iter()
         .chain(result.discarded_part_blobs.iter())
     {
-        if let Err(e) = st.router.delete(old).await {
-            tracing::warn!(error = %e, "s3 gc: blob reclaim failed after server-side copy");
+        if let Err(e) = crate::handlers::tombstone_and_resolve(&st, old).await {
+            tracing::warn!(error = %e, "s3 gc: blob reclaim failed after server-side copy (WAL row kept)");
         }
     }
     Ok(result.etag)

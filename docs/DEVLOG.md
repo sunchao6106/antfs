@@ -1645,3 +1645,48 @@ sha1/base64 零自研 CRC。
 accounting)、s3-multipart(UploadPart)、s3-metastore(+checksum 持久化)四方
 delta 合并;docs 同步(s3.md 操作映射 2 行/矩阵 3 行/新节「灵活校验」/流式分帧
 与属性节语义更新/后续方向;design README 路线档 2 ✅)。
+
+---
+
+## 步骤 66:s3-reclaim-wal —— 回收 WAL:五语义动作的 commit↔墓碑崩窗闭合
+
+**日期**:2026-10-16 · **change**:`s3-reclaim-wal`(阶段二优化路线档 3,条目 3)
+
+**动机**:五动作(put_object 遮蔽 / delete_object / put_part 同号重传换下旧片 /
+complete 弃片+遮蔽 / abort 全片)的 blob 回收是「metastore 事务提交 → handler
+router.delete」两段式;窗内崩溃或墓碑个体失败 = 行已删/已换、无任何记录知道该删,
+GC 永不收(DEVLOG 54 留观原文:「commit 后回收下发前的崩溃窗;part 回收并入 GC
+死点留独立 change」)。另:**路线档 3 条目 1 更正**——put_part 并发重传原子化已由
+`fe2fc82 s3-multipart-lifecycle` 提前落地(双方言 FOR UPDATE 锁读在档),审计时的
+retraction 留观表述过时,路线行本步更正。
+
+**落地**:
+- migration 006:`pending_reclaims(blob_id 主键, queued_at)`(PG BYTEA / MySQL
+  VARBINARY(8);CREATE IF NOT EXISTS 幂等)。
+- 五事务挂点(pg/mysql 同构,材料均取自既有 RETURNING/锁读,零额外查询):
+  遮蔽/软删/重传旧片/弃片/abort 全片 → 同事务幂等 INSERT(`ON CONFLICT DO NOTHING`
+  / `INSERT IGNORE`);入账失败随主事务回滚——不存在"无 WAL 的提交"。
+- handler 单点封装 `tombstone_and_resolve`:墓碑成功 → `resolve_pending_reclaims`
+  消账(常态表趋空);失败 → 行留(原 warn 从"manual cleanup"改指 GC 兜)。
+  配额拒绝路径不入账(事务回滚无行;"①前孤儿"是独立已知面,记档不做)。
+- GC 第 3 面:非破坏批读(200 常量)→ 逐个 router.delete → 成功者批量 resolve、
+  失败者留行下轮重试;轮末积压采样 gauge。**否决取件即删**(窗口平移进 GC)与
+  **lease/claim**(时钟语义+搁浅态;跨实例双删幂等本无需防)。
+- 指标:`s3_gc_pending_resolved_total` + `s3_gc_pending_backlog`(§7 文档两行同步;
+  errors kinds 扩 pending 三种)。
+
+**验证**:
+- metastore 单测双方言新增 `reclaim_wal_transactional_recording`(五挂点落行/resolve/
+  主键去重/入账幂等);既有直调 metastore 的 lib 测试八处补 `wal_wipe` 自洁(共享库
+  不残留);lib 忽略级测试按单线程跑(全局 wipe 相互竞态排查结论)。
+- e2e 新 2 测:`reclaim_wal_gc_closes_crash_window`(直接驱动 delete 事务跳过 handler
+  墓碑 = 崩窗模拟 → `run_once_at` 补删 → poll_tombstoned + 行清 + 计数恰 +1 落真
+  Registry)、`reclaim_wal_steady_state_runs_dry`(overwrite/delete/重传/弃片/abort
+  全套后表恒空 + backlog gauge = 0)。
+- **双言全量 e2e 各 87/87**(PG + MySQL,`--ignored --test-threads=1`,85 存量 + 2 新
+  lib 计另);全量跑毕两方言 WAL 表 **0 残行**(列级 psql/mysql 断言)。
+- workspace 72 套件绿;clippy 0;fmt 干净。
+
+**发运**:归档 `openspec/changes/archive/2026-10-16-s3-reclaim-wal/`(s3-metastore
+ADDED WAL 要求、s3-gc 两要求、s3-multipart UploadPart 口径);docs 同步(s3.md 新节
+「回收 WAL」+ GC 段 + 监控表 +2 + 矩阵 + 后续方向;design README 路线档 3 行更正)。

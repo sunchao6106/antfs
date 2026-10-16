@@ -66,6 +66,12 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 删除某 session 的全部 parts 行,返回 blob_id 集(孤儿回收专用;`take_expired_uploads`
     /// 已删 session 行,`abort_multipart` 的存在性前置不成立,故给独立原语)。
     async fn delete_parts_of_session(&self, upload_id: &str) -> Result<Vec<BlobId>>;
+    /// 回收 WAL:批读待删 blob(非破坏;GC 兜底第 3 面用,行只在 resolve 时消失)。
+    async fn pending_reclaims_batch(&self, limit: u64) -> Result<Vec<BlobId>>;
+    /// 回收 WAL:墓碑成功后消账(删行);返回删掉行数。
+    async fn resolve_pending_reclaims(&self, blob_ids: &[BlobId]) -> Result<u64>;
+    /// 回收 WAL:当前积压行数(gauge 采样用)。
+    async fn pending_reclaims_count(&self) -> Result<u64>;
 }
 
 pub async fn connect(cfg: &MetaStoreConfig) -> std::result::Result<Arc<dyn MetaStore>, S3Error> {

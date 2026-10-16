@@ -26,6 +26,21 @@ impl PgMetaStore {
         let random_part = (uuid::Uuid::new_v4().as_u128() % 1000) as i64;
         now / 1000 + random_part
     }
+
+    /// 回收 WAL 入账(幂等;调用点都在语义事务里,失败随主事务回滚)。
+    async fn queue_reclaims(tx: &mut sqlx::PgTransaction<'_>, blob_ids: &[StoreKey]) -> Result<()> {
+        for bid in blob_ids {
+            sqlx::query(
+                "INSERT INTO pending_reclaims (blob_id, queued_at) VALUES ($1, $2)
+                 ON CONFLICT (blob_id) DO NOTHING",
+            )
+            .bind(bid.as_bytes().as_slice())
+            .bind(Self::now_ms())
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -107,6 +122,11 @@ impl MetaStore for PgMetaStore {
         .bind(stored_value.as_deref())
         .execute(&mut *tx)
         .await?;
+        let shadowed_ids: Vec<StoreKey> = shadowed
+            .iter()
+            .map(|(b, _)| blob_id_from_bytes(b))
+            .collect();
+        Self::queue_reclaims(&mut tx, &shadowed_ids).await?;
         tx.commit().await?;
 
         Ok(PutObjectOutcome {
@@ -151,6 +171,10 @@ impl MetaStore for PgMetaStore {
         .bind(now)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some((blob_id, _)) = &row {
+            let bid = blob_id_from_bytes(blob_id);
+            Self::queue_reclaims(&mut tx, std::slice::from_ref(&bid)).await?;
+        }
         if let Some((_, size)) = &row {
             sqlx::query("UPDATE buckets SET used_bytes = used_bytes - $2 WHERE name = $1")
                 .bind(bucket)
@@ -430,6 +454,10 @@ impl MetaStore for PgMetaStore {
         .bind(&part.etag)
         .execute(&mut *tx)
         .await?;
+        if let Some((old_bytes,)) = &old {
+            let bid = blob_id_from_bytes(old_bytes);
+            Self::queue_reclaims(&mut tx, std::slice::from_ref(&bid)).await?;
+        }
 
         tx.commit().await?;
 
@@ -545,6 +573,7 @@ impl MetaStore for PgMetaStore {
         // put_part/abort 无法插队落孤儿行。
         let outcome = self.put_object(put_req).await?;
 
+        Self::queue_reclaims(&mut tx, &discarded_part_blobs).await?;
         sqlx::query("DELETE FROM multipart_parts WHERE upload_id = $1")
             .bind(upload_id)
             .execute(&mut *tx)
@@ -586,6 +615,8 @@ impl MetaStore for PgMetaStore {
                 .bind(upload_id)
                 .fetch_all(&mut *tx)
                 .await?;
+        let part_ids: Vec<StoreKey> = parts.iter().map(|(b,)| blob_id_from_bytes(b)).collect();
+        Self::queue_reclaims(&mut tx, &part_ids).await?;
 
         sqlx::query("DELETE FROM multipart_parts WHERE upload_id = $1")
             .bind(upload_id)
@@ -597,7 +628,40 @@ impl MetaStore for PgMetaStore {
             .await?;
         tx.commit().await?;
 
-        Ok(parts.iter().map(|(b,)| blob_id_from_bytes(b)).collect())
+        Ok(part_ids)
+    }
+
+    async fn pending_reclaims_batch(&self, limit: u64) -> Result<Vec<BlobId>> {
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT blob_id FROM pending_reclaims ORDER BY queued_at LIMIT $1")
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.iter().map(|(b,)| blob_id_from_bytes(b)).collect())
+    }
+
+    async fn resolve_pending_reclaims(&self, blob_ids: &[BlobId]) -> Result<u64> {
+        if blob_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut removed = 0u64;
+        for bid in blob_ids {
+            let res = sqlx::query("DELETE FROM pending_reclaims WHERE blob_id = $1")
+                .bind(bid.as_bytes().as_slice())
+                .execute(&mut *tx)
+                .await?;
+            removed += res.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
+    async fn pending_reclaims_count(&self) -> Result<u64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_reclaims")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n.max(0) as u64)
     }
 
     async fn list_parts(&self, upload_id: &str, opts: ListPartsOpts) -> Result<ListPartsResp> {
@@ -875,13 +939,20 @@ mod tests {
         Some(pool)
     }
 
+    async fn wal_wipe(pool: &PgPool) {
+        sqlx::query("DELETE FROM pending_reclaims")
+            .execute(pool)
+            .await
+            .expect("wal wipe");
+    }
+
     #[tokio::test]
     #[ignore]
     async fn put_get_roundtrip() {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
@@ -919,7 +990,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         let key = format!("key-{}", Uuid::new_v4());
         let got = store.get_object(&bucket, &key).await.unwrap();
@@ -932,7 +1003,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
@@ -966,6 +1037,8 @@ mod tests {
         assert_eq!(got.blob_id, StoreKey::from_parts(1, 2));
         assert_eq!(got.size, 2);
         assert_eq!(got.etag, "e2");
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -974,7 +1047,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
@@ -995,6 +1068,8 @@ mod tests {
         assert!(del.is_some());
         let got = store.get_object(&bucket, &key).await.unwrap();
         assert!(got.is_none());
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -1003,7 +1078,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         let key = format!("key-{}", Uuid::new_v4());
         let del = store.delete_object(&bucket, &key).await.unwrap();
@@ -1016,7 +1091,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let keys: Vec<String> = (0..3).map(|i| format!("k{}", i)).collect();
@@ -1045,6 +1120,8 @@ mod tests {
             let got = store.get_object(&bucket, k).await.unwrap();
             assert!(got.is_none());
         }
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -1053,7 +1130,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let keys = [
@@ -1095,7 +1172,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let keys = [
@@ -1139,7 +1216,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         for i in 0..5 {
@@ -1188,7 +1265,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner1").await.unwrap();
         let head = store.head_bucket(&bucket).await.unwrap();
@@ -1206,7 +1283,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         // 新桶默认 private(首轮 ACL 语义逐字保留)。
@@ -1246,7 +1323,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let req = PutObjectMeta {
@@ -1272,7 +1349,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
@@ -1313,6 +1390,120 @@ mod tests {
     }
 
     // ── multipart 会话生命周期:所有权恰一次(重传孤儿/abort 插队/unlisted 泄漏)──
+
+    #[tokio::test]
+    #[ignore]
+    async fn reclaim_wal_transactional_recording() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = PgMetaStore::new(pool.clone());
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let key = format!("key-{}", Uuid::new_v4());
+
+        let mk = |blob: StoreKey| PutObjectMeta {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            blob_id: blob,
+            size: 1,
+            etag: "e".into(),
+            content_type: None,
+            user_meta: UserMeta::default(),
+            parts_manifest: None,
+            sse: None,
+            checksum: None,
+        };
+        let v1 = StoreKey::from_parts(1, 91);
+        let v2 = StoreKey::from_parts(1, 92);
+        store.put_object(mk(v1)).await.unwrap();
+        store.put_object(mk(v2)).await.unwrap();
+
+        let pending = store.pending_reclaims_batch(50).await.unwrap();
+        assert!(pending.contains(&v1), "{pending:?}");
+        assert!(!pending.contains(&v2));
+        assert_eq!(store.resolve_pending_reclaims(&[v1]).await.unwrap(), 1);
+
+        assert!(store.delete_object(&bucket, &key).await.unwrap().is_some());
+        assert!(store
+            .pending_reclaims_batch(50)
+            .await
+            .unwrap()
+            .contains(&v2));
+
+        let upload_id = store
+            .create_multipart(&bucket, &key, None, &UserMeta::default())
+            .await
+            .unwrap();
+        let p_old = StoreKey::from_parts(1, 93);
+        let p_new = StoreKey::from_parts(1, 94);
+        store
+            .put_part(
+                &upload_id,
+                PartMeta {
+                    part_number: 1,
+                    blob_id: p_old,
+                    size: 1,
+                    etag: "a".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_part(
+                &upload_id,
+                PartMeta {
+                    part_number: 1,
+                    blob_id: p_new,
+                    size: 1,
+                    etag: "b".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .pending_reclaims_batch(50)
+            .await
+            .unwrap()
+            .contains(&p_old));
+        assert_eq!(
+            store.abort_multipart(&upload_id).await.unwrap(),
+            vec![p_new]
+        );
+        let pending = store.pending_reclaims_batch(50).await.unwrap();
+        assert!(
+            pending.contains(&p_new) && pending.contains(&v2),
+            "{pending:?}"
+        );
+
+        // dedupe:对已在 WAL 的 v2 再造一次遮蔽(自我覆盖同 blob),行数不变。
+        let before = store.pending_reclaims_count().await.unwrap();
+        let key2 = format!("key-{}", Uuid::new_v4());
+        let mk2 = |blob: StoreKey| PutObjectMeta {
+            bucket: bucket.clone(),
+            key: key2.clone(),
+            blob_id: blob,
+            size: 1,
+            etag: "e".into(),
+            content_type: None,
+            user_meta: UserMeta::default(),
+            parts_manifest: None,
+            sse: None,
+            checksum: None,
+        };
+        store.put_object(mk2(v2)).await.unwrap();
+        store.put_object(mk2(v2)).await.unwrap();
+        let after = store.pending_reclaims_count().await.unwrap();
+        assert_eq!(before, after, "同 blob 重入账被主键幂等去重");
+
+        // 自洁:本测产生的 WAL 行全消(共享库不给后续批次留残留)。
+        for bid in [v1, v2, p_old, p_new] {
+            let _ = store.resolve_pending_reclaims(&[bid]).await.unwrap();
+        }
+        let rest = store.pending_reclaims_batch(50).await.unwrap();
+        assert!(!rest.contains(&v1) && !rest.contains(&v2), "{rest:?}");
+        assert!(!rest.contains(&p_old) && !rest.contains(&p_new), "{rest:?}");
+    }
 
     #[tokio::test]
     #[ignore]
@@ -1374,6 +1565,8 @@ mod tests {
         owned.sort();
         expected.sort();
         assert_eq!(owned, expected, "每个 blob 的回收所有权必须恰一次");
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -1382,7 +1575,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
@@ -1425,6 +1618,8 @@ mod tests {
             .list_parts(&upload_id, ListPartsOpts::default())
             .await
             .is_err());
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -1476,6 +1671,8 @@ mod tests {
             .list_parts(&upload_id, ListPartsOpts::default())
             .await
             .is_err());
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -1484,7 +1681,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         let key = format!("key-{}", Uuid::new_v4());
         let upload_id = store
@@ -1502,6 +1699,8 @@ mod tests {
         assert_eq!(blob_ids.len(), 1);
         let list_res = store.list_parts(&upload_id, ListPartsOpts::default()).await;
         assert!(list_res.is_err());
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -1510,7 +1709,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         store.create_bucket(&bucket, "owner").await.unwrap();
         let key = format!("key-{}", Uuid::new_v4());
@@ -1540,6 +1739,8 @@ mod tests {
         }];
         let res = store.complete_multipart(&upload_id, &parts).await.unwrap();
         assert_eq!(res.blob_id, StoreKey::from_parts(1, 2));
+
+        wal_wipe(&pool).await;
     }
 
     #[tokio::test]
@@ -1548,7 +1749,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let cred = store.create_credential("owner").await.unwrap();
         let looked = store.lookup_credential(&cred.access_key).await.unwrap();
         assert!(looked.is_some());
@@ -1564,7 +1765,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let store = PgMetaStore::new(pool);
+        let store = PgMetaStore::new(pool.clone());
         let bucket = format!("bucket-{}", Uuid::new_v4());
         let _u1 = store
             .create_multipart(&bucket, "logs/a", None, &UserMeta::default())

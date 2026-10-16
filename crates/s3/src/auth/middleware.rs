@@ -281,6 +281,15 @@ mod tests {
         async fn delete_parts_of_session(&self, _upload_id: &str) -> MetaResult<Vec<BlobId>> {
             Err(not_implemented())
         }
+        async fn pending_reclaims_batch(&self, _limit: u64) -> MetaResult<Vec<BlobId>> {
+            Err(not_implemented())
+        }
+        async fn resolve_pending_reclaims(&self, _blob_ids: &[BlobId]) -> MetaResult<u64> {
+            Err(not_implemented())
+        }
+        async fn pending_reclaims_count(&self) -> MetaResult<u64> {
+            Err(not_implemented())
+        }
     }
 
     fn known_store() -> FakeMetaStore {

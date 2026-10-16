@@ -1,5 +1,5 @@
 use antfs_metric::{
-    counter, counter_vec, latency_seconds, latency_seconds_vec, HistogramVec, IntCounterVec,
+    counter, counter_vec, gauge, latency_seconds, latency_seconds_vec, HistogramVec, IntCounterVec,
     Registry,
 };
 
@@ -15,6 +15,8 @@ pub struct S3Metrics {
     pub gc_orphan_parts_blobs_total: antfs_metric::IntCounter,
     pub gc_errors_total: IntCounterVec,
     pub gc_duration_seconds: antfs_metric::Histogram,
+    pub gc_pending_resolved_total: antfs_metric::IntCounter,
+    pub gc_pending_backlog: antfs_metric::IntGauge,
     pub chunked_requests_total: antfs_metric::IntCounter,
     pub chunked_rejected_total: IntCounterVec,
 }
@@ -77,6 +79,16 @@ impl S3Metrics {
                 "s3_gc_errors_total",
                 "GC item-level failures (loop continues)",
                 &["kind"],
+            )?,
+            gc_pending_resolved_total: counter(
+                registry,
+                "s3_gc_pending_resolved_total",
+                "Blobs reclaimed through the pending-reclaims WAL by the GC loop                  (crash-window or failed-tombstone residue)",
+            )?,
+            gc_pending_backlog: gauge(
+                registry,
+                "s3_gc_pending_backlog",
+                "Rows remaining in the pending-reclaims WAL at cycle end (0 in                  steady state; sustained >0 means tombstones keep failing)",
             )?,
             gc_duration_seconds: latency_seconds(
                 registry,

@@ -1686,3 +1686,144 @@ async fn checksum_sse_plaintext_face() {
     assert_eq!(header(&get, "x-amz-server-side-encryption"), "AES256");
     assert_eq!(get.bytes().await.expect("解码体").to_vec(), data);
 }
+
+// ── 回收 WAL 崩窗兜底(s3-reclaim-wal)─────────────────────────────────────────
+
+/// 崩窗模拟:语义删除事务已提交、handler 墓碑未下发(直接调 metastore 走真实
+/// 入账路径)→ WAL 行在 → `run_once_at` 补删 → 墓碑到位 + WAL 行清 + 计数落
+/// 真接入的 Registry。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn reclaim_wal_gc_closes_crash_window() {
+    use antfs_s3::config::GcConfig;
+
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("wal").await;
+    let key = "walled.bin";
+    let body = pseudo_random(96);
+    let put = fx.put_object(&bucket, key, &body).await;
+    assert_eq!(put.status().as_u16(), 200);
+    let meta = fx
+        .state
+        .metastore
+        .get_object(&bucket, key)
+        .await
+        .expect("metastore get")
+        .expect("object present");
+    let before = fx.state.metrics.gc_pending_resolved_total.get();
+
+    // 半途崩:删除事务提交,墓碑永未下发(跳过两段式 handler 的第二段)。
+    let deleted = fx
+        .state
+        .metastore
+        .delete_object(&bucket, key)
+        .await
+        .expect("delete tx commits");
+    assert!(deleted.is_some());
+
+    let pending = fx
+        .state
+        .metastore
+        .pending_reclaims_batch(100)
+        .await
+        .unwrap();
+    assert!(
+        pending.contains(&meta.blob_id),
+        "WAL 行必须落在事务里:{pending:?}"
+    );
+
+    let cfg = GcConfig {
+        enabled: false,
+        interval_secs: 1,
+        deletion_retention_secs: 3600,
+        upload_ttl_secs: 3600,
+    };
+    antfs_s3::gc::run_once_at(&fx.state, &cfg, chrono::Utc::now().timestamp_millis()).await;
+
+    poll_tombstoned(&fx, &meta.blob_id).await;
+    let pending = fx
+        .state
+        .metastore
+        .pending_reclaims_batch(100)
+        .await
+        .unwrap();
+    assert!(!pending.contains(&meta.blob_id), "tombstone 后 resolve");
+    assert_eq!(
+        fx.state.metrics.gc_pending_resolved_total.get(),
+        before + 1,
+        "GC 补删计数落真 Registry(恰 +1)"
+    );
+}
+
+/// 常态跑干:overwrite / delete / part 同号重传 / complete 弃片 / abort 全套
+/// 之后 WAL 表空 —— handler 即段墓碑即消账(稳态表趋空的设计兑现)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn reclaim_wal_steady_state_runs_dry() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("waldry").await;
+
+    for key in ["a.bin", "b.bin"] {
+        let resp = fx.put_object(&bucket, key, b"v1").await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let resp = fx.put_object(&bucket, key, b"v2").await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    assert_eq!(
+        fx.delete_object(&bucket, "a.bin").await.status().as_u16(),
+        204
+    );
+
+    let key = "mp.bin";
+    let resp = fx.create_multipart(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let xml = resp.text().await.expect("initiate body");
+    let uid = common::xml_tag(&xml, "UploadId");
+
+    // 同号重传:旧片(基于 b"stale-part")入账即清。
+    let p1old = fx
+        .upload_part(&bucket, key, &uid, 1, b"stale-part-0001")
+        .await;
+    assert_eq!(p1old.status().as_u16(), 200);
+    let part_two = pseudo_random(8 * 1024);
+    let p1new = fx.upload_part(&bucket, key, &uid, 1, &part_two).await;
+    assert_eq!(p1new.status().as_u16(), 200);
+
+    // complete 只列 part 1(重传后的终版):同时保留的一片 part_number=2 会被丢弃
+    // (S3 语义)→ 弃片入账 + 墓碑 + 消账。
+    let p2 = fx.upload_part(&bucket, key, &uid, 2, &part_two).await;
+    assert_eq!(p2.status().as_u16(), 200);
+    let mut body = String::from("<CompleteMultipartUpload>");
+    body.push_str(&format!(
+        "<Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>",
+        header(&p1new, "etag")
+    ));
+    body.push_str("</CompleteMultipartUpload>");
+    let resp = fx
+        .complete_multipart(&bucket, key, &uid, body.as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let resp = fx.create_multipart(&bucket, "aborted.bin").await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let xml2 = resp.text().await.expect("initiate body");
+    let uid2 = common::xml_tag(&xml2, "UploadId");
+    let resp = fx
+        .upload_part(&bucket, "aborted.bin", &uid2, 1, b"doomed")
+        .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp = fx.abort_multipart(&bucket, "aborted.bin", &uid2).await;
+    assert_eq!(resp.status().as_u16(), 204);
+
+    let pending = fx
+        .state
+        .metastore
+        .pending_reclaims_batch(100)
+        .await
+        .unwrap();
+    assert!(
+        pending.is_empty(),
+        "稳态 WAL 必须跑干(handler 墓碑成功即消账):{pending:?}"
+    );
+    assert_eq!(fx.state.metrics.gc_pending_backlog.get(), 0);
+}
