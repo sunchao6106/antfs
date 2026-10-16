@@ -556,7 +556,7 @@ store server(一个进程 / 一台数据节点)
 
 ### 9.1 实现状态 + 配置/监控清单(CLAUDE.md §7 必须项)
 
-**S1(数据节点骨架 + 数据面)已实现**(`crates/store`,见 `openspec/changes/store-server/`):`DiskManager`(`statfs` 探真实容量,Q1)、`ReplicaManager`(按 partition 管 `BlobStore`,幂等)、`DataHttpServer`(axum `PUT`/`GET`,同步引擎经 `spawn_blocking` offload)。过集成测试(put/get 往返 + 409/404/400)+ 单测(statfs、ensure_replica 幂等)。**不接 master / 不复制 / 不含 EC(暂不解锁)**。
+**S1(数据节点骨架 + 数据面)已实现**(`crates/store`,见 `openspec/changes/store-server/`):`DiskManager`(`statfs` 探真实容量,Q1)、`ReplicaManager`(按 partition 管 `BlobStore`,幂等)、`DataHttpServer`(axum `PUT`/`GET`;引擎调用自 D1/N4 起经**每盘有界池** offload,`spawn_blocking` 仅剩 `ensure_replica` 等少数外围路径)。过集成测试(put/get 往返 + 409/404/400)+ 单测(statfs、ensure_replica 幂等)。**不接 master / 不复制 / 不含 EC(暂不解锁)**。
 
 **S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报;**每盘至多一发在飞探测**——超时后不再叠加新探测、改收它的迟到结果,见 [store.md §12.11](./store.md))。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
 
@@ -600,7 +600,7 @@ store server(一个进程 / 一台数据节点)
  - **已补齐(见 `blob-io-end-to-end`)**:router SDK(router 库 + CLI)、frontend(REST 网关)、master 发号 `GetBlobIds`、
    流式 put(网络流式 + 落盘暂存 + 引擎 `put_from_reader`)、`.../metadata` 端点、`StoreFull → 507`、`PUT ?expiration_ms=`。
 
-**S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分**两条**独立 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(增量压缩);同步引擎调用经 `spawn_blocking` offload。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据)。
+**S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分**两条**独立 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(增量压缩);同步引擎调用经**每盘有界池**提交(D1/N4;早期为 `spawn_blocking`,已收口)。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据)。
 
 **compaction 策略已升级**(见 `openspec/changes/store-compaction-policy/`):候选集与回收口径都不再是"无脑扫一遍"——
 
@@ -668,9 +668,11 @@ store server(一个进程 / 一台数据节点)
 | `store_server_get_total` | counter | 次 | blob GET 请求数 |
 | `store_server_put_bytes_total` | counter | 字节 | 写入字节数 |
 | `store_server_get_bytes_total` | counter | 字节 | 读取字节数 |
-| `store_server_replicas` | gauge | 个 | 本地 partition-replica 数 |
+| `store_server_replicas` | gauge | 个 | 本地 partition-replica 数(其中尚未追平的另见 `store_server_replicas_bootstrapping`) |
+| `store_server_replicas_bootstrapping` | gauge | 个 | 正处于 bootstrap 尚未追平的副本数(S3b) |
+| `store_server_mutations_total` | counter | 次 | 数据面变更类(墓碑删除)请求数 |
 | `store_server_errors_total` | counter | 次 | 数据面错误数,label `kind`(`io` / `unavailable` / `join_error`) |
-| `store_server_request_duration_seconds` | histogram | 秒 | 数据面请求延迟(handler 入口 → 引擎完成,含 spawn_blocking 排队),label `op`(`put`/`get`/`delete`/`replica_metadata`/`segments`) |
+| `store_server_request_duration_seconds` | histogram | 秒 | 数据面请求延迟(handler 入口 → 引擎完成,含每盘池排队;每盘维度另有 `store_server_disk_request_duration_seconds`),label `op`(`put`/`get`/`delete`/`replica_metadata`/`segments`) |
 | `store_server_in_flight_requests` | gauge | 个 | 在途数据面请求数,label `op` |
 | `store_server_manual_compactions_total` | counter | 次 | 手动 compact 端点(`POST /admin/partitions/{pid}/compact`)实际触发次数 |
 | `store_server_heartbeats_total` | counter | 次 | 收到的心跳指令数(S2) |
@@ -883,7 +885,7 @@ client/frontend: GetBlobIds 向 master 要号段 → 得 P + blobId(partitionId<
   → 并行 HTTP PUT 到 P 的全部 N 副本(store server)
   → 收 W = N/2+1 个 ack 即返回成功(其余请求取消);第 3 副本靠拉复制补
 ```
-- **W 由实际副本数实算,不做配置项**(见 `blob-open-end-to-end` D2):RF=3 → 2、RF=1 → 1、RF=5 → 3;
+- **W 由实际副本数实算,不做配置项**(见 `blob-io-end-to-end` D2):RF=3 → 2、RF=1 → 1、RF=5 → 3;
   副本数取**放置全量** ⇒ 掉 1 个节点仍写得进、掉 2 个写不进(少数派不接受写)。
 - 分片(大对象):`POST /stitch` 拼装,描述符当 blob 存(frontend 侧,无状态)。
 
@@ -998,3 +1000,5 @@ client/frontend: 解析 partitionId → LookupPartition(master,可缓存;副本�
 | `admin_ops_total` | counter | 次 | 运维操作数(建分区/下线/置态/修复/迁移) |
 | `admin_master_rpc_errors_total` | counter | 次 | 调 master gRPC 失败数 |
 | `admin_store_scrape_errors_total` | counter | 次 | 抓取 store `/metrics` 端点失败数(连接/超时/非 200/非法文本) |
+| `admin_scrub_runs_total` | counter | 次 | 副本一致性巡检(scrub 对拍)运行轮数 |
+| `admin_scrub_divergences_total` | counter | 次 | 巡检发现的副本间摘要差异数 |

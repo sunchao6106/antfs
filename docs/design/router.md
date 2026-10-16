@@ -98,6 +98,9 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `no_replica` | 副本返回 404「no replica for partition」 | 路由到了不持有该分区的节点 |
 | `silenced` | 副本返回 503 + `Retry-After` | 运维**请求静默**止血,不是故障 |
 | `not_found` | 所有副本都 404「对象不存在」 | 真不存在(或已删/过期) |
+| `config` / `metric` | `RouterConfig` 加载/校验失败、指标注册失败 | 启动即败类,不是运行期路由问题 |
+| `http_client` | 构建数据面 HTTP 客户端失败 | 初始化问题(如 TLS/超时配置非法) |
+| `io` | `put_file` 暂存文件 IO 失败 | 本地盘问题;请求报错,重试另选暂存 |
 | `quorum` | 未收满 W 个 ack | detail 里给出逐类失败计数 |
 | `partition_mismatch` | blobId 自带 partition 与目标不一致 | 拼错了 |
 
@@ -127,7 +130,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 > 见 §6 `router_put_store_full_retries_total`);`put_with_ttl` 的 key 已绑定分区,只摘掉该分区号段并返回
 > `StoreFull`,不重试。
 >
-> 若要从 TOML 文件加载(C 里目前只有 CLI flag / 代码内构造两条路径),同样要像 frontend 那样包一层表名
+> 若要从 TOML 文件加载(正式入口目前只有 benchmark 的 CLI flag 与代码内构造两条,无独立 router 二进制),同样要像 frontend 那样包一层表名
 > (`[router]` 表 → 一个顶层 `{ router: RouterConfig }` 包装),否则 `[router]` 表会被静默忽略。
 
 ## 6. 监控项清单

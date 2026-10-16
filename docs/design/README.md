@@ -15,7 +15,7 @@
 | frontend(HTTP REST 对象接口层;内嵌 router;对标 Ambry `ambry-frontend`) | [frontend.md](./frontend.md) | 已实现 |
 | replication(拉复制设计:墓碑恒胜合并 + 游标重校验 + 段身份 + 副本 incarnation) | [replication.md](./replication.md) | 已实现 |
 | S3 网关(S3 协议翻译 + SigV4 鉴权 + MetaStore 名字映射;外接 PG/MySQL,网关无状态) | [s3.md](./s3.md) | 已实现 |
-| S3 版本控制 / 多租户 ACL、配额(网关层增强) | *(待添加)* | 规划中 |
+| S3 网关增强(多租户 ACL + canned ACL、桶级配额、multipart 生命周期原子化、虚拟主机寻址、CopyObject/Attributes、aws-chunked 流式分帧、SSE、Range 读与流式装配) | [s3.md](./s3.md) | 已实现 |
 
 > 决策档案(含被否决方案与理由)见 `openspec/changes/`。
 
@@ -27,6 +27,20 @@
 - ambry-store 的 log 本就是**同步阻塞** `FileChannel`(非异步),路线乙是对齐原版而非退化。
 - 「伪异步/盘 hang 泄漏线程」是**可用性/容错**层面问题,由集群层的磁盘健康检测 + 多副本兜底,不在引擎层硬换异步。
 - 每 Log **定容上界 + 写满自动滚动新 partition** 是设计锚点(本轮暂缓实现)。
+
+## 阶段二优化路线(2026-10-16 快照:GetObject 硬化收官后)
+
+> 每项带证据源(档/日志/审计),防路线自己烂掉;**B2 EC 为用户明令暂缓项,重开须显式下令**;
+> versioning 计费 undelete 外部凭证源为永久拒绝族,永不在此列。排序 = 建议优先级。
+
+| # | 方向 | 内容 | 证据源 |
+|---|---|---|---|
+| 1 | S3 协议面补齐(小步快) | 条件 GET(`If-Match`/`If-None-Match`/`If-*` 族)+ `If-Range`;`?partNumber` 单片查询;ListObjectsV1 / GetBucketLocation 兼容形态(旧 SDK/迁移工具面) | S3 审计 P1 菜单(`s3.md` 后续方向) |
+| 2 | flexible checksums | CRC32/CRC32C/SHA 家族:PUT `x-amz-checksum-*` 验证 + aws-chunked trailer 已解析未验证的校验值承接(GET `?attributes` 的 `Checksum` 501 面随之开) | `s3.md` 后续方向、`2026-10-16-s3-chunked-payload` 明示不验证面 |
+| 3 | 整型正确性补强 | multipart 并发重传原子化(修法已定:PG 单语句 CTE / MySQL `FOR UPDATE`,现为两步非原子可孤儿化中间 blob);frontend 描述符 composed 位置换嗅探(磁盘格式演进,走 §3.4 兼容矩阵);GC 死点崩溃窗兜底(待回收 blob 上表,GC 周期补删) | retraction 档「真留观」、`blob-io-end-to-end` 待办首条、DEVLOG 54 留观 |
+| 4 | 性能主轴(Phase 2 正题) | 真机复验三件(4 GiB 滚转 / frontend 折损形状 / 掉电冷读);frontend→router ~200µs 固定税工程减税(可选,多核真机外推折损 12-23%);flush 有界脏窗口 P2(APFS 限流耦合);S3 multipart GET 串行取片吞吐(每片一 RTT,观察 `s3_request_duration_seconds{op}`,瓶颈显现再预取) | `benchmark/BASELINE.md` 真机复验段、DEVLOG 46/49、`s3-range-streaming` 记档 |
+| 5 | 可运维性 | SSE 主钥轮换(现为离线重加密工具,工具未建);每请求 credentials/head_bucket 双查缓存(亚毫秒池化,升吞吐前不动);阈值标定 12 数真机落地(§9.4 流程已落,数据未采) | `s3.md` SSE 局限、DEVLOG 53 留观、`cluster.md` §9.4 |
+| 6 | 密度主轴(档位项) | B2 EC 冷层(D5,P1-A 路径已解锁:master 下发 + 段 owner 后台 worker + 校验分片走数据面)——**用户裁定暂缓** | `s3.md` 后续方向、cluster.md D5 |
 
 ## 系统层级(与 Ambry 一致)
 

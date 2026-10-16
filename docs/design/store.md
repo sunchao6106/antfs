@@ -294,7 +294,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | TTL 过期对象 | `!deleted && expiration_ms != -1 && now >= expiration_ms` | 记录与索引条目一并消失:读由 `Expired` 变 `NotFound` |
 | 墓碑过保留期 | `deleted && deleted_at_ms != -1 && now - deleted_at_ms >= retention`**且过了墓碑回收闸门** | 同上:已删对象的墓碑与索引条目消失 |
 
-**墓碑的删除时刻**:`delete` 把 `now` 写进墓碑记录的 `expiration` 字段**与**索引条目的 `expiration_ms`。布局不变(21B 值、`.idx` 条目 29B),旧数据 `-1` = 删除时间未知 ⇒ **永不自动回收**(§3.4 兼容,带测试)。复制按记录头带删时刻,各副本判定一致;`stat()` 的 TTL 口径走 `IndexValue::ttl_expiration_ms()`(墓碑对外仍报 `-1`)。
+**墓碑的删除时刻**:`delete` 把 `now` 写进墓碑记录的 `expiration` 字段**与**索引条目的 `expiration_ms`。布局不变(21B 值、`.idx` 条目 29B),旧数据 `-1` = 删除时间未知 ⇒ **永不自动回收**(CLAUDE.md §3.4 磁盘格式兼容,带测试)。复制按记录头带删时刻,各副本判定一致;`stat()` 的 TTL 口径走 `IndexValue::ttl_expiration_ms()`(墓碑对外仍报 `-1`)。
 
 **墓碑回收闸门(`CompactPolicy.tombstones_allowed`)**:过保留期**只说明**"删除已足够久",还要过**跨副本传播**这一关 —— 墓碑一收,还有没追平的副本就永远学不到那条删除,已删对象会以"活数据"永久留在它上面(僵尸数据)。判据是**副本级**的:
 
@@ -387,7 +387,8 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 ## 10. 配置项清单(对齐 Ambry `StoreConfig`)
 
 > **状态:部分接入**。[`StoreConfig`](../../crates/blob/src/config.rs) 已落地 `[store]` 组的 `segment_size_bytes`
-> 与 `index_max_inmem_elements`(serde + `Default` + `Validate`),经 `BlobStore::create_with/open_with`
+> 与 `index_max_inmem_elements`,以及 `io_error_count_to_trigger_shutdown`(被动盘检自关)与
+> `defer_seal_flush`(Phase 2 滚转停摆修复)(serde + `Default` + `Validate`),经 `BlobStore::create_with/open_with`
 > 依赖注入(对齐 Ambry `StorageManager`→`BlobStore`)。`total_capacity` 是 per-replica 属性(对齐 Ambry
 > `capacityInBytes`),仍作构造参数显式传入,不在 config。**其余各组仍为规划**,待对应行为实现时逐项接入。
 > 范式见 [`common.md` §1](./common.md)。默认值/范围以 Ambry `StoreConfig` **构造函数**为准。
@@ -463,7 +464,8 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 > `BlobStore::create_with/open_with` 注入,按 `store="<id>"` label 区分多实例(见 [`common.md` §2.2](./common.md))。
 > **已接入**:`store_request_duration_seconds{store,op}`(op = put/get/delete/flush)、
 > `store_already_exists_total`、`store_compaction_reclaimed_bytes_total`、`store_compaction_duration_seconds`、
-> `store_log_used_capacity_bytes`、`store_log_invalid_data_bytes`、`store_log_segment_count`。
+> `store_log_used_capacity_bytes`、`store_log_invalid_data_bytes`、`store_log_segment_count`、
+> `store_open_bad_records_total`、`store_open_abandoned_segments_total`。
 > **仍规划**:Log 的 overflow、PersistentIndex 的 recovery/find/flush 计时与 token 计数、封存段/Fuse 过滤器命中、
 > BlobStoreStats 扫描等——这些打点在 `Log`/`PersistentIndex`/`IndexSegment` 内部,需把 handle 透传进这些模块后接入。
 > 命名规范见 [`common.md` §2](./common.md)。裸构造器(`create`/`open`)用一个丢弃的私有 Registry(打点不导出),仅测试/无监控场景。
@@ -515,7 +517,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store_compaction_in_progress` | gauge | `store` | 0/1 | 是否正在 compaction | `CompactionInProgress` |
 | `store_compaction_copied_bytes_total` | counter | `store` | 字节 | 累计拷贝字节 | `CopyRateInBytes`(Meter→counter,速率查询端算) |
 | `store_compaction_reclaimed_bytes_total` | counter | `store` | 字节 | 累计回收字节 | `CompactionBytesReclaimedCount` |
-| `store_compaction_duration_seconds` | histogram | `store`,`kind`(full/partial) | 秒 | 单次 compaction 耗时 | `CompactionFinishedForAStoreTimeInMs`/`PartialRange…` |
+| `store_compaction_duration_seconds` | histogram | `store`(实码单标签,full/partial 暂不区分) | 秒 | 单次 compaction 耗时 | `CompactionFinishedForAStoreTimeInMs`/`PartialRange…` |
 | `store_compaction_cost` / `store_compaction_benefit` | gauge | `store` | — | 选段 cost/benefit | `CompactionCost`/`CompactionBenefit` |
 | `store_server_compaction_policy_used_total` | counter | `policy`(incremental/cost_benefit/compact_all) | 次 | 按实际使用的调度策略计数的 compaction 执行次数 | — |
 
@@ -798,7 +800,7 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 
 **两个只读端点**(都要求本地有该分区副本,否则 404;都在 RequestControl 的豁免白名单里):
 
-- **`GET /partitions/{pid}/scrub-report`** → `{"partition_id","live_records","tombstones","live_bytes","sealed_segments","segments":[{"position","generation","data_end"}],"token_seg","token_off"}`。
+- **`GET /partitions/{pid}/scrub-report`** → `{"partition_id","live_records","tombstones","live_bytes","sealed_segments","segments":[{"position","generation","data_end"}],"token_seg","token_off","damaged_records","abandoned_segments"}`。
   **只走索引与 mmap,不读数据体**(开销与 key 数成正比、与数据量无关),供 admin 做副本间摘要比对。
   `token_seg/token_off` = 本副本 log 末端游标(与 `replica-metadata` 同口径),两侧一致才说明该轮**可比**。
 - **`GET /partitions/{pid}/verify?max_bytes=`** → `{"partition_id","records","bad_records","first_bad_offset":{"segment","offset"}|null,"index_mismatch","truncated"}`。
@@ -866,11 +868,11 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 >
 > **必读**:配置项/监控项/测试证据/**残留风险**都在下面各节显式列出(残留风险那节请务必看完再上线)。
 
-单进程多盘部署里,一块盘 hang 住(内核 D 态)害的不只是自己:引擎 IO 全是同步阻塞且**共用同一个进程级
-阻塞池**(tokio `spawn_blocking`,默认 512 线程,本仓库不配置它),卡住的线程**收不回来**(D 态不可取消、
-`spawn_blocking` 不可取消),池满之后连健康盘上的请求也一起排队。本节落的是一批**不改行为**的前置改动
-(盘维度观测 + 探测自身的泄漏修复);每盘有界池 / 健康闸门 / IO 看门狗 / 坏盘撤离见
-[`openspec/changes/store-disk-isolation/`](../../../openspec/changes/store-disk-isolation/)。
+单进程多盘部署里,一块盘 hang 住(内核 D 态)害的不只是自己:引擎 IO 全是同步阻塞,在落地每盘池之前它们
+**共用同一个进程级阻塞池**(tokio `spawn_blocking`,默认 512 线程,本仓库不配置它),卡住的线程**收不回来**
+(D 态不可取消、`spawn_blocking` 不可取消),池满之后连健康盘上的请求也一起排队——本节自「一」起已把每盘
+有界池**本批落地**(历史教训为它付了学费);健康闸门 / IO 看门狗 / 坏盘撤离与完整证据见
+[`openspec/changes/store-disk-isolation/`](../../openspec/changes/store-disk-isolation/)。
 
 **一、每盘有界池(线程模型;⚠️ 本节的核心改动)**
 
@@ -979,7 +981,7 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 | `store_server_disk_requests_total` | counter | `disk_id`,`op` | 次 | **落到该盘上**的数据面请求数(`rate()` = 该盘 IOPS);含随后被拒的(413 body 超限、`store_full` 等)—— 它们在 `bytes_total` 里不计,故"有 IOPS、带宽为 0"是合法读数,两列要一起看 | — |
 | `store_server_disk_bytes_total` | counter | `disk_id`,`op` | 字节 | 该盘上**成功**请求的字节数(`rate()` = 该盘带宽;失败/早退不计) | — |
 | `store_server_disk_request_duration_seconds` | histogram | `disk_id`,`op` | 秒 | 该盘上请求的**端到端**延迟(含阻塞池排队,与 `request_duration` 同口径) | — |
-| `store_server_disk_in_flight_requests` | gauge | `disk_id`,`op` | 个 | 该盘在途请求数;UI 上作为**排队深度代偿**(真队列深度随每盘池落地) | — |
+| `store_server_disk_in_flight_requests` | gauge | `disk_id`,`op` | 个 | 该盘在途请求数;真队列深度看 `store_server_disk_pool_queued`(每盘池已落地,「一」) | — |
 | `store_server_disk_slow_requests_total` | counter | `disk_id`,`op` | 次 | 端到端超过 `disk_health_timeout_secs` 的请求数(超时计数) | — |
 | `store_server_disk_probe_stuck` | gauge | `disk_id` | 0/1 | 该盘是否有一发探测卡在盘里未归(仅 `disk_health_enabled` 时非 0) | — |
 | `store_server_disk_probe_skipped_total` | counter | `disk_id` | 轮 | 因上一发探测未归而跳过的探测轮次数(× 周期 ≈ 卡住时长) | — |
@@ -1252,8 +1254,9 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 
 1. ~~**只做了一半的链路**~~ **已补齐(master 侧 D4/D5/D6 已落地)**:坏盘上的副本会被**自动搬走**
    (先补后删、且继任者必须已追平才删源),判活加了迟滞(一次抖动不再判死节点),再复制加了每 tick 预算。
-   详见 [`cluster.md` §7.7](./cluster.md) 与 §9。**仍未做**:`DROPPED` 删目录回收、admin 页接入真队列深度与
-   健康状态、全部阈值的压测标定。
+   详见 [`cluster.md` §7.7](./cluster.md) 与 §9。~~`DROPPED` 删目录回收、admin 页接入真队列深度与健康
+   状态~~两者均已落地(`DROPPED` 删目录回收见 §12.6;admin 页接入见本节 6 的「已修」注)。**仍未做**:
+   全部阈值的压测标定。
 2. **阈值未压测标定**:上面 6 个数字都是经验值 —— **测量步骤与判据见
    [`cluster.md` §9.4 阈值标定手册](./cluster.md)**(全部 12 个数字一并列出,含"标定完成后必须做的三步")。
    每个数字都有单测钉着,改默认值必须显式改测试,不会悄悄漂。

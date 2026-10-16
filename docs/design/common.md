@@ -14,8 +14,9 @@
 原则:**照搬 Ambry 的形状(每模块一个 `*Config` / `*Metrics`,handle 存成字段),实现换成 Rust 生态最佳库**,不手搬
 `VerifiableProperties`(字符串 getter + 手写区间校验)与 Dropwizard(客户端 EWMA/reservoir)这些 Java 包袱。
 
-> 注:`config` crate 与 crates.io 的 `config` 同名。命令行需消歧:`cargo test -p config@0.0.0`;
-> 其对底层库的依赖已在 `Cargo.toml` 里重命名为 `config_rs` 以避免冲突。
+> 注:两个 crate 现名 `antfs-config` / `antfs-metric`(早期叫 `config` / `metric`,lib 名已随改名变为
+> `antfs_config` / `antfs_metric`,下文示例即新名)。命令行:`cargo test -p antfs-config` / `-p antfs-metric`;
+> config 对底层 crates.io `config` 库的依赖仍在 `Cargo.toml` 里别名 `config_rs` 以避免同名。
 
 ## 1. config:配置
 
@@ -23,7 +24,7 @@
 
 ```rust
 use serde::Deserialize;
-use config::{Loader, Validate, Result, in_range, at_least};
+use antfs_config::{Loader, Validate, Result, in_range, at_least};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]                       // 缺失字段回落到 Default —— 等价 @Default
@@ -95,7 +96,7 @@ let cfg: AdminConfig = Loader::new()
 ### 2.1 每模块指标的声明范式(= Ambry `*Metrics`)
 
 ```rust
-use metric::{counter, gauge, latency_seconds, Registry, IntCounter, IntGauge, Histogram};
+use antfs_metric::{counter, gauge, latency_seconds, Registry, IntCounter, IntGauge, Histogram};
 
 pub struct StoreMetrics {
     pub get_response: Histogram,        // 延迟直方图(秒)
@@ -134,7 +135,7 @@ impl StoreMetrics {
 **实现落法(便于后续接入时照做)**:
 - Registry 上注册的是 **`*Vec`(带 `store` label)**,**每个 registry 只注册一次**;第二个 store 复用已注册的 Vec,不重复 register(否则 `AlreadyReg` 报错)。
 - 每个 store 实例在 `StoreMetrics::new(registry, store_id)` 里用 `vec.with_label_values(&[store_id])` 取**自己的子 handle** 存进字段;打点时直接用该子 handle(无需每次带 label)。
-- → `metric` crate 需补 **`*_vec` 系列 helper**(`counter_vec` / `gauge_vec` / `histogram_vec`);现有单指标 helper 用于**无实例维度的全局/per-host 指标**(如 host 级 `IndexDirectMemoryUsage`,不带 `store` label)。
+- → `metric` crate **已补 `*_vec` 系列 helper**(`counter_vec` / `gauge_vec` / `histogram_vec` / `latency_seconds_vec`);现有单指标 helper 用于**无实例维度的全局/per-host 指标**(如 host 级 `IndexDirectMemoryUsage`,不带 `store` label)。
 - **label 基数纪律**:只把**有界、低基数**维度放 label(`store` / `op` / `result` / `kind`);**绝不**把 blob id、key 等无界值放 label(会指标爆炸)。
 
 ### 2.3 与 Dropwizard 的差异(现代做法)
