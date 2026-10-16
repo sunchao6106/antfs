@@ -56,6 +56,8 @@ pub struct S3QueryParams {
     pub max_uploads: Option<i32>,
     pub delete: Option<String>,
     pub acl: Option<String>,
+    #[serde(rename = "attributes")]
+    pub attributes: Option<String>,
 }
 
 /// vhost Host → 改写后的 path+query;`None` = 放行(路径风格路由兜底)。
@@ -249,7 +251,7 @@ pub fn build_router(state: AppState) -> Router {
 /// 的请求且凭证 owner == 桶 owner;跨租户/匿名 403 AccessDenied,未知桶 404。
 /// CreateBucket/ListBuckets 不设此闸(创建即按凭证 owner 认领名字;列举本就按
 /// owner 过滤),但契约要求 Signed(见各 handler)。
-async fn require_bucket_owner(
+pub(crate) async fn require_bucket_owner(
     st: &AppState,
     principal: &Principal,
     bucket: &str,
@@ -269,7 +271,7 @@ async fn require_bucket_owner(
 /// 公开读门(s3-canned-acl):读面(GET/HEAD object、ListObjectsV2)通行证 =
 /// 桶存在且(acl = public-read,或请求为桶 owner 的签名请求)。public-read 对
 /// 匿名/跨租户/owner 一视同仁放行;私有桶维持首轮语义(owner 独占)。
-async fn require_public_read(
+pub(crate) async fn require_public_read(
     st: &AppState,
     principal: &Principal,
     bucket: &str,
@@ -347,6 +349,11 @@ async fn object_put_handler(
     if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
         return e.into_response();
     }
+    if req.headers().get("x-amz-copy-source").is_some() {
+        return crate::handlers::object::copy_object(st, &principal, &bucket, &key, req)
+            .await
+            .into_response();
+    }
     if let (Some(upload_id), Some(part_number)) = (&q.upload_id, q.part_number) {
         return crate::handlers::multipart::upload_part(
             st,
@@ -369,7 +376,17 @@ async fn object_get_handler(
     Extension(principal): Extension<Principal>,
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<S3QueryParams>,
+    req: Request,
 ) -> Response {
+    if q.attributes.is_some() {
+        // GET object?attributes:读门同 GET object(读面);属性集由请求头定。
+        if let Err(e) = require_public_read(&st, &principal, &bucket).await {
+            return e.into_response();
+        }
+        return crate::handlers::object::get_object_attributes(st, &bucket, &key, req.headers())
+            .await
+            .into_response();
+    }
     let upload_id = q.upload_id.clone();
     if let Some(uid) = &upload_id {
         // ListParts 属 multipart 会话目录,维持 owner 面。

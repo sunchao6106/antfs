@@ -29,6 +29,10 @@ pub enum S3Error {
         used: u64,
     },
     InvalidArgument(String),
+    /// 参数各自合法但组合非法(如自拷贝且 COPY 指令)——区别于 InvalidArgument 的单值坏。
+    InvalidRequest(String),
+    /// 条件拷贝/读的前置条件不满足(412 家族)。
+    PreconditionFailed,
     /// 能力显式出界(未实现的面,如 PutBucketAcl 的 XML body 形式)——不静默也不 400 误导。
     NotImplemented(String),
 }
@@ -57,6 +61,8 @@ impl S3Error {
             Self::MetadataTooLarge => "MetadataTooLarge",
             Self::QuotaExceeded { .. } => "QuotaExceeded",
             Self::InvalidArgument(_) => "InvalidArgument",
+            Self::InvalidRequest(_) => "InvalidRequest",
+            Self::PreconditionFailed => "PreconditionFailed",
             Self::NotImplemented(_) => "NotImplemented",
         }
     }
@@ -72,6 +78,8 @@ impl S3Error {
             Self::MalformedXML(_) | Self::MissingContentLength => StatusCode::BAD_REQUEST,
             Self::IncompleteBody => StatusCode::BAD_REQUEST,
             Self::MetadataTooLarge | Self::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::QuotaExceeded { .. } => StatusCode::from_u16(507).unwrap(),
             Self::AccessDenied(_)
@@ -139,6 +147,10 @@ impl S3Error {
             ),
             Self::InvalidArgument(detail) => {
                 format!("Invalid argument: {detail}")
+            }
+            Self::InvalidRequest(detail) => format!("Invalid request: {detail}"),
+            Self::PreconditionFailed => {
+                "The requested precondition(s) did not hold for the source object.".into()
             }
             Self::NotImplemented(detail) => {
                 format!(

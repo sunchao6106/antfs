@@ -1430,3 +1430,31 @@
   记录在案自警:乱码/串写检查器尚未对 env 字符串生效,**手写 env 必复制粘贴已有串**。
 
 **发运**:`2026-10-16-s3-chunked-payload` 归档,CI 五 job 硬验收(见 push)。
+
+## 步骤 61|s3-copy-attributes:CopyObject + GetObjectAttributes 落地
+
+**动机**:用户点名队列第二件。拷贝是对象面**复合原语**(服务端读源→写终,客户端零体往返);
+属性读取是 HEAD 的选择性回显面(新 CLI 默认走它)。
+
+**终形**:
+- `copy_object`:源=公开读门 / 终=PUT 写门(**闸门正交**,零新权限概念);四条件头按 AWS 优先序
+  (match > none-match > unmodified > modified,失配 `PreconditionFailed` 412 新变体;ETag 剥引号;
+  日期 rfc2822,非法 400);`COPY`/`REPLACE` 指令;自拷贝+COPY → `InvalidRequest` 400(REPLACE = 就地重写);
+  单块源:读→写→行,配额 507 弧与 put_object **全同**;multipart 源:**内部 session 逐 part 重建**
+  (≤4 MiB/步,整 blob 绝不进内存;孤儿 session 由 upload-TTL GC 兜;complete 遮蔽/弃片回收同线上);
+  带 body 的拷贝 400;`?versionId` 源 501(versioning 永久拒绝族)。响应 `CopyObjectResult` XML。
+- `get_object_attributes`:`?attributes` + `x-amz-object-attributes`(可请求集五员,未知 400);
+  支持三属体式回显(ETag 裸值 / ObjectSize / StorageClass=STANDARD)+ 响应头(引号 ETag +
+  `Last-Modified` RFC 7231);`Checksum`/`ObjectParts` **显式 501**。
+- 分叉点:`object_put_handler` 检 `x-amz-copy-source`(先于体读);`object_get_handler`
+  新增 `req` 收头 + `?attributes` 分叉;两闸门 pub(crate) 显露。
+
+**验证**:
+- xml 序列化单测 +2(引号 ETag/选集);lib 67 全绿。
+- e2e `tests/copy.rs` **11 测四跑全绿**(PG 净/脏 × MySQL 净/脏):拷贝回环(XML 含引 ETag/ISO 日期)、
+  COPY/REPLACE meta、**四条件头 6 路**(含 412 不落库断言 ×4)、自拷贝 400/200、
+  源缺 404(NoSuchKey/NoSuchBucket)、跨租户 public-read 源放行(租户自建终桶)、multipart 源装配等价、
+  配额 507(拒后终对象 404)、带 body 400、versionId 501、attributes 三属+头/未知 400/501/404。
+- 全套 e2e 双方言零变化(57 e2e 全绿);fmt/clippy 0。
+
+**发运**:归档 `2026-10-16-s3-copy-attributes`,CI 五 job 硬验收(见 push)。

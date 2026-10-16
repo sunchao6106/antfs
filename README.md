@@ -95,7 +95,7 @@ Layered reading: **gateways** (Frontend / S3) are stateless translators — ever
 | `router` | Client SDK (`crates/common/router`): blobId range leasing, W-majority writes, R=1 reads, large-blob streaming; shared by frontend and benchmarks. Counterpart of Ambry's `NonBlockingRouter` | ✅ Implemented |
 | `frontend` | HTTP REST object layer (`/blobs` + `/metrics`). Counterpart of `ambry-frontend` | ✅ Implemented |
 | `admin` | Admin web: ops actions + control-plane dashboard (topology / nodes / disks / partitions / metrics) | ✅ Implemented |
-| `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject (incl. object metadata: `Content-Type` + `x-amz-meta-*`), multipart upload, ListObjectsV2, bucket management, AWS SigV4 auth (header + presigned + `aws-chunked` streaming signatures). Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | ✅ Implemented |
+| `s3` | S3-compatible gateway: PutObject / GetObject / DeleteObject / HeadObject (incl. object metadata: `Content-Type` + `x-amz-meta-*`), multipart upload, server-side CopyObject, GetObjectAttributes, ListObjectsV2, bucket management, AWS SigV4 auth (header + presigned + `aws-chunked` streaming signatures). Stateless (metadata in external PostgreSQL or MySQL). Same tier as `frontend` | ✅ Implemented |
 | Multi-tenant S3 ACL (private-bucket semantics + bucket quota) | Gateway-layer enhancements | ✅ Implemented |
 
 > Naming: `blob` = the single-node blob storage engine; `store` = the data node server.

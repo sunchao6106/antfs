@@ -96,7 +96,7 @@
 | router | 客户端 SDK(通用组件,`crates/common/router`):向 master 取号段、W 多数派写、R=1 读、流式大文件;frontend 与压测共用;对标 Ambry `NonBlockingRouter` | ✅ 已实现 |
 | frontend | HTTP REST 对象接口层(`/blobs` 读写/删/TTL/分片拼装 + `/metrics`);内嵌同一个 router SDK;对标 Ambry `ambry-frontend` | ✅ 已实现 |
 | admin | admin web:运维操作 + 控制面 dashboard(拓扑/节点/盘/分区/指标) | ✅ 已实现 |
-| s3 | S3 兼容网关:PutObject / GetObject / DeleteObject / HeadObject(含对象元数据:`Content-Type` + `x-amz-meta-*`)、multipart 上传、ListObjectsV2、桶管理、AWS SigV4 鉴权(header + 预签 URL + `aws-chunked` 流式分帧签名——真 SDK 带体写全通);网关无状态(元数据外接 PostgreSQL / MySQL);与 frontend 同层 | ✅ 已实现 |
+| s3 | S3 兼容网关:PutObject / GetObject / DeleteObject / HeadObject(含对象元数据:`Content-Type` + `x-amz-meta-*`)、multipart 上传、服务端 CopyObject、GetObjectAttributes、ListObjectsV2、桶管理、AWS SigV4 鉴权(header + 预签 URL + `aws-chunked` 流式分帧签名——真 SDK 带体写全通);网关无状态(元数据外接 PostgreSQL / MySQL);与 frontend 同层 | ✅ 已实现 |
 | S3 多租户 ACL(私有桶语义 + 桶级配额) | 网关层增强(与 frontend 同层) | ✅ 已实现 |
 
 > 命名:`blob` = 单机 blob 存储引擎;`store` = 数据节点(store server)。

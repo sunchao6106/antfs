@@ -114,6 +114,43 @@ pub fn serialize_complete_multipart(bucket: &str, key: &str, etag: &str) -> Stri
     )
 }
 
+/// `PutObject + x-amz-copy-source` 的 200 应答体(CopyObjectResult;体式 ETag 带引号)。
+pub fn serialize_copy_object_result(etag: &str, last_modified_ms: i64) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag>\
+         </CopyObjectResult>",
+        epoch_to_iso(last_modified_ms),
+        quick_xml::escape::escape(etag),
+    )
+}
+
+/// `GET ?attributes` 的应答选集(仅请求∩支持才出项;ETag 体式裸值)。
+pub struct ObjectAttributesOut {
+    pub etag: Option<String>,
+    pub object_size: Option<u64>,
+    pub storage_class: bool,
+}
+
+pub fn serialize_object_attributes(out: &ObjectAttributesOut) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <GetObjectAttributesOutput xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    if let Some(etag) = &out.etag {
+        xml.push_str(&format!("<ETag>{}</ETag>", quick_xml::escape::escape(etag)));
+    }
+    if let Some(size) = out.object_size {
+        xml.push_str(&format!("<ObjectSize>{size}</ObjectSize>"));
+    }
+    if out.storage_class {
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+    }
+    xml.push_str("</GetObjectAttributesOutput>");
+    xml
+}
+
 pub fn serialize_list_parts(upload_id: &str, resp: &ListPartsResp) -> String {
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -559,6 +596,37 @@ mod tests {
         let xml = serialize_delete_result(&[], false);
         assert!(xml.contains("<DeleteResult"));
         assert!(xml.contains("</DeleteResult>"));
+    }
+
+    #[test]
+    fn copy_object_result_carries_quoted_etag_and_iso_date() {
+        let xml = serialize_copy_object_result("abc123", 1_762_000_000_000);
+        assert!(xml.contains("<CopyObjectResult"));
+        assert!(xml.contains("<ETag>&quot;abc123&quot;</ETag>"));
+        assert!(xml.contains("<LastModified>2025-11-01"));
+    }
+
+    #[test]
+    fn object_attributes_emits_only_requested_members() {
+        let out = ObjectAttributesOut {
+            etag: Some("deadbee".into()),
+            object_size: Some(42),
+            storage_class: true,
+        };
+        let xml = serialize_object_attributes(&out);
+        assert!(xml.contains("<ETag>deadbee</ETag>"));
+        assert!(xml.contains("<ObjectSize>42</ObjectSize>"));
+        assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+
+        let sparse = ObjectAttributesOut {
+            etag: None,
+            object_size: Some(7),
+            storage_class: false,
+        };
+        let xml = serialize_object_attributes(&sparse);
+        assert!(!xml.contains("<ETag>"));
+        assert!(!xml.contains("<StorageClass>"));
+        assert!(xml.contains("<ObjectSize>7</ObjectSize>"));
     }
 
     #[test]
