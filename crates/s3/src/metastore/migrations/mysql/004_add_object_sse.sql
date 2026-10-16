@@ -1,0 +1,1 @@
+ALTER TABLE named_objects ADD COLUMN sse VARCHAR(256) NULL;

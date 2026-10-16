@@ -25,6 +25,9 @@ pub struct AppState {
     pub metrics: Arc<S3Metrics>,
     pub registry: antfs_metric::Registry,
     pub config: Arc<S3GatewayConfig>,
+    /// `s3-sse` 主钥(None = 未部署 → 带 SSE 头的写 501;读侧行描述符 None 的对象
+    /// 永不触此面)。
+    pub sse: Option<Arc<crate::sse::MasterKey>>,
 }
 
 #[derive(Deserialize, Default)]

@@ -58,6 +58,7 @@ pub async fn put_object(
     req: Request,
 ) -> Result<Response, S3Error> {
     let (content_type, user_meta) = capture_object_meta(req.headers())?;
+    let sse_requested = parse_sse_request_header(req.headers(), &st.sse)?;
 
     let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
 
@@ -68,10 +69,26 @@ pub async fn put_object(
     };
 
     let size = body_bytes.len() as u64;
-    let (blob_key, _report) = st
-        .router
-        .put_auto_with_ttl(body_bytes, NO_EXPIRATION)
-        .await?;
+    let (blob_key, _report) = match (&sse_requested, &st.sse) {
+        (Some(master), _) => {
+            st.router
+                .put_auto_with_ttl(
+                    Bytes::from(crate::sse::frame_object(master, &body_bytes)?),
+                    NO_EXPIRATION,
+                )
+                .await?
+        }
+        _ => {
+            st.router
+                .put_auto_with_ttl(body_bytes, NO_EXPIRATION)
+                .await?
+        }
+    };
+    // 持久化语义:size/etag 恒按**明文**(配额与 ETag 口径不变);帧只影响 blob 字节。
+    // 崩溃一致性沿用既有弧:blob 先落、行后写,中途夭折 = 孤儿 blob,GC 兜底(sse 未变)。
+    let put_sse = sse_requested
+        .as_ref()
+        .map(|master| crate::sse::descriptor(master.key_id()));
 
     let outcome = match st
         .metastore
@@ -84,6 +101,7 @@ pub async fn put_object(
             content_type: Some(content_type),
             user_meta,
             parts_manifest: None,
+            sse: put_sse,
         })
         .await
     {
@@ -109,7 +127,42 @@ pub async fn put_object(
         }
     }
 
-    Ok((StatusCode::OK, [(header::ETAG, format!("\"{etag}\""))], "").into_response())
+    let mut response =
+        (StatusCode::OK, [(header::ETAG, format!("\"{etag}\""))], "").into_response();
+    if let Some(master) = &sse_requested {
+        response.headers_mut().insert(
+            "x-amz-server-side-encryption",
+            "AES256".parse().expect("static header value"),
+        );
+        let _ = master;
+    }
+    Ok(response)
+}
+
+/// SSE 请求头裁决:值须 AES256(其余 400);网关未配主钥(= 能力未部署)→ 501;
+/// 返回可用的主钥引用(未请求 → `None`,不碰加密面)。
+fn parse_sse_request_header(
+    headers: &HeaderMap,
+    configured: &Option<std::sync::Arc<crate::sse::MasterKey>>,
+) -> Result<Option<std::sync::Arc<crate::sse::MasterKey>>, S3Error> {
+    let value = headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok());
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.eq_ignore_ascii_case("AES256") {
+        return Err(S3Error::InvalidArgument(format!(
+            "unsupported x-amz-server-side-encryption value `{value}` (only AES256)"
+        )));
+    }
+    match configured {
+        Some(master) => Ok(Some(master.clone())),
+        None => Err(S3Error::NotImplemented(
+            "server-side encryption is not configured on this gateway (s3.sse.master_key_file)"
+                .into(),
+        )),
+    }
 }
 
 pub async fn get_object(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
@@ -118,6 +171,10 @@ pub async fn get_object(st: AppState, bucket: &str, key: &str) -> Result<Respons
         .get_object(bucket, key)
         .await?
         .ok_or(S3Error::NoSuchKey)?;
+
+    if meta.sse.is_some() {
+        return get_encrypted_object(&st, &meta).await;
+    }
 
     if let Some(manifest_json) = &meta.parts_manifest {
         return get_multipart_object(st, &meta, manifest_json).await;
@@ -166,6 +223,40 @@ async fn get_multipart_object(
     Ok(builder.body(Body::from(all_data)).unwrap())
 }
 
+/// SSE 对象读:blob = 帧 → 明文(解帧失败 = InternalError,响亮不吞)。配额/头
+/// 面与明文对象逐一同形(仅多回 `x-amz-server-side-encryption`)。
+async fn get_encrypted_object(st: &AppState, meta: &ObjectMeta) -> Result<Response, S3Error> {
+    let master = st.sse.as_ref().ok_or_else(|| {
+        S3Error::InternalError(
+            "row is encrypted but the gateway has no SSE master key configured".into(),
+        )
+    })?;
+    let descriptor = crate::sse::parse_descriptor(meta.sse.as_deref().unwrap_or_default())
+        .ok_or_else(|| S3Error::InternalError("corrupt sse descriptor".into()))?;
+    if descriptor.alg != "AES256" {
+        return Err(S3Error::InternalError(format!(
+            "unknown sse algorithm `{}`",
+            descriptor.alg
+        )));
+    }
+    let frame = st.router.get(&meta.blob_id).await?;
+    let plain = crate::sse::read_object_frame(master, frame.as_ref(), &descriptor.key_id)?;
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_LENGTH, meta.size.to_string())
+        .header(header::ETAG, format!("\"{}\"", meta.etag))
+        .header("x-amz-server-side-encryption", "AES256");
+    if let Some(ct) = &meta.content_type {
+        builder = builder.header(header::CONTENT_TYPE, ct.as_str());
+    }
+    for (k, v) in &meta.user_meta {
+        builder = builder.header(format!("x-amz-meta-{k}"), v.as_str());
+    }
+    builder
+        .body(Body::from(plain))
+        .map_err(|e| S3Error::InternalError(format!("response build: {e}")))
+}
+
 pub async fn head_object(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
     let meta = st
         .metastore
@@ -177,6 +268,9 @@ pub async fn head_object(st: AppState, bucket: &str, key: &str) -> Result<Respon
         .status(StatusCode::OK)
         .header(header::CONTENT_LENGTH, meta.size.to_string())
         .header(header::ETAG, format!("\"{}\"", meta.etag));
+    if meta.sse.is_some() {
+        builder = builder.header("x-amz-server-side-encryption", "AES256");
+    }
     if let Some(ct) = &meta.content_type {
         builder = builder.header(header::CONTENT_TYPE, ct.as_str());
     }
@@ -322,6 +416,7 @@ pub async fn copy_object(
         ));
     }
     evaluate_copy_conditions(&src_meta, &headers)?;
+    let sse_request = parse_sse_request_header(&headers, &st.sse)?;
 
     let (content_type, user_meta) = if directive == "REPLACE" {
         let (ct, meta) = capture_object_meta(&headers)?;
@@ -332,18 +427,49 @@ pub async fn copy_object(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let etag = match &src_meta.parts_manifest {
         Some(manifest_json) => {
+            if sse_request.is_some() {
+                return Err(S3Error::NotImplemented(
+                    "multipart objects do not support server-side encryption this round".into(),
+                ));
+            }
             let parts: Vec<ManifestPart> = serde_json::from_str(manifest_json)
                 .map_err(|e| S3Error::InternalError(format!("corrupt manifest: {e}")))?;
             copy_via_multipart(st.clone(), bucket, key, &parts, &content_type, &user_meta).await?
         }
         None => {
-            let etag =
-                copy_single_part(st, bucket, key, &src_meta, &content_type, &user_meta).await?;
-            etag
+            copy_single_part(
+                st,
+                bucket,
+                key,
+                &src_meta,
+                &content_type,
+                &user_meta,
+                &sse_request,
+            )
+            .await?
         }
     };
     let xml = crate::xml::serialize_copy_object_result(&etag, now_ms);
-    Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())
+    let mut response = (StatusCode::OK, [("content-type", "application/xml")], xml).into_response();
+    if sse_request.is_some() {
+        response.headers_mut().insert(
+            "x-amz-server-side-encryption",
+            "AES256".parse().expect("static"),
+        );
+    }
+    Ok(response)
+}
+
+fn decrypt_source_bytes(st: &AppState, meta: &ObjectMeta, raw: &[u8]) -> Result<Vec<u8>, S3Error> {
+    let Some(descriptor) = meta.sse.as_deref().and_then(crate::sse::parse_descriptor) else {
+        return Ok(raw.to_vec());
+    };
+    let master = st.sse.as_ref().ok_or_else(|| {
+        S3Error::InternalError(
+            "row is encrypted but the gateway has no SSE master key configured".into(),
+        )
+    })?;
+    crate::sse::read_object_frame(master, raw, &descriptor.key_id)
 }
 
 async fn copy_single_part(
@@ -353,12 +479,23 @@ async fn copy_single_part(
     src_meta: &ObjectMeta,
     content_type: &Option<String>,
     user_meta: &UserMeta,
+    sse: &Option<std::sync::Arc<crate::sse::MasterKey>>,
 ) -> Result<String, S3Error> {
-    let data = st.router.get(&src_meta.blob_id).await?;
-    let data = Bytes::from(data.to_vec());
+    let raw = st.router.get(&src_meta.blob_id).await?;
+    // 加密源:engine 读回的是帧 → 解出明文再走重钥逻辑(拷贝按明文重算 ETag/重定加密态)。
+    let data = Bytes::from(decrypt_source_bytes(&st, src_meta, raw.as_ref())?);
     let etag = md5_hex(&data);
     let size = data.len() as u64;
-    let (blob_id, _) = st.router.put_auto_with_ttl(data, NO_EXPIRATION).await?;
+    let blob_id = match sse {
+        Some(master) => {
+            let framing_payload = Bytes::from(crate::sse::frame_object(master, &data)?);
+            st.router
+                .put_auto_with_ttl(framing_payload, NO_EXPIRATION)
+                .await?
+                .0
+        }
+        None => st.router.put_auto_with_ttl(data, NO_EXPIRATION).await?.0,
+    };
     let outcome = st
         .metastore
         .put_object(PutObjectMeta {
@@ -370,6 +507,7 @@ async fn copy_single_part(
             content_type: content_type.clone(),
             user_meta: user_meta.clone(),
             parts_manifest: None,
+            sse: sse.as_ref().map(|m| crate::sse::descriptor(m.key_id())),
         })
         .await;
     match outcome {

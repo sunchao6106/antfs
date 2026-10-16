@@ -15,6 +15,11 @@ pub async fn create_multipart_upload(
     req: Request,
 ) -> Result<Response, S3Error> {
     let (content_type, user_meta) = crate::handlers::object::capture_object_meta(req.headers())?;
+    if req.headers().get("x-amz-server-side-encryption").is_some() {
+        return Err(S3Error::NotImplemented(
+            "multipart uploads do not support server-side encryption this round".into(),
+        ));
+    }
 
     let upload_id = st
         .metastore
@@ -33,6 +38,11 @@ pub async fn upload_part(
     part_number: i32,
     req: Request,
 ) -> Result<Response, S3Error> {
+    if req.headers().get("x-amz-server-side-encryption").is_some() {
+        return Err(S3Error::NotImplemented(
+            "multipart parts do not support server-side encryption this round".into(),
+        ));
+    }
     let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
 
     let etag = {

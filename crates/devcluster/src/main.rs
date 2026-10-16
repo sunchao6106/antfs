@@ -518,6 +518,8 @@ async fn start_s3(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
         metrics,
         registry,
         config: Arc::new(cfg),
+        // devcluster 内嵌网关默认不部署 SSE(生产走 antfs-s3 独立二进制的主钥文件)。
+        sse: None,
     };
     // 后台 GC(软删行保留期清理 + 孤儿 multipart TTL;默认 config 即启用)。
     antfs_s3::gc::spawn(state.clone(), antfs_s3::config::GcConfig::default());

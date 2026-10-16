@@ -17,6 +17,10 @@ pub struct S3GatewayConfig {
     /// 的请求按等价路径风格请求路由(路径与 query 前挂桶名;签名验证发生在改写之前)。
     /// **默认空 = 关**(行为零变化)。
     pub virtual_host_domain: String,
+    /// `s3-sse` 主钥文件路径(内容 = 64 hex 字符 = AES-256 主钥)。默认空 = SSE 能力不部署
+    /// (带 `x-amz-server-side-encryption` 的请求回 501);key_id 由 sha256(钥) 前 8 字节
+    /// 派生。单钥形态,轮换 = 离线重加密(见 docs/design/s3.md)。
+    pub sse_master_key_file: String,
 }
 
 impl Default for S3GatewayConfig {
@@ -31,6 +35,7 @@ impl Default for S3GatewayConfig {
             router: RouterConfig::default(),
             gc: GcConfig::default(),
             virtual_host_domain: String::new(),
+            sse_master_key_file: String::new(),
         }
     }
 }

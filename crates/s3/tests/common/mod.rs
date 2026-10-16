@@ -498,6 +498,11 @@ impl S3Fixture {
     }
 
     pub async fn start() -> S3Fixture {
+        Self::start_with_sse(true).await
+    }
+
+    /// `sse` = false builds the fixture with NO SSE master key (the 501 regime).
+    pub async fn start_with_sse(sse: bool) -> S3Fixture {
         let driver = std::env::var("TEST_S3_DRIVER").unwrap_or_else(|_| "postgres".to_string());
         let db_url = match driver.as_str() {
             "postgres" => std::env::var("TEST_S3_POSTGRES_URL").expect(
@@ -559,6 +564,26 @@ impl S3Fixture {
             .await
             .expect("connect metastore");
 
+        // `s3-sse` 夹具钥:tmp 目录随机 64 hex;sse=false分支不生成(None = 501 面)。
+        let sse_material = sse.then(|| {
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )
+        });
+        let key_path = tmp.path().join("sse-master.key");
+        if let Some(material) = &sse_material {
+            std::fs::write(&key_path, material).expect("write fixture sse master key");
+        }
+        let master_key = if sse_material.is_some() {
+            Some(std::sync::Arc::new(
+                antfs_s3::sse::MasterKey::load(key_path.to_string_lossy().as_ref())
+                    .expect("fixture master key just written loads"),
+            ))
+        } else {
+            None
+        };
         let s3_addr = addr(free_port());
         let cfg = S3GatewayConfig {
             listen_addr: s3_addr.clone(),
@@ -569,6 +594,11 @@ impl S3Fixture {
             // vhost e2e(tests/vhost.rs)设 TEST_S3_VHOST_DOMAIN 起「后缀开」夹具;
             // 其余二进制不设 → 默认空 = 关 —— 它们就是「默认关零变化」的回归。
             virtual_host_domain: std::env::var("TEST_S3_VHOST_DOMAIN").unwrap_or_default(),
+            sse_master_key_file: if sse {
+                key_path.to_string_lossy().into_owned()
+            } else {
+                String::new()
+            },
             ..Default::default()
         };
         cfg.validate().expect("s3 gateway config");
@@ -579,6 +609,7 @@ impl S3Fixture {
             metrics: Arc::new(metrics),
             registry,
             config: Arc::new(cfg),
+            sse: master_key,
         };
         let listener = tokio::net::TcpListener::bind(&s3_addr)
             .await

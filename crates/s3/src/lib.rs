@@ -6,4 +6,5 @@ pub mod handlers;
 pub mod metastore;
 pub mod metrics;
 pub mod server;
+pub mod sse;
 pub mod xml;

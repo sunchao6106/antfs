@@ -32,6 +32,8 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
+aes-gcm = "0.10"
+getrandom = "0.2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 percent-encoding = "2"

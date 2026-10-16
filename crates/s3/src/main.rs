@@ -31,12 +31,25 @@ async fn main() {
             .expect("connect router"),
     );
 
+    // SSE 主钥:按配置装载(缺省空 = 能力不部署;装载失败 = 启动即败,不让坏钥上线)。
+    let sse = if cfg.sse_master_key_file.is_empty() {
+        None
+    } else {
+        match antfs_s3::sse::MasterKey::load(&cfg.sse_master_key_file) {
+            Ok(master) => Some(Arc::new(master)),
+            Err(e) => {
+                eprintln!("fatal: failed to load s3 SSE master key: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
     let state = antfs_s3::server::AppState {
         router,
         metastore,
         metrics,
         registry: registry.clone(),
         config: Arc::new(cfg.clone()),
+        sse,
     };
     // 后台 GC(软删行保留期清理 + 孤儿 multipart TTL;受 antfs-s3.toml [s3.gc] 控制,默认开)。
     antfs_s3::gc::spawn(state.clone(), cfg.gc.clone());

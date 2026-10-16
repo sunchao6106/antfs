@@ -1458,3 +1458,35 @@
 - 全套 e2e 双方言零变化(57 e2e 全绿);fmt/clippy 0。
 
 **发运**:归档 `2026-10-16-s3-copy-attributes`,CI 五 job 硬验收(见 push)。
+
+## 步骤 62|s3-sse:服务端加密落地(AES256 包络,红线件收官)
+
+**动机**:用户点名队列第三件。store 盘被拿走 ≠ 对象泄密——网关层静态加密补上。
+
+**终形**:
+- `sse.rs` 模块:主钥装载(64 hex 文件;key_id=sha256 前 8B;装载失败启动即败)+
+  自述帧 `ANTFSSE1|key_id|主钥包裹DEK|base|chunk_size|64KiB 分块` —— 逐对象随机 DEK,
+  跨对象挪块(异钥)与本对象重排/复制(tag 绑计数 nonce)皆破;任意损坏响亮 500。
+- 持久化:`named_objects.sse` 可空列(迁移 004 双方言);NULL=明文,历史行/明文新写零变化;
+  事务弧零改动(blob 先落/行后写/配额恒明文口径)。
+- API 面:PUT `x-amz-server-side-encryption: AES256` 逐写 opt-in + 应答回显;GET/HEAD 回显;
+  拷贝按写选入(加密源=明文读侧+终点重钥);multipart 面 + 此头 → 显式 501;非法值 400;
+  未配主钥 501。devcluster 内嵌网关默认不部署(注记)。
+- 配置:`s3.sse.master_key_file`(默认空 = 不部署);夹具随机钥 + `start_with_sse(false)`
+  双形态。
+
+**两课(e2e/双言矩阵实证)**:
+1. **拷贝加密源的读侧初版直读引擎字节 = 帧**(行无描述符、字节是密文)——负例
+   「copy_out 后引擎字节须等于明文」当场暴露;修 = `decrypt_source_bytes`(源行描述符
+   Some → 解帧再走重钥逻辑)。
+2. **MySQL INSERT 列扩 bind 未扩**:PG 腿绿 MySQL 腿 500(双言真分叉第三例)——
+   矩阵腿是唯一能捕此类错的验证面。
+
+**验证**:
+- 单测 6(回环 0/1/64KiB 边界/2.5 块;密文≠明文+magic;七点篡改/换钥/短帧全响亮)。
+- e2e `tests/sse.rs` 6 测 **四跑全绿**(PG 净/脏 × MySQL 净/脏):PUT/GET/HEAD 回环
+  (content-length 恒明文长)+ 引擎字节即帧不即明文 + 未配钥 501 + 非法值 400 +
+  multipart 501 + 配额 507 不落库 + 拷贝双向重钥(入钥/出钥,引擎字节级断言)。
+- 全套 e2e 双方言 fresh/dirty 零变化(11 ok-线 × 4);fmt/clippy 0;lib 70 绿。
+
+**发运**:归档 `2026-10-16-s3-sse`,CI 五 job 硬验收(见 push)。

@@ -15,6 +15,8 @@ pub struct PutObjectMeta {
     pub content_type: Option<String>,
     pub user_meta: UserMeta,
     pub parts_manifest: Option<String>,
+    /// `s3-sse` 描述符(JSON `{"alg","key_id"}`);None = 明文(历史行 NULL 列同此)。
+    pub sse: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,8 @@ pub struct ObjectMeta {
     pub created_at: i64,
     pub user_meta: UserMeta,
     pub parts_manifest: Option<String>,
+    /// `s3-sse` 描述符;Some → blob 为 SSE 帧(读侧须解帧),None = 明文。
+    pub sse: Option<String>,
 }
 
 #[derive(Debug, Clone)]
