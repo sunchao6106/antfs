@@ -1690,3 +1690,40 @@ retraction 留观表述过时,路线行本步更正。
 **发运**:归档 `openspec/changes/archive/2026-10-16-s3-reclaim-wal/`(s3-metastore
 ADDED WAL 要求、s3-gc 两要求、s3-multipart UploadPart 口径);docs 同步(s3.md 新节
 「回收 WAL」+ GC 段 + 监控表 +2 + 矩阵 + 后续方向;design README 路线档 3 行更正)。
+
+---
+
+## 步骤 67:blob-composed-flag —— 拼装描述符类型位:flag 置换嗅探(存量兜底)
+
+**日期**:2026-10-16 · **change**:`blob-composed-flag`(阶段二优化路线档 3,条目 2)
+
+**动机**:frontend 读拼装对象靠 MAGIC 嗅探(≤1 MiB 整体读回比对 `ASTC` 前缀)——两个已知失真:
+① 普通 blob 恰以 `ASTC` 开头 → 502(数据没丢,网关拒绝服务);② 恰好合法的描述符字节被当普通
+文件上传 → 静默返回它引用的片内容(confused deputy)。根因 = 存储层无类型区分(`blob-io-
+end-to-end` 待办首条,三选项推演,本档采用推荐项 A:记录 flags 位)。
+
+**落地**(链路四层,裁决 D1-D6 见 change design.md):
+- 引擎:value/index flags 字节启用保留位 `FLAG_COMPOSED = 1<<4`(**布局零变化**——§3.4 双向
+  天然兼容:旧读者忽略未知位、旧值位零走旧路径;恢复/复制/压实三路径按记录自描述 flags 零代码
+  透传,重开/重建用例锁定);写口 `put_composed_ttl` / `put_composed_from_reader`(既有签名与
+  flags=0 语义逐字不动);`BlobMeta.composed` + `stat` 填充。
+- store 数据面:`PUT ?composed=true`(三写路径分派;`PutParams` serde default 容旧 router 无参);
+  `metadata` JSON 增 `composed`。
+- router:`put_url` 携 composed;`BlobStat.composed` **serde default**(旧 store JSON 容缺——
+  滚动升级读接缝);仲裁环参数化提取(`put_keyed` / `put_auto_keyed` 私有核,环体逐字搬运)+
+  组合写三件套公开法,旧签名零破坏。
+- frontend:两描述符写点切组合写(stitch / auto-chunk 管线);`download` **flag 优先**——置位即
+  拼装路径(超限/坏描述符响亮 502,不静默降级)、无位行维持嗅探(存量兼容;D5 冻结存量歧义,
+  flag-only 翻转需回填,另立项)。
+
+**验证**:
+- 引擎单测:value roundtrip 保位 / 旧值 not composed;组合写**三态保位**(stat 直读 / 重开索引
+  自盘 / 重建扫 log);s3 零涉(其 manifest 在 MetaStore,非 blob 描述符)。
+- router serde 容缺测试(旧 JSON → composed false 不炸);store 139+ 绿;frontend 11+17 绿
+  (**ASTC 前缀负例仍绿** = 存量冻结面守望;stitch 用例经新 flag 路径,断言不变 = 语义等价证明)。
+- workspace 72 套件绿;clippy 0;fmt 干净;**s3 e2e 双言各 87/87 零回归**(PG + MySQL——引擎层
+  改在 s3 之下,全量守望)。
+
+**发运**:归档 `openspec/changes/archive/2026-10-16-blob-composed-flag/`(新能力 spec 4 要求);
+docs 同步(frontend.md §4/§11、cluster.md 数据面三处、store.md 记录/索引 flags 行、design README
+路线档 3 条目 2 ✅)。

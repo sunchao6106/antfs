@@ -85,7 +85,7 @@
 |---|---|---|---|
 | 0..2 | `magic` | u16 | `"MB"` |
 | 2 | `version` | u8 | `= 4` |
-| 3 | `flags` | u8 | 0 = PUT,`FLAG_DELETED` = 墓碑(**唯一**保留的标志) |
+| 3 | `flags` | u8 | 0 = PUT,`FLAG_DELETED` = 墓碑,`FLAG_COMPOSED`(bit 4)= 拼装描述符类型位(`blob-composed-flag`,布局不变);位 1-3 预留 |
 | 4..8 | `key_suffix` | u32 | 大端 = blobId **低 32bit**(objectId) |
 | 8..16 | `expiration_ms` | i64 | `-1` = 不过期 |
 | 16..20 | `data_len` | u32 | 数据体长度 |
@@ -133,7 +133,7 @@ key(`StoreKey`,**8B** = 64bit blobId:高 32bit partitionId + 低 32bit objectId,
 ```
 0..8   offset        u64 = (段号 u32 << 32) | 段内偏移 u32
 8..12  size          u32 = 整条记录的字节数(记录头 + 数据体 + crc)
-12     flags         u8  (目前只有 FLAG_DELETED)
+12     flags         u8  (FLAG_DELETED 墓碑 / FLAG_COMPOSED 描述符类型位 bit 4;位 1-3 预留)
 13..21 expiration_ms i64 (-1 = 不过期)
 ```
 

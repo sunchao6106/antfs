@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::StoreConfig;
 use crate::error::{Error, Result};
-use crate::index::value::{FLAG_DELETED, NO_EXPIRATION};
+use crate::index::value::{FLAG_COMPOSED, FLAG_DELETED, NO_EXPIRATION};
 use crate::index::{IndexValue, PersistentIndex};
 use crate::log::Log;
 use crate::log_segment::LogSegment;
@@ -396,6 +396,8 @@ pub struct BlobMeta {
     pub expired: bool,
     pub expiration_ms: i64,
     pub data_len: u64,
+    /// 拼装描述符类型位(`FLAG_COMPOSED`);网关置信读的判定依据,引擎自身只存储不消费。
+    pub composed: bool,
 }
 
 /// 一条记录的复制信息(对齐 Ambry `MessageInfo`):key + 大小 + 当前状态标志。account/container
@@ -1004,7 +1006,17 @@ impl BlobStore {
         if !self.is_available() {
             return Err(Error::Unavailable);
         }
-        self.track(self.put_ttl_inner(key, data, expiration_ms))
+        self.track(self.put_ttl_inner(key, data, expiration_ms, 0))
+    }
+
+    /// 写入一个**拼装描述符** blob:语义与 [`put_ttl`](Self::put_ttl) 完全一致,唯记录与
+    /// 索引的 `flags` 置类型位 —— `stat` 据此报 `composed`(网关置信读依据;数据面
+    /// `?composed=true` 分派到此,前端 stitch/auto-chunk 描述符经它写入)。
+    pub fn put_composed_ttl(&self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
+        if !self.is_available() {
+            return Err(Error::Unavailable);
+        }
+        self.track(self.put_ttl_inner(key, data, expiration_ms, FLAG_COMPOSED))
     }
 
     /// 流式写入一个对象:`src` 提供 `len` 字节数据体,边读边写,**内存占用恒为一个
@@ -1026,7 +1038,21 @@ impl BlobStore {
         if !self.is_available() {
             return Err(Error::Unavailable);
         }
-        self.track(self.put_from_reader_inner(key, len, src, expiration_ms))
+        self.track(self.put_from_reader_inner(key, len, src, expiration_ms, 0))
+    }
+
+    /// [`put_composed_ttl`](Self::put_composed_ttl) 的流式形(流式写语义 + 类型位)。
+    pub fn put_composed_from_reader(
+        &self,
+        key: StoreKey,
+        len: u64,
+        src: &mut impl std::io::Read,
+        expiration_ms: i64,
+    ) -> Result<()> {
+        if !self.is_available() {
+            return Err(Error::Unavailable);
+        }
+        self.track(self.put_from_reader_inner(key, len, src, expiration_ms, FLAG_COMPOSED))
     }
 
     fn put_from_reader_inner(
@@ -1035,6 +1061,7 @@ impl BlobStore {
         len: u64,
         src: &mut impl std::io::Read,
         expiration_ms: i64,
+        flags: u8,
     ) -> Result<()> {
         let _t = self.metrics.op_timer("put");
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
@@ -1047,7 +1074,7 @@ impl BlobStore {
             return Err(Error::AlreadyExists);
         }
         let mut header = [0u8; RECORD_HEADER];
-        encode_header_into(&mut header, key.object_id(), 0, expiration_ms, data_len);
+        encode_header_into(&mut header, key.object_id(), flags, expiration_ms, data_len);
         let total = RECORD_OVERHEAD as u64 + len;
         // 预留整段后分块写入:crc 边写边算,最后补写尾部 crc 再 commit 发布。
         let reserved = inner.log.reserve(total).map_err(to_store_full)?;
@@ -1065,7 +1092,7 @@ impl BlobStore {
         }
         reserved.write(rec::DATA as u64 + len, &hasher.finalize().to_le_bytes())?;
         let offset = reserved.commit()?;
-        self.publish_put(key, offset, record_size_u32(total)?, expiration_ms)
+        self.publish_put(key, offset, record_size_u32(total)?, expiration_ms, flags)
     }
 
     /// 记录已落 log 后的统一发布:索引 + 每段存活字节 + 有效数据统计。
@@ -1077,10 +1104,12 @@ impl BlobStore {
         offset: LogOffset,
         size: u32,
         expiration_ms: i64,
+        flags: u8,
     ) -> Result<()> {
         let inner = self.inner();
         let mut value = IndexValue::put(offset, size);
         value.expiration_ms = expiration_ms;
+        value.flags = flags;
         inner.index.add(key, value)?;
         self.seg_bytes
             .lock()
@@ -1095,7 +1124,13 @@ impl BlobStore {
         Ok(())
     }
 
-    fn put_ttl_inner(&self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
+    fn put_ttl_inner(
+        &self,
+        key: StoreKey,
+        data: &[u8],
+        expiration_ms: i64,
+        flags: u8,
+    ) -> Result<()> {
         let _t = self.metrics.op_timer("put");
         let _w = self.write_lock.lock().expect("blob write_lock poisoned");
         self.check_key(&key)?;
@@ -1104,13 +1139,14 @@ impl BlobStore {
             self.metrics.already_exists.inc();
             return Err(Error::AlreadyExists);
         }
-        let record = encode_record(&key, 0, expiration_ms, data)?;
+        let record = encode_record(&key, flags, expiration_ms, data)?;
         let offset = inner.log.append(&record).map_err(to_store_full)?;
         self.publish_put(
             key,
             offset,
             record_size_u32(record.len() as u64)?,
             expiration_ms,
+            flags,
         )
     }
 
@@ -1173,6 +1209,7 @@ impl BlobStore {
             expired: v.is_expired_at(now),
             expiration_ms: v.ttl_expiration_ms(),
             data_len: v.size_bytes().saturating_sub(RECORD_OVERHEAD as u64),
+            composed: v.is_composed(),
         })
     }
 
@@ -2808,6 +2845,39 @@ mod tests {
 
         assert!(matches!(store.get(&key(999)), Err(Error::NotFound)));
         store.close().unwrap();
+    }
+
+    /// 组合位三态保位:直读(stat/get)、重开(索引自 .idx 读回)、重建(扫 log 重建索引)
+    /// —— 对应 §3.4 双向兼容与「恢复/复制/压实零代码透传」的用例锁定。
+    #[test]
+    fn composed_flag_survives_reopen_and_rebuild() {
+        let dir = temp_dir("composed");
+        let seg = seg_cap(64);
+        let store = BlobStore::create(dir.path(), seg * 8, seg, 1000).unwrap();
+
+        let data = b"descriptor-shaped payload of a composed blob".to_vec();
+        store
+            .put_composed_ttl(key(7), &data, NO_EXPIRATION)
+            .unwrap();
+        store.put_ttl(key(8), b"plain", NO_EXPIRATION).unwrap();
+
+        let meta = store.stat(&key(7)).unwrap();
+        assert!(meta.composed);
+        assert!(!meta.deleted);
+        assert_eq!(store.get(&key(7)).unwrap(), data, "组合位不改变读写语义");
+        assert!(!store.stat(&key(8)).unwrap().composed, "普通写零置位");
+        store.close().unwrap();
+
+        let reopened = BlobStore::open(dir.path(), seg * 8, seg, 1000).unwrap();
+        assert!(reopened.stat(&key(7)).unwrap().composed, "索引落盘重读保位");
+        assert_eq!(reopened.get(&key(7)).unwrap(), data);
+        reopened.close().unwrap();
+
+        let rebuilt = BlobStore::open_rebuild_index(dir.path(), seg * 8, seg, 1000).unwrap();
+        assert!(rebuilt.stat(&key(7)).unwrap().composed, "扫 log 重建保位");
+        assert!(!rebuilt.stat(&key(8)).unwrap().composed);
+        assert_eq!(rebuilt.get(&key(7)).unwrap(), data);
+        rebuilt.close().unwrap();
     }
 
     #[test]

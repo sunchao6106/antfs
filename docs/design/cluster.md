@@ -561,8 +561,8 @@ store server(一个进程 / 一台数据节点)
 **S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报;**每盘至多一发在飞探测**——超时后不再叠加新探测、改收它的迟到结果,见 [store.md §12.11](./store.md))。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
 
 - 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射;**删除不可逆**,见 `openspec/changes/simplify-delete-model/`)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)+ `GET /metrics`(Prometheus 文本导出,无鉴权)+ `POST /admin/partitions/{pid}/compact`(手动触发该分区本地副本全库 compact,对齐 Ambry `TriggerCompaction`;响应 JSON `{live_bytes, dead_bytes, segments_before, segments_after}`,无本地副本 → 404)。
-  - **`PUT ...?expiration_ms=<i64>`**(见 `blob-io-end-to-end`):建对象时**即带 TTL**(分片上传的孤儿回收需要"出生即带 TTL")。
-  - **`GET .../blobs/{key}/metadata`**(见 `blob-io-end-to-end`):只读元数据**不读数据体**的 JSON(`BlobStore::stat`),供 frontend 的 `HEAD` 用;已删/已过期也返回 200 + 标志(元数据可读 ≠ 数据体可读),从未写过 → 404。
+  - **`PUT ...?expiration_ms=<i64>`:建对象时**即带 TTL**(分片上传的孤儿回收需要"出生即带 TTL");`&composed=true`(`blob-composed-flag`)另落拼装描述符类型位(记录/索引 flags 的 bit 4,布局不变)。
+  - **`GET .../blobs/{key}/metadata`:只读元数据**不读数据体**的 JSON(`BlobStore::stat`),供 frontend 的 `HEAD`/组合判定用;已删/已过期也返回 200 + 标志(元数据可读 ≠ 数据体可读),从未写过 → 404;`composed: bool` 描述符类型位(`blob-composed-flag`;网关 serde default 容缺)。
   - **流式 PUT(见 `blob-io-end-to-end`)**:带 `Content-Length` 时:≤ 1 MiB(常量 `INLINE_BODY_MAX`)走**内存路径**
     (`Bytes` → 引擎整块写);> 1 MiB 才 body 边收边落**该副本所在盘的暂存目录**(`<disk>/tmp/`,内存 O(64KiB))
     再交引擎 `BlobStore::put_from_reader` 按已知长度顺序写。无 `Content-Length`(chunked)回落原缓冲路径。
@@ -598,7 +598,7 @@ store server(一个进程 / 一台数据节点)
 - 待续:全部阈值的**压测标定**(默认值都是经验初值;`DROPPED` 删目录回收与 admin「磁盘指标」页真队列深度均已落地,见 [store.md §12.6](./store.md)/§12.12 与 DEVLOG 步骤 27 补记)。
 - **EC 仍锁定(暂不解锁)**。
  - **已补齐(见 `blob-io-end-to-end`)**:router SDK(router 库 + CLI)、frontend(REST 网关)、master 发号 `GetBlobIds`、
-   流式 put(网络流式 + 落盘暂存 + 引擎 `put_from_reader`)、`.../metadata` 端点、`StoreFull → 507`、`PUT ?expiration_ms=`。
+   流式 put(网络流式 + 落盘暂存 + 引擎 `put_from_reader`)、`.../metadata` 端点、`StoreFull → 507`、`PUT ?expiration_ms=`(可另携 `composed=true`,`blob-composed-flag`)。
 
 **S4(本地维护 worker)已实现**(见 `openspec/changes/store-local-worker/`):数据节点常驻后台 `worker.rs`,对本节点每个本地 replica 分**两条**独立 loop 驱动 `blob` 引擎的 **flush**(推进持久化边界,缩小 W=2 page-cache 掉电窗口)、**compaction**(增量压缩);同步引擎调用经**每盘有界池**提交(D1/N4;早期为 `spawn_blocking`,已收口)。复用引擎既有崩溃安全实现(不改写路径语义),单店失败只记 warn 不拖垮全局。过单测(flush 后重开可读 / compaction 回收死数据)。
 

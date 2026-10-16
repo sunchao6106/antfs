@@ -547,7 +547,7 @@ async fn auto_chunk_store(
         let descriptor = encode_descriptor(session.unwrap_or("").as_bytes(), &chunks)?;
         let (key, _report) = st
             .router
-            .put_auto_with_ttl(Bytes::from(descriptor), expiration_ms)
+            .put_auto_composed_with_ttl(Bytes::from(descriptor), expiration_ms)
             .await?;
         Ok::<StoreKey, Error>(key)
     }
@@ -609,14 +609,24 @@ async fn download(st: &AppState, blob_id: &str) -> Result<(Response, u64), Error
     let key = parse_blob_id(blob_id)?;
     // 先取元数据:① 拿 size 决定读路径;② 顺便让"对象不存在"给出干净的 404(而非读一半才发现)。
     let meta = st.router.stat(&key).await?;
+    // 置信读(blob-composed-flag):置位即拼装描述符,不经嗅探 —— 新描述符免疫 MAGIC
+    // 碰撞;超限 = 上游损坏,响亮 502(信任位,不降级成普通对象)。
+    if meta.composed {
+        if meta.size > DESCRIPTOR_MAX_BYTES {
+            return Err(Error::Upstream(
+                "composed blob exceeds the descriptor size bound".into(),
+            ));
+        }
+        let body = st.router.get(&key).await?;
+        return stitched_body(st, &body).await;
+    }
     if meta.size <= DESCRIPTOR_MAX_BYTES {
         let body = st.router.get(&key).await?;
         if body.starts_with(DESCRIPTOR_MAGIC) {
-            // 契约:前 4 字节 == MAGIC 即按描述符解析。
-            // ⚠ 已知待议(见 `openspec/changes/blob-io-end-to-end/tasks.md` 待办首条):描述符与普通对象在存储层
-            // 无类型区分,只能靠这里嗅探 → ≤1 MiB 且以 `ASTC` 开头的普通 blob 会被误判(502,或被当清单展开后
-            // **静默返回别人的内容**)。修法建议:给 store 记录头的 flags 加一个 composed 位(SeaweedFS needle
-            // `FlagIsChunkManifest` 同款),届时这里改成只看标志位、不再嗅探。
+            // 无位行(存量描述符)的兜底嗅探:前 4 字节 == MAGIC 即按描述符解析。
+            // ⚠ 已知歧义冻结(见 blob-composed-flag design D5):存量面 ≤1 MiB 且以 `ASTC`
+            // 开头的普通 blob 仍会被误判(502,或被当清单展开后**静默返回别人的内容**)——
+            // 新描述符全走上面的置信路径;存量歧义的消除需回填/翻转(另立项)。
             return stitched_body(st, &body).await;
         }
         let len = body.len() as u64;
@@ -637,7 +647,8 @@ async fn head_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<Strin
         let key = parse_blob_id(&blob_id)?;
         let mut meta = st.router.stat(&key).await?;
         // 拼装对象:`stat` 只看到**描述符**那个 blob(几百字节),直接报出去会与 `GET`(拼装后的逻辑字节流)对不上。
-        // 故这里做与 `download` 同样的 MAGIC 嗅探,把 size 换成各片之和,并回 `x-antfs-blob-stitched`。
+        // 故这里做与 `download` 同样的小对象读回(新描述符走 composed 置信、存量走 MAGIC 嗅探,两形态同流),
+        // 把 size 换成各片之和,并回 `x-antfs-blob-stitched` 头。
         // 代价可控:描述符按构造 ≤ DESCRIPTOR_MAX_BYTES,故**只有小对象**才需要多读一次数据体(≤1 MiB);
         // size 更大者不可能是描述符,直接按原 size 回(不读数据体,保持 HEAD 的语义)。
         // 已删/已过期的拼装对象嗅不出逻辑大小(数据面拒读已过期体,下面 `get` 的失败被静默忽略)
@@ -781,9 +792,9 @@ async fn stitch_inner(
     }
     let descriptor = encode_descriptor(session.as_bytes(), &chunks)?;
     let len = descriptor.len() as u64;
-    // 描述符本身就是个普通 blob(故它只有描述符那么小,`GET` 能整体读出来嗅探 MAGIC)。
+    // 描述符以组合位落库:读侧 stat 报 composed,走置信拼装路径(不再嗅探 MAGIC)。
     let key = st.router.allocate_one().await?;
-    st.router.put(key, Bytes::from(descriptor)).await?;
+    st.router.put_composed(key, Bytes::from(descriptor)).await?;
     Ok((key, len))
 }
 

@@ -83,6 +83,9 @@ pub struct BlobStat {
     pub expiration_ms: i64,
     pub deleted: bool,
     pub expired: bool,
+    /// 拼装描述符类型位;旧 store 的响应无此字段 → false(滚动升级读接缝,serde default)。
+    #[serde(default)]
+    pub composed: bool,
 }
 
 /// 一个分区上已从 master 取回、尚未发完的 blobId 号段。
@@ -439,6 +442,33 @@ impl Router {
         data: Bytes,
         expiration_ms: i64,
     ) -> Result<PutReport> {
+        self.put_keyed(key, data, expiration_ms, false).await
+    }
+
+    /// [`put_with_ttl`](Self::put_with_ttl) 的组合写形态:数据面置 `composed=true`,落库
+    /// 记录带拼装描述符类型位(`POST /stitch` 描述符写口;仲裁语义与 plain 逐字一致)。
+    pub async fn put_composed_with_ttl(
+        &self,
+        key: StoreKey,
+        data: Bytes,
+        expiration_ms: i64,
+    ) -> Result<PutReport> {
+        self.put_keyed(key, data, expiration_ms, true).await
+    }
+
+    /// 组合写的既定 key 形([`put`](Self::put) 的描述符形态,不过期)。
+    pub async fn put_composed(&self, key: StoreKey, data: Bytes) -> Result<PutReport> {
+        self.put_composed_with_ttl(key, data, NO_EXPIRATION).await
+    }
+
+    /// 两个 key 形的共用仲裁环(环体原样,唯 `put_body` 携带 composed 位)。
+    async fn put_keyed(
+        &self,
+        key: StoreKey,
+        data: Bytes,
+        expiration_ms: i64,
+        composed: bool,
+    ) -> Result<PutReport> {
         let pid = key.partition_id();
         let replicas = self.replicas_for(pid).await?;
         let total = replicas.len();
@@ -448,7 +478,9 @@ impl Router {
             let addr = r.addr.clone();
             let data = data.clone();
             futs.push(async move {
-                let res = self.put_body(pid, &key, data, expiration_ms, &addr).await;
+                let res = self
+                    .put_body(pid, &key, data, expiration_ms, composed, &addr)
+                    .await;
                 (addr, res)
             });
         }
@@ -502,6 +534,26 @@ impl Router {
         data: Bytes,
         expiration_ms: i64,
     ) -> Result<(StoreKey, PutReport)> {
+        self.put_auto_keyed(data, expiration_ms, false).await
+    }
+
+    /// [`put_auto_with_ttl`](Self::put_auto_with_ttl) 的组合写形态(自动发号 + 类型位;
+    /// 自动分片管线的描述符写口)。
+    pub async fn put_auto_composed_with_ttl(
+        &self,
+        data: Bytes,
+        expiration_ms: i64,
+    ) -> Result<(StoreKey, PutReport)> {
+        self.put_auto_keyed(data, expiration_ms, true).await
+    }
+
+    /// 两个 auto 形的共用环:发号 → 多数派;全 507 摘分区换号重试。
+    async fn put_auto_keyed(
+        &self,
+        data: Bytes,
+        expiration_ms: i64,
+        composed: bool,
+    ) -> Result<(StoreKey, PutReport)> {
         let mut key = self.allocate_one().await?;
         let mut first_err: Option<Error> = None;
         for attempt in 0..=MAX_STORE_FULL_RETRIES {
@@ -514,7 +566,9 @@ impl Router {
                 let addr = r.addr.clone();
                 let data = data.clone();
                 futs.push(async move {
-                    let res = self.put_body(pid, &key, data, expiration_ms, &addr).await;
+                    let res = self
+                        .put_body(pid, &key, data, expiration_ms, composed, &addr)
+                        .await;
                     (addr, res)
                 });
             }
@@ -646,12 +700,13 @@ impl Router {
         key: &StoreKey,
         data: Bytes,
         expiration_ms: i64,
+        composed: bool,
         addr: &str,
     ) -> Result<()> {
         let t0 = Instant::now();
         let resp = self
             .http
-            .put(put_url(addr, pid, key, expiration_ms))
+            .put(put_url(addr, pid, key, expiration_ms, composed))
             .body(data)
             .send()
             .await
@@ -677,7 +732,7 @@ impl Router {
         let file = tokio::fs::File::open(path).await?;
         let resp = self
             .http
-            .put(put_url(addr, pid, key, expiration_ms))
+            .put(put_url(addr, pid, key, expiration_ms, false))
             .body(reqwest::Body::from(file))
             .send()
             .await
@@ -1254,13 +1309,27 @@ fn blob_url(addr: &str, pid: PartitionId, key: &StoreKey) -> String {
     format!("http://{addr}/partitions/{pid}/blobs/{}", hex_key(key))
 }
 
-/// PUT 的 URL:`expiration_ms` 非 [`NO_EXPIRATION`] 时带上写入时定下的 TTL(数据面 `PUT ?expiration_ms=`)。
-fn put_url(addr: &str, pid: PartitionId, key: &StoreKey, expiration_ms: i64) -> String {
+/// PUT 的 URL:`expiration_ms` 非 [`NO_EXPIRATION`] 时带上写入时定下的 TTL;组合写
+/// 追加 `composed=true`(数据面 `PUT ?expiration_ms=…&composed=true`)。
+fn put_url(
+    addr: &str,
+    pid: PartitionId,
+    key: &StoreKey,
+    expiration_ms: i64,
+    composed: bool,
+) -> String {
     let base = blob_url(addr, pid, key);
-    if expiration_ms == NO_EXPIRATION {
+    let mut query: Vec<String> = Vec::new();
+    if expiration_ms != NO_EXPIRATION {
+        query.push(format!("expiration_ms={expiration_ms}"));
+    }
+    if composed {
+        query.push("composed=true".into());
+    }
+    if query.is_empty() {
         base
     } else {
-        format!("{base}?expiration_ms={expiration_ms}")
+        format!("{base}?{}", query.join("&"))
     }
 }
 
@@ -1356,6 +1425,30 @@ fn map_master_error(error: &str, pid: PartitionId) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 滚动升级读接缝:旧 store 的 metadata JSON 无 composed 字段 → false 不炸;
+    /// 新 store 回 true。
+    #[test]
+    fn blob_stat_tolerates_missing_composed_field() {
+        let old = serde_json::json!({
+            "size": 10,
+            "expiration_ms": -1,
+            "deleted": false,
+            "expired": false
+        });
+        let stat: BlobStat = serde_json::from_value(old).expect("old store JSON");
+        assert!(!stat.composed);
+
+        let fresh = serde_json::json!({
+            "size": 10,
+            "expiration_ms": -1,
+            "deleted": false,
+            "expired": false,
+            "composed": true
+        });
+        let stat: BlobStat = serde_json::from_value(fresh).expect("new store JSON");
+        assert!(stat.composed);
+    }
 
     fn loc(node_id: u64, addr: &str, up: bool) -> ReplicaLoc {
         ReplicaLoc {

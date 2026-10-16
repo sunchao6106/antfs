@@ -639,6 +639,9 @@ fn record_err(metrics: &StoreServerMetrics, kind: &str) {
 struct PutParams {
     #[serde(default)]
     expiration_ms: Option<i64>,
+    /// 拼装描述符类型位(`?composed=true` 置位);旧 router 不携带该参数时被忽略,零行为变化。
+    #[serde(default)]
+    composed: Option<bool>,
 }
 
 /// 流式 put 的单块缓冲(引擎 `put_from_reader` 内部也是同量级的分块)。
@@ -1111,6 +1114,7 @@ async fn put_blob(
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
     };
     let expiration_ms = params.expiration_ms.unwrap_or(antfs_blob::NO_EXPIRATION);
+    let composed = params.composed.unwrap_or(false);
     let store = handle.store.clone();
     let t = t.with_disk(&handle.disk_id);
 
@@ -1150,7 +1154,11 @@ async fn put_blob(
             let joined = st
                 .pool
                 .run(&disk, "put", move || {
-                    store.put_ttl(key, &body, expiration_ms)
+                    if composed {
+                        store.put_composed_ttl(key, &body, expiration_ms)
+                    } else {
+                        store.put_ttl(key, &body, expiration_ms)
+                    }
                 })
                 .await;
             joined_put(&st, &t, n, joined)
@@ -1179,7 +1187,11 @@ async fn put_blob(
                 .run(&disk, "put", move || -> antfs_blob::Result<()> {
                     let f = std::fs::File::open(&path)?;
                     let mut src = std::io::BufReader::with_capacity(STAGE_BUF_BYTES, f);
-                    store.put_from_reader(key, len, &mut src, expiration_ms)
+                    if composed {
+                        store.put_composed_from_reader(key, len, &mut src, expiration_ms)
+                    } else {
+                        store.put_from_reader(key, len, &mut src, expiration_ms)
+                    }
                 })
                 .await;
             // 正常出口:显式等一次删除(删除跑在阻塞池上,不占 reactor)→ "响应发出 ⇒ 暂存文件已清"
@@ -1205,7 +1217,11 @@ async fn put_blob(
             let joined = st
                 .pool
                 .run(&disk, "put", move || {
-                    store.put_ttl(key, &body, expiration_ms)
+                    if composed {
+                        store.put_composed_ttl(key, &body, expiration_ms)
+                    } else {
+                        store.put_ttl(key, &body, expiration_ms)
+                    }
                 })
                 .await;
             joined_put(&st, &t, len, joined)
@@ -1270,6 +1286,8 @@ struct MetadataDto {
     deleted: bool,
     /// 已过期(按当前时间判定)。
     expired: bool,
+    /// 拼装描述符类型位(`?composed=true` 写入;网关置信读判定依据)。
+    composed: bool,
 }
 
 /// `GET /partitions/{pid}/blobs/{key}/metadata`:只读元数据,**不读数据体**(对齐 Ambry `GetBlobInfo`)。
@@ -1300,6 +1318,7 @@ async fn get_blob_metadata(
             expiration_ms: m.expiration_ms,
             deleted: m.deleted,
             expired: m.expired,
+            composed: m.composed,
         })
         .into_response(),
         Ok(Err(antfs_blob::Error::NotFound)) => StatusCode::NOT_FOUND.into_response(),

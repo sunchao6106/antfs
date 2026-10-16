@@ -6,7 +6,7 @@
 //! ```
 //! - `offset`:记录位置,`LogOffset::pack()`(段号 u32 ‖ 段内偏移 u32);
 //! - `size`:**整条记录**的字节数(记录头 + 数据体 + crc),用于跳过/统计;段 ≤ 4 GiB 故 u32 够;
-//! - `flags`:目前只有 `DELETED`(墓碑没有数据体);
+//! - `flags`:`DELETED`(墓碑)与 `COMPOSED`(拼装描述符类型位);位 1-3 预留;
 //! - `expiration_ms`:非墓碑 = TTL(`NO_EXPIRATION` = 不过期);**墓碑 = 删除时刻 `deleted_at_ms`**
 //!   (复用同一槽位,布局不变 → 无需索引格式迁移;`NO_EXPIRATION` = 删除时间未知,永不自动回收)。
 //!
@@ -16,6 +16,12 @@ use crate::types::LogOffset;
 
 /// 该 key 的当前赢家是墓碑(对象已删除,数据体不存在)。
 pub const FLAG_DELETED: u8 = 1 << 0;
+
+/// 该记录是**拼装描述符**(frontend stitch/auto-chunk 写下的组合对象清单,
+/// `s3` 外另一形态)。类型位,不改变数据的存储与读取;仅在网关置信读路径消费
+/// ——此前网关靠 MAGIC 嗅探,普通 blob 撞前缀即失真(`blob-composed-flag`)。
+/// 位段 1-3 预留(本 change 只启用 4)。
+pub const FLAG_COMPOSED: u8 = 1 << 4;
 
 /// 无过期时间。
 pub const NO_EXPIRATION: i64 = -1;
@@ -45,6 +51,10 @@ impl IndexValue {
 
     pub fn is_deleted(&self) -> bool {
         self.flags & FLAG_DELETED != 0
+    }
+
+    pub fn is_composed(&self) -> bool {
+        self.flags & FLAG_COMPOSED != 0
     }
 
     /// 该条目的 TTL 语义值:**墓碑恒为[`NO_EXPIRATION`]**(墓碑的 `expiration_ms` 槽位存的是删除时刻,
@@ -129,6 +139,22 @@ mod tests {
         assert_eq!(b.len(), 21);
         assert_eq!(IndexValue::from_bytes(&b).unwrap(), v);
         assert!(v.is_deleted());
+    }
+
+    /// composed 位:置位 roundtrip 保位;未置位(旧格式值)解出 not composed;与
+    /// DELETED 位互不干扰(§3.4 双向兼容的值级用例)。
+    #[test]
+    fn composed_flag_roundtrip() {
+        let mut v = IndexValue::put(LogOffset::new(1, 2), 999);
+        assert!(!v.is_composed());
+        v.flags = FLAG_COMPOSED;
+        let got = IndexValue::from_bytes(&v.to_bytes()).expect("roundtrip");
+        assert!(got.is_composed());
+        assert!(!got.is_deleted());
+
+        let legacy = IndexValue::from_bytes(&IndexValue::put(LogOffset::new(0, 0), 1).to_bytes())
+            .expect("legacy decode");
+        assert!(!legacy.is_composed());
     }
 
     #[test]
