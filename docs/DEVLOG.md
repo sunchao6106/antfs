@@ -1532,3 +1532,65 @@ s3.md 自初版就声称「流式拼接」,实码却是 `Vec` 全量 `extend`—
 **发运**:归档 `openspec/changes/archive/2026-10-16-s3-range-streaming/`(delta 已合并活 spec:s3-core
 ~2 / s3-multipart +1);docs 全量同步(s3.md 矩阵/操作映射/新节/模块树、design README 索引与优化路线、
 README en+zh)。
+
+---
+
+## 步骤 64:s3-read-compat —— 读协议补齐(条件 GET / If-Range / ?partNumber / ListObjectsV1 / ?location)
+
+**日期**:2026-10-16 · **change**:`s3-read-compat`(阶段二优化路线档 1)
+
+**动机**(读面五缺口,档 1 用户点名):GET/HEAD 无条件请求语义(缓存协商/乐观并发
+全失效,SDK 条件重试退化为全量);无 `?partNumber`(SDK 并行下载无分片直读);
+裸 `GET /{bucket}` 被 V2 形态回答(V1 老客户端分页协议对不上);`?location` 无路由;
+spec 已 SHALL 的 Last-Modified 实码不发。
+
+**落地**:
+- `object.rs`:`evaluate_read_conditions`(RFC 7232 §6 求值序纯函数,412 族先于 304
+  族;`*` 通配;坏日期 400——与拷贝路径共享原子件但判定分立)、`if_range_passes`
+  (强 ETag 相等 / 日期 ≥ Last-Modified;失败 → 窗口作废回 200 全对象)、
+  `resolve_read_window`(Range × partNumber × If-Range 三源统一解析:partNumber 片窗
+  与 Range 窗求交,空交 416;If-Range 失败早于 416)、`not_modified_response`
+  (304 空体 + ETag/Last-Modified,零 blob 读)。`get_object` manifest 解析前移
+  (片窗定位 + Σ 对账共用);`object_read_builder`/`head_object` 补 Last-Modified;
+  HEAD 接条件头(304/412 空体)。
+- `range.rs`:`manifest_part_window`(片窗 = Σ 前缀偏移)+ `intersect_windows`。
+- `bucket.rs` + `xml.rs`:`list_objects_v1`(marker→start_after 排他映射,复用
+  list 核心;V1 形态序列化器:恒回 Prefix/Marker、无 KeyCount、Contents 带
+  StorageClass、NextMarker 仅 delimiter+截断)+ `get_bucket_location`(owner 门,
+  us-east-1 空元素)。
+- `server.rs`:S3QueryParams 增 `marker`/`location`;bucket 分派序
+  acl→uploads→**location**→list(`list-type=2`→V2,否则 **V1**——裸 GET 默认语义
+  翻转,既有 e2e 全显式带参,零回归);object GET/HEAD handler 下探条件头
+  (HEAD 增 Request 参数)。
+- 无新配置/指标/迁移(304/416 经 `s3_requests_total{op,status}` 观测)。
+
+**裁决要点**(change design.md D1–D7):
+- **NextMarker 取排他 token 而非「末可见项」**——末 raw key 被 delimiter 分组吞掉
+  时,取公共前缀会让下一页 `key >` 重扫该 key(翻页重复);排他 token(末个已扫
+  raw key)零缺漏零重复,代价是值可为响应内不可见的 key。AWS「末项」字面规则在
+  我们的截断-再-分组实现下不安全,如实分立并记档。
+- 零长片窗(空对象/零尺寸片)按不可满足 → 416:与「空对象任何 range 皆 416」
+  既有口径对齐;AWS 的退化 Content-Range(`bytes 0--1/0`)是格式级怪癖,不效仿。
+- If-Range 失败优先于 416(validator 失败即整窗作废——AWS partNumber 语义
+  「失败回整个对象」;先算 416 会把 200 变 416)。
+
+**验证**:
+- 单测新增 9 个:条件矩阵/短路序/坏日期三件、if_range 八例、part_window/intersect
+  边界、V1 序列化五形、Location 两 region;s3 lib 90 绿。
+- e2e 新 8 测:`conditional_get_head_matrix`(四头矩阵 + 短路 + `*` + 400 +
+  HEAD 三态)、`if_range_gating`(过=206 ×3 / 失配=200 ×3)、
+  `part_number_single_part_object`(全幅 206/416/交集/If-Range 提权/HEAD 忽略/
+  空对象)、`part_number_sse_object`、`part_number_multipart_reads_single_part`
+  (三片对拍 ×3 / 0 与越界 416 / 片内交集 / 空交 416 / If-Range 两向)、
+  `list_objects_v1_shape_and_pagination`(形态断言 + max-keys 翻页 union)、
+  `list_objects_v1_delimiter_next_marker`(prefix+delimiter 两页 + NextMarker 排他
+  token 断言)、`get_bucket_location_us_east_1_empty`。
+- **双言全量 e2e 各 76/76**(本机真 PG + MySQL 8.4 容器,`--ignored
+  --test-threads=1`):auth 5 / chunked 7 / copy 11 / list 9 / multipart 12 /
+  object 23 / sse 6 / vhost 3——68 存量零回归 + 8 新增。
+- workspace `cargo test` exit 0(72 套件);clippy 0 告警;fmt 干净。
+
+**发运**:归档 `openspec/changes/archive/2026-10-16-s3-read-compat/`(delta 合并
+s3-core Get/HeadObject 全文强化、s3-list 新增 V1 + location 两要求);docs 同步
+(s3.md 操作映射 +3 行、矩阵 2 行升级、新节「条件读与读兼容面」、后续方向;
+design README 路线档 1 ✅)。

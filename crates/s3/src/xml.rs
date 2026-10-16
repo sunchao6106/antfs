@@ -90,6 +90,71 @@ pub fn serialize_list_bucket_result(
     xml
 }
 
+/// ListObjectsV1 形态(区别于 V2:恒回 Prefix/Marker(可空);无 KeyCount/
+/// NextContinuationToken;NextMarker 仅 delimiter 存在且截断时回,值直接用 metastore
+/// 的排他 token = 末个已扫 raw key——被 delimiter 分组吞掉的 key 不呈现也不回看;
+/// 若改用「末可见项」会对组内 raw key 产生翻页重复。Contents 带 StorageClass)。
+pub fn serialize_list_bucket_result_v1(
+    bucket: &str,
+    prefix: Option<&str>,
+    marker: Option<&str>,
+    delimiter: Option<&str>,
+    max_keys: i32,
+    resp: &ListObjectsResp,
+) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{}</Name><Prefix>{}</Prefix><Marker>{}</Marker><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>",
+        quick_xml::escape::escape(bucket),
+        quick_xml::escape::escape(prefix.unwrap_or("")),
+        quick_xml::escape::escape(marker.unwrap_or("")),
+        max_keys,
+        resp.is_truncated,
+    );
+    if let Some(d) = delimiter {
+        xml.push_str(&format!(
+            "<Delimiter>{}</Delimiter>",
+            quick_xml::escape::escape(d)
+        ));
+    }
+    if resp.is_truncated && delimiter.is_some() {
+        if let Some(next) = &resp.next_continuation_token {
+            xml.push_str(&format!(
+                "<NextMarker>{}</NextMarker>",
+                quick_xml::escape::escape(next)
+            ));
+        }
+    }
+    for e in &resp.entries {
+        xml.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size>\
+             <StorageClass>STANDARD</StorageClass></Contents>",
+            quick_xml::escape::escape(&e.key),
+            epoch_to_iso(e.last_modified),
+            quick_xml::escape::escape(&e.etag),
+            e.size,
+        ));
+    }
+    for cp in &resp.common_prefixes {
+        xml.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            quick_xml::escape::escape(cp),
+        ));
+    }
+    xml.push_str("</ListBucketResult>");
+    xml
+}
+
+/// GetBucketLocation(region == us-east-1 按官方经典区行为回**空元素**内容)。
+pub fn serialize_location_constraint(region: &str) -> String {
+    let body = if region == "us-east-1" { "" } else { region };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>",
+        quick_xml::escape::escape(body)
+    )
+}
+
 pub fn serialize_initiate_multipart(bucket: &str, key: &str, upload_id: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -462,6 +527,122 @@ mod tests {
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>bigfile.bin</Key>"));
         assert!(xml.contains("<UploadId>upload-123</UploadId>"));
+    }
+
+    #[test]
+    fn v1_shape_without_delimiter() {
+        let resp = ListObjectsResp {
+            entries: vec![ObjectEntry {
+                key: "a.txt".into(),
+                size: 5,
+                etag: "e1".into(),
+                last_modified: 1700000000000,
+            }],
+            common_prefixes: vec![],
+            is_truncated: true,
+            next_continuation_token: Some("a.txt".into()),
+            key_count: 1,
+        };
+        let xml = serialize_list_bucket_result_v1("b", None, None, None, 1000, &resp);
+        assert!(xml.contains("<Name>b</Name>"));
+        assert!(xml.contains("<Prefix></Prefix>"));
+        assert!(xml.contains("<Marker></Marker>"));
+        assert!(xml.contains("<MaxKeys>1000</MaxKeys>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+        assert!(!xml.contains("<KeyCount>"));
+        assert!(!xml.contains("<NextContinuationToken>"));
+        assert!(!xml.contains("<NextMarker>"));
+        assert!(!xml.contains("<Delimiter>"));
+    }
+
+    #[test]
+    fn v1_delimiter_truncation_emits_next_marker() {
+        let resp = ListObjectsResp {
+            entries: vec![ObjectEntry {
+                key: "zzz.txt".into(),
+                size: 1,
+                etag: "e".into(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec!["logs/2024/".into()],
+            is_truncated: true,
+            next_continuation_token: Some("zzz.txt".into()),
+            key_count: 2,
+        };
+        let xml = serialize_list_bucket_result_v1("b", None, None, Some("/"), 2, &resp);
+        assert!(xml.contains("<Delimiter>/</Delimiter>"));
+        assert!(xml.contains("<NextMarker>zzz.txt</NextMarker>"));
+        assert!(xml.contains("<Marker></Marker>"));
+    }
+
+    #[test]
+    fn v1_next_marker_uses_exclusive_token() {
+        let resp = ListObjectsResp {
+            entries: vec![ObjectEntry {
+                key: "a.txt".into(),
+                size: 1,
+                etag: "e".into(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec!["logs/".into()],
+            is_truncated: true,
+            next_continuation_token: Some("logs/a".into()),
+            key_count: 2,
+        };
+        let xml = serialize_list_bucket_result_v1("b", None, None, Some("/"), 2, &resp);
+        assert!(xml.contains("<NextMarker>logs/a</NextMarker>"));
+    }
+
+    #[test]
+    fn v1_truncation_without_delimiter_has_no_next_marker() {
+        let resp = ListObjectsResp {
+            entries: vec![ObjectEntry {
+                key: "a.txt".into(),
+                size: 1,
+                etag: "e".into(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec![],
+            is_truncated: true,
+            next_continuation_token: Some("a.txt".into()),
+            key_count: 1,
+        };
+        let xml = serialize_list_bucket_result_v1("b", Some("x"), Some("m"), None, 1, &resp);
+        assert!(xml.contains("<Prefix>x</Prefix>"));
+        assert!(xml.contains("<Marker>m</Marker>"));
+        assert!(!xml.contains("<NextMarker>"));
+    }
+
+    #[test]
+    fn v1_not_truncated_has_no_next_marker() {
+        let resp = ListObjectsResp {
+            entries: vec![ObjectEntry {
+                key: "a".into(),
+                size: 1,
+                etag: "e".into(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec!["p/".into()],
+            is_truncated: false,
+            next_continuation_token: None,
+            key_count: 2,
+        };
+        let xml = serialize_list_bucket_result_v1("b", None, None, Some("/"), 10, &resp);
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!xml.contains("<NextMarker>"));
+        assert!(xml.contains("<CommonPrefixes><Prefix>p/</Prefix></CommonPrefixes>"));
+    }
+
+    #[test]
+    fn location_constraint_regions() {
+        let us = serialize_location_constraint("us-east-1");
+        assert!(
+            us.contains("<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LocationConstraint>"),
+            "{us}"
+        );
+        let other = serialize_location_constraint("cn-north-1");
+        assert!(other.contains("<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">cn-north-1</LocationConstraint>"), "{other}");
     }
 
     #[test]

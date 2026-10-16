@@ -7,7 +7,8 @@ use bytes::Bytes;
 use antfs_router::NO_EXPIRATION;
 
 use super::range::{
-    manifest_total_size, parse_range, window_parts, ByteWindow, PartStream, RangeOutcome,
+    intersect_windows, manifest_part_window, manifest_total_size, parse_range, window_parts,
+    ByteWindow, PartStream, RangeOutcome,
 };
 use crate::error::S3Error;
 use crate::metastore::types::*;
@@ -173,6 +174,8 @@ pub async fn get_object(
     bucket: &str,
     key: &str,
     range_header: Option<&str>,
+    part_number: Option<i32>,
+    headers: &HeaderMap,
 ) -> Result<Response, S3Error> {
     let meta = st
         .metastore
@@ -180,22 +183,45 @@ pub async fn get_object(
         .await?
         .ok_or(S3Error::NoSuchKey)?;
 
-    let window = match parse_range(range_header, meta.size) {
-        RangeOutcome::Full => None,
-        RangeOutcome::Partial(w) => Some(w),
-        RangeOutcome::Unsatisfiable { spec } => {
-            return Err(S3Error::InvalidRange {
-                requested: spec,
-                actual_size: meta.size,
-            })
-        }
+    // 条件评估只吃 MetaStore 行:304/412 决不触数据面。
+    match evaluate_read_conditions(&meta, headers)? {
+        ReadOutcome::PreconditionFailed => return Err(S3Error::PreconditionFailed),
+        ReadOutcome::NotModified => return not_modified_response(&meta),
+        ReadOutcome::Proceed => {}
+    }
+    let parts: Option<Vec<ManifestPart>> = match &meta.parts_manifest {
+        Some(json) => Some(
+            serde_json::from_str(json)
+                .map_err(|e| S3Error::InternalError(format!("corrupt manifest: {e}")))?,
+        ),
+        None => None,
     };
+    if let Some(ps) = &parts {
+        let total = manifest_total_size(ps);
+        if total != meta.size {
+            return Err(S3Error::InternalError(format!(
+                "manifest parts total {total} != row size {} (bucket {}, key {})",
+                meta.size, meta.bucket, meta.key
+            )));
+        }
+    }
+    let if_range_ok = match headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) {
+        Some(v) => if_range_passes(&meta, v),
+        None => true,
+    };
+    let window = resolve_read_window(
+        &meta,
+        parts.as_deref(),
+        range_header,
+        part_number,
+        if_range_ok,
+    )?;
 
     if meta.sse.is_some() {
         return get_encrypted_object(&st, &meta, window).await;
     }
-    if let Some(manifest_json) = &meta.parts_manifest {
-        return get_multipart_object(st, &meta, manifest_json, window).await;
+    if let Some(ps) = &parts {
+        return get_multipart_object(st, &meta, ps, window).await;
     }
     get_plain_object(&st, &meta, window).await
 }
@@ -217,7 +243,8 @@ fn object_read_builder(
         .status(status)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, body_len.to_string())
-        .header(header::ETAG, format!("\"{}\"", meta.etag));
+        .header(header::ETAG, format!("\"{}\"", meta.etag))
+        .header(header::LAST_MODIFIED, http_date_from_ms(meta.created_at));
     if sse {
         builder = builder.header("x-amz-server-side-encryption", "AES256");
     }
@@ -235,6 +262,84 @@ fn object_read_builder(
 
 fn response_build_error(e: axum::http::Error) -> S3Error {
     S3Error::InternalError(format!("response build: {e}"))
+}
+
+/// 304 空体(RFC 7232:命中缓存校验器;不回 body/Content-Length)。ETag 与
+/// Last-Modified 必带,GET/HEAD 共用。
+fn not_modified_response(meta: &ObjectMeta) -> Result<Response, S3Error> {
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, format!("\"{}\"", meta.etag))
+        .header(header::LAST_MODIFIED, http_date_from_ms(meta.created_at))
+        .header(header::ACCEPT_RANGES, "bytes");
+    if meta.sse.is_some() {
+        builder = builder.header("x-amz-server-side-encryption", "AES256");
+    }
+    builder.body(Body::empty()).map_err(response_build_error)
+}
+
+/// `?partNumber=n` → 片窗(416 携实际片数)。单片对象:part 1 = 全幅窗,余皆
+/// 无此片;零长窗(空对象 / 零尺寸片)按不可满足 → 416,与「空对象任何 range
+/// 皆 416」既有语义对齐(AWS 会发退化 Content-Range `0--1`,我们不效仿)。
+fn part_window_or_416(
+    meta: &ObjectMeta,
+    parts: Option<&[ManifestPart]>,
+    n: i32,
+) -> Result<ByteWindow, S3Error> {
+    let count = parts.map_or(1, <[ManifestPart]>::len);
+    let window = match parts {
+        Some(ps) => manifest_part_window(ps, n),
+        None => (n == 1).then_some(ByteWindow {
+            start: 0,
+            len: meta.size,
+        }),
+    };
+    match window {
+        Some(w) if w.len > 0 => Ok(w),
+        _ => Err(S3Error::InvalidRange {
+            requested: format!("partNumber={n} (object has {count} part(s))"),
+            actual_size: meta.size,
+        }),
+    }
+}
+
+/// 读窗解析(Range × partNumber × If-Range;`None` = 200 全对象):
+/// validator 失败 → 两窗口双双作废(早于 416:坏窗不升显);partNumber 与 Range
+/// 各自成窗再求交(空交 → 416);Range 不可满足 → 416 既有语义。
+fn resolve_read_window(
+    meta: &ObjectMeta,
+    parts: Option<&[ManifestPart]>,
+    range_header: Option<&str>,
+    part_number: Option<i32>,
+    if_range_ok: bool,
+) -> Result<Option<ByteWindow>, S3Error> {
+    if !if_range_ok {
+        return Ok(None);
+    }
+    let part_window = match part_number {
+        None => None,
+        Some(n) => Some(part_window_or_416(meta, parts, n)?),
+    };
+    let range_window = match parse_range(range_header, meta.size) {
+        RangeOutcome::Full => None,
+        RangeOutcome::Partial(w) => Some(w),
+        RangeOutcome::Unsatisfiable { spec } => {
+            return Err(S3Error::InvalidRange {
+                requested: spec,
+                actual_size: meta.size,
+            })
+        }
+    };
+    match (part_window, range_window) {
+        (None, None) => Ok(None),
+        (Some(w), None) | (None, Some(w)) => Ok(Some(w)),
+        (Some(p), Some(r)) => intersect_windows(p, r)
+            .map(Some)
+            .ok_or(S3Error::InvalidRange {
+                requested: format!("part={} × range={:?}", p.start, range_header),
+                actual_size: meta.size,
+            }),
+    }
 }
 
 /// 缓冲体切片:先对账(体长 == 行 size,Content-Length 不说谎),再切窗口。
@@ -279,23 +384,15 @@ async fn get_plain_object(
 async fn get_multipart_object(
     st: AppState,
     meta: &ObjectMeta,
-    manifest_json: &str,
+    parts: &[ManifestPart],
     window: Option<ByteWindow>,
 ) -> Result<Response, S3Error> {
-    let parts: Vec<ManifestPart> = serde_json::from_str(manifest_json)
-        .map_err(|e| S3Error::InternalError(format!("corrupt manifest: {e}")))?;
-    let total = manifest_total_size(&parts);
-    if total != meta.size {
-        return Err(S3Error::InternalError(format!(
-            "manifest parts total {total} != row size {} (bucket {}, key {})",
-            meta.size, meta.bucket, meta.key
-        )));
-    }
+    let total = manifest_total_size(parts);
     let effective = window.unwrap_or(ByteWindow {
         start: 0,
         len: total,
     });
-    let covering = window_parts(&parts, effective)?;
+    let covering = window_parts(parts, effective)?;
     let stream = PartStream::new(st, covering);
     object_read_builder(meta, false, effective.len, window)
         .body(Body::from_stream(stream))
@@ -331,18 +428,30 @@ async fn get_encrypted_object(
         .map_err(response_build_error)
 }
 
-pub async fn head_object(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
+pub async fn head_object(
+    st: AppState,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> Result<Response, S3Error> {
     let meta = st
         .metastore
         .get_object(bucket, key)
         .await?
         .ok_or(S3Error::NoSuchKey)?;
 
+    match evaluate_read_conditions(&meta, headers)? {
+        ReadOutcome::PreconditionFailed => return Err(S3Error::PreconditionFailed),
+        ReadOutcome::NotModified => return not_modified_response(&meta),
+        ReadOutcome::Proceed => {}
+    }
+
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, meta.size.to_string())
-        .header(header::ETAG, format!("\"{}\"", meta.etag));
+        .header(header::ETAG, format!("\"{}\"", meta.etag))
+        .header(header::LAST_MODIFIED, http_date_from_ms(meta.created_at));
     if meta.sse.is_some() {
         builder = builder.header("x-amz-server-side-encryption", "AES256");
     }
@@ -413,6 +522,66 @@ fn http_date_from_ms(epoch_ms: i64) -> String {
         .unwrap_or_else(chrono::Utc::now)
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string()
+}
+
+/// RFC 7232 §6 求值序(GET/HEAD;拷贝路径走 `evaluate_copy_conditions`,语义差异:
+/// If-None-Match / If-Modified-Since 命中在此是 304 缓存协商,不是 412)。
+/// If-Match(失配 412,过则短路)> If-Unmodified-Since(无 If-Match 时;已改 412)
+/// \> If-None-Match(命中 304,`*` 通配;不匹配短路)> If-Modified-Since(无
+/// If-None-Match 时;未改 304)。坏日期 400(与拷贝路径同响亮)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOutcome {
+    Proceed,
+    NotModified,
+    PreconditionFailed,
+}
+
+fn evaluate_read_conditions(
+    meta: &ObjectMeta,
+    headers: &HeaderMap,
+) -> Result<ReadOutcome, S3Error> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(expected) = header("if-match") {
+        if strip_etag_quotes(expected) != meta.etag {
+            return Ok(ReadOutcome::PreconditionFailed);
+        }
+        return Ok(ReadOutcome::Proceed);
+    }
+    if let Some(since) = header("if-unmodified-since") {
+        if meta.created_at > parse_http_date_ms(since)? {
+            return Ok(ReadOutcome::PreconditionFailed);
+        }
+    }
+    if let Some(not) = header("if-none-match") {
+        let not = not.trim();
+        if not == "*" || strip_etag_quotes(not) == meta.etag {
+            return Ok(ReadOutcome::NotModified);
+        }
+        return Ok(ReadOutcome::Proceed);
+    }
+    if let Some(since) = header("if-modified-since") {
+        if meta.created_at <= parse_http_date_ms(since)? {
+            return Ok(ReadOutcome::NotModified);
+        }
+    }
+    Ok(ReadOutcome::Proceed)
+}
+
+/// If-Range validator(RFC 7233):ETag 形(带引号,强比较;`W/` 弱标签按失配)须与
+/// 对象 ETag 相等;HTTP-date 形须 ≥ 对象最后修改时刻;解析失败 = 不过。不过的
+/// 语义由调用方落实:忽略 Range / partNumber,回 200 全对象。
+fn if_range_passes(meta: &ObjectMeta, value: &str) -> bool {
+    let v = value.trim();
+    if v.starts_with('"') {
+        strip_etag_quotes(v) == meta.etag
+    } else if v.starts_with("W/") || v.starts_with("w/") {
+        false
+    } else {
+        match parse_http_date_ms(v) {
+            Ok(ms) => ms >= meta.created_at,
+            Err(_) => false,
+        }
+    }
 }
 
 fn evaluate_copy_conditions(meta: &ObjectMeta, headers: &HeaderMap) -> Result<(), S3Error> {
@@ -724,4 +893,235 @@ pub async fn get_object_attributes(
         .body(Body::from(body))
         .map_err(|e| S3Error::InternalError(format!("response build: {e}")))?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use antfs_router::StoreKey;
+    use axum::http::{HeaderName, HeaderValue};
+
+    const CREATED: i64 = 1_700_000_000_000;
+    const DAY_BEFORE: &str = "Mon, 13 Nov 2023 22:13:20 GMT";
+    const DAY_AFTER: &str = "Wed, 15 Nov 2023 22:13:20 GMT";
+
+    fn meta() -> ObjectMeta {
+        ObjectMeta {
+            bucket: "b".into(),
+            key: "k".into(),
+            blob_id: StoreKey::from_slice(&[1; 8]).expect("8 bytes"),
+            version: 1,
+            size: 100,
+            etag: "e".into(),
+            content_type: None,
+            created_at: CREATED,
+            user_meta: UserMeta::new(),
+            parts_manifest: None,
+            sse: None,
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).expect("lowercase name"),
+                HeaderValue::from_str(v).expect("ascii value"),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn read_conditions_matrix() {
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &HeaderMap::new()).unwrap(),
+            ReadOutcome::Proceed
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-match", "\"e\"")])).unwrap(),
+            ReadOutcome::Proceed
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-match", "\"x\"")])).unwrap(),
+            ReadOutcome::PreconditionFailed
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-none-match", "\"e\"")])).unwrap(),
+            ReadOutcome::NotModified
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-none-match", "*")])).unwrap(),
+            ReadOutcome::NotModified
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-none-match", "\"x\"")])).unwrap(),
+            ReadOutcome::Proceed
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-modified-since", DAY_AFTER)]))
+                .unwrap(),
+            ReadOutcome::NotModified
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-modified-since", DAY_BEFORE)]))
+                .unwrap(),
+            ReadOutcome::Proceed
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-unmodified-since", DAY_BEFORE)]))
+                .unwrap(),
+            ReadOutcome::PreconditionFailed
+        );
+        assert_eq!(
+            evaluate_read_conditions(&meta(), &headers(&[("if-unmodified-since", DAY_AFTER)]))
+                .unwrap(),
+            ReadOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn read_conditions_short_circuit_order() {
+        assert_eq!(
+            evaluate_read_conditions(
+                &meta(),
+                &headers(&[("if-match", "\"e\""), ("if-modified-since", DAY_AFTER)])
+            )
+            .unwrap(),
+            ReadOutcome::Proceed
+        );
+        assert_eq!(
+            evaluate_read_conditions(
+                &meta(),
+                &headers(&[("if-none-match", "\"x\""), ("if-modified-since", DAY_AFTER)])
+            )
+            .unwrap(),
+            ReadOutcome::Proceed
+        );
+        assert_eq!(
+            evaluate_read_conditions(
+                &meta(),
+                &headers(&[
+                    ("if-none-match", "\"e\""),
+                    ("if-unmodified-since", DAY_BEFORE)
+                ])
+            )
+            .unwrap(),
+            ReadOutcome::PreconditionFailed
+        );
+    }
+
+    #[test]
+    fn read_conditions_malformed_date_is_400() {
+        for name in ["if-modified-since", "if-unmodified-since"] {
+            let e = evaluate_read_conditions(&meta(), &headers(&[(name, "definitely-not-a-date")]))
+                .unwrap_err();
+            assert!(matches!(e, S3Error::InvalidArgument(_)), "{e}");
+        }
+    }
+
+    #[test]
+    fn if_range_validator_matrix() {
+        assert!(if_range_passes(&meta(), "\"e\""));
+        assert!(!if_range_passes(&meta(), "e"));
+        assert!(!if_range_passes(&meta(), "\"x\""));
+        assert!(!if_range_passes(&meta(), "W/\"e\""));
+        assert!(if_range_passes(&meta(), DAY_AFTER));
+        assert!(if_range_passes(&meta(), "Tue, 14 Nov 2023 22:13:20 GMT"));
+        assert!(!if_range_passes(&meta(), DAY_BEFORE));
+        assert!(!if_range_passes(&meta(), "definitely-not-a-date"));
+    }
+
+    fn window(start: u64, len: u64) -> Option<ByteWindow> {
+        Some(ByteWindow { start, len })
+    }
+
+    #[test]
+    fn read_window_matrix_multipart() {
+        let m = meta();
+        let json = serde_json::to_string(&vec![
+            ManifestPart {
+                blob_id: [1; 8],
+                size: 10,
+            },
+            ManifestPart {
+                blob_id: [2; 8],
+                size: 20,
+            },
+            ManifestPart {
+                blob_id: [3; 8],
+                size: 30,
+            },
+        ])
+        .unwrap();
+        let parts: Option<Vec<ManifestPart>> = serde_json::from_str(&json).unwrap();
+        let parts = parts.as_deref();
+
+        assert_eq!(
+            resolve_read_window(&m, parts, None, None, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_read_window(&m, parts, None, Some(2), true).unwrap(),
+            window(10, 20)
+        );
+        assert_eq!(
+            resolve_read_window(&m, parts, Some("bytes=90-"), None, true).unwrap(),
+            window(90, 10)
+        );
+        assert_eq!(
+            resolve_read_window(&m, parts, Some("bytes=15-19"), Some(2), true).unwrap(),
+            window(15, 5)
+        );
+        for n in [0, 4] {
+            let e = resolve_read_window(&m, parts, None, Some(n), true).unwrap_err();
+            assert!(matches!(e, S3Error::InvalidRange { .. }), "{e}");
+        }
+        assert!(matches!(
+            resolve_read_window(&m, parts, Some("bytes=0-9"), Some(2), true).unwrap_err(),
+            S3Error::InvalidRange { .. }
+        ));
+        assert!(matches!(
+            resolve_read_window(&m, parts, Some("bytes=100-"), None, true).unwrap_err(),
+            S3Error::InvalidRange { .. }
+        ));
+    }
+
+    #[test]
+    fn read_window_matrix_single_part() {
+        let m = meta();
+        assert_eq!(
+            resolve_read_window(&m, None, None, Some(1), true).unwrap(),
+            window(0, 100)
+        );
+        assert!(matches!(
+            resolve_read_window(&m, None, None, Some(2), true).unwrap_err(),
+            S3Error::InvalidRange { .. }
+        ));
+        assert_eq!(
+            resolve_read_window(&m, None, Some("bytes=10-19"), None, true).unwrap(),
+            window(10, 10)
+        );
+        assert_eq!(
+            resolve_read_window(&m, None, Some("bytes=10-19"), Some(1), true).unwrap(),
+            window(10, 10)
+        );
+    }
+
+    #[test]
+    fn if_range_failure_vacuums_the_window() {
+        let m = meta();
+        assert_eq!(
+            resolve_read_window(&m, None, Some("bytes=10-19"), None, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_read_window(&m, None, None, Some(1), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_read_window(&m, None, None, Some(9), false).unwrap(),
+            None
+        );
+    }
 }

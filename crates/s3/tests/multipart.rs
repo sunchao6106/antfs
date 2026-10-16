@@ -572,3 +572,159 @@ async fn multipart_ranged_windows() {
         "multipart EOF boundary must 416"
     );
 }
+
+// ── ?partNumber(multipart 单片直读,s3-read-compat)──────────────────────────
+
+/// multipart `?partNumber`:片窗 206(全对象坐标 Content-Range)/ 越界 416 /
+/// ×Range 交集(片内窗、空交 416)/ ×If-Range 失败提权整对象 200。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn part_number_multipart_reads_single_part() {
+    use reqwest::Method;
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mp-part").await;
+    let key = "three.bin";
+
+    let p1 = pseudo_random(10);
+    let p2 = pseudo_random(20);
+    let p3 = pseudo_random(30);
+    let blobs = [&p1, &p2, &p3];
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let mut etags = Vec::new();
+    for (idx, body) in blobs.iter().enumerate() {
+        let number = (idx + 1) as i32;
+        let resp = fx.upload_part(&bucket, key, &upload_id, number, body).await;
+        assert_eq!(resp.status().as_u16(), 200, "UploadPart {number} must 200");
+        etags.push((number, header(&resp, "etag")));
+    }
+    let resp = fx
+        .complete_multipart(&bucket, key, &upload_id, complete_xml(&etags).as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "complete must 200");
+
+    let whole = [p1.as_slice(), p2.as_slice(), p3.as_slice()].concat();
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=2"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 206, "part 2 → 206");
+    assert_eq!(header(&resp, "content-range"), "bytes 10-29/60");
+    assert_eq!(header(&resp, "content-length"), "20");
+    assert_eq!(resp.bytes().await.expect("part body").to_vec(), p2.to_vec());
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=1"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(header(&resp, "content-range"), "bytes 0-9/60");
+    assert_eq!(resp.bytes().await.expect("part body").to_vec(), p1.to_vec());
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=3"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(header(&resp, "content-range"), "bytes 30-59/60");
+    assert_eq!(resp.bytes().await.expect("part body").to_vec(), p3.to_vec());
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=0"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 416, "partNumber=0 out of range");
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=4"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 416, "beyond part count");
+    let body = resp.text().await.expect("416 body");
+    assert!(
+        body.contains("InvalidRange") && body.contains("3 part"),
+        "{body}"
+    );
+
+    let uri = format!("/{bucket}/{key}?partNumber=2");
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert("range", "bytes=15-19".parse().expect("range"));
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        206,
+        "part 2 ∩ Range = in-part window"
+    );
+    assert_eq!(header(&resp, "content-range"), "bytes 15-19/60");
+    assert_eq!(
+        resp.bytes().await.expect("body").to_vec(),
+        whole[15..20].to_vec()
+    );
+
+    let uri = format!("/{bucket}/{key}?partNumber=2");
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert("range", "bytes=0-9".parse().expect("range"));
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        416,
+        "Range entirely before part 2 → empty intersection"
+    );
+
+    let etag = {
+        let resp = fx.get_object(&bucket, key).await;
+        header(&resp, "etag")
+    };
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert(
+        "if-range",
+        etag.parse::<reqwest::header::HeaderValue>().expect("etag"),
+    );
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        206,
+        "fresh validator keeps the part window"
+    );
+    assert_eq!(header(&resp, "content-range"), "bytes 10-29/60");
+
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert("if-range", "\"stale\"".parse().expect("if-range"));
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "stale validator escalates to whole object"
+    );
+    assert!(!resp.headers().contains_key("content-range"));
+    assert_eq!(
+        resp.bytes().await.expect("body").to_vec(),
+        whole,
+        "entire assembled object"
+    );
+
+    let resp = fx
+        .request(
+            Method::HEAD,
+            &format!("/{bucket}/{key}?partNumber=2"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "HEAD ignores partNumber");
+    assert_eq!(header(&resp, "content-length"), "60");
+}

@@ -59,6 +59,8 @@ pub struct S3QueryParams {
     pub max_uploads: Option<i32>,
     pub delete: Option<String>,
     pub acl: Option<String>,
+    pub marker: Option<String>,
+    pub location: Option<String>,
     #[serde(rename = "attributes")]
     pub attributes: Option<String>,
 }
@@ -315,13 +317,28 @@ async fn bucket_get_handler(
             .await
             .into_response();
     }
-    // ListObjectsV2 走公开读门(public-read 桶匿名可列举)。
+    // GET /{bucket}?location = GetBucketLocation(租户归属元数据,owner 面,同 ?acl)。
+    if q.location.is_some() {
+        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+            return e.into_response();
+        }
+        return crate::handlers::bucket::get_bucket_location(st, &bucket)
+            .await
+            .into_response();
+    }
+    // 列举走公开读门(public-read 桶匿名可列举);无 `list-type=2` = ListObjectsV1。
     if let Err(e) = require_public_read(&st, &principal, &bucket).await {
         return e.into_response();
     }
-    crate::handlers::bucket::list_objects_v2(st, &bucket, q)
-        .await
-        .into_response()
+    if q.list_type.as_deref() == Some("2") {
+        crate::handlers::bucket::list_objects_v2(st, &bucket, q)
+            .await
+            .into_response()
+    } else {
+        crate::handlers::bucket::list_objects_v1(st, &bucket, q)
+            .await
+            .into_response()
+    }
 }
 
 async fn bucket_post_handler(
@@ -408,7 +425,7 @@ async fn object_get_handler(
         .headers()
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok());
-    crate::handlers::object::get_object(st, &bucket, &key, range)
+    crate::handlers::object::get_object(st, &bucket, &key, range, q.part_number, req.headers())
         .await
         .into_response()
 }
@@ -417,12 +434,14 @@ async fn object_head_handler(
     State(st): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path((bucket, key)): Path<(String, String)>,
+    req: Request,
 ) -> Response {
     // HEAD object 走公开读门(无子资源分派)。
     if let Err(e) = require_public_read(&st, &principal, &bucket).await {
         return e.into_response();
     }
-    crate::handlers::object::head_object(st, &bucket, &key)
+    // HEAD 忽略 Range 与 partNumber(S3 语义:眼里只有整对象元数据);条件头生效。
+    crate::handlers::object::head_object(st, &bucket, &key, req.headers())
         .await
         .into_response()
 }

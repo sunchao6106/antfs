@@ -168,6 +168,36 @@ pub(crate) fn manifest_total_size(parts: &[ManifestPart]) -> u64 {
     parts.iter().map(|p| p.size).sum()
 }
 
+/// `?partNumber=n` 的片窗(n 从 1 起);`n < 1` 或 `> 片数` → `None`(调用方 416)。
+/// 片窗与 Range 窗同构——投影到取件计划直接走 [`window_parts`]。
+pub(crate) fn manifest_part_window(parts: &[ManifestPart], n: i32) -> Option<ByteWindow> {
+    if n < 1 {
+        return None;
+    }
+    let n = n as usize;
+    if n > parts.len() {
+        return None;
+    }
+    let start: u64 = parts[..n - 1].iter().map(|p| p.size).sum();
+    Some(ByteWindow {
+        start,
+        len: parts[n - 1].size,
+    })
+}
+
+/// 两窗交集;空交 → `None`(调用方按 416)。`partNumber` 窗 × Range 窗组合用。
+pub(crate) fn intersect_windows(a: ByteWindow, b: ByteWindow) -> Option<ByteWindow> {
+    let start = a.start.max(b.start);
+    let end = (a.start + a.len).min(b.start + b.len);
+    if end <= start {
+        return None;
+    }
+    Some(ByteWindow {
+        start,
+        len: end - start,
+    })
+}
+
 /// multipart 装配流:顺序逐片 `router.get` →(可能切片)产出;**至多一片在内存**。
 /// 尚未开取的每片保有完整的 R=1 failover(`router.get` 内建);首字节(首片)已
 /// 发出后某片取回失败 = 响亮中断(连接以体错误收尾,不静默截短)。片短于 manifest
@@ -391,5 +421,41 @@ mod tests {
         let parts = vec![part(1, 1), part(2, u64::MAX / 2)];
         assert_eq!(manifest_total_size(&parts), 1 + u64::MAX / 2);
         assert_eq!(manifest_total_size(&[]), 0);
+    }
+
+    #[test]
+    fn part_window_matrix() {
+        let parts = vec![part(1, 10), part(2, 20), part(3, 30)];
+        assert_eq!(
+            manifest_part_window(&parts, 1),
+            Some(ByteWindow { start: 0, len: 10 })
+        );
+        assert_eq!(
+            manifest_part_window(&parts, 2),
+            Some(ByteWindow { start: 10, len: 20 })
+        );
+        assert_eq!(
+            manifest_part_window(&parts, 3),
+            Some(ByteWindow { start: 30, len: 30 })
+        );
+        assert_eq!(manifest_part_window(&parts, 0), None);
+        assert_eq!(manifest_part_window(&parts, 4), None);
+        assert_eq!(manifest_part_window(&[], 1), None);
+        let parts = vec![part(1, 10), part(2, 0)];
+        assert_eq!(
+            manifest_part_window(&parts, 2),
+            Some(ByteWindow { start: 10, len: 0 })
+        );
+    }
+
+    #[test]
+    fn window_intersection() {
+        let a = |s: u64, l: u64| ByteWindow { start: s, len: l };
+        assert_eq!(intersect_windows(a(0, 100), a(10, 20)), Some(a(10, 20)));
+        assert_eq!(intersect_windows(a(10, 20), a(0, 100)), Some(a(10, 20)));
+        assert_eq!(intersect_windows(a(0, 10), a(5, 100)), Some(a(5, 5)));
+        assert_eq!(intersect_windows(a(0, 10), a(10, 10)), None);
+        assert_eq!(intersect_windows(a(0, 10), a(50, 10)), None);
+        assert_eq!(intersect_windows(a(0, 0), a(0, 0)), None);
     }
 }

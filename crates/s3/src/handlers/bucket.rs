@@ -70,6 +70,52 @@ pub async fn list_objects_v2(
     Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())
 }
 
+/// ListObjectsV1(`GET /{bucket}` 无 `list-type=2`):marker(排他起点,与
+/// continuation-token 同走 `key > start_after` 通路)→ 复用同一 list 核心,V1 只换
+/// XML 形态。NextMarker 仅在 delimiter 存在且截断时回,值取末 key / 末公共前缀的
+/// 字典序大者(exclusive 排他起点,翻页零缺漏零重复)。
+pub async fn list_objects_v1(
+    st: AppState,
+    bucket: &str,
+    q: S3QueryParams,
+) -> Result<Response, S3Error> {
+    st.metastore
+        .head_bucket(bucket)
+        .await?
+        .ok_or(S3Error::NoSuchBucket)?;
+
+    let max_keys = q.max_keys.unwrap_or(1000);
+    let req = ListObjectsReq {
+        bucket: bucket.to_string(),
+        prefix: q.prefix.clone(),
+        delimiter: q.delimiter.clone(),
+        max_keys,
+        continuation_token: None,
+        start_after: q.marker.clone(),
+    };
+    let resp = st.metastore.list_objects(req).await?;
+    let xml = crate::xml::serialize_list_bucket_result_v1(
+        bucket,
+        q.prefix.as_deref(),
+        q.marker.as_deref(),
+        q.delimiter.as_deref(),
+        max_keys,
+        &resp,
+    );
+    Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())
+}
+
+/// GET /{bucket}?location(owner 专属 —— owner 闸在 server.rs 包装层)。
+/// region == us-east-1 回空元素(经典区官方行为),否则回配置 region 字符串。
+pub async fn get_bucket_location(st: AppState, bucket: &str) -> Result<Response, S3Error> {
+    st.metastore
+        .head_bucket(bucket)
+        .await?
+        .ok_or(S3Error::NoSuchBucket)?;
+    let xml = crate::xml::serialize_location_constraint(&st.config.region);
+    Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())
+}
+
 fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     if name.len() < 3 || name.len() > 63 {
         return Err(S3Error::InvalidBucketName(

@@ -1037,3 +1037,375 @@ async fn range_get_sse_object() {
         "SSE object 416 at EOF boundary"
     );
 }
+
+// ── 条件 GET/HEAD + If-Range + ?partNumber(s3-read-compat)────────────────────
+
+async fn head_with(
+    fx: &S3Fixture,
+    bucket: &str,
+    key: &str,
+    pairs: &[(&str, &str)],
+) -> reqwest::Response {
+    use reqwest::Method;
+    let uri = format!("/{bucket}/{key}");
+    let mut headers = fx.signed_headers("HEAD", &uri, &[]);
+    for (name, value) in pairs {
+        headers.insert(
+            name.parse::<reqwest::header::HeaderName>().expect("name"),
+            value.parse().expect("value"),
+        );
+    }
+    fx.send(Method::HEAD, &uri, headers, Vec::new()).await
+}
+
+const DAY_PAST: &str = "Mon, 13 Nov 2023 22:13:20 GMT";
+const DAY_FUTURE: &str = "Fri, 01 Jan 2100 00:00:00 GMT";
+
+/// RFC 7232 §6 条件矩阵:If-Match(412/短路)/ If-None-Match(304,`*` 通配,
+/// 不匹配短路)/ If-Modified-Since(304)/ If-Unmodified-Since(412)/ 坏日期 400;
+/// HEAD 同语义空体;GET 200/304 全贴 ETag + Last-Modified。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn conditional_get_head_matrix() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("cond").await;
+    let key = "cond.bin";
+    let data = pseudo_random(100);
+    let put = fx.put_object(&bucket, key, &data).await;
+    assert_eq!(put.status().as_u16(), 200, "PUT seed must 200");
+    let etag = header(&put, "etag");
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-match", etag.as_str())])
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "If-Match pass must 200");
+    assert!(
+        !header(&resp, "last-modified").is_empty(),
+        "200 carries Last-Modified"
+    );
+    assert_eq!(resp.bytes().await.expect("body").len(), 100);
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-match", "\"deadbeef\"")])
+        .await;
+    assert_eq!(resp.status().as_u16(), 412, "If-Match mismatch must 412");
+    let body = resp.text().await.expect("412 body");
+    assert!(body.contains("PreconditionFailed"), "{body}");
+
+    let resp = fx
+        .get_object_with_headers(
+            &bucket,
+            key,
+            &[("if-match", &etag), ("if-modified-since", DAY_FUTURE)],
+        )
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "If-Match pass short-circuits If-Modified-Since"
+    );
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-none-match", etag.as_str())])
+        .await;
+    assert_eq!(resp.status().as_u16(), 304, "If-None-Match hit must 304");
+    assert_eq!(header(&resp, "etag"), etag, "304 carries ETag");
+    assert!(
+        !header(&resp, "last-modified").is_empty(),
+        "304 carries Last-Modified"
+    );
+    assert!(
+        resp.bytes().await.expect("304 body").is_empty(),
+        "304 must be bodiless"
+    );
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-none-match", "*")])
+        .await;
+    assert_eq!(resp.status().as_u16(), 304, "* matches any");
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-none-match", "\"deadbeef\"")])
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "If-None-Match miss must 200");
+    assert_eq!(
+        resp.bytes().await.expect("body").len(),
+        100,
+        "miss serves the object"
+    );
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-modified-since", DAY_FUTURE)])
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        304,
+        "not modified since future → 304"
+    );
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-modified-since", DAY_PAST)])
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "modified after past date → 200"
+    );
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-unmodified-since", DAY_PAST)])
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        412,
+        "modified after unmodified-since must 412"
+    );
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-unmodified-since", DAY_FUTURE)])
+        .await;
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let resp = fx
+        .get_object_with_headers(&bucket, key, &[("if-modified-since", "not-a-date")])
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "malformed conditional date → 400"
+    );
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("InvalidArgument"), "{body}");
+
+    // HEAD:304 / 412 / 200 三态,空体。
+    let resp = head_with(&fx, &bucket, key, &[("if-none-match", etag.as_str())]).await;
+    assert_eq!(resp.status().as_u16(), 304, "HEAD 304");
+    assert!(!header(&resp, "last-modified").is_empty());
+
+    let resp = head_with(&fx, &bucket, key, &[("if-unmodified-since", DAY_PAST)]).await;
+    assert_eq!(resp.status().as_u16(), 412, "HEAD 412");
+
+    let resp = head_with(&fx, &bucket, key, &[]).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        !header(&resp, "last-modified").is_empty(),
+        "HEAD 200 has Last-Modified"
+    );
+}
+
+/// If-Range 闸:ETag/未来日期过 → 206 按窗;失配/过旧/解析失败 → 200 全对象。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn if_range_gating() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("ifrange").await;
+    let key = "gated.bin";
+    let data = pseudo_random(100);
+    let put = fx.put_object(&bucket, key, &data).await;
+    assert_eq!(put.status().as_u16(), 200);
+    let etag = header(&put, "etag");
+
+    let resp = fx
+        .get_object_with_headers(
+            &bucket,
+            key,
+            &[("range", "bytes=10-19"), ("if-range", &etag)],
+        )
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        206,
+        "fresh validator serves the range"
+    );
+    assert_eq!(header(&resp, "content-range"), "bytes 10-19/100");
+
+    let resp = fx
+        .get_object_with_headers(
+            &bucket,
+            key,
+            &[("range", "bytes=10-19"), ("if-range", DAY_FUTURE)],
+        )
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        206,
+        "date at least as recent serves the range"
+    );
+
+    for bad in ["\"deadbeef\"", DAY_PAST, "garbage"] {
+        let resp = fx
+            .get_object_with_headers(&bucket, key, &[("range", "bytes=10-19"), ("if-range", bad)])
+            .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "stale/invalid If-Range `{bad}` nullifies the window"
+        );
+        assert!(!resp.headers().contains_key("content-range"));
+        assert_eq!(
+            resp.bytes().await.expect("full body").to_vec(),
+            data,
+            "whole object must be returned"
+        );
+    }
+}
+
+/// ?partNumber 矩阵(单片对象):part 1 全幅 206 / 其余 416 / ×Range 交集 /
+/// ×If-Range 失败提权 200 / HEAD 忽略 / 空对象 416。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn part_number_single_part_object() {
+    use reqwest::Method;
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("part1").await;
+    let key = "single.bin";
+    let data = pseudo_random(100);
+    let put = fx.put_object(&bucket, key, &data).await;
+    assert_eq!(put.status().as_u16(), 200);
+    let etag = header(&put, "etag");
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=1"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 206, "part 1 → 206");
+    assert_eq!(header(&resp, "content-range"), "bytes 0-99/100");
+    assert_eq!(header(&resp, "content-length"), "100");
+    assert_eq!(resp.bytes().await.expect("body").to_vec(), data);
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=2"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 416, "no second part");
+    let body = resp.text().await.expect("416 body");
+    assert!(
+        body.contains("InvalidRange") && body.contains("1 part"),
+        "{body}"
+    );
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=0"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 416, "partNumber=0 is out of range");
+
+    let uri = format!("/{bucket}/{key}?partNumber=1");
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert("range", "bytes=10-19".parse().expect("range"));
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(resp.status().as_u16(), 206, "part 1 ∩ Range window");
+    assert_eq!(header(&resp, "content-range"), "bytes 10-19/100");
+    assert_eq!(
+        resp.bytes().await.expect("body").to_vec(),
+        data[10..20].to_vec()
+    );
+
+    let uri = format!("/{bucket}/{key}?partNumber=2");
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert("range", "bytes=0-9".parse().expect("range"));
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        416,
+        "empty intersection 416(先 part 越界)"
+    );
+
+    let uri = format!("/{bucket}/{key}?partNumber=1");
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert("range", "bytes=10-19".parse().expect("range"));
+    headers.insert("if-range", "\"deadbeef\"".parse().expect("if-range"));
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "failed validator escalates to whole object"
+    );
+    assert!(!resp.headers().contains_key("content-range"));
+    assert_eq!(resp.bytes().await.expect("body").len(), 100);
+
+    let uri = format!("/{bucket}/{key}?partNumber=1");
+    let mut headers = fx.signed_headers("GET", &uri, &[]);
+    headers.insert("if-range", etag.parse().expect("if-range"));
+    let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        206,
+        "passing validator keeps the part window"
+    );
+    assert_eq!(header(&resp, "content-range"), "bytes 0-99/100");
+
+    let resp = fx
+        .request(
+            Method::HEAD,
+            &format!("/{bucket}/{key}?partNumber=1"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "HEAD ignores partNumber");
+    assert_eq!(header(&resp, "content-length"), "100");
+
+    let resp = fx.put_object(&bucket, "empty.bin", b"").await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/empty.bin?partNumber=1"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        416,
+        "empty object has no satisfiable part"
+    );
+}
+
+/// SSE 单片对象:?partNumber=1 = 解密后全幅 206(带回加密头)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn part_number_sse_object() {
+    use reqwest::Method;
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("partsse").await;
+    let key = "enc.bin";
+    let data = pseudo_random(80);
+    let put = fx
+        .put_object_with_headers(&bucket, key, &data, &[SSE_HDR])
+        .await;
+    assert_eq!(put.status().as_u16(), 200, "SSE PUT must 200");
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=1"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 206, "SSE part 1 → 206");
+    assert_eq!(header(&resp, "content-range"), "bytes 0-79/80");
+    assert_eq!(header(&resp, "x-amz-server-side-encryption"), "AES256");
+    assert_eq!(
+        resp.bytes().await.expect("decrypted body").to_vec(),
+        data,
+        "part 1 of SSE = whole plaintext"
+    );
+
+    let resp = fx
+        .request(
+            Method::GET,
+            &format!("/{bucket}/{key}?partNumber=2"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 416, "single-part SSE has no part 2");
+}
