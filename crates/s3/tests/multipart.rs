@@ -450,3 +450,125 @@ async fn concurrent_retransmit_completes_and_reads() {
         "final body must be one of the 8 retransmitted versions"
     );
 }
+
+// ── Streaming assembly + ranged reads (s3-range-streaming) ──────────────────
+
+/// 60 × 64 KiB streaming read keeps Content-Length exact and bytes byte-identical
+/// (exercises the sequential part stream across many chunk boundaries).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_streaming_read_60_parts() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mp-stream").await;
+    let key = "many-parts.bin";
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+    const PART: usize = 64 * 1024;
+    const COUNT: usize = 60;
+
+    let mut expected = Vec::with_capacity(PART * COUNT);
+    let mut etags = Vec::new();
+    for idx in 0..COUNT {
+        let body = pseudo_random(PART);
+        let number = (idx + 1) as i32;
+        let resp = fx
+            .upload_part(&bucket, key, &upload_id, number, &body)
+            .await;
+        assert_eq!(resp.status().as_u16(), 200, "UploadPart {number} must 200");
+        etags.push((number, header(&resp, "etag")));
+        expected.extend_from_slice(&body);
+    }
+    let total = expected.len();
+
+    let resp = fx
+        .complete_multipart(&bucket, key, &upload_id, complete_xml(&etags).as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "complete must 200");
+
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(header(&resp, "content-length"), total.to_string());
+    assert_eq!(header(&resp, "accept-ranges"), "bytes");
+    let got = resp.bytes().await.expect("assembled body").to_vec();
+    assert_eq!(got, expected, "60-part assembly must be byte-exact");
+}
+
+/// Ranged reads on a 3 × 1 MiB multipart object: whole-part window, boundary
+/// cross-slicing, and suffix windows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_ranged_windows() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mp-range").await;
+    let key = "windows.bin";
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+    const PART: usize = 1024 * 1024;
+
+    let mut expected = Vec::with_capacity(PART * 3);
+    let mut etags = Vec::new();
+    for idx in 0..3 {
+        let body = pseudo_random(PART);
+        let number = idx + 1;
+        let resp = fx
+            .upload_part(&bucket, key, &upload_id, number, &body)
+            .await;
+        assert_eq!(resp.status().as_u16(), 200, "UploadPart {number} must 200");
+        etags.push((number, header(&resp, "etag")));
+        expected.extend_from_slice(&body);
+    }
+    let total = expected.len() as u64;
+
+    let resp = fx
+        .complete_multipart(&bucket, key, &upload_id, complete_xml(&etags).as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "complete must 200");
+
+    // 窗口恰为中间整片。
+    let resp = fx
+        .get_object_range(&bucket, key, "bytes=1048576-2097151")
+        .await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        header(&resp, "content-range"),
+        format!("bytes 1048576-2097151/{total}")
+    );
+    assert_eq!(
+        resp.bytes().await.expect("part-2 window").to_vec(),
+        expected[PART..2 * PART].to_vec()
+    );
+
+    // 跨片边界:片 1 尾 100 B + 片 2 首 100 B。
+    let resp = fx
+        .get_object_range(&bucket, key, "bytes=1048476-1048675")
+        .await;
+    assert_eq!(resp.status().as_u16(), 206);
+    let got = resp.bytes().await.expect("boundary window").to_vec();
+    let want = {
+        let mut v = expected[PART - 100..PART].to_vec();
+        v.extend_from_slice(&expected[PART..PART + 100]);
+        v
+    };
+    assert_eq!(
+        got, want,
+        "window crossing the part boundary must splice correctly"
+    );
+
+    // 后缀窗:对象尾 5 B。
+    let resp = fx.get_object_range(&bucket, key, "bytes=-5").await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        resp.bytes().await.expect("suffix window").to_vec(),
+        expected[expected.len() - 5..].to_vec()
+    );
+
+    // 首 byte 越界 → 416。
+    let resp = fx
+        .get_object_range(&bucket, key, &format!("bytes={total}-"))
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        416,
+        "multipart EOF boundary must 416"
+    );
+}

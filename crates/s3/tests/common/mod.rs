@@ -803,6 +803,30 @@ impl S3Fixture {
             .await
     }
 
+    /// GET carrying extra request headers unsigned(SigV4 只签 host/x-amz-*,
+    /// `Range` 等头按约定不参签,与 put_object_with_headers 同型)。
+    pub async fn get_object_with_headers(
+        &self,
+        bucket: &str,
+        key: &str,
+        extra: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let uri = format!("/{bucket}/{key}");
+        let mut headers = self.signed_headers("GET", &uri, &[]);
+        self.insert_extra_headers(&mut headers, extra);
+        self.send(Method::GET, &uri, headers, Vec::new()).await
+    }
+
+    pub async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: &str,
+    ) -> reqwest::Response {
+        self.get_object_with_headers(bucket, key, &[("range", range)])
+            .await
+    }
+
     pub async fn head_object(&self, bucket: &str, key: &str) -> reqwest::Response {
         self.request(Method::HEAD, &format!("/{bucket}/{key}"), Vec::new())
             .await

@@ -404,7 +404,11 @@ async fn object_get_handler(
     if let Err(e) = require_public_read(&st, &principal, &bucket).await {
         return e.into_response();
     }
-    crate::handlers::object::get_object(st, &bucket, &key)
+    let range = req
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok());
+    crate::handlers::object::get_object(st, &bucket, &key, range)
         .await
         .into_response()
 }

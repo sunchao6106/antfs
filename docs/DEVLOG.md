@@ -993,7 +993,9 @@
   (PostgreSQL / MySQL 各一方言实现,5 表:buckets / named_objects / multipart_uploads /
   multipart_parts / s3_credentials,sqlx::migrate 启动建表),blob 数据仍走内嵌 router SDK
   (W 多数派写 / R=1 读 → 与 frontend 完全同一套)。
-- **功能面**:PutObject / GetObject(multipart manifest 逐片流式拼接,Content-Length = Σ片)/
+- **功能面**:PutObject / GetObject(multipart manifest 逐片拼接,Content-Length = Σ片;
+  **更正 2026-10-16(步骤 63)**:原文此处写「逐片**流式**拼接」失实——实码一直是
+  `Vec` 全量内存拼接,流式装配直至 `s3-range-streaming` 才落地,失实声明同日撤回)/
   HeadObject / DeleteObject / DeleteObjects(batch XML);CreateMultipart → UploadPart →
   Complete / Abort / ListParts / ListMultipartUploads;ListObjectsV2(prefix / delimiter /
   CommonPrefixes / 分页);桶 CRUD + ListBuckets;凭证管理(admin token → 签发 / 撤销 access_key)。
@@ -1490,3 +1492,43 @@
 - 全套 e2e 双方言 fresh/dirty 零变化(11 ok-线 × 4);fmt/clippy 0;lib 70 绿。
 
 **发运**:归档 `2026-10-16-s3-sse`,CI 五 job 硬验收(见 push)。
+
+## 步骤 63|s3-range-streaming:GET 路径硬化三 P0 收官(Range + multipart 流式装配)
+
+**动机**:S3 完备度审计出三个 P0(GET 无 Range、multipart GET 整对象拼内存、
+读路径内存无上界风险),用户拍板「先完善三个 P0」。第二项同时是**文档-实码分叉**:
+s3.md 自初版就声称「流式拼接」,实码却是 `Vec` 全量 `extend`——审计抓出,本轮收口。
+
+**终形**:
+- `handlers/range.rs`(新):`parse_range` 纯函数(单区间;截断/后缀/后缀超长;
+  首 byte 越界/空对象/`bytes=-0` → 416;语法坏/多区间/非 bytes → 忽略回 200)+
+  `window_parts`(manifest 尺寸投影,非覆盖片零取件)+ `PartStream`(装配流:
+  逐片 `router.get`+切片,至多**一片**驻留内存;片短于声明 = InternalError)。
+- `object.rs`:`get_object(.., range)` 三分支(plain 切片 / SSE 解密后切 / multipart
+  流);`object_read_builder` 统一 200/206 + `Accept-Ranges` + `Content-Range`;
+  `apply_window` 先对账体长再切。multipart 响应前 `Σ manifest.size == row.size`
+  对账(失配 500)——`Content-Length` 恒不说谎。
+- `error.rs`:`InvalidRange{requested, actual_size}`(416,message 带原文与实际尺寸)。
+- 无新配置/指标/迁移(Sec. 6/7 零表变动;206/416 经 `s3_requests_total{op,status}`)。
+
+**裁决(记档 change design.md D1–D7)**:普通/SSE 对象**不**改流式——网关写入的
+每条单 blob ≤ `max_body_bytes`(PUT/Part/Copy 单块源三路同界),缓冲上界即配置值,
+且 `router.get` 保有 mid-body R=1 failover,首字节流式会丢这个换不来收益;真正
+无界的是 multipart 总量,由 `PartStream` 收口。多区间按官方语义忽略回 200
+(RFC 必须忽略,不做 416 放大)。
+
+**验证**:
+- 单测 `handlers/range.rs::tests`:rule_matrix 28 例 + window_projection 6 组 +
+  content_range 文本 + Σ 求和(无 DB 依赖);s3 lib 75 绿。
+- e2e 新 5 测:`range_get_matrix_small_object`(闭区间/截断/开区/单字节/后缀/后缀
+  超长/416×2/忽略×4/HEAD Accept-Ranges)、`range_get_empty_object_is_416`、
+  `range_get_sse_object`、`multipart_streaming_read_60_parts`(60×64KiB 逐字节
+  对拍)、`multipart_ranged_windows`(整片窗/跨界拼接/后缀/416)。
+- **双言全量 e2e 各 68/68**(本机真 PG + MySQL 8.4 容器,`--ignored
+  --test-threads=1`):auth 5 / chunked 7 / copy 11 / list 6 / multipart 11 /
+  object 19 / sse 6 / vhost 3——零回归。
+- workspace `cargo test` exit 0;clippy 0 告警;fmt 干净。
+
+**发运**:归档 `openspec/changes/archive/2026-10-16-s3-range-streaming/`(delta 已合并活 spec:s3-core
+~2 / s3-multipart +1);docs 全量同步(s3.md 矩阵/操作映射/新节/模块树、design README 索引与优化路线、
+README en+zh)。

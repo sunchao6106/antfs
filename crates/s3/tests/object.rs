@@ -849,3 +849,191 @@ async fn canned_acl_public_read_grants_reads_but_not_writes() {
         "XML-body PutBucketAcl is explicitly out of scope"
     );
 }
+
+// ── Range requests (s3-range-streaming) ─────────────────────────────────────
+
+const SSE_HDR: (&str, &str) = ("x-amz-server-side-encryption", "AES256");
+
+/// Full Range matrix on a 100-byte plaintext object: 206 / clamp / suffix / suffix-overflow /
+/// unsatisfiable 416 / invalid-and-multi-range → 200 full / Accept-Ranges on 200 and HEAD.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn range_get_matrix_small_object() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("range").await;
+    let key = "matrix.bin";
+    let data = pseudo_random(100);
+    let put = fx.put_object(&bucket, key, &data).await;
+    assert_eq!(put.status().as_u16(), 200, "PUT seed must 200");
+
+    let expected = |s: usize, e: usize| data[s..e].to_vec();
+
+    // 基本闭区间。
+    let resp = fx.get_object_range(&bucket, key, "bytes=10-19").await;
+    assert_eq!(resp.status().as_u16(), 206, "closed range must 206");
+    assert_eq!(header(&resp, "content-range"), "bytes 10-19/100");
+    assert_eq!(header(&resp, "content-length"), "10");
+    assert_eq!(header(&resp, "accept-ranges"), "bytes");
+    assert!(
+        !header(&resp, "etag").is_empty() && header(&resp, "etag").starts_with('\"'),
+        "206 must still return the object ETag"
+    );
+    assert_eq!(
+        resp.bytes().await.expect("206 body").to_vec(),
+        expected(10, 20)
+    );
+
+    // end 超界截断。
+    let resp = fx.get_object_range(&bucket, key, "bytes=90-1000").await;
+    assert_eq!(resp.status().as_u16(), 206, "clamped end must 206");
+    assert_eq!(header(&resp, "content-range"), "bytes 90-99/100");
+    assert_eq!(
+        resp.bytes().await.expect("206 body").to_vec(),
+        expected(90, 100)
+    );
+
+    // 开区间。
+    let resp = fx.get_object_range(&bucket, key, "bytes=90-").await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        resp.bytes().await.expect("206 body").to_vec(),
+        expected(90, 100)
+    );
+
+    // 单字节。
+    let resp = fx.get_object_range(&bucket, key, "bytes=99-99").await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        resp.bytes().await.expect("206 body").to_vec(),
+        expected(99, 100)
+    );
+
+    // 后缀。
+    let resp = fx.get_object_range(&bucket, key, "bytes=-7").await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(header(&resp, "content-range"), "bytes 93-99/100");
+    assert_eq!(
+        resp.bytes().await.expect("206 body").to_vec(),
+        expected(93, 100)
+    );
+
+    // 后缀超长 → 全对象 206;`bytes=0-` 同。
+    let resp = fx.get_object_range(&bucket, key, "bytes=-1000").await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(header(&resp, "content-range"), "bytes 0-99/100");
+    assert_eq!(resp.bytes().await.expect("206 body").to_vec(), data.clone());
+
+    // 首 byte 越界 → 416 InvalidRange。
+    let resp = fx.get_object_range(&bucket, key, "bytes=100-").await;
+    assert_eq!(resp.status().as_u16(), 416, "start past EOF must 416");
+    let body = resp.text().await.expect("416 body");
+    assert!(
+        body.contains("InvalidRange"),
+        "416 body must carry code, got: {body}"
+    );
+
+    // `bytes=-0`:RFC 不可满足。
+    let resp = fx.get_object_range(&bucket, key, "bytes=-0").await;
+    assert_eq!(resp.status().as_u16(), 416, "bytes=-0 is unsatisfiable");
+
+    // 语法坏 / 多区间 → 忽略,回 200 全对象。
+    for bad in [
+        "bytes=5-1",
+        "bytes=not-a-range",
+        "bytes=0-1,3-4",
+        "items=0-9",
+    ] {
+        let resp = fx.get_object_range(&bucket, key, bad).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "invalid `{bad}` must be ignored, not failed"
+        );
+        assert_eq!(header(&resp, "content-length"), "100");
+        assert_eq!(resp.bytes().await.expect("200 body").to_vec(), data);
+    }
+
+    // 无 Range 的 200 也声明 Accept-Ranges。
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(header(&resp, "accept-ranges"), "bytes");
+
+    // HEAD:忽略 Range,全量 Content-Length + Accept-Ranges,无 body。
+    let uri = format!("/{bucket}/{key}");
+    let mut headers = fx.signed_headers("HEAD", &uri, &[]);
+    headers.insert("range", "bytes=0-9".parse().unwrap());
+    let resp = fx
+        .send(reqwest::Method::HEAD, &uri, headers, Vec::new())
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "HEAD ignores Range (S3 semantics)"
+    );
+    assert_eq!(header(&resp, "content-length"), "100");
+    assert_eq!(header(&resp, "accept-ranges"), "bytes");
+    let got = resp.bytes().await.expect("read HEAD body");
+    assert!(got.is_empty(), "HEAD must not carry a body");
+}
+
+/// 空对象:任何 range 不可满足(416),无 range 仍可 200 全读。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn range_get_empty_object_is_416() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("range-empty").await;
+    let key = "empty.bin";
+    let resp = fx.put_object(&bucket, key, b"").await;
+    assert_eq!(resp.status().as_u16(), 200, "empty PUT must 200");
+
+    for range in ["bytes=0-0", "bytes=0-", "bytes=-5"] {
+        let resp = fx.get_object_range(&bucket, key, range).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            416,
+            "range `{range}` on an empty object must be 416"
+        );
+    }
+
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(header(&resp, "content-length"), "0");
+}
+
+/// SSE 对象走同一 range 语义:解密后切明文窗口,SSE 回显头照在。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn range_get_sse_object() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("range-sse").await;
+    let key = "secret.bin";
+    let data = pseudo_random(100_001);
+
+    let put = fx
+        .put_object_with_headers(&bucket, key, &data, &[SSE_HDR])
+        .await;
+    assert_eq!(put.status().as_u16(), 200, "SSE PUT must 200");
+
+    let resp = fx.get_object_range(&bucket, key, "bytes=50000-50199").await;
+    assert_eq!(resp.status().as_u16(), 206, "SSE range must 206");
+    assert_eq!(header(&resp, "content-range"), "bytes 50000-50199/100001");
+    assert_eq!(header(&resp, "x-amz-server-side-encryption"), "AES256");
+    assert_eq!(
+        resp.bytes().await.expect("206 body").to_vec(),
+        data[50000..50200].to_vec()
+    );
+
+    let resp = fx.get_object_range(&bucket, key, "bytes=-100").await;
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        resp.bytes().await.expect("suffix body").to_vec(),
+        data[data.len() - 100..].to_vec()
+    );
+
+    let resp = fx.get_object_range(&bucket, key, "bytes=100001-").await;
+    assert_eq!(
+        resp.status().as_u16(),
+        416,
+        "SSE object 416 at EOF boundary"
+    );
+}

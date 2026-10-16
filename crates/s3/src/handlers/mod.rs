@@ -3,6 +3,7 @@ pub mod batch;
 pub mod bucket;
 pub mod multipart;
 pub mod object;
+pub mod range;
 
 use axum::body::Bytes;
 use axum::extract::Request;

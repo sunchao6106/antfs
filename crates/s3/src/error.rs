@@ -35,6 +35,10 @@ pub enum S3Error {
     PreconditionFailed,
     /// 能力显式出界(未实现的面,如 PutBucketAcl 的 XML body 形式)——不静默也不 400 误导。
     NotImplemented(String),
+    InvalidRange {
+        requested: String,
+        actual_size: u64,
+    },
 }
 
 impl S3Error {
@@ -64,6 +68,7 @@ impl S3Error {
             Self::InvalidRequest(_) => "InvalidRequest",
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NotImplemented(_) => "NotImplemented",
+            Self::InvalidRange { .. } => "InvalidRange",
         }
     }
 
@@ -81,6 +86,7 @@ impl S3Error {
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::InvalidRange { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::QuotaExceeded { .. } => StatusCode::from_u16(507).unwrap(),
             Self::AccessDenied(_)
             | Self::SignatureDoesNotMatch
@@ -157,6 +163,9 @@ impl S3Error {
                     "A header or query you provided implies functionality that is not implemented: {detail}"
                 )
             }
+            Self::InvalidRange { requested, actual_size } => format!(
+                "The requested range is not satisfiable (requested: {requested}, actual object size: {actual_size} bytes)."
+            ),
         }
     }
 

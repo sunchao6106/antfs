@@ -6,6 +6,9 @@ use bytes::Bytes;
 
 use antfs_router::NO_EXPIRATION;
 
+use super::range::{
+    manifest_total_size, parse_range, window_parts, ByteWindow, PartStream, RangeOutcome,
+};
 use crate::error::S3Error;
 use crate::metastore::types::*;
 use crate::server::AppState;
@@ -165,67 +168,147 @@ fn parse_sse_request_header(
     }
 }
 
-pub async fn get_object(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
+pub async fn get_object(
+    st: AppState,
+    bucket: &str,
+    key: &str,
+    range_header: Option<&str>,
+) -> Result<Response, S3Error> {
     let meta = st
         .metastore
         .get_object(bucket, key)
         .await?
         .ok_or(S3Error::NoSuchKey)?;
 
+    let window = match parse_range(range_header, meta.size) {
+        RangeOutcome::Full => None,
+        RangeOutcome::Partial(w) => Some(w),
+        RangeOutcome::Unsatisfiable { spec } => {
+            return Err(S3Error::InvalidRange {
+                requested: spec,
+                actual_size: meta.size,
+            })
+        }
+    };
+
     if meta.sse.is_some() {
-        return get_encrypted_object(&st, &meta).await;
+        return get_encrypted_object(&st, &meta, window).await;
     }
-
     if let Some(manifest_json) = &meta.parts_manifest {
-        return get_multipart_object(st, &meta, manifest_json).await;
+        return get_multipart_object(st, &meta, manifest_json, window).await;
     }
+    get_plain_object(&st, &meta, window).await
+}
 
-    let data = st.router.get(&meta.blob_id).await?;
+/// GET 读响应头装配(三路径共用):恒回 `Accept-Ranges: bytes`,窗口 → 206 +
+/// `Content-Range`(S3 语义:leader 对象元数据头照回)。
+fn object_read_builder(
+    meta: &ObjectMeta,
+    sse: bool,
+    body_len: u64,
+    window: Option<ByteWindow>,
+) -> axum::http::response::Builder {
+    let status = if window.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
     let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_LENGTH, meta.size.to_string())
+        .status(status)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, body_len.to_string())
         .header(header::ETAG, format!("\"{}\"", meta.etag));
+    if sse {
+        builder = builder.header("x-amz-server-side-encryption", "AES256");
+    }
+    if let Some(w) = window {
+        builder = builder.header(header::CONTENT_RANGE, w.content_range(meta.size));
+    }
     if let Some(ct) = &meta.content_type {
         builder = builder.header(header::CONTENT_TYPE, ct.as_str());
     }
     for (k, v) in &meta.user_meta {
         builder = builder.header(format!("x-amz-meta-{k}"), v.as_str());
     }
-    Ok(builder.body(Body::from(data)).unwrap())
+    builder
+}
+
+fn response_build_error(e: axum::http::Error) -> S3Error {
+    S3Error::InternalError(format!("response build: {e}"))
+}
+
+/// 缓冲体切片:先对账(体长 == 行 size,Content-Length 不说谎),再切窗口。
+fn apply_window(
+    data: Bytes,
+    meta: &ObjectMeta,
+    window: Option<ByteWindow>,
+) -> Result<Bytes, S3Error> {
+    if data.len() as u64 != meta.size {
+        return Err(S3Error::InternalError(format!(
+            "blob size {} != row size {} (bucket {}, key {})",
+            data.len(),
+            meta.size,
+            meta.bucket,
+            meta.key
+        )));
+    }
+    let Some(w) = window else { return Ok(data) };
+    let start = w.start as usize;
+    let end = start + w.len as usize;
+    if end > data.len() {
+        return Err(S3Error::InternalError(
+            "range window crosses past the object body (invariant broken)".into(),
+        ));
+    }
+    Ok(data.slice(start..end))
+}
+
+async fn get_plain_object(
+    st: &AppState,
+    meta: &ObjectMeta,
+    window: Option<ByteWindow>,
+) -> Result<Response, S3Error> {
+    let data = st.router.get(&meta.blob_id).await?;
+    let body = apply_window(data, meta, window)?;
+    let len = body.len() as u64;
+    object_read_builder(meta, false, len, window)
+        .body(Body::from(body))
+        .map_err(response_build_error)
 }
 
 async fn get_multipart_object(
     st: AppState,
     meta: &ObjectMeta,
     manifest_json: &str,
+    window: Option<ByteWindow>,
 ) -> Result<Response, S3Error> {
     let parts: Vec<ManifestPart> = serde_json::from_str(manifest_json)
         .map_err(|e| S3Error::InternalError(format!("corrupt manifest: {e}")))?;
-
-    let mut all_data = Vec::new();
-    for part in &parts {
-        let blob_id = antfs_blob::StoreKey::from_slice(&part.blob_id)
-            .ok_or_else(|| S3Error::InternalError("bad blob_id in manifest".into()))?;
-        let chunk = st.router.get(&blob_id).await?;
-        all_data.extend_from_slice(&chunk);
+    let total = manifest_total_size(&parts);
+    if total != meta.size {
+        return Err(S3Error::InternalError(format!(
+            "manifest parts total {total} != row size {} (bucket {}, key {})",
+            meta.size, meta.bucket, meta.key
+        )));
     }
-
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_LENGTH, meta.size.to_string())
-        .header(header::ETAG, format!("\"{}\"", meta.etag));
-    if let Some(ct) = &meta.content_type {
-        builder = builder.header(header::CONTENT_TYPE, ct.as_str());
-    }
-    for (k, v) in &meta.user_meta {
-        builder = builder.header(format!("x-amz-meta-{k}"), v.as_str());
-    }
-    Ok(builder.body(Body::from(all_data)).unwrap())
+    let effective = window.unwrap_or(ByteWindow {
+        start: 0,
+        len: total,
+    });
+    let covering = window_parts(&parts, effective)?;
+    let stream = PartStream::new(st, covering);
+    object_read_builder(meta, false, effective.len, window)
+        .body(Body::from_stream(stream))
+        .map_err(response_build_error)
 }
 
-/// SSE 对象读:blob = 帧 → 明文(解帧失败 = InternalError,响亮不吞)。配额/头
-/// 面与明文对象逐一同形(仅多回 `x-amz-server-side-encryption`)。
-async fn get_encrypted_object(st: &AppState, meta: &ObjectMeta) -> Result<Response, S3Error> {
+/// SSE 对象读:blob = 帧 → 明文(解帧失败 = InternalError,响亮不吞)。解密仍走
+/// 缓冲路径(单 blob ≤ `max_body_bytes` 不变量),窗口在明文上切片。
+async fn get_encrypted_object(
+    st: &AppState,
+    meta: &ObjectMeta,
+    window: Option<ByteWindow>,
+) -> Result<Response, S3Error> {
     let master = st.sse.as_ref().ok_or_else(|| {
         S3Error::InternalError(
             "row is encrypted but the gateway has no SSE master key configured".into(),
@@ -241,20 +324,11 @@ async fn get_encrypted_object(st: &AppState, meta: &ObjectMeta) -> Result<Respon
     }
     let frame = st.router.get(&meta.blob_id).await?;
     let plain = crate::sse::read_object_frame(master, frame.as_ref(), &descriptor.key_id)?;
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_LENGTH, meta.size.to_string())
-        .header(header::ETAG, format!("\"{}\"", meta.etag))
-        .header("x-amz-server-side-encryption", "AES256");
-    if let Some(ct) = &meta.content_type {
-        builder = builder.header(header::CONTENT_TYPE, ct.as_str());
-    }
-    for (k, v) in &meta.user_meta {
-        builder = builder.header(format!("x-amz-meta-{k}"), v.as_str());
-    }
-    builder
-        .body(Body::from(plain))
-        .map_err(|e| S3Error::InternalError(format!("response build: {e}")))
+    let body = apply_window(Bytes::from(plain), meta, window)?;
+    let len = body.len() as u64;
+    object_read_builder(meta, true, len, window)
+        .body(Body::from(body))
+        .map_err(response_build_error)
 }
 
 pub async fn head_object(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
@@ -266,6 +340,7 @@ pub async fn head_object(st: AppState, bucket: &str, key: &str) -> Result<Respon
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
+        .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, meta.size.to_string())
         .header(header::ETAG, format!("\"{}\"", meta.etag));
     if meta.sse.is_some() {
@@ -277,7 +352,7 @@ pub async fn head_object(st: AppState, bucket: &str, key: &str) -> Result<Respon
     for (k, v) in &meta.user_meta {
         builder = builder.header(format!("x-amz-meta-{k}"), v.as_str());
     }
-    Ok(builder.body(Body::empty()).unwrap())
+    builder.body(Body::empty()).map_err(response_build_error)
 }
 
 pub async fn delete_object(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
