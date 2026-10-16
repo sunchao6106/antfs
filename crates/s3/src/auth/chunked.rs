@@ -191,14 +191,18 @@ pub fn wrap_request(
     requests_total.inc();
     let inner = std::mem::replace(req.body_mut(), Body::empty());
     let flavor = info.flavor;
+    let sink: TrailerSink =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let decoder = AwsChunkedBody::new(
         inner,
         flavor,
         info.declared,
         info.sig,
+        sink.clone(),
         rejected_total.clone(),
     );
     *req.body_mut() = Body::new(decoder);
+    req.extensions_mut().insert(ChunkedTrailers(sink));
     Ok(req)
 }
 
@@ -239,6 +243,14 @@ enum DecodeState {
 
 /// 分帧解码体:`http_body::Body` 包装,`Error = S3Error`(解码错误即最终语义,
 /// handler 侧 `axum::Error::downcast::<S3Error>` 精确回放)。
+/// trailer 行收集器(名→值;名小写归一)。分帧 body 与写路径 handler 各持克隆,
+/// 经 `request extensions` 跨越所有权边界。
+pub type TrailerSink = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>;
+
+/// extensions 载体(body 消费完毕后,写路径从这里取 trailer 快照)。
+#[derive(Clone)]
+pub struct ChunkedTrailers(pub TrailerSink);
+
 pub struct AwsChunkedBody {
     inner: Body,
     flavor: ChunkFlavor,
@@ -257,6 +269,9 @@ pub struct AwsChunkedBody {
     failed: bool,
     state: DecodeState,
     trailer_bytes: usize,
+    /// trailer 段头行收集(写路径校验用);`wrap_request` 把同一 sink 挂进
+    /// request extensions,body 读完(EOF)后可读。
+    trailers: TrailerSink,
     rejected_total: IntCounterVec,
 }
 
@@ -266,6 +281,7 @@ impl AwsChunkedBody {
         flavor: ChunkFlavor,
         declared: u64,
         sig: Option<SigCtx>,
+        trailers: TrailerSink,
         rejected_total: IntCounterVec,
     ) -> Self {
         let (key, timestamp, scope, prev_sig) = match sig {
@@ -292,6 +308,7 @@ impl AwsChunkedBody {
             failed: false,
             state: DecodeState::Header,
             trailer_bytes: 0,
+            trailers,
             rejected_total,
         }
     }
@@ -552,7 +569,12 @@ impl HttpBody for AwsChunkedBody {
                                 invalid_argument("malformed trailer header line"),
                             );
                         }
-                        tracing::debug!(trailer = %line, "aws-chunked trailer header ignored");
+                        if let Some((name, value)) = line.split_once(':') {
+                            this.trailers
+                                .lock()
+                                .expect("trailer sink lock")
+                                .insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                        }
                         continue;
                     }
                     None => {
@@ -688,19 +710,13 @@ mod tests {
             ChunkFlavor::Signed,
             declared,
             Some(sig_ctx()),
+            empty_sink(),
             dummy_metrics(),
         )
     }
 
-    fn unsigned_trailer_body(data: &[u8], chunk_len: usize, declared: u64) -> AwsChunkedBody {
-        let inner = Body::from(encode_unsigned_trailer(data, chunk_len));
-        AwsChunkedBody::new(
-            inner,
-            ChunkFlavor::UnsignedTrailer,
-            declared,
-            None,
-            dummy_metrics(),
-        )
+    fn empty_sink() -> TrailerSink {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
     fn dummy_metrics() -> IntCounterVec {
@@ -811,8 +827,22 @@ mod tests {
     #[test]
     fn decodes_unsigned_trailer_body() {
         let data = b"opaque payload".repeat(10);
-        let body = unsigned_trailer_body(&data, 16, data.len() as u64);
+        let sink = empty_sink();
+        let inner = Body::from(encode_unsigned_trailer(&data, 16));
+        let body = AwsChunkedBody::new(
+            inner,
+            ChunkFlavor::UnsignedTrailer,
+            data.len() as u64,
+            None,
+            sink.clone(),
+            dummy_metrics(),
+        );
         assert_eq!(drain(body).unwrap().to_vec(), data.to_vec());
+        assert_eq!(
+            sink.lock().expect("sink lock").get("x-amz-checksum-crc32c"),
+            Some(&"AAAAAA==".to_string()),
+            "trailer 行收集进 sink(写路径校验承接)"
+        );
     }
 
     #[test]
@@ -831,6 +861,7 @@ mod tests {
             ChunkFlavor::Signed,
             data.len() as u64,
             Some(sig_ctx()),
+            empty_sink(),
             dummy_metrics(),
         );
         assert!(matches!(drain(body), Err(S3Error::SignatureDoesNotMatch)));
@@ -845,6 +876,7 @@ mod tests {
             ChunkFlavor::Signed,
             1,
             Some(sig_ctx()),
+            empty_sink(),
             dummy_metrics(),
         );
         let err = drain(body).unwrap_err();
@@ -862,6 +894,7 @@ mod tests {
             ChunkFlavor::Signed,
             data.len() as u64,
             Some(sig_ctx()),
+            empty_sink(),
             dummy_metrics(),
         );
         assert!(matches!(drain(body), Err(S3Error::IncompleteBody)));
@@ -878,6 +911,7 @@ mod tests {
             ChunkFlavor::Signed,
             data.len() as u64,
             Some(sig_ctx()),
+            empty_sink(),
             dummy_metrics(),
         );
         assert!(matches!(drain(body), Err(S3Error::InvalidArgument(_))));
@@ -893,6 +927,7 @@ mod tests {
             ChunkFlavor::UnsignedTrailer,
             data.len() as u64,
             None,
+            empty_sink(),
             dummy_metrics(),
         );
         let err = drain(body).unwrap_err();
@@ -909,6 +944,7 @@ mod tests {
             ChunkFlavor::Signed,
             data.len() as u64,
             Some(sig_ctx()),
+            empty_sink(),
             dummy_metrics(),
         );
         let err = drain(body).unwrap_err();
@@ -932,6 +968,7 @@ mod tests {
             ChunkFlavor::SignedTrailer,
             data.len() as u64,
             Some(sig_ctx()),
+            empty_sink(),
             dummy_metrics(),
         );
         assert_eq!(drain(body).unwrap().to_vec(), data.to_vec());

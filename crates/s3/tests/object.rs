@@ -1409,3 +1409,280 @@ async fn part_number_sse_object() {
         .await;
     assert_eq!(resp.status().as_u16(), 416, "single-part SSE has no part 2");
 }
+
+// ── flexible checksums(s3-checksums)──────────────────────────────────────────
+
+use antfs_s3::checksum::ChecksumAlgo;
+
+/// 四族回环:PUT 验证+回显、GET/HEAD 按 mode 回显、无 mode 无头。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn checksum_roundtrip_all_algos() {
+    let cases = [
+        (ChecksumAlgo::Crc32, "x-amz-checksum-crc32"),
+        (ChecksumAlgo::Crc32c, "x-amz-checksum-crc32c"),
+        (ChecksumAlgo::Sha1, "x-amz-checksum-sha1"),
+        (ChecksumAlgo::Sha256, "x-amz-checksum-sha256"),
+    ];
+    for (algo, hdr) in cases {
+        let fx = S3Fixture::start().await;
+        let bucket = fx.create_unique_bucket("cksum").await;
+        let key = "obj.bin";
+        let data = pseudo_random(512);
+        let value = algo.compute(&data);
+
+        let put = fx
+            .put_object_with_headers(&bucket, key, &data, &[(hdr, value.as_str())])
+            .await;
+        assert_eq!(put.status().as_u16(), 200, "PUT {hdr} must 200");
+        assert_eq!(header(&put, hdr), value, "PUT 辗转回显算出值");
+        assert_eq!(header(&put, "x-amz-checksum-type"), "FULL_OBJECT");
+
+        let mode = [("x-amz-checksum-mode", "ENABLED")];
+        let get = fx.get_object_with_headers(&bucket, key, &mode).await;
+        assert_eq!(get.status().as_u16(), 200);
+        assert_eq!(header(&get, hdr), value, "GET mode 回显行内值");
+        assert_eq!(header(&get, "x-amz-checksum-type"), "FULL_OBJECT");
+        assert!(get.bytes().await.expect("body").len() == 512);
+
+        let head = head_with(&fx, &bucket, key, &mode).await;
+        assert_eq!(head.status().as_u16(), 200);
+        assert_eq!(header(&head, hdr), value, "HEAD mode 回显");
+
+        let plain = fx.get_object(&bucket, key).await;
+        assert_eq!(plain.status().as_u16(), 200);
+        assert!(
+            !plain
+                .headers()
+                .keys()
+                .any(|k| k.as_str().starts_with("x-amz-checksum-")),
+            "无 mode 不回任何校验头"
+        );
+    }
+}
+
+/// 拒绝面:失配 400 BadDigest 零副作用 / 坏 base64 / 长度不符 / 未实现族 501 /
+/// checksum-type 非 FULL_OBJECT / mode 坏值。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn checksum_rejection_matrix() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("cksumbad").await;
+    let data = pseudo_random(256);
+
+    let wrong = ChecksumAlgo::Sha256.compute(b"other-data");
+    let resp = fx
+        .put_object_with_headers(
+            &bucket,
+            "mismatch.bin",
+            &data,
+            &[("x-amz-checksum-sha256", wrong.as_str())],
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 400, "mismatch must 400");
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("BadDigest"), "{body}");
+    let resp = fx.get_object(&bucket, "mismatch.bin").await;
+    assert_eq!(resp.status().as_u16(), 404, "failed write leaves nothing");
+
+    for value in ["not-base64!!", "0KDAqMDA="] {
+        let resp = fx
+            .put_object_with_headers(
+                &bucket,
+                "badval.bin",
+                &data,
+                &[("x-amz-checksum-crc32", value)],
+            )
+            .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "malformed Base64 `{value}` must 400"
+        );
+        let body = resp.text().await.expect("400 body");
+        assert!(body.contains("InvalidArgument"), "{body}");
+    }
+    // 合法 base64 但 digest 长度不符(8 字节 ≠ CRC32 的 4 字节)。
+    let len_mismatch = "0KDAqMDAwMDAwMDA=";
+    let resp = fx
+        .put_object_with_headers(
+            &bucket,
+            "badlen.bin",
+            &data,
+            &[("x-amz-checksum-crc32", len_mismatch)],
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 400, "length mismatch must 400");
+
+    let resp = fx
+        .put_object_with_headers(
+            &bucket,
+            "nvme.bin",
+            &data,
+            &[("x-amz-checksum-crc64nvme", "AAAAAA==")],
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 501, "crc64nvme is out of scope");
+    let body = resp.text().await.expect("501 body");
+    assert!(body.contains("crc64nvme"), "{body}");
+
+    let resp = fx
+        .put_object_with_headers(
+            &bucket,
+            "badtype.bin",
+            &data,
+            &[
+                (
+                    "x-amz-checksum-crc32",
+                    ChecksumAlgo::Crc32.compute(&data).as_str(),
+                ),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 400, "type must be FULL_OBJECT");
+
+    let put = fx.put_object(&bucket, "plain.bin", &data).await;
+    assert_eq!(put.status().as_u16(), 200);
+    let resp = fx
+        .get_object_with_headers(&bucket, "plain.bin", &[("x-amz-checksum-mode", "garbage")])
+        .await;
+    assert_eq!(resp.status().as_u16(), 400, "mode value must be ENABLED");
+}
+
+/// 多算法并存全验证、存最强;覆盖后回显消失。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn checksum_precedence_and_overwrite() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("ckprec").await;
+    let key = "both.bin";
+    let data = pseudo_random(128);
+
+    let extras_owned = [
+        ("x-amz-checksum-crc32", ChecksumAlgo::Crc32.compute(&data)),
+        ("x-amz-checksum-sha256", ChecksumAlgo::Sha256.compute(&data)),
+    ];
+    let extras: Vec<(&str, &str)> = extras_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let resp = fx
+        .put_object_with_headers(&bucket, key, &data, &extras)
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "both valid");
+    assert_eq!(header(&resp, "x-amz-checksum-sha256"), extras_owned[1].1);
+    assert!(
+        !resp.headers().contains_key("x-amz-checksum-crc32"),
+        "存一份最强"
+    );
+
+    let get = fx
+        .get_object_with_headers(&bucket, key, &[("x-amz-checksum-mode", "ENABLED")])
+        .await;
+    assert_eq!(header(&get, "x-amz-checksum-sha256"), extras_owned[1].1);
+    assert!(!get.headers().contains_key("x-amz-checksum-crc32"));
+
+    let overwrite = fx.put_object(&bucket, key, b"smaller").await;
+    assert_eq!(overwrite.status().as_u16(), 200);
+    let get = fx
+        .get_object_with_headers(&bucket, key, &[("x-amz-checksum-mode", "ENABLED")])
+        .await;
+    assert!(
+        !get.headers()
+            .keys()
+            .any(|k| k.as_str().starts_with("x-amz-checksum-")),
+        "无校验覆盖 → 行内校验翻空"
+    );
+}
+
+/// GetObjectAttributes 的 Checksum 面:有值双元素;无值省略;ObjectParts 501 维持。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn checksum_attributes_face() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("ckattr").await;
+    let data = pseudo_random(300);
+    let value = ChecksumAlgo::Sha1.compute(&data);
+    let put = fx
+        .put_object_with_headers(
+            &bucket,
+            "sha1.bin",
+            &data,
+            &[("x-amz-checksum-sha1", value.as_str())],
+        )
+        .await;
+    assert_eq!(put.status().as_u16(), 200);
+
+    let uri = format!("/{bucket}/sha1.bin?attributes");
+    let mut headers = fx.signed_headers("GET", &uri, b"");
+    headers.insert(
+        "x-amz-object-attributes",
+        "Checksum,ObjectSize".parse().expect("attrs value"),
+    );
+    let resp = fx
+        .send(reqwest::Method::GET, &uri, headers, Vec::new())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.expect("attributes body");
+    assert!(
+        body.contains(&format!(
+            "<Checksum><ChecksumSHA1>{value}</ChecksumSHA1><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>"
+        )),
+        "{body}"
+    );
+    assert!(body.contains("<ObjectSize>300</ObjectSize>"), "{body}");
+
+    let plain_put = fx.put_object(&bucket, "plain.bin", &data).await;
+    assert_eq!(plain_put.status().as_u16(), 200);
+    let uri = format!("/{bucket}/plain.bin?attributes");
+    let mut headers = fx.signed_headers("GET", &uri, b"");
+    headers.insert(
+        "x-amz-object-attributes",
+        "Checksum".parse().expect("attrs value"),
+    );
+    let resp = fx
+        .send(reqwest::Method::GET, &uri, headers, Vec::new())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.expect("attributes body");
+    assert!(
+        !body.contains("<Checksum"),
+        "no value → element omitted: {body}"
+    );
+
+    let uri = format!("/{bucket}/plain.bin?attributes");
+    let mut headers = fx.signed_headers("GET", &uri, b"");
+    headers.insert(
+        "x-amz-object-attributes",
+        "ObjectParts".parse().expect("attrs value"),
+    );
+    let resp = fx
+        .send(reqwest::Method::GET, &uri, headers, Vec::new())
+        .await;
+    assert_eq!(resp.status().as_u16(), 501, "ObjectParts stays 501");
+}
+
+/// SSE 对象:校验按明文算/存/回显。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn checksum_sse_plaintext_face() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("cksse").await;
+    let data = pseudo_random(77);
+    let value = ChecksumAlgo::Crc32c.compute(&data);
+    let extras = [
+        ("x-amz-server-side-encryption", "AES256"),
+        ("x-amz-checksum-crc32c", value.as_str()),
+    ];
+    let put = fx
+        .put_object_with_headers(&bucket, "enc.bin", &data, &extras)
+        .await;
+    assert_eq!(put.status().as_u16(), 200, "SSE PUT with checksum");
+    assert_eq!(header(&put, "x-amz-checksum-crc32c"), value);
+
+    let get = fx
+        .get_object_with_headers(&bucket, "enc.bin", &[("x-amz-checksum-mode", "ENABLED")])
+        .await;
+    assert_eq!(get.status().as_u16(), 200);
+    assert_eq!(header(&get, "x-amz-checksum-crc32c"), value, "明文口径回显");
+    assert_eq!(header(&get, "x-amz-server-side-encryption"), "AES256");
+    assert_eq!(get.bytes().await.expect("解码体").to_vec(), data);
+}

@@ -9,8 +9,9 @@
 mod common;
 
 use common::{
-    aws_chunked_unsigned_trailer_body, header, md5_hex, pseudo_random, xml_tag, S3Fixture,
-    STREAMING_UNSIGNED_TRAILER,
+    aws_chunked_unsigned_frame_without_trailer, aws_chunked_unsigned_trailer_body,
+    aws_chunked_unsigned_trailer_body_with_value, header, md5_hex, pseudo_random, xml_tag,
+    S3Fixture, STREAMING_UNSIGNED_TRAILER,
 };
 use reqwest::Method;
 
@@ -107,8 +108,9 @@ async fn chunked_upload_part_roundtrip() {
     assert_eq!(body.as_ref(), expected.as_slice());
 }
 
-/// Unsigned trailer flavor: framing decodes, the trailing checksum header is
-/// tolerated unverified (declared behavior, trust = UNSIGNED-PAYLOAD).
+/// Unsigned trailer flavor with a **real** crc32c value: framing decodes, the
+/// trailer checksum is collected and verified against the decoded body, and
+/// the persisted checksum echoes on mode-enabled reads (s3-checksums).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn unsigned_trailer_put_roundtrip() {
@@ -116,6 +118,7 @@ async fn unsigned_trailer_put_roundtrip() {
     let bucket = fx.create_unique_bucket("chunktrailer").await;
     let key = "opaque.bin";
     let data = pseudo_random(20_007);
+    let value = antfs_s3::checksum::ChecksumAlgo::Crc32c.compute(&data);
 
     let framed = aws_chunked_unsigned_trailer_body(&data, 8_192);
     let resp = fx
@@ -129,11 +132,109 @@ async fn unsigned_trailer_put_roundtrip() {
         .await;
     assert_eq!(resp.status().as_u16(), 200, "unsigned trailer PUT must 200");
     assert_eq!(header(&resp, "etag"), format!("\"{}\"", md5_hex(&data)));
+    assert_eq!(
+        header(&resp, "x-amz-checksum-crc32c"),
+        value,
+        "写路径回显验过的 trailer 值"
+    );
+    assert_eq!(header(&resp, "x-amz-checksum-type"), "FULL_OBJECT");
 
     let get = fx.get_object(&bucket, key).await;
     assert_eq!(get.status().as_u16(), 200);
     let body = get.bytes().await.expect("get body");
     assert_eq!(body.as_ref(), data.as_slice());
+
+    let get = fx
+        .get_object_with_headers(&bucket, key, &[("x-amz-checksum-mode", "ENABLED")])
+        .await;
+    assert_eq!(
+        header(&get, "x-amz-checksum-crc32c"),
+        value,
+        "trailer 载体落行后同样回显"
+    );
+}
+
+/// Trailer 值错:BadDigest 400,零写。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn trailer_wrong_value_is_rejected() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("chunkbad").await;
+    let key = "wrong.bin";
+    let data = pseudo_random(5_120);
+
+    let framed = aws_chunked_unsigned_trailer_body_with_value(&data, 2_048, "AAAAAA==");
+    let resp = fx
+        .put_object_chunked_raw(
+            &bucket,
+            key,
+            STREAMING_UNSIGNED_TRAILER,
+            data.len() as u64,
+            framed,
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 400, "wrong trailer value must 400");
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("BadDigest"), "{body}");
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 404, "failed write leaves nothing");
+}
+
+/// `x-amz-trailer` 声明了校验头但帧尾未到:400。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn trailer_declared_but_missing_is_rejected() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("chunkmiss").await;
+    let key = "missing.bin";
+    let data = pseudo_random(4_096);
+
+    let framed = aws_chunked_unsigned_frame_without_trailer(&data, 2_048);
+    let mut headers = fx.streaming_headers(
+        "PUT",
+        &format!("/{bucket}/{key}"),
+        STREAMING_UNSIGNED_TRAILER,
+        data.len() as u64,
+    );
+    headers.insert(
+        "x-amz-trailer",
+        "x-amz-checksum-crc32c".parse().expect("trailer header"),
+    );
+    let uri = format!("/{bucket}/{key}");
+    let resp = fx.send(Method::PUT, &uri, headers, framed).await;
+    assert_eq!(resp.status().as_u16(), 400, "declared-but-missing must 400");
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("InvalidArgument"), "{body}");
+}
+
+/// 同算法「显式头 + trailer」双载体:400。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn trailer_and_header_dual_carrier_is_rejected() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("chunkdual").await;
+    let key = "dual.bin";
+    let data = pseudo_random(4_096);
+    let value = antfs_s3::checksum::ChecksumAlgo::Crc32c.compute(&data);
+
+    let framed = aws_chunked_unsigned_trailer_body(&data, 2_048);
+    let mut headers = fx.streaming_headers(
+        "PUT",
+        &format!("/{bucket}/{key}"),
+        STREAMING_UNSIGNED_TRAILER,
+        data.len() as u64,
+    );
+    headers.insert(
+        "x-amz-checksum-crc32c",
+        value.parse().expect("checksum header value"),
+    );
+    let uri = format!("/{bucket}/{key}");
+    let resp = fx.send(Method::PUT, &uri, headers, framed).await;
+    assert_eq!(resp.status().as_u16(), 400, "dual carrier must 400");
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("InvalidArgument"), "{body}");
+    let resp = fx.get_object(&bucket, key).await;
+    assert_eq!(resp.status().as_u16(), 404);
 }
 
 /// One flipped chunk-signature byte: 403, and the object never lands (404).

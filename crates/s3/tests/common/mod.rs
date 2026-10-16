@@ -971,7 +971,7 @@ impl S3Fixture {
 
     // ── aws-chunked framed PUT / UploadPart(s3-chunked-payload e2e)────────────────
 
-    fn streaming_headers(
+    pub fn streaming_headers(
         &self,
         method: &str,
         uri: &str,
@@ -1239,13 +1239,36 @@ pub fn aws_chunked_signed_body(
 /// Encode `data` as an unsigned trailer-flavored frame stream; the trailing
 /// checksum header is sent but not verified by the gateway (checksums are a
 /// separate feature; absence of verification is declared behavior).
+/// UNSIGNED-TRAILER 分帧体,trailer 携带**真实** crc32c 值(写路径会验证)。
 pub fn aws_chunked_unsigned_trailer_body(data: &[u8], chunk_len: usize) -> Vec<u8> {
+    let value = antfs_s3::checksum::ChecksumAlgo::Crc32c.compute(data);
+    aws_chunked_unsigned_trailer_body_with_value(data, chunk_len, &value)
+}
+
+/// 同型分帧体,trailer 值可指定(负例:错值)。
+pub fn aws_chunked_unsigned_trailer_body_with_value(
+    data: &[u8],
+    chunk_len: usize,
+    value: &str,
+) -> Vec<u8> {
     let mut out = Vec::new();
     for piece in data.chunks(chunk_len.max(1)) {
         out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
         out.extend_from_slice(piece);
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b"0\r\nx-amz-checksum-crc32c:AAAAAA==\r\n\r\n");
+    out.extend_from_slice(format!("0\r\nx-amz-checksum-crc32c:{value}\r\n\r\n").as_bytes());
+    out
+}
+
+/// 数据块收尾即止,不带 trailer 段(负例:声明了 trailer 却未到)。
+pub fn aws_chunked_unsigned_frame_without_trailer(data: &[u8], chunk_len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for piece in data.chunks(chunk_len.max(1)) {
+        out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        out.extend_from_slice(piece);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\n\r\n");
     out
 }

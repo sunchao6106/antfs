@@ -1,0 +1,2 @@
+ALTER TABLE named_objects ADD COLUMN IF NOT EXISTS checksum_algo VARCHAR(8) NULL;
+ALTER TABLE named_objects ADD COLUMN IF NOT EXISTS checksum_b64 VARCHAR(64) NULL;

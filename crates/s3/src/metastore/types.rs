@@ -17,6 +17,36 @@ pub struct PutObjectMeta {
     pub parts_manifest: Option<String>,
     /// `s3-sse` 描述符(JSON `{"alg","key_id"}`);None = 明文(历史行 NULL 列同此)。
     pub sse: Option<String>,
+    /// flexible checksum(`s3-checksums`):最强一份(算法+base64 值,明文口径);
+    /// None = 未随写声明(multipart 装配行/拷贝产物/历史行同此)。
+    pub checksum: Option<StoredChecksum>,
+}
+
+/// 行内持久化的 flexible checksum(migration 005 两可空列的读侧形态)。
+#[derive(Debug, Clone)]
+pub struct StoredChecksum {
+    pub algo: crate::checksum::ChecksumAlgo,
+    pub value: String,
+}
+
+impl StoredChecksum {
+    /// 双可空列 → 形态(半行 = 脏数据,按无值处理并告警,不 500:回显缺省属
+    /// 优雅降级,读写路径都不该被历史半写打穿)。
+    pub fn from_pair(algo: Option<String>, value: Option<String>) -> Option<Self> {
+        match (algo, value) {
+            (Some(a), Some(v)) => {
+                let algo = crate::checksum::ChecksumAlgo::from_algo_name(&a)?;
+                Some(StoredChecksum { algo, value: v })
+            }
+            (None, None) => None,
+            _ => {
+                tracing::warn!(
+                    "named_objects row has half-written checksum columns, treating as absent"
+                );
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +77,8 @@ pub struct ObjectMeta {
     pub parts_manifest: Option<String>,
     /// `s3-sse` 描述符;Some → blob 为 SSE 帧(读侧须解帧),None = 明文。
     pub sse: Option<String>,
+    /// 行内 flexible checksum(None → 回显面缺省)。
+    pub checksum: Option<StoredChecksum>,
 }
 
 #[derive(Debug, Clone)]

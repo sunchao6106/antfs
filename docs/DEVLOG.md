@@ -1594,3 +1594,54 @@ spec 已 SHALL 的 Last-Modified 实码不发。
 s3-core Get/HeadObject 全文强化、s3-list 新增 V1 + location 两要求);docs 同步
 (s3.md 操作映射 +3 行、矩阵 2 行升级、新节「条件读与读兼容面」、后续方向;
 design README 路线档 1 ✅)。
+
+---
+
+## 步骤 65:s3-checksums —— flexible checksums(四族校验 + trailer 承接 + 三面回显)
+
+**日期**:2026-10-16 · **change**:`s3-checksums`(阶段二优化路线档 2)
+
+**动机**:写读完整性缺口三件——PUT/UploadPart 对 `x-amz-checksum-*` 零消费(AWS
+新 SDK 默认携带,坏数据不知觉落放);分帧 trailer 校验值「已解析未验证」(
+s3-chunked-payload 归档明记);GetObjectAttributes 的 `Checksum` 挂 501 招牌。
+
+**落地**:
+- `checksum.rs`(新模块):四族 registry(CRC32/CRC32C/SHA1/SHA256,标准 base64)
+  + 收集(显式头 ∪ trailer;未知同族头 crc64nvme → 501)+ 双裁体互斥/声明未到
+  400 + 常数时间比对(失配 → 新变体 `BadDigest` 400,报文点名裁体)。
+- `chunked.rs`:`TrailerSink`(Arc<Mutex<HashMap>>)——decoder trailer 行解析处
+  收集(替换原丢弃点),`wrap_request` 经 extensions(`ChunkedTrailers` newtype)
+  上抛;body 读完(EOF)后写路径消费。
+- metastore:migration 005(PG `ADD COLUMN IF NOT EXISTS` / MySQL 直 ADD)两可空
+  列 `checksum_algo`/`checksum_b64`;`PutObjectMeta`/`ObjectMeta` 增
+  `checksum: Option<StoredChecksum>`;pg/mysql INSERT/SELECT/Row 映射同步;
+  半写行按缺省宽容(warn 不 500)。
+- `put_object`/`upload_part`:读 body 前取出 sink → 读后收集验证(**先于任何
+  blob 写,失败零孤儿**)→ 存最强一份(SHA256>SHA1>CRC32C>CRC32;全验)→ PUT
+  响应回显;part 只验证回显不持久。
+- GET/HEAD:`x-amz-checksum-mode: ENABLED`(其他值 400)回显双头(200/206;
+  304/412 不回);GetObjectAttributes `Checksum` 四属位开(有值双元素,无值省略)。
+
+**裁决要点**(change design.md D1–D8):trailer 信任面翻案范围 = **值**(块签名
+链/SIGNED-TRAILER trailer 段不签名的规格维持);SSE 校验按**明文**算存(与
+size/etag 明文口径同源);CRC64NVME 显式 501(不做静默 400);拷贝产物与
+multipart 装配行不带校验(记档不做面,后续档可补);依赖 crc32fast/crc32c/
+sha1/base64 零自研 CRC。
+
+**验证**:
+- 单测 +14(checksum.rs 五件:公开向量/优先级/收集矩阵/拒绝矩阵/mode 门;
+  chunked.rs sink 断言;xml.rs attributes 断言):s3 lib **95 绿**。
+- e2e 新 9 测:object +5(四族回环/拒绝矩阵/优先级+覆盖/attributes 面/SSE 明文),
+  chunked +3(trailer 真值回环+持久回显/错值 400 零写/声明未到 400/双裁体 400),
+  multipart +1(part 验证回环+装配行缺省);既有 copy
+  `object_attributes_boundaries` 断言按新语义更新(Checksum 开面,200 无值省略)。
+- **双言全量 e2e 各 85/85**(本机真 PG + MySQL 8.4,`--ignored --test-threads=1`):
+  76 存量零回归 + 9 新增。
+- workspace `cargo test` 72 套件绿;clippy 0 告警;fmt 干净;`openspec validate`
+  12/12。
+
+**发运**:归档 `openspec/changes/archive/2026-10-16-s3-checksums/`——s3-core
+(PutObject 全强化/attributes/新增 checksum-read 要求)、s3-auth(decoded-length
+accounting)、s3-multipart(UploadPart)、s3-metastore(+checksum 持久化)四方
+delta 合并;docs 同步(s3.md 操作映射 2 行/矩阵 3 行/新节「灵活校验」/流式分帧
+与属性节语义更新/后续方向;design README 路线档 2 ✅)。

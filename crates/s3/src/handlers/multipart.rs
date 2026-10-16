@@ -43,7 +43,28 @@ pub async fn upload_part(
             "multipart parts do not support server-side encryption this round".into(),
         ));
     }
+    let header_claims = crate::checksum::collect_claim_headers(req.headers())?;
+    let declared_trailer = req
+        .headers()
+        .get("x-amz-trailer")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let trailer_sink = req
+        .extensions()
+        .get::<crate::auth::chunked::ChunkedTrailers>()
+        .cloned();
     let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
+
+    // 与 PutObject 同一条验证管(part 不持久化校验,只验证+回显)。
+    let trailer_claims = trailer_sink
+        .map(|wrapper| wrapper.0.lock().expect("trailer sink lock").clone())
+        .unwrap_or_default();
+    let claims = crate::checksum::merge_trailer_claims(
+        header_claims,
+        &trailer_claims,
+        declared_trailer.as_deref(),
+    )?;
+    let best_claim = crate::checksum::verify_claims(&claims, &body_bytes)?;
 
     let etag = {
         use md5::{Digest, Md5};
@@ -73,7 +94,22 @@ pub async fn upload_part(
         let _ = st.router.delete(&old).await;
     }
 
-    Ok((StatusCode::OK, [(header::ETAG, format!("\"{etag}\""))], "").into_response())
+    let mut response =
+        (StatusCode::OK, [(header::ETAG, format!("\"{etag}\""))], "").into_response();
+    if let Some(claim) = best_claim {
+        response.headers_mut().insert(
+            claim.algo.lower_name(),
+            claim
+                .value
+                .parse()
+                .map_err(|_| S3Error::InternalError("checksum header".into()))?,
+        );
+        response.headers_mut().insert(
+            "x-amz-checksum-type",
+            "FULL_OBJECT".parse().expect("static header value"),
+        );
+    }
+    Ok(response)
 }
 
 pub async fn complete_multipart_upload(

@@ -31,6 +31,10 @@ impl MysqlMetaStore {
 #[async_trait]
 impl MetaStore for MysqlMetaStore {
     async fn put_object(&self, req: PutObjectMeta) -> Result<PutObjectOutcome> {
+        let (stored_algo_string, stored_value) = match &req.checksum {
+            Some(c) => (Some(c.algo.algo_name().to_string()), Some(c.value.clone())),
+            None => (None, None),
+        };
         let version = Self::gen_version();
         let now = Self::now_ms();
         let meta_json = if req.user_meta.is_empty() {
@@ -100,8 +104,8 @@ impl MetaStore for MysqlMetaStore {
         .await?;
 
         sqlx::query(
-            "INSERT INTO named_objects (bucket, `key`, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest, sse)
-             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO named_objects (bucket, `key`, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64)
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&req.bucket)
         .bind(&req.key)
@@ -114,6 +118,8 @@ impl MetaStore for MysqlMetaStore {
         .bind(&meta_json)
         .bind(&req.parts_manifest)
         .bind(&req.sse)
+        .bind(stored_algo_string.as_deref())
+        .bind(stored_value.as_deref())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -129,7 +135,7 @@ impl MetaStore for MysqlMetaStore {
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let row: Option<MysqlObjectRow> = sqlx::query_as(
-            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse
+            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64
              FROM named_objects
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL
              ORDER BY version DESC LIMIT 1",
@@ -570,6 +576,7 @@ impl MetaStore for MysqlMetaStore {
             user_meta,
             parts_manifest: Some(manifest_json.clone()),
             sse: None,
+            checksum: None,
         };
         // put_object 自持事务(objects/buckets 行)与本会话锁互不相交、加锁单向
         // (会话锁 ↔ 对象行,无环),无死锁;会话锁握过整个 put_object 窗口,期间新的
@@ -855,6 +862,8 @@ struct MysqlObjectRow {
     user_meta: Option<String>,
     parts_manifest: Option<String>,
     sse: Option<String>,
+    checksum_algo: Option<String>,
+    checksum_b64: Option<String>,
 }
 
 impl MysqlObjectRow {
@@ -876,6 +885,7 @@ impl MysqlObjectRow {
             user_meta,
             parts_manifest: self.parts_manifest,
             sse: self.sse,
+            checksum: StoredChecksum::from_pair(self.checksum_algo, self.checksum_b64),
         }
     }
 }
@@ -931,6 +941,7 @@ mod tests {
             user_meta: user_meta.clone(),
             parts_manifest: None,
             sse: None,
+            checksum: None,
         };
         let _ver = store.put_object(req).await.unwrap();
         let got = store.get_object(&bucket, &key).await.unwrap();
@@ -979,6 +990,7 @@ mod tests {
             user_meta: UserMeta::default(),
             parts_manifest: None,
             sse: None,
+            checksum: None,
         };
         store.put_object(req1).await.unwrap();
         let req2 = PutObjectMeta {
@@ -991,6 +1003,7 @@ mod tests {
             user_meta: UserMeta::default(),
             parts_manifest: None,
             sse: None,
+            checksum: None,
         };
         store.put_object(req2).await.unwrap();
         let got = store.get_object(&bucket, &key).await.unwrap().unwrap();
@@ -1019,6 +1032,7 @@ mod tests {
             user_meta: UserMeta::default(),
             parts_manifest: None,
             sse: None,
+            checksum: None,
         };
         store.put_object(req).await.unwrap();
         let del = store.delete_object(&bucket, &key).await.unwrap();
@@ -1061,6 +1075,7 @@ mod tests {
                 user_meta: UserMeta::default(),
                 sse: None,
                 parts_manifest: None,
+                checksum: None,
             };
             store.put_object(req).await.unwrap();
         }
@@ -1101,6 +1116,7 @@ mod tests {
                 user_meta: UserMeta::default(),
                 sse: None,
                 parts_manifest: None,
+                checksum: None,
             };
             store.put_object(req).await.unwrap();
         }
@@ -1142,6 +1158,7 @@ mod tests {
                 user_meta: UserMeta::default(),
                 sse: None,
                 parts_manifest: None,
+                checksum: None,
             };
             store.put_object(req).await.unwrap();
         }
@@ -1180,6 +1197,7 @@ mod tests {
                 user_meta: UserMeta::default(),
                 sse: None,
                 parts_manifest: None,
+                checksum: None,
             };
             store.put_object(req).await.unwrap();
         }
@@ -1285,6 +1303,7 @@ mod tests {
             user_meta: UserMeta::default(),
             parts_manifest: None,
             sse: None,
+            checksum: None,
         };
         store.put_object(req).await.unwrap();
         let res = store.delete_bucket(&bucket).await;

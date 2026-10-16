@@ -77,17 +77,17 @@ For the two chunk-signed flavors (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and `...-
 - **THEN** the gateway returns `SignatureDoesNotMatch` (403) and a subsequent GET of the key returns `NoSuchKey` (404)
 
 ### Requirement: decoded-length accounting
-For framed bodies the gateway SHALL account the length against `x-amz-decoded-content-length` (not the wire `Content-Length`), reject truncation and mismatch with `IncompleteBody` (400), and capture unknown framing garbage as `InvalidArgument` (400). Trailer-section checksum values (e.g. `x-amz-checksum-crc32c`) SHALL be parsed and tolerated without verification (trust level equal to `UNSIGNED-PAYLOAD`).
+For framed bodies the gateway SHALL account the length against `x-amz-decoded-content-length` (not the wire `Content-Length`), reject truncation and mismatch with `IncompleteBody` (400), and capture unknown framing garbage as `InvalidArgument` (400). Trailer-section header lines SHALL be parsed and collected into a per-request trailer collector surfaced with the request (request extensions) so writer handlers can **verify** declared checksum values after the body is consumed (previously tolerated without verification); trailer lines themselves remain unsigned in the SIGNED-TRAILER flavor (the chunk-signature chain covers data chunks only, unchanged). A request whose `x-amz-trailer` header declares a checksum form that never arrives SHALL fail with `InvalidArgument` (400) at the writer.
 
-#### Scenario: Declared length does not match decoded bytes
-- **WHEN** the decoded plaintext length differs from the declared decoded length
-- **THEN** the gateway returns `IncompleteBody` (400) and nothing is stored
+#### Scenario: Trailer checksum value is surfaced for verification
+- **WHEN** an `aws-chunked` UNSIGNED-TRAILER PUT declares `x-amz-trailer: x-amz-checksum-crc32` and streams the correct trailer value
+- **THEN** the writer verifies it against the decoded body and stores the object (200)
 
-#### Scenario: Unsigned-trailer flavor accepted
-- **WHEN** a PUT uses `STREAMING-UNSIGNED-PAYLOAD-TRAILER` framing with a trailing checksum header
-- **THEN** the object is stored from the decoded plaintext and the checksum value is not verified (reported as ignored)
+#### Scenario: Declared trailer checksum never arrives
+- **WHEN** `x-amz-trailer` declares a checksum form and the frame ends without that trailer line
+- **THEN** the write fails with `InvalidArgument` (400) and nothing is stored
 
-#### Scenario: Chunked upload part
-- **WHEN** `UploadPart` submits its part body in `aws-chunked` framing
-- **THEN** the part is decoded and verified by the same rules and the upload proceeds
+#### Scenario: Wrong trailer checksum rejected
+- **WHEN** the streamed trailer carries a checksum value that does not match the decoded body
+- **THEN** the write fails with `BadDigest` (400) and nothing is stored
 

@@ -538,9 +538,17 @@ async fn object_attributes_boundaries() {
         "Checksum,ObjectSize".parse().expect("attrs"),
     );
     let resp = fx.send(Method::GET, &uri, headers, Vec::new()).await;
-    assert_eq!(resp.status().as_u16(), 501, "Checksum is explicitly out");
-    let xml = resp.text().await.expect("501 body");
-    assert!(xml.contains("<Code>NotImplemented</Code>"), "{xml}");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "Checksum is in the requested set (s3-checksums; no persisted value on this object)"
+    );
+    let xml = resp.text().await.expect("attributes body");
+    assert!(
+        !xml.contains("<Checksum"),
+        "no value → element omitted: {xml}"
+    );
+    assert!(xml.contains("<ObjectSize>1</ObjectSize>"), "{xml}");
 
     let mut headers = fx.signed_headers("GET", &uri, b"");
     headers.insert("x-amz-object-attributes", "Bogus".parse().expect("attrs"));

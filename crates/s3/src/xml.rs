@@ -191,11 +191,13 @@ pub fn serialize_copy_object_result(etag: &str, last_modified_ms: i64) -> String
     )
 }
 
-/// `GET ?attributes` 的应答选集(仅请求∩支持才出项;ETag 体式裸值)。
+/// `GET ?attributes` 的应答选集(仅请求∩支持才出项;ETag 体式裸值)。`checksum`
+/// = (算法 XML 元素名, base64 值):行内有持久校验且被请求时出 `Checksum` 双元素。
 pub struct ObjectAttributesOut {
     pub etag: Option<String>,
     pub object_size: Option<u64>,
     pub storage_class: bool,
+    pub checksum: Option<(String, String)>,
 }
 
 pub fn serialize_object_attributes(out: &ObjectAttributesOut) -> String {
@@ -205,6 +207,13 @@ pub fn serialize_object_attributes(out: &ObjectAttributesOut) -> String {
     );
     if let Some(etag) = &out.etag {
         xml.push_str(&format!("<ETag>{}</ETag>", quick_xml::escape::escape(etag)));
+    }
+    if let Some((algo, value)) = &out.checksum {
+        xml.push_str(&format!(
+            "<Checksum><Checksum{algo}>{}</Checksum{algo}>\
+             <ChecksumType>FULL_OBJECT</ChecksumType></Checksum>",
+            quick_xml::escape::escape(value)
+        ));
     }
     if let Some(size) = out.object_size {
         xml.push_str(&format!("<ObjectSize>{size}</ObjectSize>"));
@@ -793,8 +802,12 @@ mod tests {
             etag: Some("deadbee".into()),
             object_size: Some(42),
             storage_class: true,
+            checksum: Some(("SHA256".into(), "QXBydWxl".into())),
         };
         let xml = serialize_object_attributes(&out);
+        assert!(xml.contains(
+            "<Checksum><ChecksumSHA256>QXBydWxl</ChecksumSHA256><ChecksumType>FULL_OBJECT</ChecksumType></Checksum>"
+        ));
         assert!(xml.contains("<ETag>deadbee</ETag>"));
         assert!(xml.contains("<ObjectSize>42</ObjectSize>"));
         assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
@@ -803,6 +816,7 @@ mod tests {
             etag: None,
             object_size: Some(7),
             storage_class: false,
+            checksum: None,
         };
         let xml = serialize_object_attributes(&sparse);
         assert!(!xml.contains("<ETag>"));

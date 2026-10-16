@@ -39,6 +39,10 @@ pub enum S3Error {
         requested: String,
         actual_size: u64,
     },
+    /// `x-amz-checksum-*`(头或 trailer)与网关对明文的计算值失配(400,报文点名载体)。
+    BadDigest {
+        checksum_form: String,
+    },
 }
 
 impl S3Error {
@@ -69,6 +73,7 @@ impl S3Error {
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NotImplemented(_) => "NotImplemented",
             Self::InvalidRange { .. } => "InvalidRange",
+            Self::BadDigest { .. } => "BadDigest",
         }
     }
 
@@ -83,6 +88,7 @@ impl S3Error {
             Self::MalformedXML(_) | Self::MissingContentLength => StatusCode::BAD_REQUEST,
             Self::IncompleteBody => StatusCode::BAD_REQUEST,
             Self::MetadataTooLarge | Self::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+            Self::BadDigest { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
@@ -165,6 +171,9 @@ impl S3Error {
             }
             Self::InvalidRange { requested, actual_size } => format!(
                 "The requested range is not satisfiable (requested: {requested}, actual object size: {actual_size} bytes)."
+            ),
+            Self::BadDigest { checksum_form } => format!(
+                "The {checksum_form} value you specified did not match the calculated checksum."
             ),
         }
     }

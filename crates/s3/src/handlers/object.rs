@@ -10,6 +10,7 @@ use super::range::{
     intersect_windows, manifest_part_window, manifest_total_size, parse_range, window_parts,
     ByteWindow, PartStream, RangeOutcome,
 };
+use crate::checksum::checksum_mode_enabled;
 use crate::error::S3Error;
 use crate::metastore::types::*;
 use crate::server::AppState;
@@ -63,8 +64,34 @@ pub async fn put_object(
 ) -> Result<Response, S3Error> {
     let (content_type, user_meta) = capture_object_meta(req.headers())?;
     let sse_requested = parse_sse_request_header(req.headers(), &st.sse)?;
+    let header_claims = crate::checksum::collect_claim_headers(req.headers())?;
+    let declared_trailer = req
+        .headers()
+        .get("x-amz-trailer")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let trailer_sink = req
+        .extensions()
+        .get::<crate::auth::chunked::ChunkedTrailers>()
+        .cloned();
 
     let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
+
+    // checksum 收集/验证:分帧 trailer 在 body EOF 后才齐;sink 为空(非分帧请求)
+    // 时只是无补充面。验证先于任何 blob 写 → 失败零孤儿(blob/行/墓碑)。
+    let trailer_claims = trailer_sink
+        .map(|wrapper| wrapper.0.lock().expect("trailer sink lock").clone())
+        .unwrap_or_default();
+    let claims = crate::checksum::merge_trailer_claims(
+        header_claims,
+        &trailer_claims,
+        declared_trailer.as_deref(),
+    )?;
+    let stored_checksum =
+        crate::checksum::verify_claims(&claims, &body_bytes)?.map(|claim| StoredChecksum {
+            algo: claim.algo,
+            value: claim.value,
+        });
 
     let etag = {
         use md5::{Digest, Md5};
@@ -106,6 +133,7 @@ pub async fn put_object(
             user_meta,
             parts_manifest: None,
             sse: put_sse,
+            checksum: stored_checksum.clone(),
         })
         .await
     {
@@ -139,6 +167,18 @@ pub async fn put_object(
             "AES256".parse().expect("static header value"),
         );
         let _ = master;
+    }
+    if let Some(c) = &stored_checksum {
+        response.headers_mut().insert(
+            c.algo.lower_name(),
+            c.value
+                .parse()
+                .map_err(|_| S3Error::InternalError("checksum header".into()))?,
+        );
+        response.headers_mut().insert(
+            "x-amz-checksum-type",
+            "FULL_OBJECT".parse().expect("static header value"),
+        );
     }
     Ok(response)
 }
@@ -217,13 +257,18 @@ pub async fn get_object(
         if_range_ok,
     )?;
 
+    let echo_checksum = if checksum_mode_enabled(headers)? {
+        meta.checksum.as_ref()
+    } else {
+        None
+    };
     if meta.sse.is_some() {
-        return get_encrypted_object(&st, &meta, window).await;
+        return get_encrypted_object(&st, &meta, window, echo_checksum).await;
     }
     if let Some(ps) = &parts {
-        return get_multipart_object(st, &meta, ps, window).await;
+        return get_multipart_object(st, &meta, ps, window, echo_checksum).await;
     }
-    get_plain_object(&st, &meta, window).await
+    get_plain_object(&st, &meta, window, echo_checksum).await
 }
 
 /// GET 读响应头装配(三路径共用):恒回 `Accept-Ranges: bytes`,窗口 → 206 +
@@ -233,6 +278,7 @@ fn object_read_builder(
     sse: bool,
     body_len: u64,
     window: Option<ByteWindow>,
+    echo_checksum: Option<&StoredChecksum>,
 ) -> axum::http::response::Builder {
     let status = if window.is_some() {
         StatusCode::PARTIAL_CONTENT
@@ -250,6 +296,11 @@ fn object_read_builder(
     }
     if let Some(w) = window {
         builder = builder.header(header::CONTENT_RANGE, w.content_range(meta.size));
+    }
+    if let Some(c) = echo_checksum {
+        builder = builder
+            .header(c.algo.lower_name(), c.value.as_str())
+            .header("x-amz-checksum-type", "FULL_OBJECT");
     }
     if let Some(ct) = &meta.content_type {
         builder = builder.header(header::CONTENT_TYPE, ct.as_str());
@@ -372,11 +423,12 @@ async fn get_plain_object(
     st: &AppState,
     meta: &ObjectMeta,
     window: Option<ByteWindow>,
+    echo_checksum: Option<&StoredChecksum>,
 ) -> Result<Response, S3Error> {
     let data = st.router.get(&meta.blob_id).await?;
     let body = apply_window(data, meta, window)?;
     let len = body.len() as u64;
-    object_read_builder(meta, false, len, window)
+    object_read_builder(meta, false, len, window, echo_checksum)
         .body(Body::from(body))
         .map_err(response_build_error)
 }
@@ -386,6 +438,7 @@ async fn get_multipart_object(
     meta: &ObjectMeta,
     parts: &[ManifestPart],
     window: Option<ByteWindow>,
+    echo_checksum: Option<&StoredChecksum>,
 ) -> Result<Response, S3Error> {
     let total = manifest_total_size(parts);
     let effective = window.unwrap_or(ByteWindow {
@@ -394,7 +447,7 @@ async fn get_multipart_object(
     });
     let covering = window_parts(parts, effective)?;
     let stream = PartStream::new(st, covering);
-    object_read_builder(meta, false, effective.len, window)
+    object_read_builder(meta, false, effective.len, window, echo_checksum)
         .body(Body::from_stream(stream))
         .map_err(response_build_error)
 }
@@ -405,6 +458,7 @@ async fn get_encrypted_object(
     st: &AppState,
     meta: &ObjectMeta,
     window: Option<ByteWindow>,
+    echo_checksum: Option<&StoredChecksum>,
 ) -> Result<Response, S3Error> {
     let master = st.sse.as_ref().ok_or_else(|| {
         S3Error::InternalError(
@@ -423,7 +477,7 @@ async fn get_encrypted_object(
     let plain = crate::sse::read_object_frame(master, frame.as_ref(), &descriptor.key_id)?;
     let body = apply_window(Bytes::from(plain), meta, window)?;
     let len = body.len() as u64;
-    object_read_builder(meta, true, len, window)
+    object_read_builder(meta, true, len, window, echo_checksum)
         .body(Body::from(body))
         .map_err(response_build_error)
 }
@@ -445,6 +499,11 @@ pub async fn head_object(
         ReadOutcome::NotModified => return not_modified_response(&meta),
         ReadOutcome::Proceed => {}
     }
+    let echo_checksum = if checksum_mode_enabled(headers)? {
+        meta.checksum.as_ref()
+    } else {
+        None
+    };
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -452,6 +511,11 @@ pub async fn head_object(
         .header(header::CONTENT_LENGTH, meta.size.to_string())
         .header(header::ETAG, format!("\"{}\"", meta.etag))
         .header(header::LAST_MODIFIED, http_date_from_ms(meta.created_at));
+    if let Some(c) = echo_checksum {
+        builder = builder
+            .header(c.algo.lower_name(), c.value.as_str())
+            .header("x-amz-checksum-type", "FULL_OBJECT");
+    }
     if meta.sse.is_some() {
         builder = builder.header("x-amz-server-side-encryption", "AES256");
     }
@@ -752,6 +816,7 @@ async fn copy_single_part(
             user_meta: user_meta.clone(),
             parts_manifest: None,
             sse: sse.as_ref().map(|m| crate::sse::descriptor(m.key_id())),
+            checksum: None,
         })
         .await;
     match outcome {
@@ -860,10 +925,10 @@ pub async fn get_object_attributes(
         .collect();
     for attr in &requested {
         match attr.as_str() {
-            "etag" | "storageclass" | "objectsize" => {}
-            "checksum" | "objectparts" => {
+            "etag" | "storageclass" | "objectsize" | "checksum" => {}
+            "objectparts" => {
                 return Err(S3Error::NotImplemented(format!(
-                    "object attribute `{attr}` is not implemented (checksum family / part listing)"
+                    "object attribute `{attr}` is not implemented (part listing)"
                 )))
             }
             other => {
@@ -883,6 +948,10 @@ pub async fn get_object_attributes(
         etag: wants("etag").then(|| meta.etag.clone()),
         object_size: wants("objectsize").then_some(meta.size),
         storage_class: wants("storageclass"),
+        checksum: wants("checksum")
+            .then_some(meta.checksum.as_ref())
+            .flatten()
+            .map(|c| (c.algo.algo_name().to_string(), c.value.clone())),
     };
     let body = crate::xml::serialize_object_attributes(&out);
     let response = Response::builder()
@@ -918,6 +987,7 @@ mod read_tests {
             user_meta: UserMeta::new(),
             parts_manifest: None,
             sse: None,
+            checksum: None,
         }
     }
 

@@ -38,6 +38,10 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 percent-encoding = "2"
 md-5 = "0.10"
+crc32fast = "1"
+crc32c = "0.6"
+sha1 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 antfs-master = { path = "../master" }

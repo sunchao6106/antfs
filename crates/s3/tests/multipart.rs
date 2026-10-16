@@ -728,3 +728,89 @@ async fn part_number_multipart_reads_single_part() {
     assert_eq!(resp.status().as_u16(), 200, "HEAD ignores partNumber");
     assert_eq!(header(&resp, "content-length"), "60");
 }
+
+// ── part 级 checksum(s3-checksums)───────────────────────────────────────────
+
+/// UploadPart 校验回环:正确值双头回显;错值 400 不落片;complete 装配行无
+/// 校验(回显面缺省,记档的明示不做面)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn part_checksum_verify_and_assembled_default() {
+    use antfs_s3::checksum::ChecksumAlgo;
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mp-cksum").await;
+    let key = "parted.bin";
+    let upload_id = initiate(&fx, &bucket, key).await;
+
+    let p1 = pseudo_random(64 * 1024);
+    let p2 = pseudo_random(32 * 1024);
+    let good = ChecksumAlgo::Crc32.compute(&p1);
+
+    let uri = format!("/{bucket}/{key}?uploadId={upload_id}&partNumber=1");
+    let mut headers = fx.signed_headers("PUT", &uri, &p1);
+    headers.insert(
+        "x-amz-checksum-crc32",
+        good.parse().expect("checksum value"),
+    );
+    let resp = fx
+        .send(reqwest::Method::PUT, &uri, headers, p1.clone())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "part 1 with checksum must 200");
+    assert_eq!(header(&resp, "x-amz-checksum-crc32"), good);
+    assert_eq!(header(&resp, "x-amz-checksum-type"), "FULL_OBJECT");
+    let etag1 = header(&resp, "etag").trim_matches('"').to_string();
+
+    let wrong = ChecksumAlgo::Crc32.compute(b"something-else");
+    let uri = format!("/{bucket}/{key}?uploadId={upload_id}&partNumber=2");
+    let mut headers = fx.signed_headers("PUT", &uri, &p2);
+    headers.insert(
+        "x-amz-checksum-crc32",
+        wrong.parse().expect("checksum value"),
+    );
+    let resp = fx
+        .send(reqwest::Method::PUT, &uri, headers, p2.clone())
+        .await;
+    assert_eq!(resp.status().as_u16(), 400, "wrong part checksum must 400");
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("BadDigest"), "{body}");
+
+    let uri = format!("/{bucket}/{key}?uploadId={upload_id}&partNumber=2");
+    let mut headers = fx.signed_headers("PUT", &uri, &p2);
+    headers.insert(
+        "x-amz-checksum-sha256",
+        ChecksumAlgo::Sha256
+            .compute(&p2)
+            .parse()
+            .expect("checksum value"),
+    );
+    let resp = fx
+        .send(reqwest::Method::PUT, &uri, headers, p2.clone())
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "re-upload corrected part must 200"
+    );
+    let etag2 = header(&resp, "etag").trim_matches('"').to_string();
+
+    let etags = vec![(1, etag1), (2, etag2)];
+    let resp = fx
+        .complete_multipart(&bucket, key, &upload_id, complete_xml(&etags).as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "complete must 200");
+
+    let whole = [p1.as_slice(), p2.as_slice()].concat();
+    let get = fx.get_object(&bucket, key).await;
+    assert_eq!(get.status().as_u16(), 200);
+    assert_eq!(get.bytes().await.expect("body").to_vec(), whole);
+
+    let get = fx
+        .get_object_with_headers(&bucket, key, &[("x-amz-checksum-mode", "ENABLED")])
+        .await;
+    assert!(
+        !get.headers()
+            .keys()
+            .any(|k| k.as_str().starts_with("x-amz-checksum-")),
+        "装配行无持久校验(complete 级记档)"
+    );
+}
