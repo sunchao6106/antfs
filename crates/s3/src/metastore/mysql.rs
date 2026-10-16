@@ -167,6 +167,36 @@ impl MetaStore for MysqlMetaStore {
         Ok(row.map(|r| r.into_meta()))
     }
 
+    async fn scan_sse_objects(
+        &self,
+        bucket: Option<&str>,
+        after: Option<(String, String)>,
+        limit: u64,
+    ) -> Result<Vec<ObjectMeta>> {
+        let (after_bucket, after_key) = match after {
+            Some((b, k)) => (Some(b), Some(k)),
+            None => (None, None),
+        };
+        let rows: Vec<MysqlObjectRow> = sqlx::query_as(
+            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64
+             FROM named_objects
+             WHERE sse IS NOT NULL AND state = 1 AND deleted_at IS NULL
+               AND (? IS NULL OR (bucket, `key`) > (?, ?))
+               AND (? IS NULL OR bucket = ?)
+             ORDER BY bucket, `key`
+             LIMIT ?",
+        )
+        .bind(after_bucket.clone())
+        .bind(after_bucket)
+        .bind(after_key)
+        .bind(bucket)
+        .bind(bucket)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.into_meta()).collect())
+    }
+
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<DeletedObject>> {
         let now = Self::now_ms();
         // 记账事务:墓碑与 used_bytes 扣减同事务(PG 版同构)。

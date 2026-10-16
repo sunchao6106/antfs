@@ -72,6 +72,17 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn resolve_pending_reclaims(&self, blob_ids: &[BlobId]) -> Result<u64>;
     /// 回收 WAL:当前积压行数(gauge 采样用)。
     async fn pending_reclaims_count(&self) -> Result<u64>;
+
+    /// SSE 行扫描(主钥轮换离线工具用):`state=1 且 sse 非空`的行按 `(bucket, key)`
+    /// 升序整 `ObjectMeta` 吐回;`bucket` = 域(None = 全库;按桶金丝雀轮换/测试隔离);
+    /// `after` = 排他游标(上一页末行),`limit` = 页大小。只读无事务副作用;就地重写
+    /// 已扫过的行落在游标左侧,分页无幻读环。
+    async fn scan_sse_objects(
+        &self,
+        bucket: Option<&str>,
+        after: Option<(String, String)>,
+        limit: u64,
+    ) -> Result<Vec<ObjectMeta>>;
 }
 
 pub async fn connect(cfg: &MetaStoreConfig) -> std::result::Result<Arc<dyn MetaStore>, S3Error> {

@@ -1727,3 +1727,37 @@ end-to-end` 待办首条,三选项推演,本档采用推荐项 A:记录 flags �
 **发运**:归档 `openspec/changes/archive/2026-10-16-blob-composed-flag/`(新能力 spec 4 要求);
 docs 同步(frontend.md §4/§11、cluster.md 数据面三处、store.md 记录/索引 flags 行、design README
 路线档 3 条目 2 ✅)。
+
+## 步骤 68:s3-sse-key-rotation —— SSE 主钥轮换离线工具(解帧→重帧→换行,可续跑)
+
+**动机**:s3.md SSE 局限记档「单主钥(轮换 = 离线重加密工具,后续方向)」——操作面为空:
+主钥疑似泄漏/合规周期到期时只能手改库自伤。阶段二路线档 5 第一行(「工具未建」)。
+
+**落地**(裁决 D1-D5 见 change design.md):
+- metastore:`scan_sse_objects(bucket 域, after, limit)`(双方言)——`state=1 且 sse 非空`
+  行按 `(bucket, key)` 升序整 `ObjectMeta` 吐回,排他游标分页;**就地重写已扫行落在游标
+  左侧,分页无幻读环**(行构造比较 `(bucket, key) > cursor`;state=1 键唯一)。桶域参数
+  兼作 per-fixture 测试隔离(共享测试库沉淀历代 SSE 行,精确计数收支衡平必需)。
+- `sse_rotation.rs`:`rotate(st, old, new, batch, bucket)` 逐行「守卫 → 旧钥解帧 → 新钥
+  重帧 → 新 blob → `put_object` 全字段原样只换 `blob_id`+描述符 key_id → 遮蔽 +
+  `tombstone_and_resolve`」;守卫 = alg≠AES256 **中止** / key_id≠旧钥**跳过保原** /
+  SSE 行带 manifest(不可达态)**中止**;行写失败同请求墓碑新 blob(配额拒弧同款,旧数据
+  无损)。**可续跑 = 构造所得**:已轮换行描述符携新 key_id,重跑即归「他代钥」跳过——
+  无工具侧进度状态。
+- CLI:`antfs-s3 --rotate-sse-key <new-key-file>`(同 config 起状态,不监听/不 GC/跑完即
+  退;前置校验:旧钥已配/新钥可载/新≠旧;报告 scanned/rotated/skipped;中止退出码 1 带进度
+  定位)。**硬前提 = 网关停机**(并发 PUT 与读-改-写竞态会丢更新;起手打印警告)。
+- 帧几何/描述符/读侧零改动;`etag`/`size`/元数据/checksum 恒明文口径透传。
+
+**验证**:
+- e2e 四件(sse.rs,PG 10/10 + MySQL 10/10):换钥读回(含 >64KiB 多分块 + batch=2 强制
+  跨页 + 明文对照 + 旧 blob `poll_tombstoned` 收敛 + WAL 无残行 + 「重启」网关后
+  GET/HEAD 全等 + checksum mode 回显 + 新写正常)/幂等重跑(0 rotated, 3 other-key)/
+  他代 key 行跳过(version/blob/描述符字面不变)/坏 alg 与 manifest 组合中止(带进度)。
+- 首跑教训:精确计数断言被共享库全景扫描打穿(71 行历代沉淀)→ 扫描带桶域,断言域隔离
+  (GC 断言「限本 fixture 桶域」同款纪律)。
+- workspace 72 套件 719 绿;clippy 0;fmt 净;双言全量零回归(133/133 各言,含 lib 忽略项)。
+
+**发运**:归档 `openspec/changes/archive/2026-10-16-s3-sse-key-rotation/`(s3-core 新增
+「SSE 主钥轮换」要求 + s3-metastore 新增「SSE 行扫描」要求);docs 同步(s3.md config 表
+行 + 局限行 + 新「主钥轮换」小节、design README 路线档 5 条目 1 ✅)。

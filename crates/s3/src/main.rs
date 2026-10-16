@@ -51,6 +51,17 @@ async fn main() {
         config: Arc::new(cfg.clone()),
         sse,
     };
+    // `--rotate-sse-key <file>`:SSE 主钥轮换离线模式(不监听、不起 GC,跑完即退;
+    // 网关须停机——语义见 sse_rotation 模块头)。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--rotate-sse-key") {
+        let new_key_file = args.get(pos + 1).cloned().unwrap_or_else(|| {
+            eprintln!("fatal: --rotate-sse-key requires a <new-key-file> argument");
+            std::process::exit(2);
+        });
+        antfs_s3::sse_rotation::run_tool(state, &new_key_file).await;
+        return;
+    }
     // 后台 GC(软删行保留期清理 + 孤儿 multipart TTL;受 antfs-s3.toml [s3.gc] 控制,默认开)。
     antfs_s3::gc::spawn(state.clone(), cfg.gc.clone());
     let app = antfs_s3::server::build_app(state);

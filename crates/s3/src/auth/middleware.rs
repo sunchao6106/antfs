@@ -290,6 +290,14 @@ mod tests {
         async fn pending_reclaims_count(&self) -> MetaResult<u64> {
             Err(not_implemented())
         }
+        async fn scan_sse_objects(
+            &self,
+            _bucket: Option<&str>,
+            _after: Option<(String, String)>,
+            _limit: u64,
+        ) -> MetaResult<Vec<crate::metastore::types::ObjectMeta>> {
+            Err(not_implemented())
+        }
     }
 
     fn known_store() -> FakeMetaStore {

@@ -664,6 +664,28 @@ impl S3Fixture {
         }
     }
 
+    /// 轮换测试专用:**换钥「重启」网关**——新端口起同 metastore/router 的第二个
+    /// 网关实例,SSE 主钥换装 `new_master`(模拟换钥文件后重启进程);`self.state` /
+    /// `self.s3_addr` 切到新实例,后续 `fx.*` 助手全部打到新面(签名随新 addr
+    /// 重算)。旧监听任务残命无害(测试不再发往)。
+    pub async fn restart_with_sse_master(
+        &mut self,
+        new_master: std::sync::Arc<antfs_s3::sse::MasterKey>,
+    ) {
+        let addr_str = addr(free_port());
+        let mut state = self.state.clone();
+        state.sse = Some(new_master);
+        let listener = tokio::net::TcpListener::bind(&addr_str)
+            .await
+            .expect("bind s3 gateway");
+        let app = build_app(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        self.s3_addr = addr_str;
+        self.state = state;
+    }
+
     pub fn url(&self, uri: &str) -> String {
         format!("http://{}{uri}", self.s3_addr)
     }
