@@ -281,6 +281,8 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "http-body",
+ "http-body-util",
  "md-5",
  "openraft",
  "percent-encoding",

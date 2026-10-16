@@ -15,6 +15,8 @@ pub struct S3Metrics {
     pub gc_orphan_parts_blobs_total: antfs_metric::IntCounter,
     pub gc_errors_total: IntCounterVec,
     pub gc_duration_seconds: antfs_metric::Histogram,
+    pub chunked_requests_total: antfs_metric::IntCounter,
+    pub chunked_rejected_total: IntCounterVec,
 }
 
 impl S3Metrics {
@@ -80,6 +82,17 @@ impl S3Metrics {
                 registry,
                 "s3_gc_duration_seconds",
                 "S3 gateway GC cycle duration",
+            )?,
+            chunked_requests_total: counter(
+                registry,
+                "s3_chunked_requests_total",
+                "Requests carrying an aws-chunked streaming body that entered decoding",
+            )?,
+            chunked_rejected_total: counter_vec(
+                registry,
+                "s3_chunked_rejected_total",
+                "aws-chunked bodies rejected at declaration or decode (framing/signature/length/oversize)",
+                &["reason"],
             )?,
         })
     }

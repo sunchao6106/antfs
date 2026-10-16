@@ -913,6 +913,126 @@ impl S3Fixture {
             .await
             .expect("signed request send")
     }
+
+    // ── aws-chunked framed PUT / UploadPart(s3-chunked-payload e2e)────────────────
+
+    fn streaming_headers(
+        &self,
+        method: &str,
+        uri: &str,
+        literal: &str,
+        declared: u64,
+    ) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.s3_addr).expect("valid host header"),
+        );
+        let (authorization, _seed) = sign_streaming_request(
+            method,
+            uri,
+            &mut headers,
+            literal,
+            &self.access_key,
+            &self.secret_key,
+            REGION,
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&authorization).expect("valid authorization header"),
+        );
+        headers.insert(
+            "content-encoding",
+            HeaderValue::from_str("aws-chunked").expect("valid encoding header"),
+        );
+        headers.insert(
+            "x-amz-decoded-content-length",
+            HeaderValue::from_str(&declared.to_string()).expect("valid length header"),
+        );
+        headers
+    }
+
+    /// PUT with a pre-encoded frame stream and an explicit declared decoded
+    /// length(negative tests control both knobs independently).
+    pub async fn put_object_chunked_raw(
+        &self,
+        bucket: &str,
+        key: &str,
+        literal: &str,
+        declared: u64,
+        framed: Vec<u8>,
+    ) -> reqwest::Response {
+        let uri = format!("/{bucket}/{key}");
+        let headers = self.streaming_headers("PUT", &uri, literal, declared);
+        self.send(Method::PUT, &uri, headers, framed).await
+    }
+
+    /// One signing pass → framed payload + headers(块长可调)。负例测试拿走两件
+    /// 后自行篡改再经 [`Self::send`] 出线。
+    pub fn chunked_sign_and_frame(
+        &self,
+        method: &str,
+        uri: &str,
+        data: &[u8],
+        chunk_len: usize,
+    ) -> (HeaderMap, Vec<u8>) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.s3_addr).expect("valid host header"),
+        );
+        let (authorization, seed) = sign_streaming_request(
+            method,
+            uri,
+            &mut headers,
+            STREAMING_SIGNED,
+            &self.access_key,
+            &self.secret_key,
+            REGION,
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&authorization).expect("valid authorization header"),
+        );
+        headers.insert(
+            "content-encoding",
+            HeaderValue::from_str("aws-chunked").expect("valid encoding header"),
+        );
+        headers.insert(
+            "x-amz-decoded-content-length",
+            HeaderValue::from_str(&data.len().to_string()).expect("valid length header"),
+        );
+        let framed = aws_chunked_signed_body(&self.secret_key, &seed, data, chunk_len);
+        (headers, framed)
+    }
+
+    /// Signed-flavor framed PUT(申报长度 = 实长)。
+    pub async fn put_object_chunked(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        chunk_len: usize,
+    ) -> reqwest::Response {
+        let uri = format!("/{bucket}/{key}");
+        let (headers, framed) = self.chunked_sign_and_frame("PUT", &uri, data, chunk_len);
+        self.send(Method::PUT, &uri, headers, framed).await
+    }
+
+    /// Signed-flavor framed UploadPart(申报长度 = 实长)。
+    pub async fn upload_part_chunked(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: &[u8],
+        chunk_len: usize,
+    ) -> reqwest::Response {
+        let uri = format!("/{bucket}/{key}?uploadId={upload_id}&partNumber={part_number}");
+        let (headers, framed) = self.chunked_sign_and_frame("PUT", &uri, data, chunk_len);
+        self.send(Method::PUT, &uri, headers, framed).await
+    }
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────────────────────
@@ -963,4 +1083,114 @@ pub fn xml_tag(xml: &str, tag: &str) -> String {
         .find(&close)
         .unwrap_or_else(|| panic!("response XML missing </{tag}>: {xml}"));
     rest[..end].to_string()
+}
+
+// ── aws-chunked client-side framing (s3-chunked-payload) ───────────────────────────────────
+//
+// Mirrors the server verifier in `crates/s3/src/auth/chunked.rs`: same chunk
+// signature chain (seed = request signature from the Authorization header).
+
+/// STREAMING payload-hash literals the gateway accepts.
+pub const STREAMING_SIGNED: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+pub const STREAMING_UNSIGNED_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+/// Material the chunk signature chain needs: the request signature is the seed.
+#[derive(Clone)]
+pub struct ChunkSeed {
+    pub timestamp: String,
+    pub scope: String,
+    pub signature: String,
+}
+
+/// Sign a request whose payload hash is a STREAMING-* literal; returns the
+/// Authorization header value plus the seed for chunk signature chaining.
+/// `headers` must already carry `host`; the `x-amz-*` pair is inserted here.
+pub fn sign_streaming_request(
+    method: &str,
+    uri: &str,
+    headers: &mut HeaderMap,
+    literal: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+) -> (String, ChunkSeed) {
+    headers.insert(
+        "x-amz-content-sha256",
+        HeaderValue::from_str(literal).expect("valid literal header"),
+    );
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    headers.insert(
+        "x-amz-date",
+        HeaderValue::from_str(&timestamp).expect("valid date header"),
+    );
+
+    let date = &timestamp[..8];
+    let canonical = canonical_request(method, uri, headers, literal);
+    let scope = format!("{date}/{region}/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    );
+    let key = signing_key(secret_key, date, region);
+    let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, \
+         SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
+    );
+    (
+        authorization,
+        ChunkSeed {
+            timestamp,
+            scope,
+            signature,
+        },
+    )
+}
+
+fn chunk_sig(key: &[u8], seed: &ChunkSeed, prev: &str, data: &[u8]) -> String {
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{prev}\n{}",
+        seed.timestamp,
+        seed.scope,
+        hex::encode(Sha256::digest(data))
+    );
+    hex::encode(hmac_sha256(key, string_to_sign.as_bytes()))
+}
+
+/// Encode `data` as a signed aws-chunked frame stream (pieces of `chunk_len`,
+/// bare final chunk; the trailing spare CRLF is tolerated server-side).
+pub fn aws_chunked_signed_body(
+    secret_key: &str,
+    seed: &ChunkSeed,
+    data: &[u8],
+    chunk_len: usize,
+) -> Vec<u8> {
+    let key = signing_key(secret_key, &seed.timestamp[..8], REGION);
+    let mut prev = seed.signature.clone();
+    let mut out = Vec::new();
+    for piece in data.chunks(chunk_len.max(1)) {
+        let sig = chunk_sig(&key, seed, &prev, piece);
+        out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", piece.len()).as_bytes());
+        out.extend_from_slice(piece);
+        out.extend_from_slice(b"\r\n");
+        prev = sig;
+    }
+    let final_sig = chunk_sig(&key, seed, &prev, b"");
+    out.extend_from_slice(format!("0;chunk-signature={final_sig}\r\n\r\n").as_bytes());
+    out
+}
+
+/// Encode `data` as an unsigned trailer-flavored frame stream; the trailing
+/// checksum header is sent but not verified by the gateway (checksums are a
+/// separate feature; absence of verification is declared behavior).
+pub fn aws_chunked_unsigned_trailer_body(data: &[u8], chunk_len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for piece in data.chunks(chunk_len.max(1)) {
+        out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        out.extend_from_slice(piece);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\nx-amz-checksum-crc32c:AAAAAA==\r\n\r\n");
+    out
 }

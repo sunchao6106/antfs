@@ -58,24 +58,7 @@ pub async fn put_object(
 ) -> Result<Response, S3Error> {
     let (content_type, user_meta) = capture_object_meta(req.headers())?;
 
-    let content_length: Option<u64> = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
-
-    let body_bytes = axum::body::to_bytes(req.into_body(), st.config.max_body_bytes as usize)
-        .await
-        .map_err(|_| S3Error::EntityTooLarge)?;
-
-    if let Some(cl) = content_length {
-        if body_bytes.len() as u64 != cl {
-            return Err(S3Error::InternalError(format!(
-                "body size {} != Content-Length {cl}",
-                body_bytes.len()
-            )));
-        }
-    }
+    let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
 
     let etag = {
         use md5::{Digest, Md5};

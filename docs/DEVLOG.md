@@ -1392,3 +1392,41 @@
   lib 51 绿。
 - docs:s3.md 矩阵行翻转 ✅ + 配置表行 + 「虚拟主机寻址」节 + D5/后续方向重排;
   README 双语;归档 `s3-vhost-routing`。
+
+## 步骤 60|s3-chunked-payload:`aws-chunked` 流式分帧签名落地
+
+**动机**:真 AWS SDK/CLI 带体写(大 PUT/UploadPart)默认
+`Content-Encoding: aws4-chunked` + `STREAMING-*` 字面量;旧网关头验签恰好通过、分帧字节
+**原样入库**、Content-Length 撞线上长度 → 500——真客户端写路径不可用。
+
+**终形**(gateway 层,UDP 无涉):
+- `auth/chunked.rs` 新模块:`classify`(三字面量 × Content-Encoding × decoded-length × PUT/POST ×
+  非 presigned 五条件强一致,撕裂 400 于查凭证前)+ `AwsChunkedBody`(http_body::Body 状态机:
+  Header→Data→DataEnd(验签)→Trailer→Done;`Error = S3Error` 直达语义)。
+- `authenticate` 返回升级 `AuthResolution{context, chunked}`——块签上下文(密钥链/timestamp/
+  scope/种子 = 请求签名)验签后一跳成型,零二跳查库;`GatewayPipeline` 序 = auth → 包体 →
+  vhost → dispatch;申报超 `max_body_bytes` 413 **零流读**预拒。
+- `read_bounded_body` helper(put_object/upload_part 共用):分帧时长度对账
+  `x-amz-decoded-content-length`;错误经 `source()` 链 downcast 精确回放。
+- `S3Error::IncompleteBody`(400)变体 + `Display`/`std::error::Error`/`Clone` 三补面。
+- 监控:`s3_chunked_requests_total` + `s3_chunked_rejected_total{reason}`
+  (framing/signature/length/oversize)。
+
+**两课(探针实证,归档 design)**:
+1. **axum 错误链三层**:解码 `S3Error` 经 axum `to_bytes` 装层为「包装×2→生源」;
+   `into_inner().downcast` 只摸顶层 → 块签名失配被误报 413。修 = `source()` 链
+   `downcast_ref::<S3Error>`。负例 e2e 首捕获(fake 413),临时探针单测把三层链印出来定层。
+2. **终块/trailer 宽容语法**:终块 0 尺寸也验签(空数据);终块头 CRLF 后空 CRLF 可选;
+   trailer 空行/EOF 双终结;终态后仅容空白。块级证据面保持严判。
+
+**验证**:
+- 单测 15(chunked 矩阵:三风味正/负、篡改、超申报、截断、尾垃圾、双存在性)→ lib 65 全绿。
+- e2e `tests/chunked.rs` 7 测 **四跑全绿**(PG 净/脏 × MySQL 净/脏,c1@13306):
+  多块回环+ETag、空载荷、multipart 块化 part、UNSIGNED-TRAILER(校验值明示不验证)、
+  块签篡改 **403 且 GET 404**(不落库硬断言)、长度双向舞弊(短=分帧 400/长=IncompleteBody 400)、
+  超限申报 413 零流读。
+- 全套 e2e 回归(fresh+dirty × 双方言)零变化(六二进制 46 测全绿);fmt/clippy 0;workspace 全绿。
+- 中途三次假红均自笔误(测试头 typo `decode-content`、驱动名 `postgresql`、库名 `s5_ci`),
+  记录在案自警:乱码/串写检查器尚未对 env 字符串生效,**手写 env 必复制粘贴已有串**。
+
+**发运**:`2026-10-16-s3-chunked-payload` 归档,CI 五 job 硬验收(见 push)。

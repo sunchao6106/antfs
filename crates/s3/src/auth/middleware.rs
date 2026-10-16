@@ -15,6 +15,7 @@ use axum::http::HeaderMap;
 use crate::error::S3Error;
 use crate::metastore::MetaStore;
 
+use super::chunked::ChunkedInfo;
 use super::sigv4::{self, AuthInfo, CanonicalRequest, EMPTY_BODY_SHA256, UNSIGNED_PAYLOAD};
 
 /// Authenticated caller (verified SigV4 credential).
@@ -22,6 +23,15 @@ use super::sigv4::{self, AuthInfo, CanonicalRequest, EMPTY_BODY_SHA256, UNSIGNED
 pub struct AuthContext {
     pub owner: String,
     pub access_key: String,
+}
+
+/// Successful resolution of a credentialed request: the verified caller plus
+/// the `aws-chunked` declaration (absent unless the request streams a framed
+/// body; see [`crate::auth::chunked`]). Anonymous requests resolve to `None`.
+#[derive(Debug)]
+pub struct AuthResolution {
+    pub context: AuthContext,
+    pub chunked: Option<ChunkedInfo>,
 }
 
 /// Requester identity as resolved by the middleware: a verified credential, or
@@ -49,13 +59,15 @@ pub(crate) async fn authenticate(
     method: &str,
     uri: &str,
     headers: &HeaderMap,
-) -> Result<Option<AuthContext>, S3Error> {
+) -> Result<Option<AuthResolution>, S3Error> {
     let Some(info) = extract_auth_info(uri, headers)? else {
         return Ok(None);
     };
 
     let timestamp = resolve_timestamp(&info, headers)?;
     sigv4::check_time(&info, &timestamp)?;
+
+    let chunked_shape = super::chunked::classify(method, headers, info.presigned)?;
 
     let payload_hash = payload_hash(&info, headers);
 
@@ -86,9 +98,15 @@ pub(crate) async fn authenticate(
     };
     sigv4::verify_signature(&credential.secret_key, &timestamp, &info, &request)?;
 
-    Ok(Some(AuthContext {
-        owner: credential.owner,
-        access_key: credential.access_key,
+    let chunked =
+        chunked_shape.map(|shape| shape.into_info(&credential.secret_key, &info, &timestamp));
+
+    Ok(Some(AuthResolution {
+        context: AuthContext {
+            owner: credential.owner,
+            access_key: credential.access_key,
+        },
+        chunked,
     }))
 }
 
@@ -321,12 +339,12 @@ mod tests {
     async fn authenticates_a_valid_header_signed_request() {
         let timestamp = now_timestamp();
         let headers = signed_get("/bucket/key", &timestamp);
-        let context = authenticate(&known_store(), "us-east-1", "GET", "/bucket/key", &headers)
+        let resolution = authenticate(&known_store(), "us-east-1", "GET", "/bucket/key", &headers)
             .await
             .unwrap()
             .expect("signed request yields a context");
-        assert_eq!(context.owner, OWNER);
-        assert_eq!(context.access_key, ACCESS_KEY);
+        assert_eq!(resolution.context.owner, OWNER);
+        assert_eq!(resolution.context.access_key, ACCESS_KEY);
     }
 
     #[tokio::test]
@@ -437,10 +455,10 @@ mod tests {
         let signature = sigv4::compute_signature(SECRET, &timestamp, &info, &canonical).unwrap();
         let uri = format!("{uri}&X-Amz-Signature={signature}");
 
-        let context = authenticate(&known_store(), "us-east-1", "GET", &uri, &headers)
+        let resolution = authenticate(&known_store(), "us-east-1", "GET", &uri, &headers)
             .await
             .unwrap()
             .expect("presigned request yields a context");
-        assert_eq!(context.owner, OWNER);
+        assert_eq!(resolution.context.owner, OWNER);
     }
 }

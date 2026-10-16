@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum S3Error {
     NoSuchBucket,
     NoSuchKey,
@@ -20,6 +20,8 @@ pub enum S3Error {
     MalformedXML(String),
     EntityTooLarge,
     MissingContentLength,
+    /// `aws-chunked` 流式分帧的解码长度对账失配/截断(aws-chunked 轮起)。
+    IncompleteBody,
     MetadataTooLarge,
     QuotaExceeded {
         bucket: String,
@@ -51,6 +53,7 @@ impl S3Error {
             Self::MalformedXML(_) => "MalformedXML",
             Self::EntityTooLarge => "EntityTooLarge",
             Self::MissingContentLength => "MissingContentLength",
+            Self::IncompleteBody => "IncompleteBody",
             Self::MetadataTooLarge => "MetadataTooLarge",
             Self::QuotaExceeded { .. } => "QuotaExceeded",
             Self::InvalidArgument(_) => "InvalidArgument",
@@ -67,6 +70,7 @@ impl S3Error {
                 StatusCode::BAD_REQUEST
             }
             Self::MalformedXML(_) | Self::MissingContentLength => StatusCode::BAD_REQUEST,
+            Self::IncompleteBody => StatusCode::BAD_REQUEST,
             Self::MetadataTooLarge | Self::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::QuotaExceeded { .. } => StatusCode::from_u16(507).unwrap(),
@@ -123,6 +127,10 @@ impl S3Error {
             Self::MalformedXML(detail) => format!("The XML you provided was not well-formed or did not validate against our published schema. {detail}"),
             Self::EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.".into(),
             Self::MissingContentLength => "You must provide the Content-Length HTTP header.".into(),
+            Self::IncompleteBody => {
+                "The decoded body length does not match the declared x-amz-decoded-content-length."
+                    .into()
+            }
             Self::MetadataTooLarge => {
                 "Your metadata headers exceed the maximum allowed metadata size.".into()
             }

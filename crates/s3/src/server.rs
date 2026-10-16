@@ -178,7 +178,21 @@ impl tower::Service<Request> for GatewayPipeline {
             )
             .await
             {
-                Ok(Some(ctx)) => Principal::Signed(ctx),
+                Ok(Some(resolution)) => {
+                    if let Some(info) = resolution.chunked {
+                        match crate::auth::chunked::wrap_request(
+                            req,
+                            info,
+                            st.config.max_body_bytes,
+                            &st.metrics.chunked_requests_total,
+                            &st.metrics.chunked_rejected_total,
+                        ) {
+                            Ok(wrapped) => req = wrapped,
+                            Err(error) => return Ok(error.into_response()),
+                        }
+                    }
+                    Principal::Signed(resolution.context)
+                }
                 Ok(None) => Principal::Anonymous,
                 Err(error) => return Ok(error.into_response()),
             };

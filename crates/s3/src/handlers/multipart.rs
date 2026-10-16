@@ -33,9 +33,7 @@ pub async fn upload_part(
     part_number: i32,
     req: Request,
 ) -> Result<Response, S3Error> {
-    let body_bytes = axum::body::to_bytes(req.into_body(), st.config.max_body_bytes as usize)
-        .await
-        .map_err(|_| S3Error::EntityTooLarge)?;
+    let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
 
     let etag = {
         use md5::{Digest, Md5};
