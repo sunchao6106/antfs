@@ -107,9 +107,152 @@ fn verify_respects_max_bytes_and_reports_truncated() {
 
     let full = store.verify(u64::MAX).unwrap();
     assert!(!full.truncated);
+    assert_eq!(full.end_cursor, None, "预算内扫完应报 None(开新周期信号)");
     let partial = store.verify(1).unwrap();
     assert!(partial.truncated, "max_bytes=1 应立即到点");
     assert!(partial.records < full.records, "部分扫描的记录数应更少");
+}
+
+/// 152 = 24B 记录开销 + 128B 数据:恰好一条的预算。
+const ONE_128B_RECORD: u64 = 24 + 128;
+
+/// 预算到点时的游标必须指向**下一条未扫字节**,从它续扫恰好补齐剩余、不重不漏。
+#[test]
+fn verify_budget_stop_reports_exact_resume_cursor() {
+    let dir = unique_dir();
+    let registry = antfs_metric::Registry::new();
+    let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
+    let store =
+        BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    for n in 0..5u8 {
+        store.put(key(n), &[n; 128]).unwrap();
+    }
+    store.flush().unwrap();
+
+    let r = store.verify(ONE_128B_RECORD).unwrap();
+    assert_eq!(r.records, 1, "预算恰一条: {r:?}");
+    assert_eq!(r.bytes_read, ONE_128B_RECORD);
+    assert_eq!(r.end_cursor, Some((0, ONE_128B_RECORD)));
+
+    let rest = store.verify_from(r.end_cursor, u64::MAX).unwrap();
+    assert_eq!(rest.records, 4, "从游标续扫应恰好补齐剩余: {rest:?}");
+    assert_eq!(rest.end_cursor, None);
+}
+
+/// 小预算多批接力:全库恰好覆盖一次(Σrecords = 全量,Σbytes = 全量),坏记录重同步后也能续。
+#[test]
+fn verify_from_resumes_across_budget_batches() {
+    let dir = unique_dir();
+    let registry = antfs_metric::Registry::new();
+    let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
+    let store =
+        BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    for n in 0..5u8 {
+        store.put(key(n), &[n; 128]).unwrap();
+    }
+    store.flush().unwrap();
+
+    let mut cursor: Option<(u64, u64)> = None;
+    let mut records = 0u64;
+    let mut bytes = 0u64;
+    let mut batches = 0u32;
+    loop {
+        batches += 1;
+        assert!(batches <= 6, "每批一条、共 5 条,不该超过 6 批: {batches}");
+        let r = store.verify_from(cursor, ONE_128B_RECORD).unwrap();
+        records += r.records;
+        bytes += r.bytes_read;
+        assert_eq!(r.bad_records, 0);
+        match r.end_cursor {
+            Some(c) => {
+                assert!(r.truncated, "预算到点的批应报截断: {r:?}");
+                cursor = Some(c);
+            }
+            None => {
+                assert_eq!(r.records, 1, "最后一批也是一条,扫完即 None");
+                break;
+            }
+        }
+    }
+    assert_eq!(records, 5);
+    assert_eq!(bytes, 5 * ONE_128B_RECORD);
+}
+
+/// 坏记录 + 续扫:坏的那条计数一次、按声明长度跳过后,后续批从下一条继续,不卡死也不重计。
+#[test]
+fn verify_from_resyncs_and_resumes_past_corruption() {
+    let dir = unique_dir();
+    let registry = antfs_metric::Registry::new();
+    let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
+    let store =
+        BlobStore::create_with(dir.path(), 1 << 30, &small_config(), &metrics, "p0").unwrap();
+    for n in 0..6u8 {
+        store.put(key(n), &[n; 128]).unwrap();
+    }
+    store.flush().unwrap();
+
+    // 翻坏第 2 条(offset 152)的 magic:物理 = 段头 64 + 152。
+    let seg = first_segment(dir.path());
+    let mut raw = std::fs::read(&seg).unwrap();
+    raw[64 + ONE_128B_RECORD as usize] ^= 0xff;
+    std::fs::write(&seg, &raw).unwrap();
+
+    let mut cursor: Option<(u64, u64)> = None;
+    let mut records = 0u64;
+    let mut bad = 0u64;
+    let mut first_bad: Option<(u64, u64)> = None;
+    loop {
+        let r = store.verify_from(cursor, ONE_128B_RECORD).unwrap();
+        records += r.records;
+        bad += r.bad_records;
+        if r.first_bad_offset.is_some() && first_bad.is_none() {
+            first_bad = r.first_bad_offset;
+        }
+        match r.end_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(bad, 1, "坏记录恰好计一次: bad={bad}");
+    assert_eq!(records, 5, "6 条里 1 条坏: {records}");
+    assert_eq!(first_bad, Some((0, ONE_128B_RECORD)));
+}
+
+/// 游标指向已不存在的段 / 越过段尾:从"其后第一个段"接上,两条路径(段缺席 / offset 越界
+/// 钳到 `data_end`)覆盖必须一致;游标悬空超出全部段 ⇒ 视为已扫完。
+#[test]
+fn verify_from_stale_or_beyond_end_cursor_falls_forward() {
+    let dir = unique_dir();
+    let cfg = StoreConfig {
+        segment_size_bytes: 256,
+        index_max_inmem_elements: 1000,
+        io_error_count_to_trigger_shutdown: 0,
+        defer_seal_flush: true,
+    };
+    let registry = antfs_metric::Registry::new();
+    let metrics = antfs_blob::StoreMetrics::new(&registry).unwrap();
+    let store = BlobStore::create_with(dir.path(), 1 << 30, &cfg, &metrics, "p0").unwrap();
+    for n in 0..4u8 {
+        store.put(key(n), &[n; 100]).unwrap();
+    }
+    store.flush().unwrap();
+    let full = store.verify(u64::MAX).unwrap();
+    assert!(full.records >= 4, "极小段 ⇒ 每条一段: {full:?}");
+
+    // 段缺席:游标指段 1,但库从段 0 开始 ⇒ 语义 = "段 0 已扫过",从段 1 起接上。
+    let resumed = store.verify_from(Some((1, 0)), u64::MAX).unwrap();
+    assert!(resumed.records < full.records, "应跳过段 0: {resumed:?}");
+    // offset 越界被钳到 data_end(段 0 整段消费)⇒ 与"从段 1 接上"覆盖相同。
+    let clamped = store.verify_from(Some((0, u64::MAX)), u64::MAX).unwrap();
+    assert_eq!(clamped.records, resumed.records);
+
+    // 游标位置超出全部段(理论上只见于游标损坏):空手而回、不谎报截断。
+    let beyond = store
+        .verify_from(Some((u64::MAX / 2, 0)), u64::MAX)
+        .unwrap();
+    assert_eq!(beyond.records, 0);
+    assert!(!beyond.truncated);
+    assert_eq!(beyond.end_cursor, None);
 }
 
 #[test]

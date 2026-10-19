@@ -168,6 +168,17 @@ pub struct StoreServerConfig {
     /// 本地完整性校验(`GET /partitions/{pid}/verify`)单次扫描的**读取字节上限**(默认 64 MiB):
     /// 深扫会读全量数据体,限流以免打爆盘;到点返回部分结果并在响应里标 `truncated`。
     pub scrub_max_batch_bytes: u64,
+    /// **后台一致性巡检**(bit-rot 蜗牛爬)总开关;默认关。开启后本节点定时对本节点每个副本做
+    /// 容错深扫(逐记录 CRC,坏记录记下继续),**只报警不修复**(修复走运维弧 Repair/Move/重 eval)。
+    /// 与手动 verify 端点共用引擎与扫描预算,不共用节拍;停它用 `/admin/scrub-control`(不动端点)。
+    pub scrub_background_enabled: bool,
+    /// 后台巡检两次扫描 batch 之间的**基础间隔**(秒);实际睡眠叠加 ±25% 抖动去相位(避免与
+    /// compaction 钟点或多节点同拍共振成周期性尖峰)。单 batch 字节预算 = [`Self::scrub_max_batch_bytes`]。
+    pub scrub_background_interval_secs: u64,
+    /// 全节点同时 in-flight 的扫描 batch 数上限(默认 1 = 同一时刻只有一块盘在爬;家风同 master
+    /// `balance_max_in_flight`:宁可慢,不打满)。管的是**跨盘**并发;**同盘**内由该盘的有界池
+    ///(D1)自行串行,池饱和 = 本轮跳过退避,绝不重试轰炸。
+    pub scrub_background_max_in_flight: u32,
     /// **流式 put 的暂存目录**(可选)。留空 = 默认落在各数据盘自己的 `tmp/` 子目录下(逐盘隔离,
     /// 见 [`crate::disk::Disk::tmp_dir`]);非空 = 本节点所有盘的暂存文件都落这一个目录。
     ///
@@ -293,6 +304,9 @@ impl Default for StoreServerConfig {
             max_body_bytes: 2 * 1024 * 1024,
             request_control_default_ttl_secs: 1800,
             scrub_max_batch_bytes: 64 << 20,
+            scrub_background_enabled: false,
+            scrub_background_interval_secs: 60,
+            scrub_background_max_in_flight: 1,
             // 空 = 默认(各数据盘的 `tmp/` 子目录);不擅自改默认(CLAUDE.md §5.1)。
             staging_dir: String::new(),
             // 经验初值(线上按 `disk_pool_queued` / `disk_pool_rejected` 标定;见字段注释)。
@@ -415,6 +429,18 @@ impl Validate for StoreServerConfig {
         at_least(
             "store_server.scrub_max_batch_bytes",
             self.scrub_max_batch_bytes,
+            1,
+        )?;
+        // 后台巡检:间隔 ≥1(0 会让循环退化成忙转);lane 数 ≥1(0 等于没开起来)。
+        // enabled 是开关不是数值,无需下界。
+        at_least(
+            "store_server.scrub_background_interval_secs",
+            self.scrub_background_interval_secs,
+            1,
+        )?;
+        at_least(
+            "store_server.scrub_background_max_in_flight",
+            u64::from(self.scrub_background_max_in_flight),
             1,
         )?;
         // 暂存目录:空 = 默认(各数据盘的 `tmp/` 子目录)。非空则必须是不带前后空格的路径 —— 带空格
@@ -976,6 +1002,40 @@ mod tests {
             ..base()
         };
         assert!(no_stable.validate().is_ok(), "稳定期 0 合法");
+    }
+
+    /// 后台巡检默认:关 / 60s / 单 lane。改动这几个默认值必须显式改本测试(CLAUDE.md §5.1)。
+    #[test]
+    fn scrub_background_defaults_off_and_gentle() {
+        let d = StoreServerConfig::default();
+        assert!(!d.scrub_background_enabled, "默认必须关(后台 IO 不加塞)");
+        assert_eq!(d.scrub_background_interval_secs, 60);
+        assert_eq!(d.scrub_background_max_in_flight, 1);
+        let with_disk = StoreServerConfig {
+            data_dirs: vec![DataDir::Plain("/data/a".to_string())],
+            ..d
+        };
+        assert!(with_disk.validate().is_ok());
+    }
+
+    /// 后台巡检数值下界:间隔 0(忙转)与 lane 0(形同没开)必须当场拒 —— 拼错值起不来,
+    /// 好过静默跑成一个错误的节拍。
+    #[test]
+    fn scrub_background_bounds_reject_zero() {
+        let base = || StoreServerConfig {
+            data_dirs: vec![DataDir::Plain("/data/a".to_string())],
+            ..Default::default()
+        };
+        let interval0 = StoreServerConfig {
+            scrub_background_interval_secs: 0,
+            ..base()
+        };
+        assert!(interval0.validate().is_err(), "间隔 0 = 忙转,必须拒");
+        let lanes0 = StoreServerConfig {
+            scrub_background_max_in_flight: 0,
+            ..base()
+        };
+        assert!(lanes0.validate().is_err(), "lane 0 = 形同没开,必须拒");
     }
 
     /// 改造后的 compaction 默认值:每天凌晨一点一次、阈值 30%、RW 纳入、墓碑保留 24h。

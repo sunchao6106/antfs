@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod replica;
 pub mod replication;
 pub mod request_control;
+pub mod scrub_worker;
 pub mod server;
 pub mod worker;
 

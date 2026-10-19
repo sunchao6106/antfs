@@ -624,6 +624,10 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 |---|---|---|---|---|---|
 | `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限,**两条路径都按它校验**:① 非流式抽取器(以及 PUT 的 chunked 回落路径)经 `DefaultBodyLimit`/`to_bytes` 上限;**② 流式 PUT(带 `Content-Length`)在收 body 前先比 `Content-Length`,超限直接 413(不读 body)**。**默认与 axum `DefaultBodyLimit` 默认值一致**(§5.1 不擅自改默认),要收真正的大 blob 必须显式调大 | — |
 | `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0(0 = 不设默认时长) | `/admin/request-control` 未指定 `ttl_secs` 时的默认禁用时长(秒);**0 = 永久禁用**(须显式开回) | 偏离 Ambry(其 RequestControl 无 TTL),见 12.3 |
+| `store_server.scrub_max_batch_bytes` | u64 | 67108864(64 MiB) | ≥1 | `verify`(手动端点与后台巡检共用)单次扫描的**读取字节上限**;到点返回部分结果 + `truncated` + `end_cursor` | — |
+| `store_server.scrub_background_enabled` | bool | **false** | — | 后台一致性巡检(bit-rot 蜗牛爬)总开关;关 = 与本批之前**逐字节等价**(零后台 IO)。开启后每 tick 对一个候选副本做容错深扫,只报警不修复(§12.13) | — |
+| `store_server.scrub_background_interval_secs` | u64 | 60 | ≥1 | 后台巡检两 tick 之间的**基础间隔**(秒);实际睡眠叠 ±25% 抖动去相位。单 tick 批预算 = `scrub_max_batch_bytes` | — |
+| `store_server.scrub_background_max_in_flight` | u32 | 1 | ≥1 | 全节点**跨盘**同时扫描的 batch 数上限(默认 1 = 同一时刻只有一块盘在爬);**同盘**内由每盘有界池(D1)自行串行,池饱和退避跳轮 | 家风同 master `balance_max_in_flight` |
 
 ### 12.5 监控项清单(本批新增)
 
@@ -636,6 +640,10 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 | `store_server_replicas_dropped_total` | counter | — | 次 | 收到 `DROPPED` 指令后**实际删除**本地副本数据的次数(见 §12.6);重复指令被幂等忽略,**不**计数 | — |
 | `store_server_replication_paused` | gauge | — | 0/1 | 运维是否暂停本节点主动拉复制(1 = 暂停);见 §12.7 | — |
 | `store_server_compaction_jobs_total` | counter | `state`(running/done/failed) | 次 | 异步手动 compaction 任务的提交/完成/失败计数(每个任务在 running 与 done/failed 各计一次);见 §12.8 | — |
+| `store_server_scrub_background_batches_total` | counter | — | 次 | 后台巡检完成的扫描 batch 数(每 batch = 一次 `verify_from`,预算 `scrub_max_batch_bytes`);见 §12.13 | — |
+| `store_server_scrub_background_bytes_total` | counter | — | 字节 | 后台巡检累计读取量(预算口径);配合 batches 可观测爬速 | — |
+| `store_server_scrub_background_bad_records_total` | counter | — | 次 | 后台巡检发现的坏记录数(含 index_mismatch;与手动 verify 的 `store_server_verify_bad_records_total` 分开计数,分得清"机器发现/人发现");发现同时打 WARN 日志 | — |
+| `store_server_scrub_background_paused` | gauge | — | 0/1 | 后台巡检循环被 `/admin/scrub-control` 掐停(1 = 暂停;不持久化,重启即恢复);见 §12.13 | — |
 
 > 心跳的 `used_bytes` / `lag_bytes` 是**控制面 proto 字段**(`ReplicaBeat`),不是本节点 Prometheus 指标,
 > 故不进上表;口径见 §12.1。
@@ -803,8 +811,10 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 - **`GET /partitions/{pid}/scrub-report`** → `{"partition_id","live_records","tombstones","live_bytes","sealed_segments","segments":[{"position","generation","data_end"}],"token_seg","token_off","damaged_records","abandoned_segments"}`。
   **只走索引与 mmap,不读数据体**(开销与 key 数成正比、与数据量无关),供 admin 做副本间摘要比对。
   `token_seg/token_off` = 本副本 log 末端游标(与 `replica-metadata` 同口径),两侧一致才说明该轮**可比**。
-- **`GET /partitions/{pid}/verify?max_bytes=`** → `{"partition_id","records","bad_records","first_bad_offset":{"segment","offset"}|null,"index_mismatch","truncated"}`。
+- **`GET /partitions/{pid}/verify?max_bytes=`** → `{"partition_id","records","bad_records","first_bad_offset":{"segment","offset"}|null,"index_mismatch","truncated","bytes_read","end_cursor":{"segment","offset"}|null}`。
   **会读全量数据体**(深扫),`max_bytes` 缺省取配置 `store_server.scrub_max_batch_bytes`,到点提前结束并置 `truncated`。
+  预算到点时 `end_cursor` = 下一条未扫字节(`verify_from` 的续扫起点)、`bytes_read` = 本轮计入预算的读取量;
+  预算内扫完则 `end_cursor` 为 `null`(自动巡检循环与手动分批运维都据此续,见 §12.13)。
 
 **`BlobStore::verify` 的口径**(与生产读路径的关键差异):
 
@@ -851,8 +861,10 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 
 **指标**(§12.5 同步登记):`store_server_verify_runs_total`(counter)、`store_server_verify_bad_records_total`(counter)、
 `store_server_verify_duration_seconds`(histogram)、`store_server_scrub_reports_total`(counter)。
+后台自动巡检的独立计数(`store_server_scrub_background_*`)见 §12.13。
 
-**配置**(§12.4 同步登记):`store_server.scrub_max_batch_bytes`(u64,默认 64 MiB,≥1)= verify 缺省扫描读取上限。
+**配置**(§12.4 同步登记):`store_server.scrub_max_batch_bytes`(u64,默认 64 MiB,≥1)= verify 缺省扫描读取上限;
+后台循环的三个开关/节拍/并发旋钮(`scrub_background_*`)见 §12.13。
 
 ### 12.11 盘维度打点 + 探测单飞(盘 hang 隔离 Phase 0)
 
@@ -1288,3 +1300,65 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
    - **只聚合到分位点这一层,不往上传 `le` 桶**:admin JSON 里没有桶数组,前端也就无法做跨盘/跨节点合并,
      主机汇总卡的 p99 取的是**该主机最差盘的 p99**(分位点不能相加,它是主机 p99 的上界)。
    - 没有桶样本(老版本 store / 该盘零请求)→ `null` → UI 显示「—」,**不显示 0**:没数据 ≠ 零延迟。
+
+### 12.13 后台一致性巡检:bit-rot 蜗牛爬(store-scrub-background,2026-10-19)
+
+> 把 §12.10 的"按需巡检"升级为**常驻自动扫描**,同时绝不震荡整机。**默认关**
+> (`scrub_background_enabled = false` ⇒ 现有部署逐字节等价,后台 IO 零增量)。
+> 立项动机与逐条决策见 `openspec/changes/store-scrub-background/`。
+
+**为什么需要它**:热数据读路径逐条验 CRC、追平窗口有拉复制流过 —— 两都不沾的**冷尾巴**
+(没人读、已追平的段)里,坏字节没有任何机制会发现,直到一次冷读 500;更糟的是 peer 也把数据
+压实丢了、自愈窗口关闭才发现。原 `balance-and-scrub` 勾过"可选 `scrub_interval_secs`"但从未落地
+(勾账夸大,已修)—— 本批补腿。
+
+**防震荡四条**(用户红线"别让整个机器震荡"的落地):
+
+1. **同盘串行**:每批照手动 verify 端点**同一条路**进每盘有界池(`pool.run(disk, "verify")`),
+   与 put/get/compaction 在一个池里排队;池饱和 ⇒ 本轮退避(debug 日志),下 tick 再试,
+   **绝不重试轰炸**;
+2. **跨盘总闸**:`scrub_background_max_in_flight`(默认 1)= 全节点同时在爬的盘数上限
+   (家风同 master `balance_max_in_flight`);
+3. **蜗牛爬节拍**:每 tick 每 lane 最多一个 batch(≤ `scrub_max_batch_bytes`),tick 间睡
+   `scrub_background_interval_secs` 叠 **±25% 抖动**(去相位:恒速定时器会与 compaction 凌晨
+   钟点/多节点同拍共振成周期性尖峰)。100 GiB 副本 ≈ 26 小时一个周期 —— 慢即特性;
+4. **只报警不修复**:坏记录/索引漂移 ⇒ WARN 日志 + `store_server_scrub_background_*` 指标;
+   处置永远是运维弧(手点 verify 定位 + `RepairPartition`/`MoveReplica`)。
+
+**候选集**(与 compaction 刻意相反的部分已显式标注):
+
+- **SEALED 照扫** —— compaction 不碰封存段是"别在 EC 对象身上搬字节";巡检只读不搬,
+  恰是冷数据唯一看护人;
+- 集群模式下 `BOOTSTRAP`(未追平)副本跳过(还在被拉复制填充,扫了也白扫);
+  单机模式(未知状态下发)不受此闸 —— 与 compaction 候选判据同一家;
+- 盘 `UNAVAILABLE/DEGRADED` 跳过,计 `store_server_disk_worker_skipped_total{task="scrub"}`。
+
+**续扫游标**:blob 层新能力 `verify_from(start, max_bytes)`。游标 = 上轮预算耗尽处的"下一条
+未扫字节";游标段被增量 compaction 摘走 ⇒ 从其后第一段接(新段位置恒大,不漏);段内坏墙 ⇒
+弃该段剩余、后续段照扫(与 open 带伤恢复同语义)。游标只在循环内存里(重启即从各副本头部重扫
+—— verify 只读幂等,多扫无害;不持久化,家风同 compaction 台账/复制开关);周期走完
+(`end_cursor = None`)自动从头开新周期。手动 verify 端点同享该能力并回显
+`bytes_read`/`end_cursor`,运维可手动分批接力。
+
+**运维闸**:`GET|POST /admin/scrub-control`(`{"paused":bool}`)掐停/恢复后台循环。
+手动 verify/scrub-report 端点**不受影响**(应急检查能力必须常在;`request_control` 的可静默集
+仍只有 put/get/delete,不动)。开关不持久化、不动游标 —— 恢复后从原处续爬。
+
+**看门狗折页提示**(纯配置建议,不改码):想让后台批的深扫 IO 按"大顺序 IO"档判,配
+`[store_server.disk_watchdog_ms_by_op] verify = 300000`(compaction 同量级;`verify` 本就是
+`KNOWN_OPS` 成员,拼错会在配置校验期被拒)。默认空表 = 不开,行为不变。
+
+**配置**:三个新键见 §12.4 表(`scrub_background_enabled` / `interval_secs` / `max_in_flight`,
+默认 false/60/1,Validate ≥1 ×2)。**监控**:四个新指标见 §12.5 表(`scrub_background_batches/
+bytes/bad_records_total` + `scrub_background_paused` gauge)。
+
+**测试证据**:blob `tests/verify.rs` 11/11(新增 5 件:预算恰停游标精指/多批接力恰好覆盖一次/
+坏记录重同步后续扫/悬空游标两路一致/越全段空手);`scrub_worker` 单测 6/6(轮转+周期重开字节
+守恒/UNAVAILABLE 跳过可见/BOOTSTRAP 集群跳过+单机照扫/SEALED 照扫/池满退避/抖动界);
+`tests/scrub_background.rs` 5/5(真 serve() 循环:自动爬/在线翻坏字节被后台指标发现且不停摆/
+掐停两 tick 零增长+暂停期手动 verify 可用+恢复续爬/端点回显契约/默认关零批)。
+
+**残留边界(如实)**:① 周期化的是**逐盘 bit-rot 自查**;admin 级跨副本逻辑比对的周期化
+(发现分歧→建议 Repair)未做,另议;② 小副本每 tick 全量重扫(预算钳幅 ≤64 MiB/拍,无害但
+批次计数增长快);③ 游标内存态,重启重扫(幂等);④ 带伤启动的副本被巡到时 `bad_records`
+会持续报(盘上坏字节不删不改是设计,见 §12.10 残留边界)。

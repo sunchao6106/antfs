@@ -1849,3 +1849,36 @@ AllUsers→public-read/五拒面[WRITE、FULL_CONTROL 予他人、坏 Owner、�
 **发运**:归档 `2026-10-19-s3-acl-xml`;docs 同步(s3.md 矩阵行收官、public-read API
 行、新「ACL XML 授予面」节、授权面全收官宣告)。S3 功能面完结批
 (C1/C2/C3)至此收官。
+
+## 步骤 72:store-scrub-background —— 后台一致性巡检蜗牛爬(补 balance-and-scrub 的未落地腿)
+
+**动机**:S3 收官后盘点运维存货,用户连问三轮把我的旧存货清单打穿了(一致性巡检说成
+"没有任何检查手段"—— 实际按需面全在;自动均衡说成"只能手动搬"—— 实际 eval→plan→执行
+闭环全在,详见 `.omo/HANDOFF-s3-optimization.md` 纠错记录)。真残余里挑了最小纯软件件:
+scrub **周期化**(tasks 勾过 `scrub_interval_secs` 但代码零落地,勾账夸大)。用户两条红线:
+"配置 -1 代表不周期执行"被纠正为家庭惯例(`enabled` 独立 bool,默认 false);"周期性执行注意
+同时执行的数量,别整个机器震荡" → 防震荡四条成为设计重心。
+
+**落地**:blob `verify_from(start, max_bytes)`(`end_cursor` = 下一条未扫字节;游标段被
+compaction 摘走从其后段接、坏墙弃段续后段)`VerifyReport` 增 `bytes_read`/`end_cursor`;
+store `scrub_worker.rs`(tick 循环:健康闸+追平闸筛候选 → 按 pid 轮转挑 ≤`max_in_flight`
+个 lane → 每批经每盘池 `verify` 串行 → JoinSet 汇拢推游标 + 计数 + WARN;间隔 ±25% 抖动
+去相位);config 三旋钮(默认 false/60/1,Validate ≥1);`POST|GET /admin/scrub-control`
+(只掐定时腿,手动 verify 永不受限);verify 端点回显续扫字段;勾账修正回
+`openspec/changes/balance-and-scrub/tasks.md`。防震荡四条:同盘池串行+饱和退避 / 跨盘
+`max_in_flight` / 蜗牛爬(64MiB batch × 60s tick,日程级周期)/ 只报警不修复。
+
+**验证**:blob `tests/verify.rs` **11/11**(5 新:预算恰停游标精指下一条/多批接力恰好
+覆盖一次 Σ=全量不重不漏/坏记录重同步后续扫一计数/悬空游标两路覆盖一致/越全段空手);
+store lib **147/147**(scrub_worker 6 新:轮转+周期重开字节守恒 4×152/UNAVAILABLE 跳过
+可见/BOOTSTRAP 集群跳过+单机照扫/SEALED 照扫[与 compaction 候选集刻意相反]/池满退避
+10s 超时钳/抖动界);`tests/scrub_background.rs` **5/5**(真 serve() 起循环 —— 首版测试
+手动 axum serve(router()) 根本没起循环,教训入 harness 注释:自动爬 + 手动计数零占/
+在线翻坏字节后台指标发现且循环不停摆/掐停两 tick 零增长+暂停期手动 verify 可用+恢复续爬/
+端点回显契约/默认关零批);blob 全量 95/95;data_plane/compaction_async/replication_control
+回归绿;clippy 0;fmt 净;`openspec validate store-scrub-background` 过。
+
+**发运**:归档 `store-scrub-background`;docs 同步(store.md §12.13 新节 + §12.4/§12.5
+配置/监控两表 7 行 + §12.10 verify 响应契约更新)。顺带翻案完成:存疑四件
+(DELETE 409 无证据/compaction 异步已修/DROPPED 真删已落/disk-capacity-guard 已落)
+全部结案,运维存货清单从"一筐"修成"就四件"。

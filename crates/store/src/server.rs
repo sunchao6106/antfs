@@ -37,6 +37,9 @@ struct AppState {
     request_control: Arc<RequestControl>,
     /// A7 运行期复制开关:暂停后本节点**主动拉取**跳过本轮(别人来拉不受影响)。
     replication_paused: Arc<AtomicBool>,
+    /// 后台巡检开关:暂停后蜗牛爬循环空转跳批(**不动**手动 verify/scrub-report 端点 ——
+    /// 应急检查能力必须常在)。家风同 `replication_paused`:不持久化,重启即恢复。
+    scrub_paused: Arc<AtomicBool>,
     /// `scrub_max_batch_bytes`:verify 缺省扫描上限(来自配置,避免 handler 再持 config)。
     scrub_max_batch_bytes: u64,
     /// 慢请求观测阈值(= `disk_health_timeout_secs`,避免为纯观测新增配置):端到端超过它的请求
@@ -131,6 +134,8 @@ impl StoreServer {
             Arc::new(RequestControl::new(config.request_control_default_ttl_secs));
         // A7 复制开关:与 `request_control` 同风格,起时全开(false = 正常拉复制)。
         let replication_paused = Arc::new(AtomicBool::new(false));
+        // 后台巡检开关:同风格,起时全开(false = 正常轮转;只有 enabled 时才起循环)。
+        let scrub_paused = Arc::new(AtomicBool::new(false));
         // A3 compaction 台账:进程内内存态,重启即丢。
         let compactions = Arc::new(CompactionJobs::new());
         // 先取出标量再 move `config`(handlers 需要 body 上限做流式 put 的前置校验)。
@@ -157,6 +162,7 @@ impl StoreServer {
                 registry: registry.clone(),
                 request_control,
                 replication_paused,
+                scrub_paused,
                 scrub_max_batch_bytes,
                 slow_op_threshold,
                 compactions,
@@ -206,6 +212,10 @@ impl StoreServer {
             .route(
                 "/admin/replication-control",
                 post(set_replication_control).get(get_replication_control),
+            )
+            .route(
+                "/admin/scrub-control",
+                post(set_scrub_control).get(get_scrub_control),
             )
             .merge(data_plane)
             .with_state(self.state.clone())
@@ -276,6 +286,16 @@ impl StoreServer {
                 self.state.metrics.clone(),
                 self.state.pool.clone(),
                 self.state.health.clone(),
+            );
+        }
+        if self.config.scrub_background_enabled {
+            crate::scrub_worker::spawn_scrub_worker(
+                self.config.clone(),
+                self.state.replicas.clone(),
+                self.state.metrics.clone(),
+                self.state.pool.clone(),
+                self.state.health.clone(),
+                self.state.scrub_paused.clone(),
             );
         }
         Ok(())
@@ -1043,6 +1063,52 @@ async fn get_replication_control(State(st): State<AppState>) -> Response {
     .into_response()
 }
 
+/// `POST /admin/scrub-control` 的请求体。
+#[derive(serde::Deserialize)]
+struct ScrubControlBody {
+    /// `true` = 暂停后台巡检循环,`false` = 恢复轮转。
+    paused: bool,
+}
+
+/// `GET|POST /admin/scrub-control` 的响应体(操作后的开关状态)。
+#[derive(serde::Serialize)]
+struct ScrubControlResponse {
+    paused: bool,
+}
+
+/// `POST /admin/scrub-control`:运行期暂停/恢复**后台巡检循环**(只掐定时腿)。
+///
+/// 手动 `GET /partitions/{pid}/verify` / `scrub-report` 不受影响(应急时检查能力必须常在)。
+/// 状态**不持久化**(重启即恢复轮转,与 `/admin/replication-control` 同家风),也不动各副本的
+/// 续扫游标(恢复后从原处续爬)。循环未起(`scrub_background_enabled = false`)时置位无副作用,
+/// 读回照样可见 —— 它表达的是"运维意愿",不是"循环在跑"。
+async fn set_scrub_control(
+    State(st): State<AppState>,
+    Json(body): Json<ScrubControlBody>,
+) -> Response {
+    st.scrub_paused.store(body.paused, Ordering::Relaxed);
+    st.metrics
+        .scrub_background_paused
+        .set(i64::from(body.paused));
+    if body.paused {
+        tracing::info!("background scrub loop paused by operator");
+    } else {
+        tracing::info!("background scrub loop resumed by operator");
+    }
+    Json(ScrubControlResponse {
+        paused: body.paused,
+    })
+    .into_response()
+}
+
+/// `GET /admin/scrub-control`:当前后台巡检开关状态。
+async fn get_scrub_control(State(st): State<AppState>) -> Response {
+    Json(ScrubControlResponse {
+        paused: st.scrub_paused.load(Ordering::Relaxed),
+    })
+    .into_response()
+}
+
 /// `POST /admin/request-control` 的请求体。
 #[derive(serde::Deserialize)]
 struct RequestControlBody {
@@ -1385,7 +1451,9 @@ async fn scrub_report(State(st): State<AppState>, Path(pid): Path<PartitionId>) 
 /// `GET /partitions/{pid}/verify?max_bytes=`:本地完整性校验(逐记录验 CRC + 索引对拍)。
 ///
 /// **会读全量数据体**(可 `max_bytes` 限流,缺省用配置 `scrub_max_batch_bytes`),故为显式运维动作。
-/// 无本地副本 → 404;响应带 `truncated` 说明扫描是否覆盖全量。
+/// 无本地副本 → 404;响应带 `truncated` 说明扫描是否覆盖全量。预算到点时带 `end_cursor`
+/// (下一条未扫字节)与 `bytes_read` —— 手动分批运维可据此续扫(交给下一批的 `start` 语义
+/// 见 [`antfs_blob::BlobStore::verify_from`]);`null` = 本轮预算内扫完全量。
 async fn verify_partition(
     State(st): State<AppState>,
     Path(pid): Path<PartitionId>,
@@ -1415,6 +1483,9 @@ async fn verify_partition(
             let first = r.first_bad_offset.map(
                 |(segment, offset)| serde_json::json!({ "segment": segment, "offset": offset }),
             );
+            let end_cursor = r.end_cursor.map(
+                |(segment, offset)| serde_json::json!({ "segment": segment, "offset": offset }),
+            );
             Json(serde_json::json!({
                 "partition_id": pid,
                 "records": r.records,
@@ -1422,6 +1493,8 @@ async fn verify_partition(
                 "first_bad_offset": first,
                 "index_mismatch": r.index_mismatch,
                 "truncated": r.truncated,
+                "bytes_read": r.bytes_read,
+                "end_cursor": end_cursor,
             }))
             .into_response()
         }

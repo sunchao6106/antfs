@@ -18,7 +18,7 @@
 - [x] store:`GET /partitions/{pid}/verify`(只读,`spawn_blocking`,可带限流参数)+ `GET /partitions/{pid}/scrub-report`(摘要:记录数/活字节/墓碑数/段清单;需 blob 新增 `index_stats()`)+ 指标 `store_server_scrub_runs_total`/`scrub_bad_records`
 - [x] admin:`POST /api/partitions/{id}/scrub`(fan-out 各副本 + 比对逻辑 + 报告,仿 compact 聚合)、`GET /api/scrub`;报告带各副本 token/bytes_read 以标注可比性
 - [x] (可选)`GET /partitions/{pid}/entries?from_key=&limit=` + blob 按键有序区间遍历,支撑逐 key 全量对拍与 digest 分桶定位
-- [x] 配置 `scrub_max_batch_bytes` / 可选 `scrub_interval_secs`(后台周期)+ Validate
+- [x] 配置 `scrub_max_batch_bytes`(默认 64 MiB)+ Validate。~~`scrub_interval_secs`(后台周期)~~ 当时未落地(本行原勾账夸大,2026-10-19 复核发现;后台周期已由 `store-scrub-background` change 以 `scrub_background_enabled`/`scrub_background_interval_secs`/`scrub_background_max_in_flight` 三旋钮补齐落地)
 - [x] UI:分区页 scrub 按钮 + 报告面板(逐副本摘要、比对结果、坏记录位置)
 - [x] 测试:store 侧 verify 检出人为损坏;admin 侧比对检出"某副本缺 key"(在 `replication_enabled` 的 harness 里制造落后);`?replication=1`/心跳路径不受 verify 影响
 - [x] 文档:cluster.md §9 端点/配置/指标 + store.md scrub 语义与"发现不了什么"(字节内容损坏、并发写导致的假不一致)

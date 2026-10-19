@@ -374,6 +374,11 @@ pub struct VerifyReport {
     pub index_mismatch: u64,
     /// 扫描未覆盖全部 log:`max_bytes` 到点,或遇到无法重同步的坏记录(段尾截断)时为 true。
     pub truncated: bool,
+    /// 本次计入预算的读取字节数(含"记下坏记录后按声明长度跳过"的部分;预算到点时 = 到点为止)。
+    pub bytes_read: u64,
+    /// 续扫游标:预算耗尽处的"下一条未扫字节";`None` = 未耗预算即扫完全部段。
+    /// 语义(为什么预算耗尽也能无缝续)见 [`BlobStore::verify_from`]。
+    pub end_cursor: Option<(u64, u64)>,
 }
 
 /// 副本摘要(只走索引/mmap,**不读数据体**,开销与 key 数成正比)。
@@ -1431,14 +1436,37 @@ impl BlobStore {
     ///   **发现不了**"索引里指向了 log 中并不存在的 offset"(那需要遍历索引反向核对,属后续增强)。
     /// - `max_bytes` 是本次扫描的**读取字节上限**(到点返回部分结果 + `truncated=true`),供深扫限流用。
     pub fn verify(&self, max_bytes: u64) -> Result<VerifyReport> {
+        self.verify_from(None, max_bytes)
+    }
+
+    /// [`verify`](Self::verify) 的可续扫版:从 `start`(上一轮报告的 `end_cursor`)继续,
+    /// 预算耗尽即停并把新的续扫点写进 `end_cursor`。
+    ///
+    /// 游标语义(`end_cursor` 指向**下一条未扫字节**,续扫为何不重不漏):
+    /// - 游标段还在 ⇒ 从 `offset` 继续(段被 compaction 压短则 `offset` 越过 `data_end`,
+    ///   本段自然不进,落到其后段);
+    /// - 游标段已不存在(被增量 compaction 摘走)⇒ 从**其后第一个段**接上 —— compaction 建的
+    ///   新段位置恒大于旧段,数据在"位置 > 游标段"处延续,不漏;
+    /// - 游标位置超出全部段(只见于游标本身损坏)⇒ 视为已扫完,空手返回。
+    ///
+    /// `end_cursor = None`(预算内扫完全部段)后应**从头开新周期** —— 本函数不跨调用持有状态。
+    /// 坏记录的"段内坏墙"(无法重同步)不写游标:该段剩余部分被放弃,但后续段照扫(语义同
+    /// open 的带伤恢复,见 `OpenDamage`)。
+    pub fn verify_from(&self, start: Option<(u64, u64)>, max_bytes: u64) -> Result<VerifyReport> {
         let inner = self.inner();
         let mut report = VerifyReport::default();
         let mut read: u64 = 0;
         'segments: for (position, data_end) in inner.log.segment_spans() {
-            let mut off = 0u64;
+            let mut off = match start {
+                // 游标之前的段:上轮已扫,整段跳过。
+                Some((seg, _)) if position < seg => continue,
+                Some((seg, cursor_off)) if position == seg => cursor_off.min(data_end),
+                _ => 0,
+            };
             while off < data_end {
                 if read >= max_bytes {
                     report.truncated = true;
+                    report.end_cursor = Some((position, off));
                     break 'segments;
                 }
                 let at = LogOffset::new(position, off);
@@ -1484,6 +1512,7 @@ impl BlobStore {
                 }
             }
         }
+        report.bytes_read = read;
         Ok(report)
     }
 

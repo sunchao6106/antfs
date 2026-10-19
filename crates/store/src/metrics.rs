@@ -133,6 +133,14 @@ pub struct StoreServerMetrics {
     pub verify_duration: Histogram,
     /// scrub 摘要(`GET /partitions/{pid}/scrub-report`)调用次数。
     pub scrub_reports: IntCounter,
+    /// 后台巡检完成的扫描 batch 数(每 batch = 一次 verify_from 调用,预算 `scrub_max_batch_bytes`)。
+    pub scrub_background_batches: IntCounter,
+    /// 后台巡检累计读取的字节数。
+    pub scrub_background_bytes: IntCounter,
+    /// 后台巡检发现的坏记录数(与手动 verify 的 `verify_bad_records` 分开计数,分得清自动/人工)。
+    pub scrub_background_bad_records: IntCounter,
+    /// 后台巡检暂停开关(1 = 被 `/admin/scrub-control` 掐停;重启即恢复)。
+    pub scrub_background_paused: IntGauge,
     pub heartbeats: IntCounter,
     pub mutations: IntCounter,
     pub replication_rounds: IntCounter,
@@ -343,6 +351,26 @@ impl StoreServerMetrics {
                 registry,
                 "store_server_scrub_reports_total",
                 "scrub report endpoint calls",
+            )?,
+            scrub_background_batches: counter(
+                registry,
+                "store_server_scrub_background_batches_total",
+                "background scrub batches completed (one verify_from call each)",
+            )?,
+            scrub_background_bytes: counter(
+                registry,
+                "store_server_scrub_background_bytes_total",
+                "bytes read by background scrub batches (budget-inclusive)",
+            )?,
+            scrub_background_bad_records: counter(
+                registry,
+                "store_server_scrub_background_bad_records_total",
+                "bad records found by background scrub (separate from manual verify counters)",
+            )?,
+            scrub_background_paused: gauge(
+                registry,
+                "store_server_scrub_background_paused",
+                "background scrub loop paused by operator (1 = paused)",
             )?,
             heartbeats: counter(
                 registry,
