@@ -197,7 +197,7 @@ pub struct ObjectAttributesOut {
     pub etag: Option<String>,
     pub object_size: Option<u64>,
     pub storage_class: bool,
-    pub checksum: Option<(String, String)>,
+    pub checksum: Option<(String, String, String)>,
 }
 
 pub fn serialize_object_attributes(out: &ObjectAttributesOut) -> String {
@@ -208,10 +208,10 @@ pub fn serialize_object_attributes(out: &ObjectAttributesOut) -> String {
     if let Some(etag) = &out.etag {
         xml.push_str(&format!("<ETag>{}</ETag>", quick_xml::escape::escape(etag)));
     }
-    if let Some((algo, value)) = &out.checksum {
+    if let Some((algo, value, kind)) = &out.checksum {
         xml.push_str(&format!(
             "<Checksum><Checksum{algo}>{}</Checksum{algo}>\
-             <ChecksumType>FULL_OBJECT</ChecksumType></Checksum>",
+             <ChecksumType>{kind}</ChecksumType></Checksum>",
             quick_xml::escape::escape(value)
         ));
     }
@@ -802,7 +802,7 @@ mod tests {
             etag: Some("deadbee".into()),
             object_size: Some(42),
             storage_class: true,
-            checksum: Some(("SHA256".into(), "QXBydWxl".into())),
+            checksum: Some(("SHA256".into(), "QXBydWxl".into(), "FULL_OBJECT".into())),
         };
         let xml = serialize_object_attributes(&out);
         assert!(xml.contains(

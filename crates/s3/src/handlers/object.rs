@@ -65,6 +65,7 @@ pub async fn put_object(
     let (content_type, user_meta) = capture_object_meta(req.headers())?;
     let sse_requested = parse_sse_request_header(req.headers(), &st.sse)?;
     let header_claims = crate::checksum::collect_claim_headers(req.headers())?;
+    crate::checksum::ensure_full_object_type(req.headers())?;
     let declared_trailer = req
         .headers()
         .get("x-amz-trailer")
@@ -91,6 +92,7 @@ pub async fn put_object(
         crate::checksum::verify_claims(&claims, &body_bytes)?.map(|claim| StoredChecksum {
             algo: claim.algo,
             value: claim.value,
+            kind: crate::checksum::ChecksumKind::FullObject,
         });
 
     let etag = {
@@ -298,7 +300,7 @@ fn object_read_builder(
     if let Some(c) = echo_checksum {
         builder = builder
             .header(c.algo.lower_name(), c.value.as_str())
-            .header("x-amz-checksum-type", "FULL_OBJECT");
+            .header("x-amz-checksum-type", c.kind.as_str());
     }
     if let Some(ct) = &meta.content_type {
         builder = builder.header(header::CONTENT_TYPE, ct.as_str());
@@ -512,7 +514,7 @@ pub async fn head_object(
     if let Some(c) = echo_checksum {
         builder = builder
             .header(c.algo.lower_name(), c.value.as_str())
-            .header("x-amz-checksum-type", "FULL_OBJECT");
+            .header("x-amz-checksum-type", c.kind.as_str());
     }
     if meta.sse.is_some() {
         builder = builder.header("x-amz-server-side-encryption", "AES256");
@@ -875,6 +877,7 @@ async fn copy_via_multipart(
                     blob_id: new_blob,
                     size,
                     etag: etag.clone(),
+                    checksum: None,
                 },
             )
             .await?;
@@ -882,7 +885,7 @@ async fn copy_via_multipart(
     }
     let result = match st
         .metastore
-        .complete_multipart(&upload_id, &complete_parts)
+        .complete_multipart(&upload_id, &complete_parts, CompleteChecksum::None)
         .await
     {
         Ok(result) => result,
@@ -949,7 +952,13 @@ pub async fn get_object_attributes(
         checksum: wants("checksum")
             .then_some(meta.checksum.as_ref())
             .flatten()
-            .map(|c| (c.algo.algo_name().to_string(), c.value.clone())),
+            .map(|c| {
+                (
+                    c.algo.algo_name().to_string(),
+                    c.value.clone(),
+                    c.kind.as_str().to_string(),
+                )
+            }),
     };
     let body = crate::xml::serialize_object_attributes(&out);
     let response = Response::builder()

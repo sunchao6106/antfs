@@ -18,37 +18,17 @@ The S3 gateway SHALL accept `POST /<bucket>/<key>?uploads`, generate a unique `u
 - **THEN** gateway returns `MetadataTooLarge` (400), no session is created
 
 ### Requirement: UploadPart writes a part as an independent blob
-The S3 gateway SHALL accept `PUT /<bucket>/<key>?partNumber=N&uploadId=ID`, write the part body as a separate blob via `put_auto_with_ttl`, compute its MD5 ETag, and upsert a row in `multipart_parts` **inside a single metastore transaction that takes the session's `multipart_uploads` row lock (`SELECT … FOR UPDATE`) first and locks the part row before reading it**. On re-upload of the same part number the upsert SHALL return the replaced part's `blob_id`, and the handler SHALL tombstone it (`router.delete`) within the same request (idempotent), resolving its reclaim-WAL row (queued in the same transaction) on success. Under concurrent re-uploads of the same part number, the ownership of every replaced blob SHALL be handed over exactly once (no blob left without a reclaimer; lock-reads return the latest committed row, so a late uploader never receives a stale old value). A crash between commit and tombstone SHALL leave the WAL row for GC reclamation.
+The S3 gateway SHALL accept `PUT /<bucket>/<key>?partNumber=N&uploadId=ID`, write the part body as a separate blob via `put_auto_with_ttl`, compute its MD5 ETag, and upsert a row in `multipart_parts` **inside a single metastore transaction that takes the session's `multipart_uploads` row lock (`SELECT … FOR UPDATE`) first and locks the part row before reading it**. On re-upload of the same part number the upsert SHALL return the replaced part's `blob_id`, and the handler SHALL tombstone it (`router.delete`) within the same request (idempotent), resolving its reclaim WAL row (queued in the same transaction) on success. Under concurrent re-uploads of the same part number, the ownership of every replaced blob SHALL be handed over exactly once (no blob left without a reclaimer; lock-reads return the latest committed row, so a late uploader never receives a stale old value). A crash between commit and tombstone SHALL leave the WAL row for GC reclamation.
 
-Flexible checksums on a part body SHALL be verified with the same semantics as PutObject (request-header and trailer carriers, `BadDigest`/`InvalidArgument`/`NotImplemented` faces, verification before the blob write), and the UploadPart response SHALL echo the gateway-computed checksum (`x-amz-checksum-{algo}` + `x-amz-checksum-type: FULL_OBJECT`). Part checksums SHALL NOT be persisted (complete-level composite/full-object checksums are out of this change's scope).
+Flexible checksums on a part body SHALL be verified with the same semantics as PutObject (request-header and trailer carriers, `BadDigest`/`InvalidArgument`/`NotImplemented` faces, verification before the blob write), and the UploadPart response SHALL echo the gateway-computed checksum (`x-amz-checksum-{algo}` + `x-amz-checksum-type: FULL_OBJECT`). The **verified** part checksum (strongest claim when several algorithms are declared, mirroring PutObject persistence) SHALL be persisted on the `multipart_parts` row (`part_checksum_algo` / `part_checksum_b64`, migration 007) as raw material for CompleteMultipartUpload's complete-level rulings.
 
 #### Scenario: Successful part upload
 - **WHEN** client sends `PUT /mybucket/bigfile.bin?partNumber=1&uploadId=abc` with 5 MiB body
 - **THEN** gateway returns 200 with `ETag` for that part
 
-#### Scenario: Part checksum verified and echoed
+#### Scenario: Part checksum verified, echoed, and persisted
 - **WHEN** a part upload carries the correct `x-amz-checksum-crc32`
-- **THEN** the response includes `x-amz-checksum-crc32` and `x-amz-checksum-type: FULL_OBJECT`
-
-#### Scenario: Part checksum mismatch rejected
-- **WHEN** a part upload carries a wrong checksum value
-- **THEN** gateway returns 400 `BadDigest`; no part blob is written and the session is unchanged
-
-#### Scenario: Re-upload overwrites previous part
-- **WHEN** client uploads partNumber=1 twice with different data
-- **THEN** the second upload's blob_id and etag replace the first in `multipart_parts`; the old part blob is tombstoned (`router.delete`) within the same request
-
-#### Scenario: Re-upload crash window is WAL-backed
-- **WHEN** the gateway crashes after the re-upload transaction commits but before the old part's tombstone lands
-- **THEN** the old part's blob id remains in the reclaim WAL and GC reclaims it
-
-#### Scenario: Concurrent re-upload of the same part number
-- **WHEN** 8 clients concurrently upload partNumber=1 for the same session with different bodies
-- **THEN** all requests succeed (200); each uploaded blob is accounted for exactly once — it is either the final row's blob or handed back as the old value to exactly one request; no intermediate blob is left without a tombstone
-
-#### Scenario: Upload racing with abort sees an ordered outcome
-- WHEN one client uploads a part WHILE another aborts the session
-- THEN either the upload is rejected with `NoSuchUpload` (abort committed first, no part row survives), or the abort's returned blob list includes the part the uploading client stored (upload committed first); in neither order does an ownerless `multipart_parts` row or part blob remain afterwards
+- **THEN** the response echoes the value with `x-amz-checksum-type: FULL_OBJECT`, and the part row persists the algorithm and value for the complete-level ruling
 
 ### Requirement: CompleteMultipartUpload assembles parts into a named object
 The S3 gateway SHALL accept `POST /<bucket>/<key>?uploadId=ID` with XML listing parts, validate ETags match, store a manifest (ordered part blob_ids + sizes) in `named_objects` — inheriting the `content_type`/`user_meta` captured at CreateMultipartUpload — delete the multipart session, and return the final object's ETag. **The whole session read + session deletion SHALL run in one metastore transaction holding the `multipart_uploads` row lock (so no part upload can interleave between the manifest snapshot and the session cleanup).** Part blobs that were uploaded but NOT listed in the CompleteMultipartUpload XML SHALL be reported back to the handler via `CompleteMultipartResult.discarded_part_blobs` and tombstoned (`router.delete`), per S3's "complete discards unlisted parts" semantics.
@@ -110,4 +90,30 @@ When the request carries a satisfiable `Range`, the gateway SHALL translate it v
 #### Scenario: Manifest-row size mismatch fails loud
 - **WHEN** a row's `size` disagrees with the sum of its manifest part sizes (corrupt metadata)
 - **THEN** gateway returns `InternalError` (500) instead of serving a body that contradicts its `Content-Length`
+
+### Requirement: CompleteMultipartUpload enforces complete-level checksums
+
+CompleteMultipartUpload SHALL evaluate the object's final checksum from the manifest-listed parts, accept client-supplied complete-level checksum headers, and persist the winning value on the object row with an explicit kind (`checksum_type` column: `FULL_OBJECT` | `COMPOSITE`; NULL reads as `FULL_OBJECT` for pre-migration rows).
+
+**COMPOSITE path** (`x-amz-checksum-type: COMPOSITE`): only the CRC32/CRC32C family is legal (SHA-family or both CRCs together → `InvalidRequest` 400). The composite value SHALL be `base64(concat(raw-part-checksum-bytes in manifest order))`, derived **inside the complete transaction's session lock** where the part snapshot is final; the object row stores `{algo, composite, COMPOSITE}` and the response echoes it. A client-supplied composite value SHALL be compared against the derivation — mismatch → `BadDigest` 400 with zero side effects (session and parts rows untouched, retry-safe). Derivation requires every manifest-listed part to carry a same-family CRC part checksum; mixed algorithms or partially-covered parts (or no part values at all) under the composite claim → `InvalidRequest` 400.
+
+**FULL_OBJECT path** (type absent defaults here, or explicit): every four-family checksum value header present SHALL be verified against the streamed concatenation of the manifest-listed part blobs (bounded memory, at most one part in flight), before the metastore commit; mismatch on any → `BadDigest` 400 zero side effects. Passing values are persisted under the existing strongest-one-wins rule with kind `FULL_OBJECT`. A declared type with no value headers → `InvalidRequest` 400. `x-amz-checksum-crc64nvme` → 501 (family policy, consistent with PUT/Part).
+
+When parts carry a same-family CRC and the request supplies no complete-level headers, the gateway SHALL still derive, persist, and echo the composite (integrity-by-default). Bare parts (no values anywhere) and no headers → object row keeps NULL checksums (existing behavior).
+
+#### Scenario: Composite auto-derivation
+- **WHEN** parts 1..3 upload with correct `x-amz-checksum-crc32` values and complete is sent plain
+- **THEN** the complete response carries `x-amz-checksum-crc32` = base64(concat of raw CRCs) + `x-amz-checksum-type: COMPOSITE`, the object row persists it, and a later mode-enabled GET echoes the same pair
+
+#### Scenario: SDK composite value mismatch is rejected with no side effects
+- **WHEN** complete supplies a wrong `x-amz-checksum-crc32` composite value with type COMPOSITE
+- **THEN** gateway returns `BadDigest` 400 and re-sending the same complete with the correct value succeeds on the untouched session
+
+#### Scenario: Full-object verification
+- **WHEN** complete supplies `x-amz-checksum-sha256` with type FULL_OBJECT (or absent type) over a two-part object
+- **THEN** the streamed concatenation is hashed and compared before commit; correct values persist with kind FULL_OBJECT and echo on the complete response, wrong values fail `BadDigest` with the session intact
+
+#### Scenario: Family violations are loudly rejected
+- **WHEN** complete supplies `x-amz-checksum-sha256` with type COMPOSITE, or parts carry crc32 on some parts and crc32c on others under a composite claim, or some listed parts lack checksum values
+- **THEN** gateway returns `InvalidRequest` 400 naming the violation
 

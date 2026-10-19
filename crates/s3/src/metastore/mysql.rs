@@ -6,6 +6,7 @@ use antfs_blob::StoreKey;
 
 use super::types::*;
 use super::{MetaStore, Result};
+use crate::checksum::ChecksumKind;
 use crate::error::S3Error;
 
 pub struct MysqlMetaStore {
@@ -46,9 +47,13 @@ impl MysqlMetaStore {
 #[async_trait]
 impl MetaStore for MysqlMetaStore {
     async fn put_object(&self, req: PutObjectMeta) -> Result<PutObjectOutcome> {
-        let (stored_algo_string, stored_value) = match &req.checksum {
-            Some(c) => (Some(c.algo.algo_name().to_string()), Some(c.value.clone())),
-            None => (None, None),
+        let (stored_algo_string, stored_value, stored_kind) = match &req.checksum {
+            Some(c) => (
+                Some(c.algo.algo_name().to_string()),
+                Some(c.value.clone()),
+                Some(c.kind.as_str().to_string()),
+            ),
+            None => (None, None, None),
         };
         let version = Self::gen_version();
         let now = Self::now_ms();
@@ -119,8 +124,8 @@ impl MetaStore for MysqlMetaStore {
         .await?;
 
         sqlx::query(
-            "INSERT INTO named_objects (bucket, `key`, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64)
-             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO named_objects (bucket, `key`, version, blob_id, state, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64, checksum_type)
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&req.bucket)
         .bind(&req.key)
@@ -135,6 +140,7 @@ impl MetaStore for MysqlMetaStore {
         .bind(&req.sse)
         .bind(stored_algo_string.as_deref())
         .bind(stored_value.as_deref())
+        .bind(stored_kind.as_deref())
         .execute(&mut *tx)
         .await?;
         let shadowed_ids: Vec<StoreKey> = shadowed
@@ -155,7 +161,7 @@ impl MetaStore for MysqlMetaStore {
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let row: Option<MysqlObjectRow> = sqlx::query_as(
-            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64
+            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64, checksum_type
              FROM named_objects
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL
              ORDER BY version DESC LIMIT 1",
@@ -178,7 +184,7 @@ impl MetaStore for MysqlMetaStore {
             None => (None, None),
         };
         let rows: Vec<MysqlObjectRow> = sqlx::query_as(
-            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64
+            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64, checksum_type
              FROM named_objects
              WHERE sse IS NOT NULL AND state = 1 AND deleted_at IS NULL
                AND (? IS NULL OR (bucket, `key`) > (?, ?))
@@ -508,16 +514,23 @@ impl MetaStore for MysqlMetaStore {
         .fetch_optional(&mut *tx)
         .await?;
 
+        let (part_algo, part_value) = match &part.checksum {
+            Some(c) => (Some(c.algo.algo_name().to_string()), Some(c.value.clone())),
+            None => (None, None),
+        };
         sqlx::query(
-            "INSERT INTO multipart_parts (upload_id, part_number, blob_id, size, etag)
-             VALUES (?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE blob_id = VALUES(blob_id), size = VALUES(size), etag = VALUES(etag)",
+            "INSERT INTO multipart_parts (upload_id, part_number, blob_id, size, etag, part_checksum_algo, part_checksum_b64)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE blob_id = VALUES(blob_id), size = VALUES(size), etag = VALUES(etag),
+                           part_checksum_algo = VALUES(part_checksum_algo), part_checksum_b64 = VALUES(part_checksum_b64)",
         )
         .bind(upload_id)
         .bind(part.part_number)
         .bind(part.blob_id.as_bytes().as_slice())
         .bind(part.size as i64)
         .bind(&part.etag)
+        .bind(part_algo.as_deref())
+        .bind(part_value.as_deref())
         .execute(&mut *tx)
         .await?;
         if let Some((old_bytes,)) = &old {
@@ -534,6 +547,7 @@ impl MetaStore for MysqlMetaStore {
         &self,
         upload_id: &str,
         parts: &[CompletePart],
+        checksum: CompleteChecksum,
     ) -> Result<CompleteMultipartResult> {
         let mut tx = self.pool.begin().await?;
 
@@ -547,8 +561,8 @@ impl MetaStore for MysqlMetaStore {
         .await?;
         let (bucket, key, content_type, user_meta_json) = upload.ok_or(S3Error::NoSuchUpload)?;
 
-        let stored: Vec<(i32, Vec<u8>, i64, String)> = sqlx::query_as(
-            "SELECT part_number, blob_id, size, etag FROM multipart_parts
+        let stored: Vec<(i32, Vec<u8>, i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT part_number, blob_id, size, etag, part_checksum_algo, part_checksum_b64 FROM multipart_parts
              WHERE upload_id = ? ORDER BY part_number",
         )
         .bind(upload_id)
@@ -564,14 +578,17 @@ impl MetaStore for MysqlMetaStore {
             .map(|(_, bid, ..)| blob_id_from_bytes(bid))
             .collect();
 
-        let stored_map: HashMap<i32, (Vec<u8>, i64, String)> = stored
+        let stored_map: HashMap<i32, (Vec<u8>, i64, String, Option<StoredChecksum>)> = stored
             .into_iter()
-            .map(|(pn, bid, sz, et)| (pn, (bid, sz, et)))
+            .map(|(pn, bid, sz, et, calgo, cval)| {
+                (pn, (bid, sz, et, StoredChecksum::from_pair(calgo, cval)))
+            })
             .collect();
 
         let mut manifest_parts = Vec::with_capacity(parts.len());
         let mut total_size: u64 = 0;
         let mut etag_parts = Vec::new();
+        let mut listed_checksums: Vec<Option<StoredChecksum>> = Vec::with_capacity(parts.len());
         let mut prev_part_num = 0i32;
 
         for cp in parts {
@@ -580,7 +597,7 @@ impl MetaStore for MysqlMetaStore {
             }
             prev_part_num = cp.part_number;
 
-            let (blob_bytes, size, stored_etag) = stored_map
+            let (blob_bytes, size, stored_etag, part_ck) = stored_map
                 .get(&cp.part_number)
                 .ok_or(S3Error::InvalidPart)?;
 
@@ -597,7 +614,41 @@ impl MetaStore for MysqlMetaStore {
             });
             total_size += *size as u64;
             etag_parts.push(stored_etag.clone());
+            listed_checksums.push(part_ck.clone());
         }
+
+        // complete 级校验终判(锁内快照;规则同 pg 版,见 change design D1/D4)。
+        let final_checksum = match checksum {
+            CompleteChecksum::FullObject(verified) => Some(verified),
+            CompleteChecksum::None => {
+                crate::metastore::derive_composite_if_uniform(&listed_checksums)
+            }
+            CompleteChecksum::Composite { claimed } => {
+                let (algo, values) = crate::metastore::uniform_part_values(&listed_checksums)?;
+                let derived =
+                    crate::checksum::derive_composite(algo, &values).ok_or_else(|| {
+                        S3Error::InvalidRequest(
+                        "part checksum value is not a valid full-object digest for its algorithm"
+                            .into(),
+                    )
+                    })?;
+                if let Some(claimed) = claimed {
+                    if claimed != derived {
+                        return Err(S3Error::BadDigest {
+                            checksum_form: format!(
+                                "complete composite {} mismatch",
+                                algo.lower_name()
+                            ),
+                        });
+                    }
+                }
+                Some(StoredChecksum {
+                    algo,
+                    value: derived,
+                    kind: ChecksumKind::Composite,
+                })
+            }
+        };
 
         let composite_etag = if parts.len() == 1 {
             etag_parts[0].clone()
@@ -632,7 +683,7 @@ impl MetaStore for MysqlMetaStore {
             user_meta,
             parts_manifest: Some(manifest_json.clone()),
             sse: None,
-            checksum: None,
+            checksum: final_checksum.clone(),
         };
         // put_object 自持事务(objects/buckets 行)与本会话锁互不相交、加锁单向
         // (会话锁 ↔ 对象行,无环),无死锁;会话锁握过整个 put_object 窗口,期间新的
@@ -659,6 +710,7 @@ impl MetaStore for MysqlMetaStore {
             parts_manifest: manifest_json,
             shadowed_blobs: outcome.shadowed_blobs,
             discarded_part_blobs,
+            checksum: final_checksum,
         })
     }
 
@@ -774,6 +826,36 @@ impl MetaStore for MysqlMetaStore {
             is_truncated,
             next_part_number_marker: next_marker,
         })
+    }
+
+    async fn session_parts(&self, upload_id: &str) -> Result<Vec<PartMeta>> {
+        let exists: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM multipart_uploads WHERE upload_id = ?")
+                .bind(upload_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if exists.is_none() {
+            return Err(S3Error::NoSuchUpload);
+        }
+        let rows: Vec<(i32, Vec<u8>, i64, String, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT part_number, blob_id, size, etag, part_checksum_algo, part_checksum_b64
+                 FROM multipart_parts
+                 WHERE upload_id = ? ORDER BY part_number",
+            )
+            .bind(upload_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(pn, bid, sz, et, calgo, cval)| PartMeta {
+                part_number: pn,
+                blob_id: blob_id_from_bytes(&bid),
+                size: sz as u64,
+                etag: et,
+                checksum: StoredChecksum::from_pair(calgo, cval),
+            })
+            .collect())
     }
 
     async fn list_multipart_uploads(
@@ -956,6 +1038,7 @@ struct MysqlObjectRow {
     sse: Option<String>,
     checksum_algo: Option<String>,
     checksum_b64: Option<String>,
+    checksum_type: Option<String>,
 }
 
 impl MysqlObjectRow {
@@ -977,7 +1060,11 @@ impl MysqlObjectRow {
             user_meta,
             parts_manifest: self.parts_manifest,
             sse: self.sse,
-            checksum: StoredChecksum::from_pair(self.checksum_algo, self.checksum_b64),
+            checksum: StoredChecksum::from_row(
+                self.checksum_algo,
+                self.checksum_b64,
+                self.checksum_type,
+            ),
         }
     }
 }
@@ -1434,12 +1521,14 @@ mod tests {
             blob_id: StoreKey::from_parts(1, 1),
             size: 5,
             etag: "11111111111111111111111111111111".to_string(),
+            checksum: None,
         };
         let part2 = PartMeta {
             part_number: 2,
             blob_id: StoreKey::from_parts(1, 2),
             size: 3,
             etag: "22222222222222222222222222222222".to_string(),
+            checksum: None,
         };
         store.put_part(&upload_id, part1).await.unwrap();
         store.put_part(&upload_id, part2).await.unwrap();
@@ -1453,7 +1542,10 @@ mod tests {
                 etag: "22222222222222222222222222222222".to_string(),
             },
         ];
-        let res = store.complete_multipart(&upload_id, &parts).await.unwrap();
+        let res = store
+            .complete_multipart(&upload_id, &parts, CompleteChecksum::None)
+            .await
+            .unwrap();
         assert_eq!(res.bucket, bucket);
         assert_eq!(res.key, key);
         assert!(!res.parts_manifest.is_empty());
@@ -1516,6 +1608,7 @@ mod tests {
                     blob_id: p_old,
                     size: 1,
                     etag: "a".into(),
+                    checksum: None,
                 },
             )
             .await
@@ -1528,6 +1621,7 @@ mod tests {
                     blob_id: p_new,
                     size: 1,
                     etag: "b".into(),
+                    checksum: None,
                 },
             )
             .await
@@ -1608,6 +1702,7 @@ mod tests {
                             blob_id: StoreKey::from_parts(9, i),
                             size: 1,
                             etag: format!("{i:032}"),
+                            checksum: None,
                         },
                     )
                     .await
@@ -1662,6 +1757,7 @@ mod tests {
                         blob_id: StoreKey::from_parts(4, oid),
                         size: 2,
                         etag: format!("{oid:032}"),
+                        checksum: None,
                     },
                 )
                 .await
@@ -1678,7 +1774,10 @@ mod tests {
                 etag: format!("{:032}", 2),
             },
         ];
-        let res = store.complete_multipart(&upload_id, &parts).await.unwrap();
+        let res = store
+            .complete_multipart(&upload_id, &parts, CompleteChecksum::None)
+            .await
+            .unwrap();
         assert_eq!(res.discarded_part_blobs.len(), 1);
         assert_eq!(
             res.discarded_part_blobs[0].as_bytes().to_vec(),
@@ -1719,6 +1818,7 @@ mod tests {
                         blob_id: StoreKey::from_parts(5, 7),
                         size: 1,
                         etag: "etag".to_string(),
+                        checksum: None,
                     },
                 )
                 .await
@@ -1763,6 +1863,7 @@ mod tests {
             blob_id: StoreKey::from_parts(1, 5),
             size: 2,
             etag: "etag".to_string(),
+            checksum: None,
         };
         store.put_part(&upload_id, part).await.unwrap();
         let blob_ids = store.abort_multipart(&upload_id).await.unwrap();
@@ -1792,6 +1893,7 @@ mod tests {
             blob_id: StoreKey::from_parts(1, 1),
             size: 1,
             etag: "e1".to_string(),
+            checksum: None,
         };
         let old = store.put_part(&upload_id, part1).await.unwrap();
         assert!(old.is_none());
@@ -1800,6 +1902,7 @@ mod tests {
             blob_id: StoreKey::from_parts(1, 2),
             size: 2,
             etag: "e2".to_string(),
+            checksum: None,
         };
         let old = store.put_part(&upload_id, part2).await.unwrap();
         assert!(old.is_some());
@@ -1807,7 +1910,10 @@ mod tests {
             part_number: 1,
             etag: "e2".to_string(),
         }];
-        let res = store.complete_multipart(&upload_id, &parts).await.unwrap();
+        let res = store
+            .complete_multipart(&upload_id, &parts, CompleteChecksum::None)
+            .await
+            .unwrap();
         assert_eq!(res.blob_id, StoreKey::from_parts(1, 2));
 
         wal_wipe(&pool).await;

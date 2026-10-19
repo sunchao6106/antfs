@@ -27,16 +27,36 @@ pub struct PutObjectMeta {
 pub struct StoredChecksum {
     pub algo: crate::checksum::ChecksumAlgo,
     pub value: String,
+    /// 值口径(migration 007 列;历史行读侧归 FULL_OBJECT)。
+    pub kind: crate::checksum::ChecksumKind,
 }
 
 impl StoredChecksum {
     /// 双可空列 → 形态(半行 = 脏数据,按无值处理并告警,不 500:回显缺省属
     /// 优雅降级,读写路径都不该被历史半写打穿)。
-    pub fn from_pair(algo: Option<String>, value: Option<String>) -> Option<Self> {
+    /// 对象行三列读(named_objects checksum_algo/b64/type);type NULL = FULL_OBJECT
+    /// (migration 005 历史行),野值按缺值告警宽容。
+    pub fn from_row(
+        algo: Option<String>,
+        value: Option<String>,
+        kind: Option<String>,
+    ) -> Option<Self> {
+        let kind = match kind.as_deref() {
+            None | Some("FULL_OBJECT") => crate::checksum::ChecksumKind::FullObject,
+            Some("COMPOSITE") => crate::checksum::ChecksumKind::Composite,
+            Some(other) => {
+                tracing::warn!(kind = other, "unknown checksum_type, treating as absent");
+                return None;
+            }
+        };
         match (algo, value) {
             (Some(a), Some(v)) => {
                 let algo = crate::checksum::ChecksumAlgo::from_algo_name(&a)?;
-                Some(StoredChecksum { algo, value: v })
+                Some(StoredChecksum {
+                    algo,
+                    value: v,
+                    kind,
+                })
             }
             (None, None) => None,
             _ => {
@@ -46,6 +66,11 @@ impl StoredChecksum {
                 None
             }
         }
+    }
+
+    /// part 行两列读(multipart_parts;part 值恒为单片 FULL_OBJECT)。
+    pub fn from_pair(algo: Option<String>, value: Option<String>) -> Option<Self> {
+        Self::from_row(algo, value, None)
     }
 }
 
@@ -145,6 +170,8 @@ pub struct PartMeta {
     pub blob_id: BlobId,
     pub size: u64,
     pub etag: String,
+    /// UploadPart 已验证的最强声明(migration 007;None = 该片未带校验上传)。
+    pub checksum: Option<StoredChecksum>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +194,20 @@ pub struct CompleteMultipartResult {
     /// 被顶替换下的旧 part blob 不在此列(put_part 已把 old 恰一次交还给上传方回收)。
     /// handler 需逐一 `router.delete`,否则这些 blob 无墓碑、GC 永不收。
     pub discarded_part_blobs: Vec<BlobId>,
+    /// complete 级裁决后的行存校验(composite 推导产物/FULL_OBJECT 验证产物;None = 无)。
+    pub checksum: Option<StoredChecksum>,
+}
+
+/// CompleteMultipartUpload 的 complete 级校验声明(handler 裁决后传入 metastore;
+/// composite 的部件族性/同族性比对在会话锁内终判)。
+#[derive(Debug, Clone)]
+pub enum CompleteChecksum {
+    /// 无声明(若 manifest 片全员同族 CRC 有值,仍自动推导 composite 落行)。
+    None,
+    /// FULL_OBJECT:handler 已流式全验的最强值。
+    FullObject(StoredChecksum),
+    /// COMPOSITE:claimed = SDK 供值(Some)或纯推导(None)。
+    Composite { claimed: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -251,4 +292,42 @@ pub struct ListUploadsResp {
 pub struct ManifestPart {
     pub blob_id: [u8; 8],
     pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_row_decodes_kinds_and_tolerates_legacy() {
+        // 007 前历史行:两列有值、type NULL → FULL_OBJECT。
+        let legacy = StoredChecksum::from_row(Some("SHA256".into()), Some("QUJD".into()), None)
+            .expect("legacy row decodes");
+        assert_eq!(legacy.kind, crate::checksum::ChecksumKind::FullObject);
+
+        let composite = StoredChecksum::from_row(
+            Some("CRC32".into()),
+            Some("QUJD".into()),
+            Some("COMPOSITE".into()),
+        )
+        .expect("composite kind decodes");
+        assert_eq!(composite.kind, crate::checksum::ChecksumKind::Composite);
+
+        // 野值 kind:告警宽容(按缺值处理)。
+        assert!(StoredChecksum::from_row(
+            Some("CRC32".into()),
+            Some("QUJD".into()),
+            Some("BASE64".into())
+        )
+        .is_none());
+
+        // 半写行(既有 005 契约):缺一列 → None。
+        assert!(StoredChecksum::from_row(Some("CRC32".into()), None, None).is_none());
+        assert!(StoredChecksum::from_row(None, Some("QUJD".into()), None).is_none());
+
+        // part 行两列读:恒 FULL_OBJECT。
+        let part = StoredChecksum::from_pair(Some("CRC32".into()), Some("QUJD".into()))
+            .expect("part row decodes");
+        assert_eq!(part.kind, crate::checksum::ChecksumKind::FullObject);
+    }
 }

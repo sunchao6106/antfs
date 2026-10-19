@@ -232,6 +232,7 @@ mod tests {
             &self,
             _upload_id: &str,
             _parts: &[CompletePart],
+            _checksum: CompleteChecksum,
         ) -> MetaResult<CompleteMultipartResult> {
             Err(not_implemented())
         }
@@ -296,6 +297,9 @@ mod tests {
             _after: Option<(String, String)>,
             _limit: u64,
         ) -> MetaResult<Vec<crate::metastore::types::ObjectMeta>> {
+            Err(not_implemented())
+        }
+        async fn session_parts(&self, _upload_id: &str) -> MetaResult<Vec<PartMeta>> {
             Err(not_implemented())
         }
     }

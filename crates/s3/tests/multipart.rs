@@ -230,6 +230,7 @@ async fn orphan_upload_expires_via_gc() {
                 blob_id: blob,
                 size: 12,
                 etag: "\"x\"".to_string(),
+                checksum: None,
             },
         )
         .await
@@ -813,4 +814,479 @@ async fn part_checksum_verify_and_assembled_default() {
             .any(|k| k.as_str().starts_with("x-amz-checksum-")),
         "装配行无持久校验(complete 级记档)"
     );
+}
+
+// ── complete 级校验(s3-multipart-complete-checksum)─────────────────────────
+
+/// composite 期望值:base64(逐片 raw 校验字节串接)——与网关推导式对拍。
+fn composite_of(part_values: &[String]) -> String {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let mut raw = Vec::new();
+    for v in part_values {
+        raw.extend_from_slice(&B64.decode(v).expect("part checksum b64"));
+    }
+    B64.encode(raw)
+}
+
+/// 带(可选)校验头的片上传;断言 200 并回吐该片的 etag(去引号)。
+async fn put_part_claiming(
+    fx: &S3Fixture,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    number: i32,
+    data: &[u8],
+    claim: Option<(&str, String)>,
+) -> String {
+    let uri = format!("/{bucket}/{key}?uploadId={upload_id}&partNumber={number}");
+    let mut headers = fx.signed_headers("PUT", &uri, data);
+    if let Some((name, value)) = claim {
+        headers.insert(
+            name.parse::<reqwest::header::HeaderName>()
+                .expect("checksum header name"),
+            value.parse().expect("checksum value"),
+        );
+    }
+    let resp = fx
+        .send(reqwest::Method::PUT, &uri, headers, data.to_vec())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "part {number} must 200");
+    header(&resp, "etag").trim_matches('"').to_string()
+}
+
+/// 带(可选)extra 头的 complete 调用。
+async fn complete_with_headers(
+    fx: &S3Fixture,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    etag_pairs: &[(i32, String)],
+    extra: &[(&str, &str)],
+) -> reqwest::Response {
+    let body = complete_xml(etag_pairs);
+    let uri = format!("/{bucket}/{key}?uploadId={upload_id}");
+    let mut headers = fx.signed_headers("POST", &uri, body.as_bytes());
+    for (name, value) in extra {
+        headers.insert(
+            name.parse::<reqwest::header::HeaderName>()
+                .expect("complete header name"),
+            value.parse().expect("complete header value"),
+        );
+    }
+    fx.send(reqwest::Method::POST, &uri, headers, body.into_bytes())
+        .await
+}
+
+/// 三片同族 crc32:无头 complete 仍自动推导 composite 并回显;GET(mode)同值同
+/// COMPOSITE 型;裸片对照会话无校验头(零变化)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_complete_composite_derived_and_echoed() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mpckcomp").await;
+    let key = "composed.bin";
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let parts: [&[u8]; 3] = [b"alpha", b"beta-grams", b"gamma!"];
+    let mut etags = Vec::new();
+    let mut values = Vec::new();
+    for (idx, data) in parts.iter().enumerate() {
+        let number = i32::try_from(idx + 1).expect("small index");
+        let v = antfs_s3::checksum::ChecksumAlgo::Crc32.compute(data);
+        values.push(v.clone());
+        let etag = put_part_claiming(
+            &fx,
+            &bucket,
+            key,
+            &upload_id,
+            number,
+            data,
+            Some(("x-amz-checksum-crc32", v)),
+        )
+        .await;
+        etags.push((number, etag));
+    }
+
+    let resp = fx
+        .complete_multipart(&bucket, key, &upload_id, complete_xml(&etags).as_bytes())
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "plain complete with valued parts must 200"
+    );
+    let expected = composite_of(&values);
+    assert_eq!(
+        header(&resp, "x-amz-checksum-crc32"),
+        expected,
+        "composite must auto-derive and echo"
+    );
+    assert_eq!(header(&resp, "x-amz-checksum-type"), "COMPOSITE");
+
+    let get = fx
+        .get_object_with_headers(&bucket, key, &[("x-amz-checksum-mode", "ENABLED")])
+        .await;
+    assert_eq!(get.status().as_u16(), 200);
+    assert_eq!(header(&get, "x-amz-checksum-crc32"), expected);
+    assert_eq!(header(&get, "x-amz-checksum-type"), "COMPOSITE");
+    let body = get.bytes().await.expect("body");
+    let mut want = Vec::new();
+    for p in &parts {
+        want.extend_from_slice(p);
+    }
+    assert_eq!(body.as_ref(), want.as_slice());
+
+    let get_silent = fx.get_object(&bucket, key).await;
+    assert!(
+        get_silent.headers().get("x-amz-checksum-crc32").is_none(),
+        "no mode → no echo"
+    );
+
+    // 裸片对照:无任何校验参与的旧会话语义零变化。
+    let key2 = "bare.bin";
+    let upload2 = initiate(&fx, &bucket, key2).await;
+    let mut etags2 = Vec::new();
+    for (idx, data) in [b"bare-a", b"bare-b"].iter().enumerate() {
+        let number = i32::try_from(idx + 1).expect("small index");
+        let resp = fx.upload_part(&bucket, key2, &upload2, number, *data).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        etags2.push((number, header(&resp, "etag")));
+    }
+    let resp = fx
+        .complete_multipart(&bucket, key2, &upload2, complete_xml(&etags2).as_bytes())
+        .await;
+    assert_eq!(resp.status().as_u16(), 200, "bare complete unchanged");
+    assert!(
+        resp.headers().get("x-amz-checksum-crc32").is_none(),
+        "bare complete must not invent a checksum"
+    );
+}
+
+/// SDK 供 composite 值:错值 400(BadDigest 零副作用)、对值 200——重试闭环。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_complete_composite_claim_mismatch_then_good() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mpckclaim").await;
+    let key = "claimed.bin";
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let p1 = pseudo_random(128);
+    let p2 = pseudo_random(64);
+    let v1 = antfs_s3::checksum::ChecksumAlgo::Crc32.compute(&p1);
+    let v2 = antfs_s3::checksum::ChecksumAlgo::Crc32.compute(&p2);
+    let etag1 = put_part_claiming(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        &p1,
+        Some(("x-amz-checksum-crc32", v1.clone())),
+    )
+    .await;
+    let etag2 = put_part_claiming(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        2,
+        &p2,
+        Some(("x-amz-checksum-crc32", v2.clone())),
+    )
+    .await;
+    let etags = [(1, etag1), (2, etag2)];
+
+    let wrong = antfs_s3::checksum::ChecksumAlgo::Crc32.compute(b"bogus");
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &etags,
+        &[
+            ("x-amz-checksum-type", "COMPOSITE"),
+            ("x-amz-checksum-crc32", &wrong),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "wrong composite claim must 400"
+    );
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("BadDigest"), "{body}");
+
+    let expected = composite_of(&[v1.clone(), v2.clone()]);
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &etags,
+        &[
+            ("x-amz-checksum-type", "COMPOSITE"),
+            ("x-amz-checksum-crc32", &expected),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "retry on intact session must 200"
+    );
+    assert_eq!(header(&resp, "x-amz-checksum-crc32"), expected);
+    assert_eq!(header(&resp, "x-amz-checksum-type"), "COMPOSITE");
+}
+
+/// FULL_OBJECT:流式全验 → 行存 + 回显(同发 sha1+sha256 存最强);坏值 400 后
+/// 重试成功(零副作用闭环);GET(mode)回 FULL_OBJECT 型。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_complete_full_object_verified() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mpckfull").await;
+    let key = "fullobj.bin";
+
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let p1 = pseudo_random(64 * 1024);
+    let p2 = pseudo_random(999);
+    let etag1 = {
+        let resp = fx.upload_part(&bucket, key, &upload_id, 1, &p1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        header(&resp, "etag").trim_matches('"').to_string()
+    };
+    let etag2 = {
+        let resp = fx.upload_part(&bucket, key, &upload_id, 2, &p2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        header(&resp, "etag").trim_matches('"').to_string()
+    };
+    let etags = [(1, etag1), (2, etag2)];
+
+    let mut full = p1.clone();
+    full.extend_from_slice(&p2);
+    let sha256 = antfs_s3::checksum::ChecksumAlgo::Sha256.compute(&full);
+    let sha1 = antfs_s3::checksum::ChecksumAlgo::Sha1.compute(&full);
+    let bad = antfs_s3::checksum::ChecksumAlgo::Sha256.compute(b"not-the-object");
+
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &etags,
+        &[
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+            ("x-amz-checksum-sha256", &bad),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "wrong full object value must 400"
+    );
+    let body = resp.text().await.expect("400 body");
+    assert!(body.contains("BadDigest"), "{body}");
+
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &etags,
+        &[
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+            ("x-amz-checksum-sha256", &sha256),
+            ("x-amz-checksum-sha1", &sha1),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "retry with good values must 200"
+    );
+    assert_eq!(header(&resp, "x-amz-checksum-sha256"), sha256);
+    assert_eq!(header(&resp, "x-amz-checksum-type"), "FULL_OBJECT");
+    let get = fx
+        .get_object_with_headers(&bucket, key, &[("x-amz-checksum-mode", "ENABLED")])
+        .await;
+    assert_eq!(get.status().as_u16(), 200);
+    assert_eq!(
+        header(&get, "x-amz-checksum-sha256"),
+        sha256,
+        "strongest of the multi-algo set persists"
+    );
+    assert!(get.headers().get("x-amz-checksum-sha1").is_none());
+    assert_eq!(header(&get, "x-amz-checksum-type"), "FULL_OBJECT");
+}
+
+/// composite 拒绝面:混族/半值/全裸三种形态都响亮 400(带定位文案)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_complete_composite_rejects_mixed_partial_and_bare() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mpckreject").await;
+
+    // 混族:crc32 + crc32c
+    let key = "mixed.bin";
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let a = pseudo_random(8);
+    let b = pseudo_random(8);
+    let va = antfs_s3::checksum::ChecksumAlgo::Crc32.compute(&a);
+    let vb = antfs_s3::checksum::ChecksumAlgo::Crc32c.compute(&b);
+    let e1 = put_part_claiming(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        &a,
+        Some(("x-amz-checksum-crc32", va)),
+    )
+    .await;
+    let e2 = put_part_claiming(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        2,
+        &b,
+        Some(("x-amz-checksum-crc32c", vb)),
+    )
+    .await;
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &[(1, e1), (2, e2)],
+        &[("x-amz-checksum-type", "COMPOSITE")],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400, "mixed families must 400");
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("mixed checksum algorithms"), "{body}");
+
+    // 半值:一片带校验一片裸
+    let key = "partial.bin";
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let a = pseudo_random(8);
+    let b = pseudo_random(8);
+    let va = antfs_s3::checksum::ChecksumAlgo::Crc32.compute(&a);
+    let e1 = put_part_claiming(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        1,
+        &a,
+        Some(("x-amz-checksum-crc32", va)),
+    )
+    .await;
+    let resp2 = fx.upload_part(&bucket, key, &upload_id, 2, &b).await;
+    assert_eq!(resp2.status().as_u16(), 200);
+    let e2 = header(&resp2, "etag").trim_matches('"').to_string();
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &[(1, e1), (2, e2)],
+        &[("x-amz-checksum-type", "COMPOSITE")],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400, "partial coverage must 400");
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("without a checksum"), "{body}");
+
+    // 全裸 + 显式 composite 声明
+    let key = "bare.bin";
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let a = pseudo_random(8);
+    let resp2 = fx.upload_part(&bucket, key, &upload_id, 1, &a).await;
+    let e1 = header(&resp2, "etag").trim_matches('"').to_string();
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &[(1, e1)],
+        &[("x-amz-checksum-type", "COMPOSITE")],
+    )
+    .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "bare parts under composite claim must 400"
+    );
+}
+
+/// 请求头形态边缘:type 野值/声明无值/SHA 配 composite/CRC64NVME 族面。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_complete_header_semantics_edges() {
+    let fx = S3Fixture::start().await;
+    let bucket = fx.create_unique_bucket("mpckedge").await;
+    let key = "edge.bin";
+    let upload_id = initiate(&fx, &bucket, key).await;
+    let fake_etags = [(1, "d41d8cd98f00b204e9800998ecf8427e".to_string())];
+
+    let v = antfs_s3::checksum::ChecksumAlgo::Sha256.compute(b"x");
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &fake_etags,
+        &[
+            ("x-amz-checksum-type", "COMPOSITE"),
+            ("x-amz-checksum-sha256", &v),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400, "sha under COMPOSITE must 400");
+
+    let v = antfs_s3::checksum::ChecksumAlgo::Crc32.compute(b"x");
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &fake_etags,
+        &[
+            ("x-amz-checksum-type", "BASE64"),
+            ("x-amz-checksum-crc32", &v),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400, "bogus type value must 400");
+
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &fake_etags,
+        &[("x-amz-checksum-type", "FULL_OBJECT")],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400, "type without value must 400");
+
+    let nvme = "AAAAAAAAAAA=";
+    let resp = complete_with_headers(
+        &fx,
+        &bucket,
+        key,
+        &upload_id,
+        &fake_etags,
+        &[
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+            ("x-amz-checksum-crc64nvme", nvme),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 501, "crc64nvme family stays 501");
 }

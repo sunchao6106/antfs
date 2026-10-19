@@ -1761,3 +1761,34 @@ docs 同步(frontend.md §4/§11、cluster.md 数据面三处、store.md 记录/
 **发运**:归档 `openspec/changes/archive/2026-10-16-s3-sse-key-rotation/`(s3-core 新增
 「SSE 主钥轮换」要求 + s3-metastore 新增「SSE 行扫描」要求);docs 同步(s3.md config 表
 行 + 局限行 + 新「主钥轮换」小节、design README 路线档 5 条目 1 ✅)。
+
+## 步骤 69:s3-multipart-complete-checksum —— 完结批 C1:complete 级校验(composite 合并 + FULL_OBJECT 全验)
+
+**动机**:档 2 收官记档「multipart complete 级校验(composite 合成/FULL_OBJECT 派生需
+per-part 持久化,另立档)」;用户 2026-10-19 指令「全力完善 s3 功能,把这个先完结」
+——multipart 通道的完整性裁决层补齐,完结批 C1 落地。
+
+**落地**(裁决 D1-D5 见 change design.md):
+- migration 007(双方言):`multipart_parts` 两校验列 + `named_objects.checksum_type`
+  (NULL=FULL_OBJECT 历史行零特判)+ `checksum_b64`→TEXT(composite 上界 53KB)。
+- `ChecksumKind`(FULL_OBJECT|COMPOSITE)入 `StoredChecksum`;PUT/Part 写入带 kind,
+  三列读侧后向兼容(lib 单测锁);
+- UploadPart 落存已验最强声明;complete 三面:COMPOSITE(SHA/双 CRC/声明无值/混族/
+  半值/全裸各响亮 400;锁内推导 + SDK 供值比对,失配 BadDigest 零副作用)与
+  FULL_OBJECT(PartStream 流式逐片全验,至多一片在内存,「恰存最强」落行);
+  无声自动推导 = 部件有值即默认完整性。
+- 请求形态门抽取 `ensure_full_object_type`(PUT/Part 只认 FULL_OBJECT,收集器成为
+  类型无关);GET/HEAD/attributes 回显按行 kind;complete 应答回显推导/验证值。
+- fake metastore 签名同步;trait +`session_parts` 行读。
+
+**验证**:
+- e2e 六件双言(multipart.rs;PG 18/18 + MySQL 18/18):composite 自动推导+回显+
+  mode-GET 同值/裸会话零变化对照、SDK 供值恶→善重试闭环、FULL_OBJECT 善(多算法
+  存最强)+恶(零副作用)、混族/半值/全裸三拒、type 语义四缘(SHA×COMPOSITE/野值/
+  无值/CRC64NVME 501)。
+- 全量双言 PG 138/138 + MySQL 138/138 零回归(含 migration 007 对既有库的在线升级);
+  workspace 72 套 720 绿;clippy 0;fmt 净。
+
+**发运**:归档 `openspec/changes/archive/2026-10-19-s3-multipart-complete-checksum/`
+(s3-multipart 一改一增、s3-metastore 一增);docs 同步(s3.md 矩阵两行/回显段/
+「明示不做」首项翻转/新「complete 级校验」小节、README 档 2 尾注收口)。

@@ -40,9 +40,13 @@ pub trait MetaStore: Send + Sync + 'static {
         &self,
         upload_id: &str,
         parts: &[CompletePart],
+        checksum: CompleteChecksum,
     ) -> Result<CompleteMultipartResult>;
     async fn abort_multipart(&self, upload_id: &str) -> Result<Vec<BlobId>>;
     async fn list_parts(&self, upload_id: &str, opts: ListPartsOpts) -> Result<ListPartsResp>;
+    /// 会话全部 part 行(按 part_number 升序,含 migration 007 校验两列)——complete 级
+    /// FULL_OBJECT 预检按 manifest 映射片 blob 用(handler 侧只读)。
+    async fn session_parts(&self, upload_id: &str) -> Result<Vec<PartMeta>>;
     async fn list_multipart_uploads(
         &self,
         bucket: &str,
@@ -83,6 +87,68 @@ pub trait MetaStore: Send + Sync + 'static {
         after: Option<(String, String)>,
         limit: u64,
     ) -> Result<Vec<ObjectMeta>>;
+}
+
+/// complete 级 composite 的部件值形态:manifest 片**全员有值且同族** → 返回该算法与
+/// 值表(manifest 序);否则 None(自动推导静默放弃)或 Err(显式 composite 声明时
+/// 响亮报违约形态)。
+pub(crate) fn uniform_part_values(
+    listed: &[Option<StoredChecksum>],
+) -> std::result::Result<(crate::checksum::ChecksumAlgo, Vec<String>), S3Error> {
+    let mut values: Vec<String> = Vec::with_capacity(listed.len());
+    for (idx, ck) in listed.iter().enumerate() {
+        match ck {
+            Some(c) => values.push(c.value.clone()),
+            None => {
+                return Err(S3Error::InvalidRequest(format!(
+                    "part {} was uploaded without a checksum; a composite complete-level \
+                    value cannot be derived or verified",
+                    idx + 1
+                )))
+            }
+        }
+    }
+    let Some(first) = listed.first().and_then(|c| c.as_ref()) else {
+        return Err(S3Error::InvalidRequest(
+            "no part carries a checksum; composite cannot be derived".into(),
+        ));
+    };
+    let algo = first.algo;
+    if listed
+        .iter()
+        .any(|c| c.as_ref().map(|x| x.algo) != Some(algo))
+    {
+        return Err(S3Error::InvalidRequest(
+            "parts carry mixed checksum algorithms; composite requires one family".into(),
+        ));
+    }
+    if !matches!(
+        algo,
+        crate::checksum::ChecksumAlgo::Crc32 | crate::checksum::ChecksumAlgo::Crc32c
+    ) {
+        return Err(S3Error::InvalidRequest(
+            "composite complete-level checksums are only defined for the CRC family".into(),
+        ));
+    }
+    Ok((algo, values))
+}
+
+/// 自动推导(None 声明路径):只有全员同族 CRC 有值才出 composite,否则放弃(行校验
+/// 为空)——静默放弃面与显式声明的响亮拒面严格分开。
+pub(crate) fn derive_composite_if_uniform(
+    listed: &[Option<StoredChecksum>],
+) -> Option<StoredChecksum> {
+    if listed.iter().any(|c| c.is_none()) {
+        return None;
+    }
+    let outcome = uniform_part_values(listed).ok()?;
+    let algo = outcome.0;
+    let value = crate::checksum::derive_composite(algo, &outcome.1)?;
+    Some(StoredChecksum {
+        algo,
+        value,
+        kind: crate::checksum::ChecksumKind::Composite,
+    })
 }
 
 pub async fn connect(cfg: &MetaStoreConfig) -> std::result::Result<Arc<dyn MetaStore>, S3Error> {

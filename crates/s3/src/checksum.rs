@@ -11,6 +11,24 @@ use base64::Engine as _;
 use crate::error::S3Error;
 use axum::http::HeaderMap;
 
+/// 持久化校验值的口径(`named_objects.checksum_type` 列):FULL_OBJECT = 单体完整
+/// 摘要(PUT/Part 验证产物、complete FULL_OBJECT 验证产物、历史行);COMPOSITE =
+/// complete 级装配值(CRC 族逐片 raw 字节串接的 base64)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumKind {
+    FullObject,
+    Composite,
+}
+
+impl ChecksumKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChecksumKind::FullObject => "FULL_OBJECT",
+            ChecksumKind::Composite => "COMPOSITE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChecksumAlgo {
     Crc32,
@@ -73,6 +91,62 @@ impl ChecksumAlgo {
     }
 }
 
+/// complete 级 FULL_OBJECT 的流式摘要器:与 [`ChecksumAlgo::compute`] 单发摘要逐字节
+/// 同值(composite 的对象无整片副本,逐片流喂)。
+pub(crate) enum StreamingDigest {
+    Crc32(crc32fast::Hasher),
+    Crc32c(u32),
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
+
+impl StreamingDigest {
+    pub(crate) fn new(algo: ChecksumAlgo) -> Self {
+        use sha1::Digest as _;
+        match algo {
+            ChecksumAlgo::Crc32 => StreamingDigest::Crc32(crc32fast::Hasher::new()),
+            ChecksumAlgo::Crc32c => StreamingDigest::Crc32c(0u32),
+            ChecksumAlgo::Sha1 => StreamingDigest::Sha1(sha1::Sha1::new()),
+            ChecksumAlgo::Sha256 => StreamingDigest::Sha256(sha2::Sha256::new()),
+        }
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        use sha1::Digest as _;
+        match self {
+            StreamingDigest::Crc32(h) => h.update(bytes),
+            StreamingDigest::Crc32c(crc) => *crc = crc32c::crc32c_append(*crc, bytes),
+            StreamingDigest::Sha1(h) => h.update(bytes),
+            StreamingDigest::Sha256(h) => h.update(bytes),
+        }
+    }
+
+    /// 产品 = 与 `algo.compute(data)` 完全一致的 base64 文本。
+    pub(crate) fn finish(self) -> String {
+        use sha1::Digest as _;
+        match self {
+            StreamingDigest::Crc32(h) => BASE64.encode(h.finalize().to_be_bytes()),
+            StreamingDigest::Crc32c(crc) => BASE64.encode(crc.to_be_bytes()),
+            StreamingDigest::Sha1(h) => BASE64.encode(h.finalize()),
+            StreamingDigest::Sha256(h) => BASE64.encode(h.finalize()),
+        }
+    }
+}
+
+/// complete 级 composite 值:base64(逐片 raw 校验字节按 manifest 序串接)。
+/// 每片值须为该算法的单体完整值(CRC 族 4 字节),解码长度不合 → None(上游响亮拒)。
+pub(crate) fn derive_composite(algo: ChecksumAlgo, part_values: &[String]) -> Option<String> {
+    let mut raw = Vec::with_capacity(part_values.len() * 4);
+    for v in part_values {
+        let bytes = BASE64.decode(v).ok()?;
+        if bytes.len() != algo.digest_len() {
+            return None;
+        }
+        raw.extend_from_slice(&bytes);
+    }
+    Some(BASE64.encode(raw))
+}
+
 /// 一条待验证的校验声明(载体:显式头或 trailer)。
 #[derive(Debug, Clone)]
 pub(crate) struct ChecksumClaim {
@@ -124,6 +198,12 @@ pub(crate) fn collect_claim_headers(headers: &HeaderMap) -> Result<Vec<ChecksumC
             from_trailer: false,
         });
     }
+    Ok(claims)
+}
+
+/// 请求形态门:PUT / UploadPart 的 `x-amz-checksum-type` 只能是 FULL_OBJECT
+/// (COMPOSITE 是 complete 级独有形态,complete 侧自判)。
+pub(crate) fn ensure_full_object_type(headers: &HeaderMap) -> Result<(), S3Error> {
     if let Some(type_value) = headers
         .get("x-amz-checksum-type")
         .and_then(|v| v.to_str().ok())
@@ -134,7 +214,7 @@ pub(crate) fn collect_claim_headers(headers: &HeaderMap) -> Result<Vec<ChecksumC
             )));
         }
     }
-    Ok(claims)
+    Ok(())
 }
 
 /// 把 trailer 收集器(`TrailerSink` 之快照)并入声明集:同算法双载体 → 400;
@@ -325,8 +405,9 @@ mod tests {
         assert!(matches!(e, S3Error::NotImplemented(_)), "{e}");
 
         let h = headers(&[("x-amz-checksum-type", "COMPOSITE")]);
-        let e = collect_claim_headers(&h).unwrap_err();
+        let e = ensure_full_object_type(&h).unwrap_err();
         assert!(matches!(e, S3Error::InvalidArgument(_)), "{e}");
+        collect_claim_headers(&h).expect("collector itself is type-agnostic");
 
         let h = headers(&[
             ("x-amz-checksum-type", "FULL_OBJECT"),
