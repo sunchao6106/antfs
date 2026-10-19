@@ -141,11 +141,26 @@ pub struct BalancePlanDto {
     pub moves: Vec<BalanceMoveDto>,
 }
 
-/// `GET /api/balance` 的响应;`present=false` 时 `plan` 为 null。
+/// 搬迁中间态条目("目标已补、源未摘";master 记账派生):
+/// `status` = `in_flight`(RUNNING 计划认领)/ `failed`(判败,带 error)/
+/// `unplanned`(计划外:手动迁移或计划取消/替换后的遗留)。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BalanceMovingDto {
+    pub partition_id: u32,
+    pub from_node_id: u64,
+    /// 继任者节点;记账缺失时为 0(master 防御性如实透出)。
+    pub to_node_id: u64,
+    pub status: String,
+    pub error: String,
+}
+
+/// `GET /api/balance` 的响应;`present=false` 时 `plan` 为 null(当前没有计划),
+/// 但 `moving` 仍可能有条目(手动迁移/计划遗留 —— 无计划 ≠ 无中间态)。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BalanceStateDto {
     pub present: bool,
     pub plan: Option<BalancePlanDto>,
+    pub moving: Vec<BalanceMovingDto>,
 }
 
 /// `POST /api/balance/{eval,start,cancel}` 的结果(master 侧 ok=false 也走 200 + ok:false)。
@@ -517,6 +532,7 @@ impl MasterApi for GrpcMasterApi {
         Ok(BalanceStateDto {
             present: resp.present,
             plan: resp.plan.map(plan_dto),
+            moving: resp.moving.into_iter().map(moving_dto).collect(),
         })
     }
 
@@ -614,5 +630,16 @@ fn plan_dto(p: antfs_master::pb::BalancePlan) -> BalancePlanDto {
                 error: m.error,
             })
             .collect(),
+    }
+}
+
+/// pb `BalanceMovingEntry` → 对外 DTO。
+fn moving_dto(e: antfs_master::pb::BalanceMovingEntry) -> BalanceMovingDto {
+    BalanceMovingDto {
+        partition_id: e.partition_id,
+        from_node_id: e.from_node_id,
+        to_node_id: e.to_node_id,
+        status: e.status,
+        error: e.error,
     }
 }

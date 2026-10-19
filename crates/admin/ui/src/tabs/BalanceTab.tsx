@@ -33,6 +33,18 @@ function movePillClass(status: string): string {
   }
 }
 
+/** 中间态条目分类徽标:in_flight 蓝(计划在推)/ failed 红(判败留痕)/ unplanned 黄(计划外)。 */
+function movingPillClass(status: string): string {
+  switch (status) {
+    case "in_flight":
+      return "info";
+    case "failed":
+      return "down";
+    default:
+      return "warn"; // unplanned
+  }
+}
+
 export function BalanceTab({ t, isOperator }: { t: T; isOperator: boolean }) {
   const [state, setState] = useState<BalanceState | null>(null);
   const [loadErr, setLoadErr] = useState("");
@@ -115,6 +127,7 @@ export function BalanceTab({ t, isOperator }: { t: T; isOperator: boolean }) {
   };
 
   const plan = state?.present ? state.plan : null;
+  const moving = state?.moving ?? [];
   const pct = plan && plan.total > 0 ? Math.round((plan.done / plan.total) * 100) : 0;
 
   return (
@@ -219,6 +232,43 @@ export function BalanceTab({ t, isOperator }: { t: T; isOperator: boolean }) {
                     <td>
                       <span className={`pill small ${movePillClass(m.status)}`}>
                         {t(`moveStatus_${m.status}`)}
+                      </span>
+                    </td>
+                    <td className="wrap">{m.error || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {moving.length > 0 && (
+        <>
+          <h2>{t("balanceMoving")}</h2>
+          <p className="card-sub">{t("balanceMovingHint")}</p>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>{t("balanceColPartition")}</th>
+                  <th>{t("balanceMovingColFrom")}</th>
+                  <th>{t("balanceMovingColTo")}</th>
+                  <th>{t("status")}</th>
+                  <th>{t("balanceColError")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {moving.map((m) => (
+                  <tr key={`${m.partition_id}-${m.from_node_id}`}>
+                    <td>{m.partition_id}</td>
+                    <td className="mono">n{m.from_node_id}</td>
+                    <td className="mono">
+                      {m.to_node_id === 0 ? "—" : `n${m.to_node_id}`}
+                    </td>
+                    <td>
+                      <span className={`pill small ${movingPillClass(m.status)}`}>
+                        {t(`movingStatus_${m.status}`)}
                       </span>
                     </td>
                     <td className="wrap">{m.error || "—"}</td>

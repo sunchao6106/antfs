@@ -431,6 +431,22 @@ message BalanceStateResponse {
   uint32 version = 1;
   bool present = 2;      // 当前是否有计划
   BalancePlan plan = 3;  // 计划 + 逐 move 进度(进度由 master 从状态派生,不额外存)
+  // 搬迁中间态("目标已补、源未摘")== moving 记账的派生视图,不额外存。**无计划也可有
+  // 条目**:手动 MoveReplica 与计划取消/替换/DONE 后的遗留都在这里。status:
+  // `in_flight`(RUNNING 计划认领)/ `failed`(认领计划判败,error 带原因)/
+  // `unplanned`(计划外:手动迁移或遗留;≠ 异常,自然收敛照常跑)。
+  // 全部条目由 reconciler 无条件的后删路径收敛,继任副本追平(上报 ACTIVE)即摘源。
+  repeated BalanceMovingEntry moving = 4;
+}
+
+// 单条搬迁中间态(由 `moving` + `move_targets` + 当前计划纯派生,BTreeSet 序确定排序)。
+// to_node_id = 继任者;记账缺失时防御性为 0(不跳过——可见性件宁可难看,不可说谎)。
+message BalanceMovingEntry {
+  uint32 partition_id = 1;
+  uint64 from_node_id = 2;
+  uint64 to_node_id = 3;
+  string status = 4;  // in_flight / failed / unplanned
+  string error = 5;   // 仅 failed 非空
 }
 
 // 一次均衡计划。`status`:`PREVIEW`(待确认)/`RUNNING`/`CANCELLED`/`DONE`。

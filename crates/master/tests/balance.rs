@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use antfs_master::config::MasterConfig;
 use antfs_master::pb::master_client::MasterClient;
 use antfs_master::pb::{
-    BalanceStateRequest, CancelBalanceRequest, EvalBalanceRequest, ReplicaBeat, StartBalanceRequest,
+    BalanceStateRequest, CancelBalanceRequest, EvalBalanceRequest, MoveReplicaRequest, ReplicaBeat,
+    StartBalanceRequest,
 };
 use antfs_master::types::{DiskSpec, MasterCommand, NodeInfo, ReplicaPlacement};
 use antfs_master::MasterNode;
@@ -746,4 +747,99 @@ async fn balance_stuck_move_fails_and_plan_completes() {
         !any_node_has(&nodes, "master_balance_moves_total", 1),
         "no move completed"
     );
+}
+
+/// 手动 `MoveReplica` 落进"搬迁中间态"镜头(admin-balance-midstate 核心契约):
+/// 无计划(present=false)也必须返回 moving 条目 → 状态 `unplanned`、继任者如实;
+/// 重新 eval 出 PREVIEW 计划也不认领它(planner 跳过 moving 中的分区,镜头不撒谎);
+/// 全员 ACTIVE 后走既有"后删 + ConfirmDrop"自然收敛 → 条目清零、placement 如愿搬完。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_move_visible_as_unplanned_then_converges_to_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = start_masters(tmp.path(), 300).await;
+    let leader = leader_of(&nodes);
+    let mut client = connect(leader).await;
+
+    register_data_nodes(leader).await;
+    let pids = make_skew(leader).await;
+    let all_active = |_| "ACTIVE";
+    drive_beats(&mut client, leader, &all_active).await;
+
+    // 无计划时手动搬 pids[0]:101 → 104。
+    let m = client
+        .move_replica(MoveReplicaRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            partition_id: pids[0],
+            from_node_id: 101,
+            to_node_id: 104,
+        })
+        .await
+        .expect("move")
+        .into_inner();
+    assert!(m.ok, "manual move: {}", m.error);
+    assert_eq!(m.to_node_id, 104);
+
+    // 镜头:present=false(无计划)但 moving 恰 1 条,unplanned、to=104。
+    // (此刻 104 对新副本尚无心跳上报 → 后删闸门按住,条目短期稳定。)
+    let s = balance_state(&mut client).await;
+    assert!(!s.present, "no balance plan exists yet");
+    assert_eq!(s.moving.len(), 1, "manual move must be visible");
+    let e = &s.moving[0];
+    assert_eq!(e.to_node_id, 104, "successor node as recorded");
+    assert_eq!(e.from_node_id, 101);
+    assert_eq!(e.partition_id, pids[0]);
+    assert_eq!(e.status, "unplanned", "plan-outside entry: manual move");
+    assert!(e.error.is_empty());
+
+    // 重新 eval:计划必须跳过 moving 中的分区(重 eval 清不掉搬运中条目)→ 呈 PREVIEW 计划,
+    // 但镜头里这条 move 仍是 unplanned(PREVIEW 未投递不认领)。
+    let ev = client
+        .eval_balance(EvalBalanceRequest {
+            version: 1,
+            cluster_secret: SECRET.into(),
+            max_moves: 0,
+        })
+        .await
+        .expect("eval")
+        .into_inner();
+    assert!(ev.ok, "eval: {}", ev.error);
+    let plan = ev.plan.expect("preview plan");
+    assert!(
+        plan.moves.iter().all(|m| m.partition_id != pids[0]),
+        "planner must skip partitions currently in the moving set"
+    );
+    let s = balance_state(&mut client).await;
+    assert!(s.present);
+    assert_eq!(s.moving.len(), 1);
+    assert_eq!(
+        s.moving[0].status, "unplanned",
+        "a PREVIEW plan has not dispatched anything and must not claim the entry"
+    );
+
+    // 收敛:全员 ACTIVE(104 补上即报 ACTIVE = 追平)→ 后删摘源 → DROPPED → 记账清空。
+    let start = Instant::now();
+    loop {
+        drive_beats(&mut client, leader, &all_active).await;
+        let converged = {
+            let g = leader.sm_data.read().expect("sm");
+            g.state.moving.is_empty() && g.state.pending_drop.is_empty()
+        };
+        if converged {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "manual move must converge naturally; moving/pending_drop stuck"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let s = balance_state(&mut client).await;
+    assert!(
+        s.moving.is_empty(),
+        "the lens reflects hard state: converged ⟹ empty"
+    );
+    let h = holdings(leader);
+    assert!(!h[&101].contains(&pids[0]), "source dropped");
+    assert!(h[&104].contains(&pids[0]), "successor holds the replica");
 }

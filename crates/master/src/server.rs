@@ -2810,7 +2810,8 @@ impl Master for MasterService {
         }
     }
 
-    /// GetBalanceState:任何节点可答(只读);返回计划 + 逐 move 的派生进度。
+    /// GetBalanceState:任何节点可答(只读);返回计划 + 逐 move 的派生进度 +
+    /// 搬迁中间态(moving 记账派生;**无计划也可有条目** —— 手动迁移/计划遗留的镜头)。
     async fn get_balance_state(
         &self,
         _request: Request<BalanceStateRequest>,
@@ -2819,21 +2820,21 @@ impl Master for MasterService {
             .sm_data
             .read()
             .map_err(|_| Status::internal("sm lock poisoned"))?;
-        match g.state.balance.as_ref() {
-            Some(plan) => {
-                let view = crate::balance::plan_view(plan, &g.state.partitions, &g.state.moving);
-                Ok(Response::new(BalanceStateResponse {
-                    version: PROTO_VERSION,
-                    present: true,
-                    plan: Some(view),
-                }))
-            }
-            None => Ok(Response::new(BalanceStateResponse {
-                version: PROTO_VERSION,
-                present: false,
-                plan: None,
-            })),
-        }
+        let moving = crate::balance::moving_entries(
+            &g.state.moving,
+            &g.state.move_targets,
+            g.state.balance.as_ref(),
+        );
+        Ok(Response::new(BalanceStateResponse {
+            version: PROTO_VERSION,
+            present: g.state.balance.is_some(),
+            plan: g
+                .state
+                .balance
+                .as_ref()
+                .map(|plan| crate::balance::plan_view(plan, &g.state.partitions, &g.state.moving)),
+            moving,
+        }))
     }
 }
 

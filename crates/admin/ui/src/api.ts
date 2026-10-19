@@ -429,10 +429,25 @@ export interface BalancePlan {
   moves: BalanceMove[];
 }
 
-/** `GET /api/balance`:`present=false` 时 `plan` 为 null(当前没有计划)。 */
+/** 搬迁中间态条目的分类("目标已补、源未摘"的一款)。 */
+export type BalanceMovingStatus = "in_flight" | "failed" | "unplanned";
+
+/** 搬迁中间态:目标副本已补、源未摘(master 记账派生)。 */
+export interface BalanceMovingEntry {
+  partition_id: number;
+  from_node_id: number;
+  /** 继任者节点;记账缺失时为 0。 */
+  to_node_id: number;
+  status: BalanceMovingStatus;
+  error: string;
+}
+
+/** `GET /api/balance`:`present=false` 时 `plan` 为 null(当前没有计划),
+ * 但 `moving` 仍可能有条目 —— 手动迁移/计划遗留(无计划 ≠ 无中间态)。 */
 export interface BalanceState {
   present: boolean;
   plan: BalancePlan | null;
+  moving: BalanceMovingEntry[];
 }
 
 export interface BalanceEvalResult {

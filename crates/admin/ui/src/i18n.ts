@@ -318,6 +318,17 @@ const en: Dict = {
   moveStatus_done: "done",
   moveStatus_failed: "failed",
   moveStatus_infeasible: "infeasible",
+  balanceMoving: "Mid-flight moves (target placed, source not removed)",
+  balanceMovingHint:
+    "Sources are removed automatically once the successor replica catches up. " +
+    "'Unplanned' entries are manual moves or leftovers from a cancelled/replaced plan — re-evaluating " +
+    "a plan does NOT clear them (the planner skips partitions currently in a move); " +
+    "a lingering entry means the target node needs attention.",
+  balanceMovingColFrom: "From node",
+  balanceMovingColTo: "To node (successor)",
+  movingStatus_in_flight: "in-flight",
+  movingStatus_failed: "failed",
+  movingStatus_unplanned: "unplanned",
   balanceEvalOk: "Plan {id} evaluated: {n} moves",
   balanceStarted: "Plan {id} started",
   balanceCancelled: "Plan {id} cancelled",
@@ -689,6 +700,15 @@ const zh: Dict = {
   moveStatus_done: "完成",
   moveStatus_failed: "失败",
   moveStatus_infeasible: "不可行",
+  balanceMoving: "搬迁中间态(目标已补、源未摘)",
+  balanceMovingHint:
+    "继任副本追平后自动摘源收敛。『计划外』条目 = 手动迁移或计划取消/替换后的遗留 —— 重新评估" +
+    "计划**不会**清掉它们(评估器跳过搬运中的分区);长期不动说明目标节点需要检查。",
+  balanceMovingColFrom: "源节点",
+  balanceMovingColTo: "继任节点",
+  movingStatus_in_flight: "计划内",
+  movingStatus_failed: "判败",
+  movingStatus_unplanned: "计划外",
   balanceEvalOk: "已生成计划 {id}:{n} 条迁移",
   balanceStarted: "计划 {id} 已开始执行",
   balanceCancelled: "计划 {id} 已取消",

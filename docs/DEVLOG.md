@@ -1922,10 +1922,11 @@ admin 侧跨副本逻辑比对仍靠手点(原 scrub 批已知边界记"另议")
 「周期」徽标 + hint 双语。节拍公式:全量覆盖周期 = 分区数 × 间隔(千分区 ≈ 7 天一轮)
 —— 慢即特性,与 store 侧蜗牛爬同哲学;只报警不修复(裁决不变)。
 
-**验证**:admin lib **73/73**(新增 6:config 默认锁 + 0 拒 / 候选过滤纯逻辑 / 真循环
-FakeMaster+假 store:周期条目 origin=scheduled 经 /api/scrub 可见、掐停两 tick 零增长
-+ gauge、**暂停期手动比对照常且 origin=manual**、恢复续产 / 控制端点角色门
-viewer GET 200·POST 403·operator 回显);workspace **75 套 753/0**;clippy 0;fmt 净;
+**验证**:admin lib **71/71**(新增 5 —— config 默认锁 + 0 拒(2)/ 候选过滤纯逻辑(1)/
+真循环 FakeMaster+假 store(1:周期条目 origin=scheduled 经 /api/scrub 可见、掐停两 tick
+零增长 + gauge、**暂停期手动比对照常且 origin=manual**、恢复续产)/ 控制端点角色门
+viewer GET 200·POST 403·operator 回显(1);原稿误记"73/73 新增 6",步 75 对账时按
+`cargo test -p antfs-admin` 现场输出改正);workspace **75 套 753/0**;clippy 0;fmt 净;
 `openspec validate` 过。真面(devcluster 真 admin 路由):控制端点操作/回显、
 `/api/scrub` 形状含 origin;循环行为由带真 HTTP fan-out 的集成用例覆盖。
 步 73"76 套"笔误本批顺修(→ 75 套 748)。
@@ -1933,3 +1934,43 @@ viewer GET 200·POST 403·operator 回显);workspace **75 套 753/0**;clippy 0;f
 **发运**:归档 `admin-scrub-schedule`;docs:cluster.md §11.1 两行 + §11.2 一行 +
 §11 路由段(调度语义/origin/单 admin 实例假设)。巡检周期化至此两层齐:store 字节态、
 admin 逻辑态。软件面存货仅剩 composed 存量回填(中件)+ balance 判败中间态提示(小件)。
+
+### 步 75(admin-balance-midstate):均衡搬迁中间态镜头
+
+**动念**:接手"balance 判败中间态辅助"小件,交接红线是"动 master 前必须实读 moving 收敛链,
+不要自作聪明去猜测"。实读(reconcile.rs / types.rs / balance.rs / server.rs)得到的**事实链**:
+
+- `MoveReplica` 落位即记 `moving` + `move_targets`(先补);**唯一的清账路径** = reconciler
+  **无条件**(与计划无关,每 tick)跑 `plan_move`,在"继任者上报 ACTIVE ∧ 非源健康副本 ≥ RF"
+  时 `RemoveReplica` 摘源(顺带清 `moving`、进 `pending_drop`,由心跳 `ConfirmDrop` 收尾)。
+- `FailBalanceMove` 只写**计划的** `failed`(判败释放预算、不再重投);`moving` 刻意不动
+  (自然收敛保留)。Cancel/换计划**不回滚** —— 引导语里"自然收敛已存在"属实,无语义洞。
+- **真正的洞是可见性**:继任者永不 ACTIVE ⇒ `moving` 条目 + 多余副本无限悬挂;
+  且 planner **跳过 moving 中的分区 ⇒ 重 eval 清不掉**;plan 级 failed 随取消/换计划消失;
+  admin 的手动 `move_replica` 也走这条记账(计划外大户)。中间态在 admin 无处可见。
+
+**切口**(纯读,零语义改动):master `GetBalanceState` 增量带 `moving` 列表(旧读者忽略);
+三态分类纯函数 `moving_entries`:`in_flight`(RUNNING 计划认领)/ `failed`(判败带 error,
+**任意**计划 status 都透出)/ `unplanned`(无计划认领:手动迁移/遗留,≠ 异常);`to` 缺失
+防御 0(not prettified)。admin `/api/balance` 透传 + BalanceTab「搬迁中间态」小节
+(只在非空时渲染;计划有无都渲染)+ hint 道出**真话**(自动收敛条件、重 eval 不清、
+卡滞查目标节点)。**刻意不做**运维清账杠杆:清 `moving` 而不摘多余副本 = 永久 RF 膨胀
+且从此无收敛器(比悬挂更糟)——可见性 ≠ 操作权。`pending_drop` 镜头也刻意不做
+(DROPPED 每拍重发自愈,停滞主因"节点 down"节点页已可见)。
+
+**改动**:proto `BalanceMovingEntry` + response `moving=4`;`balance.rs` 纯函数(+4 单测);
+`get_balance_state` 改统构造(两分支都带);`tests/balance.rs` +1 集成(手动 move →
+unplanned 可见(present=false)→ 重新 eval 出 PREVIEW 也不认领 → 全员 ACTIVE 收敛 →
+镜头清零);admin `master_api.rs`(DTO+映射+`moving_dto`)+ FakeMaster 夹具 +
+形状断言;ui api.ts/BalanceTab/i18n + dist 重建;cluster.md §7.3 语义句 + §11 路由段。
+
+**验证**:master lib **116/116**(moving_entries 派生单测 4:三态分类/无计划全 unplanned/
+PREVIEW 不认领·DONE 保 failed/防御 to=0)+ balance 集成 **5/5**(新增手动迁移→收敛闭环);
+admin lib **71/71**;workspace **75 套 758/0**;clippy 0;fmt 净;`openspec validate` 过;真面(
+devcluster `--store-count 4`,重建二进制):`POST /api/partitions/0/move` 101→自动 104 →
+`GET /api/balance`(viewer)即出 `{present:false, moving:[{pid:0, from:101, to:104,
+ status:unplanned}]}` ——**无计划也有条目**,核心契约拿证;约 3 秒后 104 追平摘源,镜头清零,
+placement=[102,103,104] —— 自然收敛闭环在真二进制上演毕。admin lib 计数对账同时翻案步 74
+笔误(实 71/71 非 73/73)。
+
+**发运**:归档 `admin-balance-midstate`。软件面存货仅剩 composed 存量回填(中件)。

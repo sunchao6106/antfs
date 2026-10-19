@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::pb::{BalanceMove, BalancePlan};
+use crate::pb::{BalanceMove, BalanceMovingEntry, BalancePlan};
 use crate::placement::{select_disks, usable_capacity, DiskFree};
 use crate::soft::DiskUsage;
 use crate::types::{
@@ -356,6 +356,62 @@ pub fn move_phase(
     } else {
         (MovePhase::Pending, String::new())
     }
+}
+
+/// 逐条搬迁中间态视图("目标已补、源未摘"):`moving` 记账 + 认领关系**纯派生**,不落盘。
+///
+/// 认领语义(admin-balance-midstate design):
+/// - `failed` **优先**:当前计划(任意 status)的 `failed` 记着 `(pid, from)` → 带出 error 原文
+///   (DONE 计划的判败条目仍卡在中间态时,运营要能看到判败原因;取消/换计划后 error 随旧计划
+///   消失,条目降级 `unplanned` 照常收敛);
+/// - `in_flight`:当前 **RUNNING** 计划的 moves 认领该条(正常推进;PREVIEW 未投递不算认领);
+/// - 其余 `unplanned`:无计划认领 —— 手动 `MoveReplica`、或计划取消/替换/DONE 后的遗留
+///   (≠ 异常态:reconciler 的 `plan_move` 后删**与计划无关**,照常收敛)。
+///
+/// `to_node_id` 取 `move_targets` 记账(与 `moving` 同一 apply 写入);缺失防御性 0、不跳过
+/// ——可见性件宁可难看,不可说谎。
+pub fn moving_entries(
+    moving: &BTreeSet<(PartitionId, NodeId)>,
+    move_targets: &BTreeMap<PartitionId, BTreeMap<NodeId, NodeId>>,
+    plan: Option<&BalancePlanRecord>,
+) -> Vec<BalanceMovingEntry> {
+    let claims = |pid: PartitionId, from: NodeId| -> Option<&BalanceMoveRecord> {
+        let p = plan?;
+        if p.status != BalanceStatus::Running {
+            return None; // PREVIEW 未投递不认领;DONE/CANCELLED 的索赔权已随执行期结束
+        }
+        p.moves
+            .iter()
+            .find(|m| m.partition_id == pid && m.from_node_id == from)
+    };
+    let failed_err = |pid: PartitionId, from: NodeId| -> Option<&String> {
+        plan?
+            .failed
+            .iter()
+            .find(|(fpid, ffrom, _)| *fpid == pid && *ffrom == from)
+            .map(|(_, _, err)| err)
+    };
+    moving
+        .iter()
+        .map(|&(pid, from)| {
+            let (status, error) = match failed_err(pid, from) {
+                Some(err) => ("failed".to_string(), err.clone()),
+                None if claims(pid, from).is_some() => ("in_flight".to_string(), String::new()),
+                None => ("unplanned".to_string(), String::new()),
+            };
+            BalanceMovingEntry {
+                partition_id: pid,
+                from_node_id: from,
+                to_node_id: move_targets
+                    .get(&pid)
+                    .and_then(|m| m.get(&from))
+                    .copied()
+                    .unwrap_or(0),
+                status,
+                error,
+            }
+        })
+        .collect()
 }
 
 /// 计划状态的 proto 串(与 proto 注释一致)。
@@ -705,5 +761,119 @@ mod tests {
         let (phase, err) = move_phase(&clean, &mv, &parts, &BTreeSet::new());
         assert_eq!(phase, MovePhase::Failed);
         assert!(!err.is_empty());
+    }
+
+    /// moving_entries 测试共用的 move 记录造具。
+    fn mv_record(pid: u32, from: u64, to: u64) -> BalanceMoveRecord {
+        BalanceMoveRecord {
+            partition_id: pid,
+            from_node_id: from,
+            from_disk_id: "d0".into(),
+            to_node_id: to,
+            to_disk_id: "d0".into(),
+        }
+    }
+
+    #[test]
+    fn moving_view_classifies_in_flight_failed_unplanned() {
+        // RUNNING 计划认领 (7,1)→4 成 in_flight;判败 (8,2)→4 带 error;手动迁移 (9,3)→4 无
+        // 认领成 unplanned(手动 MoveReplica 是计划外大户)。排序按 (pid, from) 确定。
+        let plan = BalancePlanRecord {
+            plan_id: 1,
+            status: BalanceStatus::Running,
+            created_at_ms: 0,
+            max_in_flight: 1,
+            moves: vec![mv_record(7, 1, 4)],
+            failed: vec![(8, 2, "in-flight move stuck for over 300s".to_string())],
+        };
+        let moving = BTreeSet::from([(7u32, 1u64), (8, 2), (9, 3)]);
+        let targets = BTreeMap::from([
+            (7u32, BTreeMap::from([(1u64, 4u64)])),
+            (8, BTreeMap::from([(2, 4)])),
+            (9, BTreeMap::from([(3, 4)])),
+        ]);
+        let view: Vec<(u32, u64, u64, String, String)> =
+            moving_entries(&moving, &targets, Some(&plan))
+                .into_iter()
+                .map(|e| {
+                    (
+                        e.partition_id,
+                        e.from_node_id,
+                        e.to_node_id,
+                        e.status,
+                        e.error,
+                    )
+                })
+                .collect();
+        assert_eq!(
+            view,
+            vec![
+                (7, 1, 4, "in_flight".to_string(), String::new()),
+                (
+                    8,
+                    2,
+                    4,
+                    "failed".to_string(),
+                    "in-flight move stuck for over 300s".to_string()
+                ),
+                (9, 3, 4, "unplanned".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_view_without_plan_is_all_unplanned() {
+        // 无计划也有条目(cancel 后遗留/手动迁移):present=false 的镜头空窗是刻意的洞,
+        // 本集合钉死"无计划 ≠ 无中间态"。
+        let moving = BTreeSet::from([(7u32, 1u64)]);
+        let targets = BTreeMap::from([(7u32, BTreeMap::from([(1u64, 4u64)]))]);
+        let view = moving_entries(&moving, &targets, None);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].status, "unplanned");
+        assert_eq!(view[0].to_node_id, 4);
+        // 空集 ⇒ 空视图。
+        assert!(moving_entries(&BTreeSet::new(), &targets, None).is_empty());
+    }
+
+    #[test]
+    fn moving_view_preview_does_not_claim_and_done_keeps_failure() {
+        let moving = BTreeSet::from([(7u32, 1u64), (8, 2)]);
+        let targets = BTreeMap::from([
+            (7u32, BTreeMap::from([(1u64, 4u64)])),
+            (8, BTreeMap::from([(2, 4)])),
+        ]);
+        // PREVIEW 未投递不认领(标 in_flight 会骗人:计划根本没开始执行)。
+        let preview = BalancePlanRecord {
+            plan_id: 1,
+            status: BalanceStatus::Preview,
+            created_at_ms: 0,
+            max_in_flight: 1,
+            moves: vec![mv_record(7, 1, 4)],
+            failed: vec![],
+        };
+        let view = moving_entries(&moving, &targets, Some(&preview));
+        assert_eq!(view[0].status, "unplanned", "preview 不得认领在途条目");
+        assert_eq!(view[1].status, "unplanned");
+        // DONE 计划的 failed 记录仍要透出(条目还卡在中间态,判败的原因正是运营要看的)。
+        let done = BalancePlanRecord {
+            status: BalanceStatus::Done,
+            failed: vec![(8, 2, "target node 4 not up".to_string())],
+            ..preview.clone()
+        };
+        let view = moving_entries(&moving, &targets, Some(&done));
+        // (7,1):RUNNING 才认领 ⇒ DONE 后降级 unplanned;(8,2):failed 优先于一切。
+        assert_eq!(view[0].status, "unplanned");
+        assert_eq!(view[1].status, "failed");
+        assert_eq!(view[1].error, "target node 4 not up");
+    }
+
+    #[test]
+    fn moving_view_defensive_to_node_zero_when_target_bookkeeping_missing() {
+        // moving 有而 move_targets 无(理论上不可达:同一 apply 写入)→ to=0 如实透出,
+        // 不跳过:可见性件宁可难看,不可说谎。
+        let moving = BTreeSet::from([(7u32, 1u64)]);
+        let view = moving_entries(&moving, &BTreeMap::new(), None);
+        assert_eq!(view[0].to_node_id, 0);
+        assert_eq!(view[0].status, "unplanned");
     }
 }

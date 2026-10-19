@@ -1727,8 +1727,8 @@ fn forward_store(r: std::result::Result<(StatusCode, String), String>) -> Respon
 mod tests {
     use super::*;
     use crate::master_api::{
-        BalanceMoveDto, BalanceOpOutcome, BalancePlanDto, BalanceStateDto, ClusterDto, MoveOutcome,
-        NodeDto, PartitionDto, RepairOutcome, ReplicaDto,
+        BalanceMoveDto, BalanceMovingDto, BalanceOpOutcome, BalancePlanDto, BalanceStateDto,
+        ClusterDto, MoveOutcome, NodeDto, PartitionDto, RepairOutcome, ReplicaDto,
     };
     use async_trait::async_trait;
     use axum::body::Body;
@@ -1946,6 +1946,13 @@ mod tests {
                         error: String::new(),
                     }],
                 }),
+                moving: vec![BalanceMovingDto {
+                    partition_id: 5,
+                    from_node_id: 102,
+                    to_node_id: 103,
+                    status: "unplanned".into(),
+                    error: String::new(),
+                }],
             })
         }
 
@@ -3405,6 +3412,12 @@ mod tests {
         assert_eq!(v["plan"]["status"], "PREVIEW");
         assert_eq!(v["plan"]["moves"][0]["partition_id"], 3);
         assert_eq!(v["plan"]["moves"][0]["to_node_id"], 104);
+        // 搬迁中间态镜头:随 /api/balance 透出(viewer 可读);计划外条目如实分类。
+        assert_eq!(v["moving"][0]["partition_id"], 5);
+        assert_eq!(v["moving"][0]["from_node_id"], 102);
+        assert_eq!(v["moving"][0]["to_node_id"], 103);
+        assert_eq!(v["moving"][0]["status"], "unplanned");
+        assert_eq!(v["moving"][0]["error"], "");
     }
 
     #[tokio::test]
