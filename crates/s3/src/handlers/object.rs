@@ -979,6 +979,77 @@ pub async fn get_object_attributes(
     Ok(response)
 }
 
+// ── 对象 ACL XML(`s3-acl-xml`,管理面恒 owner——闸在 server.rs 包装层)──────────
+
+/// PUT /{key}?acl:AccessControlPolicy 全量换置对象 grants(READ 家族:具名 owner 或
+/// AllUsers[*对象域合法]);FULL_CONTROL 限 owner 自授;就地 UPDATE 不 bump 版本。
+pub async fn put_object_acl(
+    st: AppState,
+    bucket: &str,
+    key: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    let body = crate::handlers::read_bounded_body(&st, req).await?;
+    let xml_str = std::str::from_utf8(&body)
+        .map_err(|_| S3Error::InvalidRequest("ACL body is not UTF-8".into()))?;
+    let parsed = crate::xml::parse_access_control_policy(xml_str)?;
+    crate::handlers::bucket::validate_acl_object_body(&st, bucket, &parsed).await?;
+    let mut grants: Vec<crate::policy::AclGrant> = Vec::new();
+    for grant in &parsed.grants {
+        match (&grant.grantee, grant.permission.as_str()) {
+            (crate::policy::AclGrantee::Owner(id), "READ") => {
+                if *id != parsed.owner {
+                    grants.push(crate::policy::AclGrant {
+                        grantee: crate::policy::AclGrantee::Owner(id.clone()),
+                        permission: "READ".into(),
+                    });
+                }
+            }
+            (crate::policy::AclGrantee::AllUsers, "READ") => {
+                grants.push(crate::policy::AclGrant {
+                    grantee: crate::policy::AclGrantee::AllUsers,
+                    permission: "READ".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+    let grants_json: Option<String> = if grants.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&grants)
+                .map_err(|e| S3Error::InternalError(format!("serialize acl grants: {e}")))?,
+        )
+    };
+    st.metastore
+        .set_object_acl_grants(bucket, key, grants_json.as_deref())
+        .await?;
+    Ok(StatusCode::OK.into_response())
+}
+
+/// GET /{key}?acl:回 grants 形态(无授予 = 纯 owner FULL_CONTROL 单条)。
+pub async fn get_object_acl(st: AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
+    let meta = st
+        .metastore
+        .get_object(bucket, key)
+        .await?
+        .ok_or(S3Error::NoSuchKey)?;
+    let grants: Vec<crate::policy::AclGrant> = match meta.acl_grants.as_deref() {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|e| S3Error::InternalError(format!("corrupt stored acl_grants: {e}")))?,
+        None => Vec::new(),
+    };
+    let owner = st
+        .metastore
+        .head_bucket(bucket)
+        .await?
+        .ok_or(S3Error::NoSuchBucket)?
+        .owner;
+    let xml = crate::xml::serialize_access_control_policy_for_grants(&owner, &grants);
+    Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())
+}
+
 #[cfg(test)]
 mod read_tests {
     use super::*;
@@ -1003,6 +1074,7 @@ mod read_tests {
             parts_manifest: None,
             sse: None,
             checksum: None,
+            acl_grants: None,
         }
     }
 

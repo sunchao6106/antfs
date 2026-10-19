@@ -29,6 +29,16 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 桶策略 upsert(`s3-bucket-policy`):doc = 调用方已全验的 JSON;None = 撤(幂等)。
     /// 桶不存在 → NoSuchBucket;行不动(仅 policy 列)。
     async fn set_bucket_policy(&self, bucket: &str, policy: Option<&str>) -> Result<()>;
+    /// 桶 ACL 授予集 upsert(`s3-acl-xml`;None = 撤,幂等)。
+    async fn set_bucket_acl_grants(&self, bucket: &str, grants: Option<&str>) -> Result<()>;
+    /// 对象 ACL 授予集 upsert(就地 UPDATE state=1 当前行,不 bump 版本;无活行 →
+    /// NoSuchKey)。
+    async fn set_object_acl_grants(
+        &self,
+        bucket: &str,
+        key: &str,
+        grants: Option<&str>,
+    ) -> Result<()>;
 
     // Multipart
     async fn create_multipart(

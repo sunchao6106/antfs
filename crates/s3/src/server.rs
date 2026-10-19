@@ -313,7 +313,47 @@ pub(crate) async fn authorize(
             "request is explicitly denied by the bucket policy".into(),
         )),
         crate::policy::PolicyDecision::Allow => Ok(()),
-        crate::policy::PolicyDecision::NotApplicable => fallback_gate(meta, principal, fallback),
+        crate::policy::PolicyDecision::NotApplicable => {
+            // ACL grants 腿(`s3-acl-xml`):策略缺位且兜底将拒时才评估——只抬,
+            // 永不压显式 Deny/Allow。桶域 grants 抬 ListBucket(AllUsers 走 canned
+            // 不在列);对象域 grants 抬 GetObject(懒查行,常态零开销)。
+            let would_pass = match principal {
+                Principal::Signed(ctx) if ctx.owner == meta.owner => true,
+                _ if fallback == GateFallback::PublicRead
+                    && matches!(meta.acl, BucketAcl::PublicRead) =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if !would_pass {
+                let owner = principal_owner(principal).map(str::to_string);
+                if action == crate::policy::PolicyAction::ListBucket
+                    && crate::policy::acl_grants_allow(meta.acl_grants.as_deref(), owner.as_deref())
+                {
+                    return Ok(());
+                }
+                if let (crate::policy::PolicyAction::GetObject, Some(k)) = (action, key) {
+                    // 匿名主语也走(对象 AllUsers 授予 = 任何请求者)——
+                    // acl_grants_allow 内部按具名/AllUsers 分别匹配。
+                    let granted = st
+                        .metastore
+                        .get_object(bucket, k)
+                        .await?
+                        .map(|m| {
+                            crate::policy::acl_grants_allow(
+                                m.acl_grants.as_deref(),
+                                owner.as_deref(),
+                            )
+                        })
+                        .unwrap_or(false);
+                    if granted {
+                        return Ok(());
+                    }
+                }
+            }
+            fallback_gate(meta, principal, fallback)
+        }
     }
 }
 
@@ -441,6 +481,15 @@ async fn object_put_handler(
     Query(q): Query<S3QueryParams>,
     req: Request,
 ) -> Response {
+    // PUT /{key}?acl = PutObjectAcl(管理面 owner 独占;全量换置对象 grants,不 bump 版本)。
+    if q.acl.is_some() {
+        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+            return e.into_response();
+        }
+        return crate::handlers::object::put_object_acl(st, &bucket, &key, req)
+            .await
+            .into_response();
+    }
     if let Err(e) = authorize(
         &st,
         &principal,
@@ -482,6 +531,15 @@ async fn object_get_handler(
     Query(q): Query<S3QueryParams>,
     req: Request,
 ) -> Response {
+    // GET /{key}?acl = GetObjectAcl(管理面 owner 独占)。
+    if q.acl.is_some() {
+        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+            return e.into_response();
+        }
+        return crate::handlers::object::get_object_acl(st, &bucket, &key)
+            .await
+            .into_response();
+    }
     if q.attributes.is_some() {
         // GET object?attributes:读门同 GET object(读面);属性集由请求头定。
         if let Err(e) = authorize(
@@ -684,7 +742,7 @@ async fn create_bucket_handler(
         if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
             return e.into_response();
         }
-        return crate::handlers::bucket::put_bucket_acl(st, &bucket, &headers)
+        return crate::handlers::bucket::put_bucket_acl(st, &bucket, req, headers)
             .await
             .into_response();
     }

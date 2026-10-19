@@ -431,6 +431,7 @@ mod tests {
                 created_at: 1700000000000,
                 acl: BucketAcl::Private,
                 policy: None,
+                acl_grants: None,
             },
             BucketMeta {
                 name: "beta".into(),
@@ -438,6 +439,7 @@ mod tests {
                 created_at: 1700000001000,
                 acl: BucketAcl::Private,
                 policy: None,
+                acl_grants: None,
             },
         ];
         let xml = serialize_list_all_my_buckets(&buckets);
@@ -466,8 +468,8 @@ mod tests {
             owner: "o".into(),
             created_at: 0,
             acl: BucketAcl::Private,
-
             policy: None,
+            acl_grants: None,
         }];
         let xml = serialize_list_all_my_buckets(&buckets);
         assert!(
@@ -865,6 +867,7 @@ mod tests {
             created_at: 0,
             acl: BucketAcl::Private,
             policy: None,
+            acl_grants: None,
         }]));
 
         let resp = ListObjectsResp {
@@ -913,4 +916,122 @@ mod tests {
         assert_valid_xml(&serialize_delete_result(&dr, false));
         assert_valid_xml(&serialize_delete_result(&dr, true));
     }
+}
+
+/// `s3-acl-xml`:PUT ?acl body 的解析产物(Owner + Grant 列表;Grantee 已规整为
+/// AllUsers / 具名 owner 两类;权限字原样保留由 handler 校验白名单)。
+#[derive(Debug, Clone)]
+pub struct ParsedAcl {
+    pub owner: String,
+    pub grants: Vec<ParsedAclGrant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedAclGrant {
+    pub grantee: crate::policy::AclGrantee,
+    pub permission: String,
+}
+
+pub fn parse_access_control_policy(xml_str: &str) -> Result<ParsedAcl, S3Error> {
+    #[derive(serde::Deserialize)]
+    struct Acp {
+        #[serde(rename = "Owner")]
+        owner: XmlOwner,
+        #[serde(rename = "AccessControlList")]
+        list: XmlList,
+    }
+    #[derive(serde::Deserialize)]
+    struct XmlOwner {
+        #[serde(rename = "ID")]
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct XmlList {
+        #[serde(rename = "Grant", default)]
+        grants: Vec<XmlGrant>,
+    }
+    #[derive(serde::Deserialize)]
+    struct XmlGrant {
+        #[serde(rename = "Grantee")]
+        grantee: XmlGrantee,
+        #[serde(rename = "Permission")]
+        permission: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct XmlGrantee {
+        #[serde(rename = "ID", default)]
+        id: Option<String>,
+        #[serde(rename = "URI", default)]
+        uri: Option<String>,
+    }
+    let parsed: Acp =
+        quick_xml::de::from_str(xml_str).map_err(|e| S3Error::MalformedXML(e.to_string()))?;
+    let grants = parsed
+        .list
+        .grants
+        .into_iter()
+        .map(|g| {
+            let grantee = match (&g.grantee.id, &g.grantee.uri) {
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(S3Error::MalformedXML(
+                        "ACL Grantee must carry exactly one of ID or URI".into(),
+                    ))
+                }
+                (Some(id), None) => crate::policy::AclGrantee::Owner(id.clone()),
+                (None, Some(uri)) => {
+                    if uri.as_str() == "http://acs.amazonaws.com/groups/global/AllUsers" {
+                        crate::policy::AclGrantee::AllUsers
+                    } else {
+                        return Err(S3Error::InvalidArgument(format!(
+                            "unsupported ACL grantee URI `{uri}` (only the AllUsers group is supported)"
+                        )));
+                    }
+                }
+            };
+            Ok(ParsedAclGrant {
+                grantee,
+                permission: g.permission,
+            })
+        })
+        .collect::<Result<Vec<_>, S3Error>>()?;
+    Ok(ParsedAcl {
+        owner: parsed.owner.id,
+        grants,
+    })
+}
+
+/// `s3-acl-xml`:GET ?acl 的 grants 形态(命名授予逐条回吐;AllUsers grant 走
+/// 形态串联,canned 单元已有 AllUsers 面)。
+pub fn serialize_access_control_policy_for_grants(
+    owner: &str,
+    grants: &[crate::policy::AclGrant],
+) -> String {
+    let o = quick_xml::escape::escape(owner);
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Owner><ID>{o}</ID><DisplayName>{o}</DisplayName></Owner>\
+         <AccessControlList>\
+         <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+         <ID>{o}</ID><DisplayName>{o}</DisplayName></Grantee>\
+         <Permission>FULL_CONTROL</Permission></Grant>"
+    );
+    for grant in grants {
+        let (xsi_type, element, value) = match &grant.grantee {
+            crate::policy::AclGrantee::Owner(id) => ("CanonicalUser", "ID", id.as_str()),
+            crate::policy::AclGrantee::AllUsers => (
+                "Group",
+                "URI",
+                "http://acs.amazonaws.com/groups/global/AllUsers",
+            ),
+        };
+        let v = quick_xml::escape::escape(value);
+        let perm = quick_xml::escape::escape(&grant.permission);
+        xml.push_str(&format!(
+            "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"{xsi_type}\"><{element}>{v}</{element}></Grantee>\
+             <Permission>{perm}</Permission></Grant>"
+        ));
+    }
+    xml.push_str("</AccessControlList></AccessControlPolicy>");
+    xml
 }

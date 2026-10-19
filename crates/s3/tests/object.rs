@@ -832,7 +832,8 @@ async fn canned_acl_public_read_grants_reads_but_not_writes() {
         "unsupported x-amz-acl value is InvalidArgument"
     );
 
-    // PUT ?acl 的 XML body 形式 → 501 NotImplemented(显式出界,不静默不误导)。
+    // XML body 形式自 `s3-acl-xml` 起受理(语义详见 tests/aclxml.rs);残缺文档照旧
+    // 响亮拒:此体缺 Owner/AccessControlList → 400 MalformedXML。
     let xml_body = "<AccessControlPolicy></AccessControlPolicy>";
     let headers = fx.signed_headers("PUT", &format!("/{bucket}?acl"), xml_body.as_bytes());
     let resp = fx
@@ -845,8 +846,8 @@ async fn canned_acl_public_read_grants_reads_but_not_writes() {
         .unwrap();
     assert_eq!(
         resp.status().as_u16(),
-        501,
-        "XML-body PutBucketAcl is explicitly out of scope"
+        400,
+        "malformed XML-body PutBucketAcl is loud (MalformedXML)"
     );
 }
 

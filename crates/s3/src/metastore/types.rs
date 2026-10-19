@@ -104,6 +104,8 @@ pub struct ObjectMeta {
     pub sse: Option<String>,
     /// 行内 flexible checksum(None → 回显面缺省)。
     pub checksum: Option<StoredChecksum>,
+    /// 对象级 ACL READ 授予集(`s3-acl-xml`;None = 无)。
+    pub acl_grants: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +167,8 @@ pub struct BucketMeta {
     /// 桶策略 JSON 文档(`s3-bucket-policy`;None = 未设)。head_bucket 读侧填,
     /// list_buckets 等低敏列举面不强填(读侧废弃注:`None` 语义仍是"未设"或"未载")。
     pub policy: Option<String>,
+    /// ACL XML READ 授予集(`s3-acl-xml` JSON;AllUsers 不在此——直映射 canned 列)。
+    pub acl_grants: Option<String>,
 }
 
 #[derive(Debug, Clone)]

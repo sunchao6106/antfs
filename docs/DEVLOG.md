@@ -1825,3 +1825,27 @@ per-part 持久化,另立档)」;用户 2026-10-19 指令「全力完善 s3 功�
 **发运**:归档 `openspec/changes/archive/2026-10-19-s3-bucket-policy/`(s3-core +
 s3-metastore 各一新要求);docs 同步(s3.md 矩阵行、新「桶策略」节、「尚未支持」行
 翻转、README 档 5 附注、DEVLOG 步 70)。
+
+## 步骤 71:s3-acl-xml —— ACL XML 授予面:授权面收官(完结批 C3)
+
+**动机**:矩阵 116 行唯一余项(object 级 ACL / PutBucketAcl XML body 形式,当时显式
+501 出界);用户 2026-10-19 完结指令尾件。
+
+**落地**(D1-D4 见 change design.md):migration 009(buckets/named_objects +acl_grants
+TEXT);xml.rs AccessControlPolicy 解析(Grantee ID/URI 二选一互斥)与 grants 形态回吐
+序列化;`AclGrant{Owner/AllUsers}` + `acl_grants_allow`(存坏 JSON fail-close 于默认
+拒绝面)。authorize 增两腿(NotApplicable 且兜底将拒才评估):桶 grants 抬 ListBucket
+(内联零查询;AllUsers = canned public-read 直映射不进列)、对象 grants 抬 GetObject
+(deny-路径懒查行;匿名经 AllUsers 认领,修了首版漏匿名的缺陷)。PUT/GET ?acl 桶/对象
+两路(canned 头路径逐字不动,换置语义下同清 grants);权限白名单外(W 族/AC 族/
+FULL_CONTROL 予他人)400 响亮;Owner 非桶主 403;对象不存在 404。
+
+**验证**:e2e 双言 aclxml.rs PG 6/6 + MySQL 6/6(桶 READ 授予抬列举不抬对象读[几何
+断言]/对象授予抬单对象 + 兄弟键仍 403 + AllUsers 开匿读/策略显式 Deny 压授予/桶
+AllUsers→public-read/五拒面[WRITE、FULL_CONTROL 予他人、坏 Owner、坏 XML、幽灵对象
+404]/canned 头换置清授予);object.rs 一处旧边界断言按新契约翻转(XML 残缺 →
+400)。全量双言 PG 150/150 + MySQL 150/150;workspace 74 套 722 绿;clippy 0;fmt 净。
+
+**发运**:归档 `2026-10-19-s3-acl-xml`;docs 同步(s3.md 矩阵行收官、public-read API
+行、新「ACL XML 授予面」节、授权面全收官宣告)。S3 功能面完结批
+(C1/C2/C3)至此收官。

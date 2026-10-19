@@ -512,3 +512,42 @@ mod tests {
         );
     }
 }
+
+/// `s3-acl-xml` 的授予语义(评估腿位于策略 NotApplicable 的兜底拒绝前):
+/// 桶域 grants 抬 `s3:ListBucket`;对象域 grants 抬 `s3:GetObject`(AllUsers 建
+/// bucket 走 canned public-read 直映射,不在此列)。授予**永远抬不赢**显式策略
+/// Deny——它只在策略缺位、兜底将拒时出现。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AclGrant {
+    pub grantee: AclGrantee,
+    pub permission: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AclGrantee {
+    /// 具名租户(凭证 owner id)。
+    Owner(String),
+    /// AllUsers 组(对象域 = 任何请求者;桶域直映射 canned,不落此列)。
+    AllUsers,
+}
+
+/// grants JSON 是否放行该主语具名成员(具名匹配 owner;`*` 语义 = AllUsers 匹配
+/// 所有)。存坏 JSON → false(fail-closed:授予腿本就只在拒绝路径上)。
+pub(crate) fn acl_grants_allow(grants_json: Option<&str>, owner: Option<&str>) -> bool {
+    let Some(raw) = grants_json else {
+        return false;
+    };
+    // 形态已受信(put 时全验);坏行(理论仅人工改库)→ 拒抬并告警,同 fail-closed。
+    let grants: std::result::Result<Vec<AclGrant>, _> = serde_json::from_str(raw);
+    let grants = match grants {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::warn!("corrupt stored acl grants; lifting disabled");
+            Vec::new()
+        }
+    };
+    grants.iter().any(|g| match &g.grantee {
+        AclGrantee::AllUsers => true,
+        AclGrantee::Owner(id) => owner.is_some_and(|o| o == id.as_str()),
+    })
+}

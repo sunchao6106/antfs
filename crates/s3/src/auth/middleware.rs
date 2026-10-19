@@ -216,6 +216,21 @@ mod tests {
         async fn set_bucket_policy(&self, _bucket: &str, _policy: Option<&str>) -> MetaResult<()> {
             Err(not_implemented())
         }
+        async fn set_bucket_acl_grants(
+            &self,
+            _bucket: &str,
+            _grants: Option<&str>,
+        ) -> MetaResult<()> {
+            Err(not_implemented())
+        }
+        async fn set_object_acl_grants(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _grants: Option<&str>,
+        ) -> MetaResult<()> {
+            Err(not_implemented())
+        }
         async fn set_bucket_acl(&self, _bucket: &str, _acl: BucketAcl) -> MetaResult<()> {
             Err(not_implemented())
         }

@@ -161,7 +161,7 @@ impl MetaStore for MysqlMetaStore {
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let row: Option<MysqlObjectRow> = sqlx::query_as(
-            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64, checksum_type
+            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64, checksum_type, acl_grants
              FROM named_objects
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL
              ORDER BY version DESC LIMIT 1",
@@ -184,7 +184,7 @@ impl MetaStore for MysqlMetaStore {
             None => (None, None),
         };
         let rows: Vec<MysqlObjectRow> = sqlx::query_as(
-            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64, checksum_type
+            "SELECT bucket, `key`, version, blob_id, size, etag, content_type, created_at, user_meta, parts_manifest, sse, checksum_algo, checksum_b64, checksum_type, acl_grants
              FROM named_objects
              WHERE sse IS NOT NULL AND state = 1 AND deleted_at IS NULL
                AND (? IS NULL OR (bucket, `key`) > (?, ?))
@@ -417,18 +417,19 @@ impl MetaStore for MysqlMetaStore {
     }
 
     async fn head_bucket(&self, name: &str) -> Result<Option<BucketMeta>> {
-        let row: Option<(String, String, i64, String, Option<String>)> = sqlx::query_as(
-            "SELECT name, owner, created_at, acl, policy FROM buckets WHERE name = ?",
+        let row: Option<(String, String, i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT name, owner, created_at, acl, policy, acl_grants FROM buckets WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(n, o, c, a, p)| BucketMeta {
+        Ok(row.map(|(n, o, c, a, p, g)| BucketMeta {
             name: n,
             owner: o,
             created_at: c,
             acl: BucketAcl::parse(&a).unwrap_or(BucketAcl::Private),
             policy: p,
+            acl_grants: g,
         }))
     }
 
@@ -440,6 +441,38 @@ impl MetaStore for MysqlMetaStore {
             .await?;
         if result.rows_affected() == 0 {
             return Err(S3Error::NoSuchBucket);
+        }
+        Ok(())
+    }
+
+    async fn set_bucket_acl_grants(&self, bucket: &str, grants: Option<&str>) -> Result<()> {
+        let result = sqlx::query("UPDATE buckets SET acl_grants = ? WHERE name = ?")
+            .bind(grants)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(S3Error::NoSuchBucket);
+        }
+        Ok(())
+    }
+
+    async fn set_object_acl_grants(
+        &self,
+        bucket: &str,
+        key: &str,
+        grants: Option<&str>,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE named_objects SET acl_grants = ? WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL",
+        )
+        .bind(grants)
+        .bind(bucket)
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(S3Error::NoSuchKey);
         }
         Ok(())
     }
@@ -471,6 +504,7 @@ impl MetaStore for MysqlMetaStore {
                 created_at: c,
                 acl: BucketAcl::parse(&a).unwrap_or(BucketAcl::Private),
                 policy: None,
+                acl_grants: None,
             })
             .collect())
     }
@@ -1054,6 +1088,7 @@ struct MysqlObjectRow {
     checksum_algo: Option<String>,
     checksum_b64: Option<String>,
     checksum_type: Option<String>,
+    acl_grants: Option<String>,
 }
 
 impl MysqlObjectRow {
@@ -1080,6 +1115,7 @@ impl MysqlObjectRow {
                 self.checksum_b64,
                 self.checksum_type,
             ),
+            acl_grants: self.acl_grants,
         }
     }
 }
