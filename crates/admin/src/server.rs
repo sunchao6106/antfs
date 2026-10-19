@@ -153,6 +153,7 @@ pub fn build_router(state: AppState, auth: AuthConfig) -> Router {
         .route("/api/audit", get(get_audit))
         .route("/api/partitions", get(get_partitions).post(post_partitions))
         .route("/api/partitions/{id}", get(get_partition))
+        .route("/api/layout", get(get_layout))
         .route("/api/partitions/{id}/state", post(post_partition_state))
         .route("/api/partitions/{id}/repair", post(post_repair))
         .route("/api/partitions/{id}/move", post(post_move))
@@ -832,6 +833,78 @@ fn pick_labeled(samples: &[antfs_metric::Sample], name: &str, want: &[(&str, &st
         })
         .map(|s| s.value as u64)
         .unwrap_or(0)
+}
+
+/// 分页拉全量分区表的一页上限。整表 500 内一拍;更大表逐页齐 `total`(页空提前停,防
+/// 分区被并发删除时循环空转)。
+const LAYOUT_PAGE_LIMIT: u32 = 500;
+
+/// `GET /api/layout`(viewer 可读):布局反查 + 放置合规审计(点击式、无状态、纯只读)。
+///
+/// server 侧经既有 master API join(`nodes()` + 分页循环 `partitions()`),计算核是纯函数
+/// [`crate::layout::compute`](违约集与"只报警不修复"的口径见其模块文档)。报关"状态事实"
+/// (down/BOOTSTRAP)不入违规;违例 = placement 强制约束被破(`same_node`)或注册面漂移
+/// (`unknown_node`/`unknown_disk`)。
+async fn get_layout(State(st): State<AppState>) -> Response {
+    st.metrics.api_requests.inc();
+    let nodes = match st.master.nodes().await {
+        Ok(n) => n,
+        Err(e) => return map_err(&st, e).into_response(),
+    };
+    let mut partitions = Vec::new();
+    let mut total = u64::MAX;
+    while (partitions.len() as u64) < total {
+        let offset = partitions.len() as u64;
+        let (page, t) = match st.master.partitions("", offset, LAYOUT_PAGE_LIMIT).await {
+            Ok(x) => x,
+            Err(e) => return map_err(&st, e).into_response(),
+        };
+        total = t;
+        if page.is_empty() {
+            break;
+        }
+        partitions.extend(page);
+    }
+    let report = crate::layout::compute(&nodes, &partitions);
+    let violations: Vec<serde_json::Value> = report
+        .violations
+        .iter()
+        .map(|v| {
+            json!({
+                "kind": v.kind,
+                "partition_id": v.partition_id,
+                "node_id": v.node_id,
+                "disk_id": v.disk_id,
+                "detail": v.detail,
+            })
+        })
+        .collect();
+    let nodes_json: Vec<serde_json::Value> = report
+        .nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "node_id": n.node_id,
+                "addr": n.addr,
+                "up": n.up,
+                "replica_count": n.replica_count,
+                "replicas": n.replicas.iter().map(|e| json!({
+                    "partition_id": e.partition_id,
+                    "disk_id": e.disk_id,
+                    "target_state": e.target_state,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({
+        "generated_at_ms": now_ms(),
+        "total_partitions": report.total_partitions,
+        "total_replicas": report.total_replicas,
+        "compliant": report.compliant,
+        "nodes": nodes_json,
+        "violations": violations,
+    }))
+    .into_response()
 }
 
 async fn get_partition(State(st): State<AppState>, Path(id): Path<u32>) -> Response {
@@ -1591,11 +1664,28 @@ mod tests {
         nodes: Vec<NodeDto>,
         /// 每个分区上报的 `used_bytes`(按副本顺序)。
         used_bytes: u64,
+        /// 分区表覆写(layout 测试用);`None` = 旧的固定 0..5 生成路径(既有用例不变)。
+        custom_partitions: Option<Vec<PartitionDto>>,
     }
 
     impl FakeMaster {
         fn take_calls(&self) -> Vec<String> {
             std::mem::take(&mut self.calls.lock().unwrap_or_else(|p| p.into_inner()))
+        }
+
+        /// 既有用例的默认分区(0..5):副本集/used_bytes 来自桩字段,RF 恒 3。
+        fn one_partition(&self, pid: u32) -> PartitionDto {
+            PartitionDto {
+                partition_id: pid,
+                state: "RW".into(),
+                replication_factor: 3,
+                replicas: self.replicas.clone(),
+                used_bytes: self.used_bytes,
+                healthy_replicas: 3,
+                healable: true,
+                under_replicated_reason: String::new(),
+                moving_out_nodes: vec![],
+            }
         }
 
         /// 让 `nodes()` 回一个指向该地址的在线节点。
@@ -1659,22 +1749,21 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(format!("partitions {state} {offset} {limit}"));
-            let all: Vec<PartitionDto> = (0..5u32)
-                .map(|i| PartitionDto {
-                    partition_id: i,
-                    state: if i == 0 {
-                        "RO".to_string()
-                    } else {
-                        "RW".to_string()
-                    },
-                    replication_factor: 3,
-                    replicas: self.replicas.clone(),
-                    used_bytes: self.used_bytes,
-                    healthy_replicas: 3,
-                    healable: true,
-                    under_replicated_reason: String::new(),
-                    moving_out_nodes: vec![],
+            let generated: Vec<PartitionDto> = (0..5u32)
+                .map(|i| {
+                    let mut p = self.one_partition(i);
+                    if i == 0 {
+                        p.state = "RO".to_string();
+                    }
+                    p
                 })
+                .collect();
+            let all: Vec<PartitionDto> = match &self.custom_partitions {
+                Some(list) => list.clone(),
+                None => generated,
+            };
+            let all: Vec<PartitionDto> = all
+                .into_iter()
                 .filter(|p| state.is_empty() || p.state == state)
                 .collect();
             let take = if limit == 0 {
@@ -3478,5 +3567,113 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(status(&router, req).await, StatusCode::NOT_FOUND);
+    }
+
+    // ── 布局反查 + 合规(admin-layout-compliance)────────────────────────────────
+
+    fn layout_node(id: u64, up: bool, disks: &[&str]) -> NodeDto {
+        crate::layout::tests::node(id, up, disks)
+    }
+
+    fn layout_partition(pid: u32, reps: &[(u64, &str)]) -> PartitionDto {
+        crate::layout::tests::partition(pid, reps)
+    }
+
+    /// 反查聚合 + 合规结论:节点计数/排序/零副本节点/状态照抄,清白 = compliant。
+    #[tokio::test]
+    async fn layout_endpoint_reverse_lookup_and_compliance() {
+        let master = Arc::new(FakeMaster {
+            nodes: vec![
+                layout_node(1, true, &["a1"]),
+                layout_node(2, false, &["b1"]),
+                layout_node(3, true, &["c1"]),
+            ],
+            custom_partitions: Some(vec![
+                layout_partition(7, &[(1, "a1"), (2, "b1")]),
+                layout_partition(2, &[(1, "a1")]),
+            ]),
+            ..Default::default()
+        });
+        let router = app_with(master, Default::default());
+        let req = Request::get("/api/layout").body(Body::empty()).unwrap();
+        let v = body_json(&router, req).await;
+        assert_eq!(v["total_partitions"], 2, "{v}");
+        assert_eq!(v["total_replicas"], 3, "{v}");
+        assert_eq!(v["compliant"], true, "{v}");
+        assert!(v["generated_at_ms"].as_u64().unwrap() > 0);
+        let nodes = v["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3, "零副本节点也必须出现: {v}");
+        assert_eq!(nodes[0]["node_id"], 1);
+        assert_eq!(nodes[0]["replica_count"], 2);
+        let entries = nodes[0]["replicas"].as_array().unwrap();
+        assert_eq!(entries[0]["partition_id"], 2, "清单按 pid 升序: {nodes:?}");
+        assert_eq!(entries[1]["partition_id"], 7);
+        assert_eq!(nodes[1]["up"], false, "up 态照抄节点表");
+        assert_eq!(nodes[2]["replica_count"], 0);
+        assert_eq!(v["violations"].as_array().unwrap().len(), 0);
+    }
+
+    /// 三违例齐出:同分区分副本同节点 / 未注册盘 / 未注册节点;compliant = false。
+    #[tokio::test]
+    async fn layout_endpoint_flags_the_three_kinds() {
+        let master = Arc::new(FakeMaster {
+            nodes: vec![layout_node(1, true, &["a1"])],
+            custom_partitions: Some(vec![
+                layout_partition(9, &[(1, "a1"), (1, "a1")]),
+                layout_partition(5, &[(1, "ghost")]),
+                layout_partition(4, &[(77, "z")]),
+            ]),
+            ..Default::default()
+        });
+        let router = app_with(master, Default::default());
+        let req = Request::get("/api/layout").body(Body::empty()).unwrap();
+        let v = body_json(&router, req).await;
+        assert_eq!(v["compliant"], false, "{v}");
+        let violations = v["violations"].as_array().unwrap();
+        let kinds: Vec<&str> = violations
+            .iter()
+            .filter_map(|x| x["kind"].as_str())
+            .collect();
+        for want in ["same_node", "unknown_disk", "unknown_node"] {
+            assert!(kinds.contains(&want), "缺 {want}: {violations:?}");
+        }
+        assert_eq!(v["total_replicas"], 4, "幽灵副本计入合计(观测不丢): {v}");
+    }
+
+    /// viewer 可读(纯只读报表,与 /api/partitions 同级公民)。
+    #[tokio::test]
+    async fn layout_endpoint_is_viewer_readable() {
+        let router = app_auth(AuthConfig {
+            users: Vec::new(),
+            operator_token: "op".into(),
+            viewer_token: "view".into(),
+        });
+        let req = Request::get("/api/layout")
+            .header(header::AUTHORIZATION, "Bearer view")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, req).await, StatusCode::OK);
+    }
+
+    /// 分页拉全:1200 个分区跨越 500/页的两页以上,合计与清单必须齐(空页/齐 total 提前止)。
+    #[tokio::test]
+    async fn layout_endpoint_pages_the_full_table() {
+        let parts: Vec<PartitionDto> = (0..1200u32)
+            .map(|i| layout_partition(i, &[(1, "a1")]))
+            .collect();
+        let master = Arc::new(FakeMaster {
+            nodes: vec![layout_node(1, true, &["a1"])],
+            custom_partitions: Some(parts),
+            ..Default::default()
+        });
+        let router = app_with(master.clone(), Default::default());
+        let req = Request::get("/api/layout").body(Body::empty()).unwrap();
+        let v = body_json(&router, req).await;
+        assert_eq!(v["total_partitions"], 1200, "{v}");
+        assert_eq!(v["total_replicas"], 1200, "{v}");
+        assert_eq!(v["nodes"][0]["replica_count"], 1200);
+        let calls = master.take_calls();
+        let partitions_calls = calls.iter().filter(|c| c.starts_with("partitions")).count();
+        assert!(partitions_calls >= 3, "跨页必须多拍拉取(500/页): {calls:?}");
     }
 }

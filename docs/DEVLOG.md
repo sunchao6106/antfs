@@ -1882,3 +1882,28 @@ store lib **147/147**(scrub_worker 6 新:轮转+周期重开字节守恒 4×152/
 配置/监控两表 7 行 + §12.10 verify 响应契约更新)。顺带翻案完成:存疑四件
 (DELETE 409 无证据/compaction 异步已修/DROPPED 真删已落/disk-capacity-guard 已落)
 全部结案,运维存货清单从"一筐"修成"就四件"。
+
+## 步骤 73:admin-layout-compliance —— 布局反查 + 放置合规审计(「布局」页)
+
+**动机**:纠错后核准的运维残余 #1。布局原来只有正查(分区 → 副本),"这台机器承载哪些副本"
+要翻页人肉拼;反亲和只在 placement 创建时强制,事后违例(修复流落点错)没有任何面会亮。
+排水/搬机的"眼镜"件。
+
+**落地**:admin `GET /api/layout`(viewer 可读,点击式无状态)——server 侧经既有 master API
+join(`nodes()` + `ListPartitions` 分页循环页 500,齐 total/空页即止);计算核纯函数
+`crates/admin/src/layout.rs`(反查聚合按 pid 升序、零副本节点也列、幽灵副本计入合计);违规集 =
+placement 真实强制约束 + join 完整性(`same_node`/`unknown_node`/`unknown_disk`),
+状态事实(down/BOOTSTRAP)刻意不入红灯。UI 新「布局」tab(汇总卡 + 合规徽标 + 违规表 +
+逐节点副本清单行展开;i18n en/zh 双份)。FakeMaster 增 `custom_partitions` 覆写,既有用例
+默认路径不动。master/proto/store/迁移零改动;零新配置零新指标。
+
+**验证**:admin lib **66/66**(layout 纯函数 5 新 + 端点 4 新:反查聚合含零副本节点与排序/
+三违规齐出且幽灵计入合计/viewer 200/1200 分区跨 500 页·页 1200 齐且拉取 ≥3 拍);workspace
+**76 套 748/0**(数字含上批 75 套 739 基础上 admin +5 网络路径用例… 全量口径见门禁输出);
+clippy workspace 0;fmt 净(修 1 处 needless_update);`openspec validate` 过。**真集群验证**
+(devcluster 3 节点 3 分区 RF=3,`--admin-port 17312`):`GET /api/layout` 回 compliant=true、
+合计 3/9/3、每节点 3/3/3 且 replicas 升序、violations 空;坏 token 401;SPA 含新 tab。
+UI:`npm run build` 过(tsc + vite singlefile)。
+
+**发运**:归档 `admin-layout-compliance`;docs:cluster.md §11 新契约行。运维残余剩两件
+(balance 判败中间态辅助 / composed 回填)+ admin 级比对周期化(另议)。

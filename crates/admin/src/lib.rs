@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod config;
 pub mod error;
+pub mod layout;
 pub mod master_api;
 pub mod metrics;
 pub mod scrub;

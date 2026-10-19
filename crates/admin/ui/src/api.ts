@@ -366,6 +366,41 @@ export interface PartitionPage {
 export type BalancePlanStatus = "PREVIEW" | "RUNNING" | "CANCELLED" | "DONE";
 export type BalanceMoveStatus = "pending" | "in_flight" | "done" | "failed" | "infeasible";
 
+/** 布局反查:机器视角的一条副本(哪个分区、哪块盘、目标态)。 */
+export interface LayoutReplica {
+  partition_id: number;
+  disk_id: string;
+  target_state: string;
+}
+
+/** 布局反查:一个节点承载的全部副本(按 partition_id 升序)。 */
+export interface LayoutNode {
+  node_id: number;
+  addr: string;
+  up: boolean;
+  replica_count: number;
+  replicas: LayoutReplica[];
+}
+
+/** 一处放置违例(kind 与 `VIOLATION_KINDS` 同源:same_node / unknown_node / unknown_disk)。 */
+export interface LayoutViolation {
+  kind: string;
+  partition_id: number | null;
+  node_id: number | null;
+  disk_id: string | null;
+  detail: string;
+}
+
+/** `GET /api/layout` 的形状(点击式、无状态)。 */
+export interface LayoutReport {
+  generated_at_ms: number;
+  total_partitions: number;
+  total_replicas: number;
+  compliant: boolean;
+  nodes: LayoutNode[];
+  violations: LayoutViolation[];
+}
+
 /** 均衡计划里的一条副本搬迁。 */
 export interface BalanceMove {
   partition_id: number;
@@ -509,6 +544,8 @@ export const api = {
     }),
   /** 当前均衡计划(无计划时 `present=false`)。 */
   balanceState: () => req<BalanceState>("/api/balance"),
+  /** 布局反查 + 放置合规审计(viewer 可读)。 */
+  layout: () => req<LayoutReport>("/api/layout"),
   /** 评估生成一份预览计划(operator;`maxMoves` 省略时用服务端默认)。 */
   balanceEval: (maxMoves?: number) =>
     req<BalanceEvalResult>("/api/balance/eval", {
