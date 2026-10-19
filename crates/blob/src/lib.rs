@@ -13,9 +13,8 @@ pub mod metrics;
 pub mod types;
 
 pub use blob::{
-    ApplyOutcome, BlobStore, CompactPolicy, CompactionStats, FindInfo, FindToken,
-    MarkComposedOutcome, MessageInfo, ReplicatedRecord, TokenResetReason, VerifyReport,
-    LOG_INCARNATION_FILE,
+    ApplyOutcome, BlobStore, CompactPolicy, CompactionStats, FindInfo, FindToken, MessageInfo,
+    ReplicatedRecord, TokenResetReason, VerifyReport, LOG_INCARNATION_FILE,
 };
 pub use config::StoreConfig;
 pub use error::{Error, Result};

@@ -73,9 +73,8 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 2. **`POST /stitch`**:
    - 校验 `x-antfs-session` 非空、片列表非空且 ≤ 4096、每个 id 是 16 hex;
    - 逐片 `stat` 拿尺寸(拿不到 → 400);
-   - 构造**自描述描述符**(小端,当**普通 blob** 写入):
+   - 构造**自描述描述符**(小端,经组合写口落位 —— `composed` 类型位随写置上):
      ```
-     MAGIC = b"ASTC"   (4B)
      version: u8 = 1
      chunk_count: u32
      session_len: u16
@@ -85,22 +84,14 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
      描述符上限 1 MiB(超 → 400);片列表**当 blob 存**是刻意的:中心存一份"片→对象"映射就等于引入
      **每对象元数据**,与 D3 冲突。
    - 因此 `POST /stitch` 是**幂等性无关**的普通写:201 + `Location: /blobs/{stitchedId}`。
-3. **读 stitched blob**:先 `stat`;**组合置信读**(`blob-composed-flag`):置 `composed` 位的行即拼装
-   描述符,整体读回解析(超上限 = 上游损坏,响亮 502;不再嗅探,免疫 MAGIC 碰撞);**存量兜底**:无位行
-   小到可能是描述符时才整体读出来看 MAGIC(避免把大对象整个缓进内存,CLAUDE.md §5.3),命中则解析描述符、
-   逐片 `get` 并**流式拼接**进响应(内存 O(单片));
+3. **读 stitched blob**:先 `stat`;**位是唯一类型判定**(`composed` 置位 ⇔ 描述符):置位行整体读回
+   解析拼装(超上限/结构坏 = 上游损坏响亮 502,信任位不降级),逐片 `get` 并**流式拼接**进响应
+   (内存 O(单片));无位行 = 普通对象原字节返回,任何前缀都不触发内容探测
+   (避免把大对象整个缓进内存,CLAUDE.md §5.3);
    片缺失/描述符损坏 → **502**(上游数据不一致,不是客户端的问题)。
-   **置信翻转**(`store-composed-backfill`,`frontend.composed_flag_only = true`):无位行**不再嗅探** ——
-   GET 返回原始字节、失真①(`ASTC` 前缀普通件 502)就此消失;有位行置信路径逐字不变。
-   **誓约**:只可在每个 store 跑过 `POST /admin/backfill-composed` 并核过报告之后翻开(见
-   [`store.md` 的 `/admin/backfill-composed` 段](./store.md)),否则存量真描述符会按普通对象返回
-   **描述符本体字节**(静默错内容)。
-4. **`HEAD` 与 `GET` 对齐**:`HEAD` 做同样的小对象读回(置位行按 composed 置信、无位行兜底嗅探),拼装对象报**逻辑大小**(各片之和)+
-   `x-antfs-blob-stitched: true` / `x-antfs-blob-stitch-chunks: N`;普通对象报自身大小、不带这两个头。
-   代价可控:描述符按构造 ≤ 1 MiB(`DESCRIPTOR_MAX_BYTES`),故**只有小对象**需要多读一次数据体,
-   更大的对象不可能是描述符、直接按 `stat` 的 size 回(不读数据体)。
-   置信翻转后无位行**免读数据体**(逻辑大小即原始 size、无 stitched 头)——置信翻转的 HEAD 节省
-   "自然兑现"。
+4. **`HEAD` 与 `GET` 对齐**:置位行做一次小对象读回换算**逻辑大小**(各片之和)+
+   `x-antfs-blob-stitched: true` / `x-antfs-blob-stitch-chunks: N`;无位行不读数据体,报自身
+   `stat` 大小、不带这两个头。代价可控:描述符按构造 ≤ 1 MiB(`DESCRIPTOR_MAX_BYTES`)。
 4. **`DELETE` 只删描述符本身,不递归删片**:一次删 N 个对象是危险动作(且片可能被多个 stitched blob 共享);
     孤儿片靠 `x-antfs-ttl-ms` + store 本地 worker 回收。自动分片(§5)产生的对象**删描述符后同样留下孤儿片**
     —— 服务端知悉但故意不递归(无法从描述符区分"片是否被共享"是原因之一;描述符现已带 composed 类型位(`blob-composed-flag`),
@@ -138,7 +129,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
   (上一条"内存换磁盘"的代价,自动分片按片数放大)。
   **已知取舍**:超大 body 会先整体占掉体量等大的系统临时目录空间,总量上限(默认 4096 × 4 MiB = 16 GiB)
   同时也是暂存空间的界 —— 大 body 场景建议给临时目录单独的卷;另见 §4 末条(删描述符留孤儿片)。
-- **读方向**:大对象(> 1 MiB)先经 SDK 落到暂存文件再**流式**回给客户端,小对象才整体读以嗅探分片描述符的 MAGIC
+- **读方向**:大对象(> 1 MiB)先经 SDK 落到暂存文件再**流式**回给客户端,小对象才整体读回
   —— 故 **frontend 侧内存不随对象大小涨**。**但 store 侧的 `GET` 仍把数据体整个读进内存**(真流式 GET 是 store 的待办,
   见 §11),所以端到端内存上界仍由 store 决定(自动分片的 `GET` 同样受此限:逐片 `get`、内存 = 单片)。
 - 一次上传的落盘量:frontend 暂存 1 份 + store 侧暂存 1 份 + log 1 份 —— 这是"内存换磁盘"的代价,记在 D5
@@ -175,7 +166,6 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend.auto_chunk_enabled` | bool | `true` | — | 服务端自动分片开关:开 = body 超过 `max_body_bytes` 时自动切片多次上传并返回描述符的 blobId;关 = 恢复旧行为(超 `max_body_bytes` 一律 413,客户端手动走 `/stitch`) | 无(router 侧 chunking 在 Ambry 是另一层的事) |
 | `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | 自动分片单片大小:切片逐片入库的粒度,也是写路径单片驻留内存的读写缓冲大小;总量上限 = 4096 片 × 此值(默认 16 GiB) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层) |
 | `frontend.cors_allowed_origins` | Vec\<String\> | `[]` | 各项为非空且非 `*` 的合法 header 值(校验期就拒) | CORS 来源白名单(**空 = 不挂 CORS 层**;不接受 `*`) | `frontend.options.allow.methods` 等 |
-| `frontend.composed_flag_only` | bool | **false** | — | **置信读翻转**(`store-composed-backfill`):`true` = 无 composed 位的对象不再嗅探 MAGIC——GET 原始字节、HEAD 免读数据体。**誓约开关**:每个 store 跑过 `POST /admin/backfill-composed` 且核过报告(migrated+already 与预期相符、failed 清零、invalid 可解释)之前**不得翻开**,否则存量真描述符按普通对象返回本体字节(静默错内容)。回填端点与升级顺序见 [`store.md` 的 `/admin/backfill-composed` 段](./store.md) | 无 |
 | `frontend.router.master_addr` | String | `127.0.0.1:7101` | 非空 | 内嵌 SDK 的 master 地址(见 [`router.md` §5](./router.md)) | 无 |
 | `frontend.router.cluster_secret` | String | `""` | — | 集群准入密钥 | 无 |
 | `frontend.router.request_timeout_secs` | u64 | `10` | ≥1 | 单请求超时 | `router.routerRequestTimeoutMs` |
@@ -220,24 +210,16 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 - **服务端 session 表**(分片上传):引入每对象/会话元数据,与 D3 冲突且让 frontend 变有状态;描述符自描述已够。
 - **frontend 直接读写 store 字节、不走 SDK**:会把 W/R 语义复制成两份实现(必然漂移)。
 - **自动分片放在 router SDK 层**(Ambry `NonBlockingRouter` 的 composite-blob 路线):切片与描述符/拼装
-  读回强耦合,而 antfs 的拼装语义(MAGIC 嗅探、透明拼装)判定在 frontend —— router 保持纯"恒等翻译
-  层"(W/R/发号)。描述符**编解码**已下沉公共 crate `antfs-descriptor`(`store-composed-backfill`,
-  frontend 读写与 store 存量回填甄别共用同一份 parse);将来 S3 multipart 等网关需要同款能力时直接复用。
+  读回强耦合,而 antfs 的拼装语义(透明拼装、位判定)判定在 frontend —— router 保持纯"恒等翻译
+  层"(W/R/发号)。描述符**编解码**在公共 crate `antfs-descriptor`;将来 S3 multipart 等网关需要
+  同款能力时直接复用。
 
 ## 11. 待办
 
-- [x] ~~拼装对象的类型判定靠"嗅探数据体前 4 字节"~~ —— **分两步完结**:
-      1. `blob-composed-flag`(2026-10-16):记录/索引 flags 的 composed 位 + 数据面 `?composed=true` +
-         `metadata` 回 `composed` + 新描述符置信读,见 §4。三选项推演与先例出处见
-         `openspec/changes/blob-io-end-to-end/tasks.md` 待办首条;此前的两个已复现失真(≤1 MiB 且以
-         `ASTC` 开头的普通 blob 被误判:要么 502 拒绝服务、要么被当清单展开后**静默返回别人的内容**)
-         当时冻结在存量面。
-      2. `store-composed-backfill`(2026-10-19):存量回填 + 置信翻转收尾 —— store
-         `POST /admin/backfill-composed` 给无位真描述符落位(引擎同 key 追加置换,幂等可续跑),
-         `frontend.composed_flag_only`(默认 false)翻开后无位行**不再嗅探**(GET 原字节、HEAD 免读
-         数据体,两失真就此消除;誓约:翻开前每个 store 的回填报告须先核过)。端点语义与升级顺序见
-         [`store.md` §12.14](./store.md)。
-      完整复现、三个选项与先例出处见 `openspec/changes/blob-io-end-to-end/tasks.md` 的待办首条。
+- [x] ~~拼装对象的类型判定~~ —— **`FLAG_COMPOSED` 位是唯一判定**(`blob-composed-flag` 2026-10-16
+      落位:`?composed=true` 组合写口 + `metadata` 回 `composed`;`descriptor-drop-magic` 2026-10-19
+      收口:无位行恒按普通对象原字节返回,内容探测退役)。三选项推演与先例出处见
+      `openspec/changes/blob-io-end-to-end/tasks.md` 待办首条。
 - [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**,`x-antfs-ttl-ms` 现为单次多数派写。
 - [ ] **store 侧真流式 GET**(把数据体整个读进内存的是 store;frontend 侧已落暂存再流式回)。
 - [ ] router 暴露单副本状态,让副本的 409(重复 `put` 命中已存在 key)能透传到 REST 层(现在收敛成 503;重复 `DELETE` 已幂等 204,不在此列)。

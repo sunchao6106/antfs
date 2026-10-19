@@ -362,7 +362,6 @@ version = "0.0.0"
 dependencies = [
  "antfs-blob",
  "antfs-config",
- "antfs-descriptor",
  "antfs-master",
  "antfs-metric",
  "axum",

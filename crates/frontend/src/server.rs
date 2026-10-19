@@ -84,14 +84,11 @@ const CORS_EXPOSED_HEADERS: [HeaderName; 8] = [
 const BLOB_ID_INVALID: &str = "blob id must be 8 bytes (16 hex)";
 
 // ── 拼装描述符格式(无状态拼装的落盘契约;格式演进见 CLAUDE.md §3.4)────────────────────────────
-// 格式单点在 `antfs-descriptor`(frontend 读写、store 存量回填甄别共用同一份 parse,
-// 防两处漂移);此处只按本层错误口径做薄壳映射。
+// 格式单点在 `antfs-descriptor`;此处按本层错误口径做薄壳映射。
 
-/// 描述符 MAGIC(4 字节):`GET` 见此前缀即按描述符解析。
-const DESCRIPTOR_MAGIC: &[u8; 4] = antfs_descriptor::MAGIC;
 /// 单个拼装对象的片数上限。
 const MAX_CHUNKS: usize = antfs_descriptor::MAX_CHUNKS;
-/// 描述符字节上限(1 MiB):`GET` 据此决定"整体读出判断 MAGIC"还是"直接流式"(CLAUDE.md §5.3);
+/// 描述符字节上限(1 MiB):`GET` 据此决定"整体读出判定"还是"直接流式"(CLAUDE.md §5.3);
 /// 片数与会话长度各自设限后,正常永远到不了这个上界(4096 片最多约 160 KiB)。
 const DESCRIPTOR_MAX_BYTES: u64 = antfs_descriptor::MAX_BYTES;
 
@@ -236,9 +233,6 @@ pub struct AppState {
     pub auto_chunk_bytes: u64,
     /// CORS 允许来源;空 = 不挂 CORS 层。
     pub cors_allowed_origins: Vec<String>,
-    /// **置信读翻转**(`store-composed-backfill`;誓约语义见 `FrontendConfig::composed_flag_only`):
-    /// `true` = 无位对象不嗅探,GET 原始字节 / HEAD 免读数据体;有位置信路径不受影响。
-    pub composed_flag_only: bool,
 }
 
 impl AppState {
@@ -256,7 +250,6 @@ impl AppState {
             auto_chunk_enabled: cfg.auto_chunk_enabled,
             auto_chunk_bytes: cfg.auto_chunk_bytes,
             cors_allowed_origins: cfg.cors_allowed_origins.clone(),
-            composed_flag_only: cfg.composed_flag_only,
         })
     }
 }
@@ -602,15 +595,15 @@ async fn get_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<String
 
 /// 读一个对象,返回 `(响应, 响应体字节数)`。
 ///
-/// - **小对象**(`stat.size <= DESCRIPTOR_MAX_BYTES`)整体读回,以便判断它是不是拼装描述符;
-/// - **大对象不整体进内存**(CLAUDE.md §5.3):`get_file` 落暂存文件后流式回给调用方。
-///   SDK 只有 `get`(整体进内存)与 `get_file`(落文件)两个读口,后者才不把对象整个缓进内存。
+/// - **类型只看 `composed` 位**(descriptor-drop-magic 后唯一判定):置位 = 拼装描述符
+///   → 整体读回解析拼装(超限/坏描述符响亮 502,信任位不降级);无位 = 普通对象原字节;
+/// - **小对象**整体读回;**大对象不整体进内存**(CLAUDE.md §5.3):`get_file` 落暂存文件后
+///   流式回给调用方。SDK 只有 `get`(整体进内存)与 `get_file`(落文件)两个读口,
+///   后者才不把对象整个缓进内存。
 async fn download(st: &AppState, blob_id: &str) -> Result<(Response, u64), Error> {
     let key = parse_blob_id(blob_id)?;
     // 先取元数据:① 拿 size 决定读路径;② 顺便让"对象不存在"给出干净的 404(而非读一半才发现)。
     let meta = st.router.stat(&key).await?;
-    // 置信读(blob-composed-flag):置位即拼装描述符,不经嗅探 —— 新描述符免疫 MAGIC
-    // 碰撞;超限 = 上游损坏,响亮 502(信任位,不降级成普通对象)。
     if meta.composed {
         if meta.size > DESCRIPTOR_MAX_BYTES {
             return Err(Error::Upstream(
@@ -622,14 +615,6 @@ async fn download(st: &AppState, blob_id: &str) -> Result<(Response, u64), Error
     }
     if meta.size <= DESCRIPTOR_MAX_BYTES {
         let body = st.router.get(&key).await?;
-        if !st.composed_flag_only && body.starts_with(DESCRIPTOR_MAGIC) {
-            // 无位行(存量描述符)的兜底嗅探:前 4 字节 == MAGIC 即按描述符解析。
-            // ⚠ 已知歧义(blob-composed-flag design D5):存量面 ≤1 MiB 且以 `ASTC`
-            // 开头的普通 blob 仍会被误判(502,或被当清单展开后**静默返回别人的内容**)——
-            // 新描述符全走上面的置信路径;打开 `composed_flag_only`(回填验收后)即弃本嗅探,
-            // 普通 blob 原字节返回。store-composed-backfill 负责给存量真描述符落位。
-            return stitched_body(st, &body).await;
-        }
         let len = body.len() as u64;
         return Ok(((StatusCode::OK, body).into_response(), len));
     }
@@ -648,26 +633,17 @@ async fn head_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<Strin
         let key = parse_blob_id(&blob_id)?;
         let mut meta = st.router.stat(&key).await?;
         // 拼装对象:`stat` 只看到**描述符**那个 blob(几百字节),直接报出去会与 `GET`(拼装后的逻辑字节流)对不上。
-        // 故这里做与 `download` 同样的小对象读回(新描述符走 composed 置信、存量走 MAGIC 嗅探,两形态同流),
-        // 把 size 换成各片之和,并回 `x-antfs-blob-stitched` 头。
-        // 代价可控:描述符按构造 ≤ DESCRIPTOR_MAX_BYTES,故**只有小对象**才需要多读一次数据体(≤1 MiB);
-        // size 更大者不可能是描述符,直接按原 size 回(不读数据体,保持 HEAD 的语义)。
-        // `composed_flag_only` 置位(回填验收后)⇒ **无位行免读数据体**(D5"HEAD 节省"自然兑现):
-        // 逻辑大小 = 原始 size、无 stitched 头;有位行照常走下面这段换算。
-        // 已删/已过期的拼装对象嗅不出逻辑大小(数据面拒读已过期体,下面 `get` 的失败被静默忽略)
+        // 故对**置位行**做小对象读回,把 size 换成各片之和,并回 `x-antfs-blob-stitched` 头
+        // (无位行不读数据体:位是唯一类型判定,普通对象没有"逻辑大小"一说)。
+        // 代价可控:描述符按构造 ≤ DESCRIPTOR_MAX_BYTES,置位行才需要多读一次数据体(≤1 MiB)。
+        // 已删/已过期的拼装对象读不出逻辑大小(数据面拒读已过期体,`get` 的失败被静默忽略)
         // —— 退回描述符自身的 stat 是已知取舍;过期的对象本就不再是"取内容"的语义。
         let mut stitched_chunks = None;
-        let needs_body_probe = !meta.deleted
-            && !meta.expired
-            && meta.size <= DESCRIPTOR_MAX_BYTES
-            && (meta.composed || !st.composed_flag_only);
-        if needs_body_probe {
+        if meta.composed && !meta.deleted && !meta.expired && meta.size <= DESCRIPTOR_MAX_BYTES {
             if let Ok(body) = st.router.get(&key).await {
-                if meta.composed || body.starts_with(DESCRIPTOR_MAGIC) {
-                    if let Ok(chunks) = decode_descriptor(&body) {
-                        meta.size = chunks.iter().map(|c| c.size).sum();
-                        stitched_chunks = Some(chunks.len());
-                    }
+                if let Ok(chunks) = decode_descriptor(&body) {
+                    meta.size = chunks.iter().map(|c| c.size).sum();
+                    stitched_chunks = Some(chunks.len());
                 }
             }
         }
@@ -799,7 +775,7 @@ async fn stitch_inner(
     }
     let descriptor = encode_descriptor(session.as_bytes(), &chunks)?;
     let len = descriptor.len() as u64;
-    // 描述符以组合位落库:读侧 stat 报 composed,走置信拼装路径(不再嗅探 MAGIC)。
+    // 描述符以组合位落库:读侧 stat 报 composed,位是唯一类型判定。
     let key = st.router.allocate_one().await?;
     st.router.put_composed(key, Bytes::from(descriptor)).await?;
     Ok((key, len))
@@ -840,12 +816,12 @@ struct DescriptorChunk {
 /// 编码拼装描述符(小端):
 ///
 /// ```text
-/// MAGIC(4) | version(1) | chunk_count(u32) | session_len(u16) | session |
+/// version(1) | chunk_count(u32) | session_len(u16) | session |
 /// × chunk_count: blobId(8) | size(u64) | expiration_ms(i64)
 /// ```
 ///
-/// 格式本体在 `antfs-descriptor`(前端与 store 存量回填共用);此处把本层的
-/// `DescriptorChunk`(id 是 `StoreKey`)转到纯字节层并映射错误口径。
+/// 格式本体在 `antfs-descriptor`;此处把本层的 `DescriptorChunk`(id 是 `StoreKey`)
+/// 转到纯字节层并映射错误口径。
 fn encode_descriptor(session: &[u8], chunks: &[DescriptorChunk]) -> Result<Vec<u8>, Error> {
     let refs: Vec<antfs_descriptor::ChunkRef> = chunks
         .iter()
@@ -863,7 +839,7 @@ fn encode_descriptor(session: &[u8], chunks: &[DescriptorChunk]) -> Result<Vec<u
 }
 
 /// 解码拼装描述符。任何结构性错误 → [`Error::Upstream`](502):
-/// 能读到 MAGIC 说明这是本层写下的对象,解析不了即上游数据损坏。
+/// 描述符字节由组合写口落位(parse 只吃位字节),解析不了即上游损坏。
 fn decode_descriptor(buf: &[u8]) -> Result<Vec<DescriptorChunk>, Error> {
     let refs = antfs_descriptor::parse(buf).map_err(|e| Error::Upstream(e.to_string()))?;
     let mut chunks = Vec::with_capacity(refs.len());
@@ -1170,12 +1146,7 @@ mod tests {
     fn descriptor_roundtrip() {
         let chunks = vec![chunk(7, 1, 100), chunk(7, 2, 4096), chunk(9, 3, 0)];
         let buf = encode_descriptor(b"session-abc", &chunks).expect("encode");
-        assert!(buf.starts_with(DESCRIPTOR_MAGIC));
-        assert_eq!(
-            buf[4],
-            antfs_descriptor::VERSION,
-            "版本位必须在头部第二字节"
-        );
+        assert_eq!(buf[0], antfs_descriptor::VERSION, "版本位在首字节");
         let back = decode_descriptor(&buf).expect("decode");
         assert_eq!(back.len(), 3);
         for (got, want) in back.iter().zip(chunks.iter()) {
@@ -1217,16 +1188,13 @@ mod tests {
         trailing.push(0);
         assert!(decode_descriptor(&trailing).is_err(), "多余字节必须拒");
         let mut bad_version = buf.clone();
-        bad_version[4] = antfs_descriptor::VERSION + 1;
+        bad_version[0] = antfs_descriptor::VERSION + 1;
         assert!(decode_descriptor(&bad_version).is_err(), "未知版本必须拒");
         assert!(
             decode_descriptor(b"nope-nope-nope").is_err(),
-            "无 MAGIC 必须拒"
+            "坏版本必须拒"
         );
-        assert!(
-            decode_descriptor(DESCRIPTOR_MAGIC).is_err(),
-            "只有 MAGIC 必须拒"
-        );
+        assert!(decode_descriptor(&[]).is_err(), "空 body 必须拒");
     }
 
     /// blobId 文本形式:非 hex / 长度不是 8 字节都归 400,且文案固定。

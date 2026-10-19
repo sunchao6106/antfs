@@ -48,18 +48,14 @@ The Router SDK SHALL offer composed write methods (`put_composed`, `put_composed
 - **WHEN** a metadata response lacks the `composed` field
 - **THEN** `BlobStat.composed` deserializes as false without error
 
-### Requirement: Frontend trusts the flag first and keeps legacy sniff fallback
-The frontend SHALL write the stitch descriptor (both `POST /stitch` and the auto-chunk pipeline's descriptor) via composed router writes. The GET read path SHALL dispatch flag-first: a `composed: true` stat enters the descriptor assembly path unconditionally (an over-limit or undecodable composed blob is a 502 upstream error, never a silent fallback to plain); rows without the flag keep the pre-existing MAGIC sniff so pre-change descriptors and plain objects behave byte-identically. HEAD structure is unchanged (small-object descriptor reads serve both shapes).
+### Requirement: Frontend trusts the flag; the flag is the sole type marker
+The frontend SHALL write the stitch descriptor (both `POST /stitch` and the auto-chunk pipeline's descriptor) via composed router writes. The GET read path SHALL dispatch on the composed flag alone: a `composed: true` stat enters the descriptor assembly path unconditionally (an over-limit or undecodable composed blob is a 502 upstream error, never a silent fallback to plain); rows without the flag are plain objects — served byte-as-stored, with no content probing of any kind. HEAD SHALL likewise probe and decode the descriptor body only for `composed: true` rows (logical size + stitch headers); flag-less rows report the raw stat size without reading the body. There is no publisher-side sniffing, no magic-based classification, and no optional policy toggle: the flag is the sole type marker.
 
-#### Scenario: New descriptors are read by flag, immune to magic collisions
-- **WHEN** a descriptor was written after this change (flagged), and a plain blob beginning with the descriptor MAGIC exists
-- **THEN** the flagged object assembles its chunks via the flag path, and the plain object keeps its legacy behavior (known ambiguity frozen, see design D5)
+#### Scenario: Plain blob with any byte prefix is served as-is
+- **WHEN** an ordinary small blob whose leading bytes are anything (including former descriptor-magic-looking prefixes) is fetched
+- **THEN** the response is 200 with the original bytes — flag-less rows are never parsed, classified, or expanded
 
-#### Scenario: Legacy descriptors still assemble
-- **WHEN** a descriptor written before this change (unflagged) is fetched
-- **THEN** the sniff fallback recognizes and assembles it exactly as before
-
-#### Scenario: Corrupt composed blob fails loudly
-- **WHEN** a composed stat points at a blob that cannot be decoded as a descriptor (or exceeds the descriptor size bound)
-- **THEN** GET returns a 502 upstream error rather than silently serving the raw bytes
+#### Scenario: Flagged blob keeps authoritative assembly semantics
+- **WHEN** a descriptor written through the current frontend (composed flag set) is fetched
+- **THEN** the response is the assembled logical byte stream, and an over-limit or structurally invalid composed blob yields a loud 502 upstream error, byte-identical to the pre-change flag path
 

@@ -2037,3 +2037,36 @@ curl 超时属运维调参面。
 **验证**:纯文档变更(归档 design D7/tasks + 本步);无代码改动,无门碍面。
 
 **发运**:与步 76 同 change 的档案修正,小 commit 独立收尾。
+
+### 步 78(descriptor-drop-magic):终裁落地 —— 从格式到文档 全部退役
+
+**动念**:所有者两问收束为终裁:"不做新格式,在代码和文档中去掉所有 ASTC magic 相关的
+逻辑和说明,全部干掉,就当从来没有出现过——技术方案可行、不产生业务逻辑问题的前提下。"
+
+**可行性先证后动**:MAGIC 的三项现役职责逐条盘(嗅探路由/回填甄别/parse 校验)。其弱化
+唯一的暴露面 = "对无位字节做判型"的路径;故终案 = **三路径一并铲除**(嗅探、回填 sweep、
+连同 `composed_flag_only` 旋钮),parse 输入域收敛为"组合写口落位的位字节" —— 判别再弱
+也无敌人可打。这一刀顺带把历史两失真(前缀拦截 502 / 伪件静默展开)**连根拔掉**:
+不是修复,是疟疾病灶(嗅探)整体摘除。
+
+**落地**(`descriptor-drop-magic` change 四件套 + spec delta):
+- `antfs-descriptor`:格式 `version(1)|chunk_count|session_len|session|entries`(头 11B→7B),
+  `MAGIC`/`BadMagic` 退役;遗留前缀字节遇新 parse → `UnsupportedVersion(0x41)` **响亮 502**
+  (Owner Ruling:无部署态旧二进制、无必要保留的落盘存量 —— 兼容性由两条所有者裁定承载并记档);
+- frontend:download/HEAD 嗅探分支删除,无位行恒原字节(HEAD 不读数据体);
+  `composed_flag_only` 全链删除(config 字段/AppState/文档行/誓约语义);
+- store/blob 回填子系统整建撤销(`POST /admin/backfill-composed`、sweep/报告/单飞闸、
+  `mark_composed`/`for_each_entry_winner`/索引迭代、全部测试、antfs-descriptor 依赖);
+- spec 增量:`blob-composed-flag` "flag-first + 嗅探兜底" MODIFIED → flag-first **且 flag-only**;
+  `store-composed-backfill` 能力 REMOVED。
+
+## Testing Done
+
+- antfs-descriptor 6/6;blob 95/95;store 147/147;frontend lib 11/11 + rest 18/18
+  (嗅探 502 钉住用例改写为"任意前缀 200 原字节"三前缀循环;回填弧与旋钮弧随特性删除;
+  新增纯位判定弧:无位合法结构字节原字节返回 + 有位 stitch 照常拼装 + HEAD 语义对齐)
+- workspace 77 套 765/0;clippy 0;fmt 净;devcluster 真面(重建二进制)
+  :历史前缀字节普通件 GET 200 原字节(无探测);正常 stitch 201 → GET 拼装字节恒等
+- 历史档案(DEVLOG 47-77 步、openspec 历版归档)按"改记不改史"保留;本步为最新裁决
+
+## 发运

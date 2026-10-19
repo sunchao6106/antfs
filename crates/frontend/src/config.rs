@@ -38,12 +38,6 @@ pub struct FrontendConfig {
     /// CORS 允许的来源列表;**默认空 = 不挂 CORS 层**(不是"放开所有跨域")。
     /// 需要浏览器直连时才逐个列出。
     pub cors_allowed_origins: Vec<String>,
-    /// **置信读翻转**(`store-composed-backfill`):`true` = 无 composed 位的对象**不再嗅探**
-    /// MAGIC —— GET 返回原始字节、HEAD 免读数据体。**誓约开关**:只可在**每个 store** 都跑过
-    /// `POST /admin/backfill-composed` 并核过报告(migrated+already 与预期相符、failed 清零、
-    /// invalid 全部可解释)之后翻开;否则存量真描述符会以普通对象身份返回**描述符本体字节**
-    /// (静默错内容)。默认 false ⇒ 读路径行为逐字节同今。
-    pub composed_flag_only: bool,
     /// 内嵌的 router SDK 配置(`[frontend.router]` 子表)。
     pub router: RouterConfig,
 }
@@ -57,7 +51,6 @@ impl Default for FrontendConfig {
             auto_chunk_enabled: true,
             auto_chunk_bytes: 4 * 1024 * 1024,
             cors_allowed_origins: Vec::new(),
-            composed_flag_only: false,
             router: RouterConfig::default(),
         }
     }
