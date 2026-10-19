@@ -6,6 +6,7 @@ pub mod gc;
 pub mod handlers;
 pub mod metastore;
 pub mod metrics;
+pub mod policy;
 pub mod server;
 pub mod sse;
 pub mod sse_rotation;

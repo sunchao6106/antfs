@@ -26,6 +26,9 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn get_bucket_quota(&self, bucket: &str) -> Result<Option<BucketQuota>>;
     async fn set_bucket_quota(&self, bucket: &str, quota_bytes: u64) -> Result<()>;
     async fn set_bucket_acl(&self, bucket: &str, acl: BucketAcl) -> Result<()>;
+    /// 桶策略 upsert(`s3-bucket-policy`):doc = 调用方已全验的 JSON;None = 撤(幂等)。
+    /// 桶不存在 → NoSuchBucket;行不动(仅 policy 列)。
+    async fn set_bucket_policy(&self, bucket: &str, policy: Option<&str>) -> Result<()>;
 
     // Multipart
     async fn create_multipart(

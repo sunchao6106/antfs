@@ -1,3 +1,4 @@
+use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
@@ -177,4 +178,44 @@ fn parse_canned_acl(raw: Option<&str>) -> Result<BucketAcl, S3Error> {
             "unsupported x-amz-acl value `{other}` (supported: private | public-read)"
         ))),
     }
+}
+
+// ── 桶策略(s3-bucket-policy,管理面恒 owner——闸在 server.rs 包装层)──────────
+
+/// PUT /{bucket}?policy:body = 策略 JSON(≤ 20 KiB);put 时全量校验(不支持即
+/// 响亮 400),存的是受信形态。
+pub async fn put_bucket_policy(
+    st: AppState,
+    bucket: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    let headers = req.headers().clone();
+    let body = crate::handlers::read_bounded_body(&st, req).await?;
+    let raw = std::str::from_utf8(&body)
+        .map_err(|_| S3Error::InvalidRequest("policy is not UTF-8".into()))?;
+    let _ = headers;
+    crate::policy::BucketPolicy::parse(raw, bucket)?;
+    st.metastore.set_bucket_policy(bucket, Some(raw)).await?;
+    Ok(StatusCode::OK.into_response())
+}
+
+/// GET /{bucket}?policy:回存档原文;无策略 404 NoSuchBucketPolicy。
+pub async fn get_bucket_policy(st: AppState, bucket: &str) -> Result<Response, S3Error> {
+    let meta = st
+        .metastore
+        .head_bucket(bucket)
+        .await?
+        .ok_or(S3Error::NoSuchBucket)?;
+    match meta.policy {
+        Some(raw) => {
+            Ok((StatusCode::OK, [("content-type", "application/json")], raw).into_response())
+        }
+        None => Err(S3Error::NoSuchBucketPolicy),
+    }
+}
+
+/// DELETE /{bucket}?policy:幂等撤(无策略同 204;桶不存在 404)。
+pub async fn delete_bucket_policy(st: AppState, bucket: &str) -> Result<Response, S3Error> {
+    st.metastore.set_bucket_policy(bucket, None).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

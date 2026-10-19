@@ -417,17 +417,31 @@ impl MetaStore for MysqlMetaStore {
     }
 
     async fn head_bucket(&self, name: &str) -> Result<Option<BucketMeta>> {
-        let row: Option<(String, String, i64, String)> =
-            sqlx::query_as("SELECT name, owner, created_at, acl FROM buckets WHERE name = ?")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(n, o, c, a)| BucketMeta {
+        let row: Option<(String, String, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT name, owner, created_at, acl, policy FROM buckets WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(n, o, c, a, p)| BucketMeta {
             name: n,
             owner: o,
             created_at: c,
             acl: BucketAcl::parse(&a).unwrap_or(BucketAcl::Private),
+            policy: p,
         }))
+    }
+
+    async fn set_bucket_policy(&self, bucket: &str, policy: Option<&str>) -> Result<()> {
+        let result = sqlx::query("UPDATE buckets SET policy = ? WHERE name = ?")
+            .bind(policy)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(S3Error::NoSuchBucket);
+        }
+        Ok(())
     }
 
     async fn set_bucket_acl(&self, bucket: &str, acl: BucketAcl) -> Result<()> {
@@ -456,6 +470,7 @@ impl MetaStore for MysqlMetaStore {
                 owner: o,
                 created_at: c,
                 acl: BucketAcl::parse(&a).unwrap_or(BucketAcl::Private),
+                policy: None,
             })
             .collect())
     }

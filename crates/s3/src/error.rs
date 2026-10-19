@@ -4,6 +4,8 @@ use axum::response::{IntoResponse, Response};
 #[derive(Debug, Clone)]
 pub enum S3Error {
     NoSuchBucket,
+    /// GetBucketPolicy 无策略文档(S3 同名错误码)。
+    NoSuchBucketPolicy,
     NoSuchKey,
     NoSuchUpload,
     BucketAlreadyExists,
@@ -48,7 +50,7 @@ pub enum S3Error {
 impl S3Error {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::NoSuchBucket => "NoSuchBucket",
+            Self::NoSuchBucket | Self::NoSuchBucketPolicy => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
             Self::NoSuchUpload => "NoSuchUpload",
             Self::BucketAlreadyExists => "BucketAlreadyExists",
@@ -79,7 +81,10 @@ impl S3Error {
 
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload => StatusCode::NOT_FOUND,
+            Self::NoSuchBucket
+            | Self::NoSuchBucketPolicy
+            | Self::NoSuchKey
+            | Self::NoSuchUpload => StatusCode::NOT_FOUND,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InvalidBucketName(_) | Self::InvalidPart | Self::InvalidPartOrder => {
@@ -106,6 +111,7 @@ impl S3Error {
     pub fn message(&self) -> String {
         match self {
             Self::NoSuchBucket => "The specified bucket does not exist.".into(),
+            Self::NoSuchBucketPolicy => "The bucket policy does not exist.".into(),
             Self::NoSuchKey => "The specified key does not exist.".into(),
             Self::NoSuchUpload => "The specified multipart upload does not exist.".into(),
             Self::BucketAlreadyExists => "The requested bucket name is not available.".into(),

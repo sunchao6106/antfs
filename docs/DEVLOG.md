@@ -1792,3 +1792,36 @@ per-part 持久化,另立档)」;用户 2026-10-19 指令「全力完善 s3 功�
 **发运**:归档 `openspec/changes/archive/2026-10-19-s3-multipart-complete-checksum/`
 (s3-multipart 一改一增、s3-metastore 一增);docs 同步(s3.md 矩阵两行/回显段/
 「明示不做」首项翻转/新「complete 级校验」小节、README 档 2 尾注收口)。
+
+## 步骤 70:s3-bucket-policy —— 桶策略 JSON:数据面跨租户授权(完结批 C2)
+
+**动机**:矩阵 116 行记档的「object 级 ACL / 桶策略 JSON / 跨 owner 授权面——授予留
+评估(二期)」;用户 2026-10-19 指令「全力完善 s3 功能,把这个先完结」。C1
+(complete 级校验,c67afcc)既推,本件续接。
+
+**落地**(裁决 D1-D5 见 change design.md):
+- migration 008(buckets +policy TEXT);`BucketMeta.policy` 随 head_bucket 载入;
+  `set_bucket_policy` upsert(撤= NULL,幂等)。
+- `policy.rs`:语言子集 put 全验(Version/Effect/Principal/Action/Resource;Condition/
+  Not*/IAM-ARN/他桶资源/非尾缀 glob 响亮 400)→ `evaluate`(Deny > Allow >
+  NotApplicable;对象级/桶级资源几何;匿名仅 `*`)。
+- `authorize`(server.rs 单点,`GateFallback`{PublicRead, OwnerOnly}):评估叠
+  兜底,兜底与前两门逐位同形(无策略零行为变化);存坏策略 fail-closed 500。
+  11 处数据面门点换门(object get/head/attributes、列举、PUT 面、DELETE 面、
+  POST multipart 面、ListParts/ListMultipartUploads、HEAD bucket、copy 源门);
+  管理面(?policy/?acl/?location/quota/batch)恒 require_bucket_owner(D3:
+  策略永不评估策略面,防 owner 被锁死)。`require_public_read` 功成身退(兜底
+  并入 fallback_gate)。
+- API:PUT/GET/DELETE ?policy(owner 门;404 NoSuchBucketPolicy;幂等 204)。
+
+**验证**:
+- e2e 双言 policy.rs PG 6/6 + MySQL 6/6(跨租户前缀读[界外 403/列举 403/匿名 403/
+  原文回吐/删后回私有]、Deny 压 owner 蕴含但策略管理永不锁死、私有桶匿名 `*` 读、
+  坏文档七形态 400 + 零存库、跨租户 scoped 写[资源域 403/动作单向 403]、存坏
+  fail-closed 500+复原)。
+- 全量双言 PG 143/143 + MySQL 143/143 零回归(canned-ACL/vhost/copy/auth 全量守望);
+  workspace 73 套 722 绿;clippy 0;fmt 净;lib 101 绿(policy 三单测)。
+
+**发运**:归档 `openspec/changes/archive/2026-10-19-s3-bucket-policy/`(s3-core +
+s3-metastore 各一新要求);docs 同步(s3.md 矩阵行、新「桶策略」节、「尚未支持」行
+翻转、README 档 5 附注、DEVLOG 步 70)。

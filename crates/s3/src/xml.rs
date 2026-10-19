@@ -430,12 +430,14 @@ mod tests {
                 owner: "o".into(),
                 created_at: 1700000000000,
                 acl: BucketAcl::Private,
+                policy: None,
             },
             BucketMeta {
                 name: "beta".into(),
                 owner: "o".into(),
                 created_at: 1700000001000,
                 acl: BucketAcl::Private,
+                policy: None,
             },
         ];
         let xml = serialize_list_all_my_buckets(&buckets);
@@ -464,6 +466,8 @@ mod tests {
             owner: "o".into(),
             created_at: 0,
             acl: BucketAcl::Private,
+
+            policy: None,
         }];
         let xml = serialize_list_all_my_buckets(&buckets);
         assert!(
@@ -860,6 +864,7 @@ mod tests {
             owner: "o".into(),
             created_at: 0,
             acl: BucketAcl::Private,
+            policy: None,
         }]));
 
         let resp = ListObjectsResp {

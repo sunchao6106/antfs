@@ -162,6 +162,9 @@ pub struct BucketMeta {
     pub owner: String,
     pub created_at: i64,
     pub acl: BucketAcl,
+    /// 桶策略 JSON 文档(`s3-bucket-policy`;None = 未设)。head_bucket 读侧填,
+    /// list_buckets 等低敏列举面不强填(读侧废弃注:`None` 语义仍是"未设"或"未载")。
+    pub policy: Option<String>,
 }
 
 #[derive(Debug, Clone)]

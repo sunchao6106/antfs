@@ -213,6 +213,9 @@ mod tests {
         async fn set_bucket_quota(&self, _bucket: &str, _quota_bytes: u64) -> MetaResult<()> {
             Err(not_implemented())
         }
+        async fn set_bucket_policy(&self, _bucket: &str, _policy: Option<&str>) -> MetaResult<()> {
+            Err(not_implemented())
+        }
         async fn set_bucket_acl(&self, _bucket: &str, _acl: BucketAcl) -> MetaResult<()> {
             Err(not_implemented())
         }

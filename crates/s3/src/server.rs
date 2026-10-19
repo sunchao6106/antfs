@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
@@ -59,6 +59,7 @@ pub struct S3QueryParams {
     pub max_uploads: Option<i32>,
     pub delete: Option<String>,
     pub acl: Option<String>,
+    pub policy: Option<String>,
     pub marker: Option<String>,
     pub location: Option<String>,
     #[serde(rename = "attributes")]
@@ -273,23 +274,68 @@ pub(crate) async fn require_bucket_owner(
     }
 }
 
-/// 公开读门(s3-canned-acl):读面(GET/HEAD object、ListObjectsV2)通行证 =
-/// 桶存在且(acl = public-read,或请求为桶 owner 的签名请求)。public-read 对
-/// 匿名/跨租户/owner 一视同仁放行;私有桶维持首轮语义(owner 独占)。
-pub(crate) async fn require_public_read(
+/// 兜底种类(策略 NotApplicable 时):PublicRead = 读族門的 canned 兜底,OwnerOnly =
+/// 原私有语义。同动作同脸(HEAD bucket 与 ListObjects 都是 s3:ListBucket,但兜底
+/// 不同——策略评估一致,既有兜底逐位保形)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateFallback {
+    PublicRead,
+    OwnerOnly,
+}
+
+/// 数据面授权门(`s3-bucket-policy`):评估序 = 显式 Deny > policy Allow > 既有兜底。
+/// 无策略行 = NotApplicable → 兜底(零行为变化);存坏策略 fail-closed(500,绝不
+/// 静默放松);管理面(策略/ACL/location/quota/batch)不走此门,恒 owner。
+pub(crate) async fn authorize(
     st: &AppState,
     principal: &Principal,
     bucket: &str,
+    key: Option<&str>,
+    action: crate::policy::PolicyAction,
+    fallback: GateFallback,
 ) -> Result<(), S3Error> {
-    match st.metastore.head_bucket(bucket).await? {
-        None => Err(S3Error::NoSuchBucket),
-        Some(meta) if meta.acl == BucketAcl::PublicRead => Ok(()),
-        Some(meta) => match principal {
-            Principal::Signed(ctx) if ctx.owner == meta.owner => Ok(()),
-            _ => Err(S3Error::AccessDenied(
-                "bucket belongs to another tenant".into(),
-            )),
-        },
+    let meta = st
+        .metastore
+        .head_bucket(bucket)
+        .await?
+        .ok_or(S3Error::NoSuchBucket)?;
+    let decision = match &meta.policy {
+        None => crate::policy::PolicyDecision::NotApplicable,
+        Some(raw) => {
+            let policy = crate::policy::BucketPolicy::parse_trusted(raw, bucket).map_err(|e| {
+                S3Error::InternalError(format!("corrupt stored bucket policy: {e}"))
+            })?;
+            policy.evaluate(principal_owner(principal), action, bucket, key)
+        }
+    };
+    match decision {
+        crate::policy::PolicyDecision::Deny => Err(S3Error::AccessDenied(
+            "request is explicitly denied by the bucket policy".into(),
+        )),
+        crate::policy::PolicyDecision::Allow => Ok(()),
+        crate::policy::PolicyDecision::NotApplicable => fallback_gate(meta, principal, fallback),
+    }
+}
+
+fn principal_owner(principal: &Principal) -> Option<&str> {
+    match principal {
+        Principal::Signed(ctx) => Some(&ctx.owner),
+        Principal::Anonymous => None,
+    }
+}
+
+fn fallback_gate(
+    meta: crate::metastore::types::BucketMeta,
+    principal: &Principal,
+    fallback: GateFallback,
+) -> Result<(), S3Error> {
+    match principal {
+        Principal::Signed(ctx) if ctx.owner == meta.owner => Ok(()),
+        _ if fallback == GateFallback::PublicRead && meta.acl == BucketAcl::PublicRead => Ok(()),
+        Principal::Signed(_) => Err(S3Error::AccessDenied(
+            "bucket belongs to another tenant".into(),
+        )),
+        Principal::Anonymous => Err(S3Error::AccessDenied("authentication required".into())),
     }
 }
 
@@ -299,6 +345,15 @@ async fn bucket_get_handler(
     Path(bucket): Path<String>,
     Query(q): Query<S3QueryParams>,
 ) -> Response {
+    // GET /{bucket}?policy = GetBucketPolicy(管理面恒 owner,策略永不评估策略面)。
+    if q.policy.is_some() {
+        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+            return e.into_response();
+        }
+        return crate::handlers::bucket::get_bucket_policy(st, &bucket)
+            .await
+            .into_response();
+    }
     // GET /{bucket}?acl = GetBucketAcl(owner 专属)。
     if q.acl.is_some() {
         if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
@@ -308,9 +363,19 @@ async fn bucket_get_handler(
             .await
             .into_response();
     }
-    // ListMultipartUploads 属 multipart 会话目录,维持 owner 面(public-read 不放开)。
+    // ListMultipartUploads 属 multipart 会话目录;策略 s3:ListBucketMultipartUploads,
+    // 兜底维持 owner 面(public-read 不放开)。
     if q.uploads.is_some() {
-        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+        if let Err(e) = authorize(
+            &st,
+            &principal,
+            &bucket,
+            None,
+            crate::policy::PolicyAction::ListBucketMultipartUploads,
+            GateFallback::OwnerOnly,
+        )
+        .await
+        {
             return e.into_response();
         }
         return crate::handlers::multipart::list_multipart_uploads(st, &bucket, q)
@@ -326,8 +391,18 @@ async fn bucket_get_handler(
             .await
             .into_response();
     }
-    // 列举走公开读门(public-read 桶匿名可列举);无 `list-type=2` = ListObjectsV1。
-    if let Err(e) = require_public_read(&st, &principal, &bucket).await {
+    // 列举:策略 s3:ListBucket,兜底 = canned public-read(匿名可列举);
+    // 无 `list-type=2` = ListObjectsV1。
+    if let Err(e) = authorize(
+        &st,
+        &principal,
+        &bucket,
+        None,
+        crate::policy::PolicyAction::ListBucket,
+        GateFallback::PublicRead,
+    )
+    .await
+    {
         return e.into_response();
     }
     if q.list_type.as_deref() == Some("2") {
@@ -366,7 +441,16 @@ async fn object_put_handler(
     Query(q): Query<S3QueryParams>,
     req: Request,
 ) -> Response {
-    if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+    if let Err(e) = authorize(
+        &st,
+        &principal,
+        &bucket,
+        Some(&key),
+        crate::policy::PolicyAction::PutObject,
+        GateFallback::OwnerOnly,
+    )
+    .await
+    {
         return e.into_response();
     }
     if req.headers().get("x-amz-copy-source").is_some() {
@@ -400,7 +484,16 @@ async fn object_get_handler(
 ) -> Response {
     if q.attributes.is_some() {
         // GET object?attributes:读门同 GET object(读面);属性集由请求头定。
-        if let Err(e) = require_public_read(&st, &principal, &bucket).await {
+        if let Err(e) = authorize(
+            &st,
+            &principal,
+            &bucket,
+            Some(&key),
+            crate::policy::PolicyAction::GetObject,
+            GateFallback::PublicRead,
+        )
+        .await
+        {
             return e.into_response();
         }
         return crate::handlers::object::get_object_attributes(st, &bucket, &key, req.headers())
@@ -409,16 +502,34 @@ async fn object_get_handler(
     }
     let upload_id = q.upload_id.clone();
     if let Some(uid) = &upload_id {
-        // ListParts 属 multipart 会话目录,维持 owner 面。
-        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+        // ListParts 属 multipart 会话目录;策略动作 s3:ListMultipartUploadParts,兜底维持 owner。
+        if let Err(e) = authorize(
+            &st,
+            &principal,
+            &bucket,
+            Some(&key),
+            crate::policy::PolicyAction::ListMultipartUploadParts,
+            GateFallback::OwnerOnly,
+        )
+        .await
+        {
             return e.into_response();
         }
         return crate::handlers::multipart::list_parts(st, uid, q)
             .await
             .into_response();
     }
-    // GET object 走公开读门(public-read 桶匿名可读)。
-    if let Err(e) = require_public_read(&st, &principal, &bucket).await {
+    // GET object:策略 s3:GetObject(对象级资源),兜底 = canned public-read。
+    if let Err(e) = authorize(
+        &st,
+        &principal,
+        &bucket,
+        Some(&key),
+        crate::policy::PolicyAction::GetObject,
+        GateFallback::PublicRead,
+    )
+    .await
+    {
         return e.into_response();
     }
     let range = req
@@ -436,8 +547,17 @@ async fn object_head_handler(
     Path((bucket, key)): Path<(String, String)>,
     req: Request,
 ) -> Response {
-    // HEAD object 走公开读门(无子资源分派)。
-    if let Err(e) = require_public_read(&st, &principal, &bucket).await {
+    // HEAD object:门同 GET object(GetObject 动作,public 兜底;无子资源分派)。
+    if let Err(e) = authorize(
+        &st,
+        &principal,
+        &bucket,
+        Some(&key),
+        crate::policy::PolicyAction::GetObject,
+        GateFallback::PublicRead,
+    )
+    .await
+    {
         return e.into_response();
     }
     // HEAD 忽略 Range 与 partNumber(S3 语义:眼里只有整对象元数据);条件头生效。
@@ -452,13 +572,34 @@ async fn object_delete_handler(
     Path((bucket, key)): Path<(String, String)>,
     Query(q): Query<S3QueryParams>,
 ) -> Response {
-    if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
-        return e.into_response();
-    }
     if let Some(upload_id) = &q.upload_id {
+        if let Err(e) = authorize(
+            &st,
+            &principal,
+            &bucket,
+            Some(&key),
+            crate::policy::PolicyAction::AbortMultipartUpload,
+            GateFallback::OwnerOnly,
+        )
+        .await
+        {
+            return e.into_response();
+        }
         return crate::handlers::multipart::abort_multipart_upload(st, upload_id)
             .await
             .into_response();
+    }
+    if let Err(e) = authorize(
+        &st,
+        &principal,
+        &bucket,
+        Some(&key),
+        crate::policy::PolicyAction::DeleteObject,
+        GateFallback::OwnerOnly,
+    )
+    .await
+    {
+        return e.into_response();
     }
     crate::handlers::object::delete_object(st, &bucket, &key)
         .await
@@ -472,7 +613,18 @@ async fn object_post_handler(
     Query(q): Query<S3QueryParams>,
     req: Request,
 ) -> Response {
-    if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+    // create-multipart / complete 都是对象写面(PutObject 动作;batch-delete 子资源
+    // 不在此路由)。
+    if let Err(e) = authorize(
+        &st,
+        &principal,
+        &bucket,
+        Some(&key),
+        crate::policy::PolicyAction::PutObject,
+        GateFallback::OwnerOnly,
+    )
+    .await
+    {
         return e.into_response();
     }
     if q.uploads.is_some() {
@@ -515,8 +667,18 @@ async fn create_bucket_handler(
     Extension(principal): Extension<Principal>,
     Path(bucket): Path<String>,
     Query(q): Query<S3QueryParams>,
-    headers: HeaderMap,
+    req: Request,
 ) -> Response {
+    let headers = req.headers().clone();
+    // PUT /{bucket}?policy = PutBucketPolicy(管理面恒 owner,body = JSON 策略)。
+    if q.policy.is_some() {
+        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+            return e.into_response();
+        }
+        return crate::handlers::bucket::put_bucket_policy(st, &bucket, req)
+            .await
+            .into_response();
+    }
     // PUT /{bucket}?acl = PutBucketAcl(owner 专属,canned 头形式;XML body 形式 501)。
     if q.acl.is_some() {
         if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
@@ -542,7 +704,17 @@ async fn delete_bucket_handler(
     State(st): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path(bucket): Path<String>,
+    Query(q): Query<S3QueryParams>,
 ) -> Response {
+    // DELETE /{bucket}?policy(管理面恒 owner;幂等,无策略也 204)。
+    if q.policy.is_some() {
+        if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+            return e.into_response();
+        }
+        return crate::handlers::bucket::delete_bucket_policy(st, &bucket)
+            .await
+            .into_response();
+    }
     if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
         return e.into_response();
     }
@@ -556,7 +728,17 @@ async fn head_bucket_handler(
     Extension(principal): Extension<Principal>,
     Path(bucket): Path<String>,
 ) -> Response {
-    if let Err(e) = require_bucket_owner(&st, &principal, &bucket).await {
+    // HEAD bucket = s3:ListBucket(策略可授予跨租户;兜底维持原 owner 面)。
+    if let Err(e) = authorize(
+        &st,
+        &principal,
+        &bucket,
+        None,
+        crate::policy::PolicyAction::ListBucket,
+        GateFallback::OwnerOnly,
+    )
+    .await
+    {
         return e.into_response();
     }
     crate::handlers::bucket::head_bucket(st, &bucket)

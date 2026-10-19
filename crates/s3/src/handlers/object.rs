@@ -702,7 +702,15 @@ pub async fn copy_object(
     }
 
     let (src_bucket, src_key) = parse_copy_source(copy_source)?;
-    crate::server::require_public_read(&st, principal, &src_bucket).await?;
+    crate::server::authorize(
+        &st,
+        principal,
+        &src_bucket,
+        Some(&src_key),
+        crate::policy::PolicyAction::GetObject,
+        crate::server::GateFallback::PublicRead,
+    )
+    .await?;
     let src_meta = st
         .metastore
         .get_object(&src_bucket, &src_key)
