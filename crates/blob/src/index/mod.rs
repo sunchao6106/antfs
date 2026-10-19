@@ -156,6 +156,18 @@ impl PersistentIndex {
         Ok(())
     }
 
+    /// 遍历**全部索引条目**(活跃段 + 各封存段,含被 newer-wins 盖掉的陈旧条目)。
+    /// 供 admin 扫描用:调用方需要"当前赢家"时自行用 [`find`](Self::find) 比对
+    /// `offset == entry.offset`(与 compaction 的赢家判据同一口径)。
+    pub fn for_each_entry(&self, mut f: impl FnMut(StoreKey, IndexValue)) {
+        for e in self.active.iter() {
+            f(*e.key(), *e.value());
+        }
+        for seg in self.sealed.read().expect("index sealed poisoned").iter() {
+            seg.for_each_entry(&mut |k: &StoreKey, v: IndexValue| f(*k, v));
+        }
+    }
+
     /// 查找 key 的最新值(newest-wins):活跃段 → 封存段(新→旧)。
     pub fn find(&self, key: &StoreKey) -> Option<IndexValue> {
         if let Some(v) = self.active.get(key) {

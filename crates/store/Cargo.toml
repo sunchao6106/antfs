@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 antfs-blob = { path = "../blob" }
+antfs-descriptor = { path = "../common/descriptor" }
 antfs-master = { path = "../master" }
 antfs-config = { path = "../common/config" }
 antfs-metric = { path = "../common/metric" }

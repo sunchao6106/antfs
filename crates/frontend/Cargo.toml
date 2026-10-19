@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 antfs-router = { path = "../common/router" }
 antfs-config = { path = "../common/config" }
+antfs-descriptor = { path = "../common/descriptor" }
 antfs-metric = { path = "../common/metric" }
 antfs-blob = { path = "../blob" }
 axum = "0.8"
@@ -28,7 +29,9 @@ futures = "0.3"
 [dev-dependencies]
 antfs-master = { path = "../master" }
 antfs-store = { path = "../store" }
+antfs-descriptor = { path = "../common/descriptor" }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 tempfile = "3"
 # 测试用真 HTTP 客户端打 frontend;dev 侧只需 json(裸 socket 用例直接用 tokio::net)。
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+hex = "0.4"

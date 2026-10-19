@@ -84,20 +84,16 @@ const CORS_EXPOSED_HEADERS: [HeaderName; 8] = [
 const BLOB_ID_INVALID: &str = "blob id must be 8 bytes (16 hex)";
 
 // ── 拼装描述符格式(无状态拼装的落盘契约;格式演进见 CLAUDE.md §3.4)────────────────────────────
+// 格式单点在 `antfs-descriptor`(frontend 读写、store 存量回填甄别共用同一份 parse,
+// 防两处漂移);此处只按本层错误口径做薄壳映射。
 
 /// 描述符 MAGIC(4 字节):`GET` 见此前缀即按描述符解析。
-const DESCRIPTOR_MAGIC: &[u8; 4] = b"ASTC";
-/// 描述符格式版本(读到不认识的版本即报上游数据损坏)。
-const DESCRIPTOR_VERSION: u8 = 1;
+const DESCRIPTOR_MAGIC: &[u8; 4] = antfs_descriptor::MAGIC;
 /// 单个拼装对象的片数上限。
-const MAX_CHUNKS: usize = 4096;
+const MAX_CHUNKS: usize = antfs_descriptor::MAX_CHUNKS;
 /// 描述符字节上限(1 MiB):`GET` 据此决定"整体读出判断 MAGIC"还是"直接流式"(CLAUDE.md §5.3);
 /// 片数与会话长度各自设限后,正常永远到不了这个上界(4096 片最多约 160 KiB)。
-const DESCRIPTOR_MAX_BYTES: u64 = 1024 * 1024;
-/// 描述符固定头:`MAGIC(4) | version(1) | chunk_count(u32) | session_len(u16)`。
-const DESCRIPTOR_HEADER_BYTES: usize = 11;
-/// 描述符里每片的条目长:`blobId(8) | size(u64) | expiration_ms(i64)`。
-const DESCRIPTOR_ENTRY_BYTES: usize = 24;
+const DESCRIPTOR_MAX_BYTES: u64 = antfs_descriptor::MAX_BYTES;
 
 // ── 流式读写参数 ────────────────────────────────────────────────────────────────────────────
 
@@ -240,6 +236,9 @@ pub struct AppState {
     pub auto_chunk_bytes: u64,
     /// CORS 允许来源;空 = 不挂 CORS 层。
     pub cors_allowed_origins: Vec<String>,
+    /// **置信读翻转**(`store-composed-backfill`;誓约语义见 `FrontendConfig::composed_flag_only`):
+    /// `true` = 无位对象不嗅探,GET 原始字节 / HEAD 免读数据体;有位置信路径不受影响。
+    pub composed_flag_only: bool,
 }
 
 impl AppState {
@@ -257,6 +256,7 @@ impl AppState {
             auto_chunk_enabled: cfg.auto_chunk_enabled,
             auto_chunk_bytes: cfg.auto_chunk_bytes,
             cors_allowed_origins: cfg.cors_allowed_origins.clone(),
+            composed_flag_only: cfg.composed_flag_only,
         })
     }
 }
@@ -622,11 +622,12 @@ async fn download(st: &AppState, blob_id: &str) -> Result<(Response, u64), Error
     }
     if meta.size <= DESCRIPTOR_MAX_BYTES {
         let body = st.router.get(&key).await?;
-        if body.starts_with(DESCRIPTOR_MAGIC) {
+        if !st.composed_flag_only && body.starts_with(DESCRIPTOR_MAGIC) {
             // 无位行(存量描述符)的兜底嗅探:前 4 字节 == MAGIC 即按描述符解析。
-            // ⚠ 已知歧义冻结(见 blob-composed-flag design D5):存量面 ≤1 MiB 且以 `ASTC`
+            // ⚠ 已知歧义(blob-composed-flag design D5):存量面 ≤1 MiB 且以 `ASTC`
             // 开头的普通 blob 仍会被误判(502,或被当清单展开后**静默返回别人的内容**)——
-            // 新描述符全走上面的置信路径;存量歧义的消除需回填/翻转(另立项)。
+            // 新描述符全走上面的置信路径;打开 `composed_flag_only`(回填验收后)即弃本嗅探,
+            // 普通 blob 原字节返回。store-composed-backfill 负责给存量真描述符落位。
             return stitched_body(st, &body).await;
         }
         let len = body.len() as u64;
@@ -651,12 +652,18 @@ async fn head_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<Strin
         // 把 size 换成各片之和,并回 `x-antfs-blob-stitched` 头。
         // 代价可控:描述符按构造 ≤ DESCRIPTOR_MAX_BYTES,故**只有小对象**才需要多读一次数据体(≤1 MiB);
         // size 更大者不可能是描述符,直接按原 size 回(不读数据体,保持 HEAD 的语义)。
+        // `composed_flag_only` 置位(回填验收后)⇒ **无位行免读数据体**(D5"HEAD 节省"自然兑现):
+        // 逻辑大小 = 原始 size、无 stitched 头;有位行照常走下面这段换算。
         // 已删/已过期的拼装对象嗅不出逻辑大小(数据面拒读已过期体,下面 `get` 的失败被静默忽略)
         // —— 退回描述符自身的 stat 是已知取舍;过期的对象本就不再是"取内容"的语义。
         let mut stitched_chunks = None;
-        if !meta.deleted && !meta.expired && meta.size <= DESCRIPTOR_MAX_BYTES {
+        let needs_body_probe = !meta.deleted
+            && !meta.expired
+            && meta.size <= DESCRIPTOR_MAX_BYTES
+            && (meta.composed || !st.composed_flag_only);
+        if needs_body_probe {
             if let Ok(body) = st.router.get(&key).await {
-                if body.starts_with(DESCRIPTOR_MAGIC) {
+                if meta.composed || body.starts_with(DESCRIPTOR_MAGIC) {
                     if let Ok(chunks) = decode_descriptor(&body) {
                         meta.size = chunks.iter().map(|c| c.size).sum();
                         stitched_chunks = Some(chunks.len());
@@ -836,120 +843,40 @@ struct DescriptorChunk {
 /// MAGIC(4) | version(1) | chunk_count(u32) | session_len(u16) | session |
 /// × chunk_count: blobId(8) | size(u64) | expiration_ms(i64)
 /// ```
+///
+/// 格式本体在 `antfs-descriptor`(前端与 store 存量回填共用);此处把本层的
+/// `DescriptorChunk`(id 是 `StoreKey`)转到纯字节层并映射错误口径。
 fn encode_descriptor(session: &[u8], chunks: &[DescriptorChunk]) -> Result<Vec<u8>, Error> {
-    let chunk_count = u32::try_from(chunks.len())
-        .map_err(|_| Error::Invalid(format!("chunk count must be in 1..={MAX_CHUNKS}")))?;
-    if chunk_count == 0 || chunks.len() > MAX_CHUNKS {
-        return Err(Error::Invalid(format!(
-            "chunk count must be in 1..={MAX_CHUNKS}"
-        )));
-    }
-    let session_len = u16::try_from(session.len())
-        .map_err(|_| Error::Invalid("x-antfs-session must be at most 65535 bytes".into()))?;
-    let mut out = Vec::with_capacity(
-        DESCRIPTOR_HEADER_BYTES + session.len() + chunks.len() * DESCRIPTOR_ENTRY_BYTES,
-    );
-    out.extend_from_slice(DESCRIPTOR_MAGIC);
-    out.push(DESCRIPTOR_VERSION);
-    out.extend_from_slice(&chunk_count.to_le_bytes());
-    out.extend_from_slice(&session_len.to_le_bytes());
-    out.extend_from_slice(session);
-    for c in chunks {
-        out.extend_from_slice(c.id.as_bytes());
-        out.extend_from_slice(&c.size.to_le_bytes());
-        out.extend_from_slice(&c.expiration_ms.to_le_bytes());
-    }
-    // 兜底:片数与 session 长度各自设限后到不了这个上界,守住它才能保证 `GET` 的整体读判定成立。
-    if out.len() as u64 > DESCRIPTOR_MAX_BYTES {
-        return Err(Error::Invalid(format!(
-            "stitch descriptor exceeds {DESCRIPTOR_MAX_BYTES} bytes"
-        )));
-    }
-    Ok(out)
+    let refs: Vec<antfs_descriptor::ChunkRef> = chunks
+        .iter()
+        .map(|c| {
+            let mut id = [0u8; 8];
+            id.copy_from_slice(c.id.as_bytes());
+            antfs_descriptor::ChunkRef {
+                id,
+                size: c.size,
+                expiration_ms: c.expiration_ms,
+            }
+        })
+        .collect();
+    antfs_descriptor::encode(session, &refs).map_err(|e| Error::Invalid(e.to_string()))
 }
 
 /// 解码拼装描述符。任何结构性错误 → [`Error::Upstream`](502):
 /// 能读到 MAGIC 说明这是本层写下的对象,解析不了即上游数据损坏。
 fn decode_descriptor(buf: &[u8]) -> Result<Vec<DescriptorChunk>, Error> {
-    let bad = |msg: &str| Error::Upstream(format!("corrupt stitch descriptor: {msg}"));
-    if !buf.starts_with(DESCRIPTOR_MAGIC) {
-        return Err(bad("bad magic"));
-    }
-    let mut cur = Cursor {
-        buf,
-        pos: DESCRIPTOR_MAGIC.len(),
-    };
-    let version = cur.u8()?;
-    if version != DESCRIPTOR_VERSION {
-        return Err(bad(&format!("unsupported descriptor version {version}")));
-    }
-    let chunk_count = usize::try_from(cur.u32()?).map_err(|_| bad("chunk count overflow"))?;
-    if chunk_count == 0 || chunk_count > MAX_CHUNKS {
-        return Err(bad("chunk count out of range"));
-    }
-    let session_len = usize::from(cur.u16()?);
-    cur.take(session_len)?; // session 内容只在客户端侧有意义,这里只跳过。
-    let mut chunks = Vec::with_capacity(chunk_count);
-    for _ in 0..chunk_count {
-        let id = StoreKey::from_slice(cur.take(8)?).ok_or_else(|| bad("bad chunk id"))?;
+    let refs = antfs_descriptor::parse(buf).map_err(|e| Error::Upstream(e.to_string()))?;
+    let mut chunks = Vec::with_capacity(refs.len());
+    for r in refs {
+        let id = StoreKey::from_slice(&r.id)
+            .ok_or_else(|| Error::Upstream("corrupt stitch descriptor: bad chunk id".into()))?;
         chunks.push(DescriptorChunk {
             id,
-            size: cur.u64()?,
-            expiration_ms: cur.i64()?,
+            size: r.size,
+            expiration_ms: r.expiration_ms,
         });
     }
-    if cur.pos != buf.len() {
-        return Err(bad("trailing bytes"));
-    }
     Ok(chunks)
-}
-
-/// 描述符的小端游标:越界即报错,不做任何索引/切片 panic。
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let bad = |msg: &str| Error::Upstream(format!("corrupt stitch descriptor: {msg}"));
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| bad("length overflow"))?;
-        let out = self
-            .buf
-            .get(self.pos..end)
-            .ok_or_else(|| bad("truncated"))?;
-        self.pos = end;
-        Ok(out)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| Error::Upstream("corrupt stitch descriptor: truncated".into()))
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(u8::from_le_bytes(self.array::<1>()?))
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_le_bytes(self.array::<2>()?))
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.array::<4>()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        Ok(u64::from_le_bytes(self.array::<8>()?))
-    }
-
-    fn i64(&mut self) -> Result<i64, Error> {
-        Ok(i64::from_le_bytes(self.array::<8>()?))
-    }
 }
 
 // ── 读取与拼装 ──────────────────────────────────────────────────────────────────────────────
@@ -1244,7 +1171,11 @@ mod tests {
         let chunks = vec![chunk(7, 1, 100), chunk(7, 2, 4096), chunk(9, 3, 0)];
         let buf = encode_descriptor(b"session-abc", &chunks).expect("encode");
         assert!(buf.starts_with(DESCRIPTOR_MAGIC));
-        assert_eq!(buf[4], DESCRIPTOR_VERSION, "版本位必须在头部第二字节");
+        assert_eq!(
+            buf[4],
+            antfs_descriptor::VERSION,
+            "版本位必须在头部第二字节"
+        );
         let back = decode_descriptor(&buf).expect("decode");
         assert_eq!(back.len(), 3);
         for (got, want) in back.iter().zip(chunks.iter()) {
@@ -1255,7 +1186,9 @@ mod tests {
         // 头长 + session + 每条目定长:描述符长度可精确算出。
         assert_eq!(
             buf.len(),
-            DESCRIPTOR_HEADER_BYTES + "session-abc".len() + 3 * DESCRIPTOR_ENTRY_BYTES
+            antfs_descriptor::HEADER_BYTES
+                + "session-abc".len()
+                + 3 * antfs_descriptor::ENTRY_BYTES
         );
     }
 
@@ -1284,7 +1217,7 @@ mod tests {
         trailing.push(0);
         assert!(decode_descriptor(&trailing).is_err(), "多余字节必须拒");
         let mut bad_version = buf.clone();
-        bad_version[4] = DESCRIPTOR_VERSION + 1;
+        bad_version[4] = antfs_descriptor::VERSION + 1;
         assert!(decode_descriptor(&bad_version).is_err(), "未知版本必须拒");
         assert!(
             decode_descriptor(b"nope-nope-nope").is_err(),

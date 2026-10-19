@@ -90,10 +90,17 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
    小到可能是描述符时才整体读出来看 MAGIC(避免把大对象整个缓进内存,CLAUDE.md §5.3),命中则解析描述符、
    逐片 `get` 并**流式拼接**进响应(内存 O(单片));
    片缺失/描述符损坏 → **502**(上游数据不一致,不是客户端的问题)。
+   **置信翻转**(`store-composed-backfill`,`frontend.composed_flag_only = true`):无位行**不再嗅探** ——
+   GET 返回原始字节、失真①(`ASTC` 前缀普通件 502)就此消失;有位行置信路径逐字不变。
+   **誓约**:只可在每个 store 跑过 `POST /admin/backfill-composed` 并核过报告之后翻开(见
+   [`store.md` 的 `/admin/backfill-composed` 段](./store.md)),否则存量真描述符会按普通对象返回
+   **描述符本体字节**(静默错内容)。
 4. **`HEAD` 与 `GET` 对齐**:`HEAD` 做同样的小对象读回(置位行按 composed 置信、无位行兜底嗅探),拼装对象报**逻辑大小**(各片之和)+
    `x-antfs-blob-stitched: true` / `x-antfs-blob-stitch-chunks: N`;普通对象报自身大小、不带这两个头。
    代价可控:描述符按构造 ≤ 1 MiB(`DESCRIPTOR_MAX_BYTES`),故**只有小对象**需要多读一次数据体,
    更大的对象不可能是描述符、直接按 `stat` 的 size 回(不读数据体)。
+   置信翻转后无位行**免读数据体**(逻辑大小即原始 size、无 stitched 头)——置信翻转的 HEAD 节省
+   "自然兑现"。
 4. **`DELETE` 只删描述符本身,不递归删片**:一次删 N 个对象是危险动作(且片可能被多个 stitched blob 共享);
     孤儿片靠 `x-antfs-ttl-ms` + store 本地 worker 回收。自动分片(§5)产生的对象**删描述符后同样留下孤儿片**
     —— 服务端知悉但故意不递归(无法从描述符区分"片是否被共享"是原因之一;描述符现已带 composed 类型位(`blob-composed-flag`),
@@ -168,6 +175,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend.auto_chunk_enabled` | bool | `true` | — | 服务端自动分片开关:开 = body 超过 `max_body_bytes` 时自动切片多次上传并返回描述符的 blobId;关 = 恢复旧行为(超 `max_body_bytes` 一律 413,客户端手动走 `/stitch`) | 无(router 侧 chunking 在 Ambry 是另一层的事) |
 | `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | 自动分片单片大小:切片逐片入库的粒度,也是写路径单片驻留内存的读写缓冲大小;总量上限 = 4096 片 × 此值(默认 16 GiB) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层) |
 | `frontend.cors_allowed_origins` | Vec\<String\> | `[]` | 各项为非空且非 `*` 的合法 header 值(校验期就拒) | CORS 来源白名单(**空 = 不挂 CORS 层**;不接受 `*`) | `frontend.options.allow.methods` 等 |
+| `frontend.composed_flag_only` | bool | **false** | — | **置信读翻转**(`store-composed-backfill`):`true` = 无 composed 位的对象不再嗅探 MAGIC——GET 原始字节、HEAD 免读数据体。**誓约开关**:每个 store 跑过 `POST /admin/backfill-composed` 且核过报告(migrated+already 与预期相符、failed 清零、invalid 可解释)之前**不得翻开**,否则存量真描述符按普通对象返回本体字节(静默错内容)。回填端点与升级顺序见 [`store.md` 的 `/admin/backfill-composed` 段](./store.md) | 无 |
 | `frontend.router.master_addr` | String | `127.0.0.1:7101` | 非空 | 内嵌 SDK 的 master 地址(见 [`router.md` §5](./router.md)) | 无 |
 | `frontend.router.cluster_secret` | String | `""` | — | 集群准入密钥 | 无 |
 | `frontend.router.request_timeout_secs` | u64 | `10` | ≥1 | 单请求超时 | `router.routerRequestTimeoutMs` |
@@ -212,18 +220,23 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 - **服务端 session 表**(分片上传):引入每对象/会话元数据,与 D3 冲突且让 frontend 变有状态;描述符自描述已够。
 - **frontend 直接读写 store 字节、不走 SDK**:会把 W/R 语义复制成两份实现(必然漂移)。
 - **自动分片放在 router SDK 层**(Ambry `NonBlockingRouter` 的 composite-blob 路线):切片与描述符/拼装
-  读回强耦合,而 antfs 的描述符编解码、MAGIC 嗅探、透明拼装都判定在 frontend —— router 保持纯"恒等翻译
-  层"(W/R/发号);将来 S3 multipart 等网关需要同款能力时,再把描述符编解码下沉为公共 crate 复用即可。
+  读回强耦合,而 antfs 的拼装语义(MAGIC 嗅探、透明拼装)判定在 frontend —— router 保持纯"恒等翻译
+  层"(W/R/发号)。描述符**编解码**已下沉公共 crate `antfs-descriptor`(`store-composed-backfill`,
+  frontend 读写与 store 存量回填甄别共用同一份 parse);将来 S3 multipart 等网关需要同款能力时直接复用。
 
 ## 11. 待办
 
-- [x] ~~拼装对象的类型判定靠"嗅探数据体前 4 字节"~~ —— **`blob-composed-flag` 已落地**(2026-10-16:记录/索引
-      flags 的 composed 位 + 数据面 `?composed=true` + `metadata` 回 `composed` + 新描述符置信读,见 §4;
-      三选项推演与先例\s出处见 `openspec/changes/blob-io-end-to-end/tasks.md` 待办首条)。**翻转条件未到**:存量行(无位)仍
-      兜底嗅探,两失真在存量面仍存在;彻底消除需回填或 flag-only 翻转(独立后续项;归档 design D5)。:≤1 MiB 且以 `ASTC` 开头的普通 blob 会被误判
-      (要么 502 拒绝服务、要么被当清单展开后**静默返回别人的内容**)。本层是实现该嗅探的地方,但**改法要落在
-      数据面**:推荐在 store 记录头的 `flags` 里加一个"composed"位(SeaweedFS needle `FlagIsChunkManifest` 同款),
-      之后 HEAD/GET 只看标志、不再嗅探(顺带省掉 HEAD 对小对象的那次数据体读取)。
+- [x] ~~拼装对象的类型判定靠"嗅探数据体前 4 字节"~~ —— **分两步完结**:
+      1. `blob-composed-flag`(2026-10-16):记录/索引 flags 的 composed 位 + 数据面 `?composed=true` +
+         `metadata` 回 `composed` + 新描述符置信读,见 §4。三选项推演与先例出处见
+         `openspec/changes/blob-io-end-to-end/tasks.md` 待办首条;此前的两个已复现失真(≤1 MiB 且以
+         `ASTC` 开头的普通 blob 被误判:要么 502 拒绝服务、要么被当清单展开后**静默返回别人的内容**)
+         当时冻结在存量面。
+      2. `store-composed-backfill`(2026-10-19):存量回填 + 置信翻转收尾 —— store
+         `POST /admin/backfill-composed` 给无位真描述符落位(引擎同 key 追加置换,幂等可续跑),
+         `frontend.composed_flag_only`(默认 false)翻开后无位行**不再嗅探**(GET 原字节、HEAD 免读
+         数据体,两失真就此消除;誓约:翻开前每个 store 的回填报告须先核过)。端点语义与升级顺序见
+         [`store.md` §12.14](./store.md)。
       完整复现、三个选项与先例出处见 `openspec/changes/blob-io-end-to-end/tasks.md` 的待办首条。
 - [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**,`x-antfs-ttl-ms` 现为单次多数派写。
 - [ ] **store 侧真流式 GET**(把数据体整个读进内存的是 store;frontend 侧已落暂存再流式回)。

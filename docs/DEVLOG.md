@@ -1974,3 +1974,46 @@ placement=[102,103,104] —— 自然收敛闭环在真二进制上演毕。admi
 笔误(实 71/71 非 73/73)。
 
 **发运**:归档 `admin-balance-midstate`。软件面存货仅剩 composed 存量回填(中件)。
+
+### 步 76(store-composed-backfill):存量描述符回填 + 置信读可翻转
+
+**日期**:2026-10-19 · **change**:`store-composed-backfill`(软件面存货最后一件)
+
+**动念**:blob-composed-flag(D5)冻结的存量两失真(① `ASTC` 前缀普通件 502 ② 伪描述符
+静默展开)消除条件 = 集群内全部描述符带位。立项前按红线实读:公开写口对已占用 key 恒
+`AlreadyExists`(连墓碑后都不松)⇒ 回填**不能**重写同 id;恢复重建 = 顺序扫 log + 索引
+upsert(index/mod.rs);压实以 `find(key).offset == off` 选赢家(todo);delete/apply_replicated
+的置换记账范本 —— 机制链全部踏勘后才拍板。
+
+**落地**(裁决 D1-D6 见 change design.md):
+- **antfs-descriptor 新 crate**(common 家族,零依赖):描述符格式单点(常量 + encode/严格
+  parse)。frontend 编解码换薄壳(既有 stitch 用例零改零绿 = 字节级等价);store 甄别复用
+  **同一 parse**(格式即契约 §3.4)。
+- **引擎**:`BlobStore::mark_composed(key)` = 同 key 追加置换(write_lock 内 check-then-publish
+  原子;旧段 live→dead、valid_stats 换值,纪律逐字对齐 apply_replicated;数据逐字节不变、
+  TTL 原样);`for_each_entry_winner`(与压实同判据的赢家单遍扫)。四类单测钉死:五态与
+  幂等/置换后 delete 无复活/重开·重建 newest-wins 保位/压实搬新弃旧(dead 字节对账)。
+- **store**:`POST /admin/backfill-composed`(admin 路由族,单飞 409,同步一报告):
+  MAGIC 形似才进甄别(invalid 是撞车专列不给普通对象当噪音);**行为奇偶校验口径**——
+  不查 chunk 引用(存量真描述符落位、ASTC 撞车不落位、存量伪件带位后行为同今,残余如实
+  记档)。零新配置零新监控(报告即响应)。
+- **frontend**:`composed_flag_only`(默认**false**,誓约注释满格)——无位行不嗅探:GET
+  原始字节(失真①修复)、HEAD 免数据体(D5"HEAD 节省"自然兑现);有位置信路径逐字不动。
+
+**验证**:descriptor 5/
+5;blob **103/103**(+4);store **149/149**(+2)含 `tests/backfill_composed.rs` 2/2
+(数据面普通 PUT = 存量行模拟:甄别/落位/byte-不变/已删不复活/幂等/带位 already);
+frontend lib 11 + rest **19/19**(+2:真集群三聚合回填弧 + 旋钮四断言;既有 ASTC 502 负例
+钉住不动 = 存量守望);**workspace 78 套 771/0**;clippy 0;fmt 净;`openspec validate` 过;
+真面(devcluster 重建二进制):裸描述符经 frontend 普通 PUT(无位)→ GET 嗅探拼装 200
+→ 三 store 各 POST /admin/backfill-composed(计 migrated=3/invalid=3/already=0)→
+GET 仍拼装(置信路径,三 store metadata 均 composed=true)→ ASTC 前缀普通件 502 钉住
+(旋钮未开存量行为)→ 二跑 migrated=0/already=3(幂等)。**顺带**:本批问询裁决「ASTC
+前缀为什么不删」入档 design D7(格式契约/互证纵深/甄别依赖/收益不对称),并修三处文档-
+实现漂移(store.md §12.13 残留① admin 巡检周期化其实已落地、frontend.md §11 待办尾巴/
+被否决段的"编解码已下沉"、README 路线档 3 行)。
+
+**发运**:归档 `store-composed-backfill`。**软件面存货至此归零**(真机耦合项与 B2 EC
+按 handoff 另立)。嗅觉残留(记档):① 存量伪描述符(parse 合法者)带位后照旧拼装,
+与今一致且永不自清;② 置换使候选记录瞬时翻倍(压实回收);③ 大 store 同步端点分钟级,
+curl 超时属运维调参面。

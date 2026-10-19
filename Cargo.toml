@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common/config", "crates/common/metric", "crates/common/router", "crates/smoke", "crates/blob", "crates/master", "crates/store", "crates/admin", "crates/devcluster", "crates/frontend", "crates/s3", "benchmark/common", "benchmark/blob", "benchmark/router", "benchmark/frontend"]
+members = ["crates/common/config", "crates/common/metric", "crates/common/router", "crates/common/descriptor", "crates/smoke", "crates/blob", "crates/master", "crates/store", "crates/admin", "crates/devcluster", "crates/frontend", "crates/s3", "benchmark/common", "benchmark/blob", "benchmark/router", "benchmark/frontend"]
 
 [workspace.package]
 edition = "2021"

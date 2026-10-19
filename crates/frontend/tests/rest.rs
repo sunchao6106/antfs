@@ -1335,3 +1335,226 @@ fn header_from_raw(raw: &str, name: &str) -> String {
     }
     panic!("响应缺少头 {name}:\n{raw}");
 }
+
+// ── 14:存量回填 + 置信翻转(store-composed-backfill)───────────────────────────────────────
+
+/// 铸一段"存量无位描述符"字节(格式 = antfs-descriptor 单点):手工指定 session 与片表。
+fn legacy_descriptor_bytes(session: &[u8], entries: &[([u8; 8], u64, i64)]) -> Vec<u8> {
+    let refs: Vec<antfs_descriptor::ChunkRef> = entries
+        .iter()
+        .map(|(id, size, exp)| antfs_descriptor::ChunkRef {
+            id: *id,
+            size: *size,
+            expiration_ms: *exp,
+        })
+        .collect();
+    antfs_descriptor::encode(session, &refs).expect("encode descriptor")
+}
+
+fn id_bytes(hex_id: &str) -> [u8; 8] {
+    let raw = hex::decode(hex_id).expect("hex blob id");
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&raw);
+    out
+}
+
+/// 存量回填全弧:普通 PUT 描述符字节(= 升级前世界的存量行)→ 回填前嗅探照常拼装 →
+/// 三个 store 各跑一轮 `POST /admin/backfill-composed` → 报告计数如家(migrated 收 description、
+/// invalid 收 ASTC 前缀普通件、deleted 收已删行)→ **二跑幂等**(migrated=0 且 already 有货 =
+/// 位落位的报告段证明)→ 回填后 GET 仍拼装(置信路径接棒)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_descriptors_are_backfilled_by_store_sweep() {
+    let fx = Fixture::quorum_cluster().await;
+
+    // 片与"存量描述符":全部走普通 PUT(无位),忠实模拟升级前数据。
+    let part_a = pseudo_random(100 * 1024);
+    let part_b = pseudo_random(57);
+    let id_a = fx.upload(&part_a).await;
+    let id_b = fx.upload(&part_b).await;
+    let desc = legacy_descriptor_bytes(
+        b"legacy-session",
+        &[
+            (id_bytes(&id_a), part_a.len() as u64, -1),
+            (id_bytes(&id_b), part_b.len() as u64, -1),
+        ],
+    );
+    let desc_id = fx.upload(&desc).await;
+
+    // 无位 + ASTC 前缀普通件(失真①素材)与一个回填前已删的行(复活防护素材)。
+    let mut astc = b"ASTC".to_vec();
+    astc.extend_from_slice(b"plain file bytes, not a descriptor at all");
+    let astc_id = fx.upload(&astc).await;
+    let doomed = fx
+        .upload(&legacy_descriptor_bytes(
+            b"doomed",
+            &[(id_bytes(&id_a), part_a.len() as u64, -1)],
+        ))
+        .await;
+    let resp = fx
+        .http
+        .delete(fx.url(&format!("/blobs/{doomed}")))
+        .send()
+        .await
+        .expect("delete doomed");
+    assert_eq!(resp.status().as_u16(), 204);
+
+    // 回填前:嗅探路径照常拼装(存量行为,不因本改动回退)。
+    let expected: Vec<u8> = [part_a.clone(), part_b.clone()].concat();
+    assert_eq!(fx.get_ok(&desc_id).await, expected, "回填前嗅探拼装");
+    assert_eq!(
+        fx.get(&astc_id).await.status().as_u16(),
+        502,
+        "回填前失真①仍在"
+    );
+
+    // 逐 store 跑一轮并对计数求和(描述符/普通件各落在写多数派的副本上)。
+    let round = {
+        let mut total = serde_json::json!({});
+        for store in fx.store_addrs.values() {
+            let resp = fx
+                .http
+                .post(format!("http://{store}/admin/backfill-composed"))
+                .send()
+                .await
+                .expect("backfill");
+            assert_eq!(resp.status().as_u16(), 200, "admin 路由不受闸");
+            let r: serde_json::Value = resp.json().await.expect("report");
+            for k in ["migrated", "invalid", "deleted", "already"] {
+                let acc = total[k].as_u64().unwrap_or(0) + r[k].as_u64().unwrap_or(0);
+                total[k] = serde_json::json!(acc);
+            }
+        }
+        total
+    };
+    assert!(
+        round["migrated"].as_u64().unwrap() >= 1,
+        "存量描述符要被落位: {round}"
+    );
+    assert!(
+        round["invalid"].as_u64().unwrap() >= 1,
+        "ASTC 前缀普通件要被计数不落位: {round}"
+    );
+    assert!(
+        round["deleted"].as_u64().unwrap() >= 1,
+        "已删行如实计 deleted(且绝不复活): {round}"
+    );
+
+    // 回填后:GET 仍拼装(置信路径接棒);已删行依旧 404;ASTC 件行为不变(旋钮未开)。
+    assert_eq!(
+        fx.get_ok(&desc_id).await,
+        expected,
+        "回填后置信拼装,字节不变"
+    );
+    assert_eq!(
+        fx.get(&doomed).await.status().as_u16(),
+        404,
+        "回填不得复活已删"
+    );
+    assert_eq!(
+        fx.get(&astc_id).await.status().as_u16(),
+        502,
+        "失真①待旋钮翻转修复"
+    );
+
+    // 二跑幂等:migrated=0、already ≥ 1(位在场的报告段证明)。
+    let mut second_migrated = 0u64;
+    let mut second_already = 0u64;
+    for store in fx.store_addrs.values() {
+        let r: serde_json::Value = fx
+            .http
+            .post(format!("http://{store}/admin/backfill-composed"))
+            .send()
+            .await
+            .expect("backfill 2")
+            .json()
+            .await
+            .expect("report 2");
+        second_migrated += r["migrated"].as_u64().unwrap_or(0);
+        second_already += r["already"].as_u64().unwrap_or(0);
+    }
+    assert_eq!(second_migrated, 0, "幂等:二跑不重复落位");
+    assert!(second_already >= 1, "二跑的 already = 位已落位的证明");
+}
+
+/// 置信翻转(`composed_flag_only`):① 失真①修复(ASTC 前缀普通件 200 原字节);
+/// ② 无位【合法】描述符返回本体字节(翻转语义实录,不是 bug);
+/// ③ 有位 stitch 照常拼装(置信路径不受旋钮影响);④ HEAD 免数据体读。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flag_only_policy_serves_plain_bytes_and_keeps_trusted_stitch() {
+    let cfg = FrontendConfig {
+        composed_flag_only: true,
+        ..Default::default()
+    };
+    let fx = Fixture::start_with_frontend(cfg, &[101, 102]).await;
+
+    // ① ASTC 前缀普通小件:旋钮开了不再嗅探,200 + 原字节(默认世界是 502,见上用例)。
+    let mut astc = b"ASTC".to_vec();
+    astc.extend_from_slice(b"plain file bytes, not a descriptor at all");
+    let astc_id = fx.upload(&astc).await;
+    let resp = fx.get(&astc_id).await;
+    assert_eq!(resp.status().as_u16(), 200, "失真①在翻转后修复");
+    let body = resp.bytes().await.expect("body");
+    assert_eq!(&body[..], &astc[..], "原字节返回,无静默替换");
+    let head = fx
+        .http
+        .head(fx.url(&format!("/blobs/{astc_id}")))
+        .send()
+        .await
+        .expect("head");
+    assert_eq!(
+        header(&head, "x-antfs-blob-size").parse::<u64>().unwrap(),
+        astc.len() as u64,
+        "无位行 HEAD 报原始大小(免数据体读后的正确语义)"
+    );
+    assert!(head.headers().get("x-antfs-blob-stitched").is_none());
+
+    // ② 无位【合法】描述符:翻转后按"普通对象"返回描述符本体(誓约语义的实录)。
+    let part = pencil(64);
+    let part_id = fx.upload(&part).await;
+    let desc = legacy_descriptor_bytes(b"raw", &[(id_bytes(&part_id), part.len() as u64, -1)]);
+    let desc_id = fx.upload(&desc).await;
+    assert_eq!(fx.get_ok(&desc_id).await, desc, "无位 = 本体字节,不再展开");
+
+    // ③ 有位 stitch(正常走 /stitch):照常拼装。
+    let session = "flag-only-stitch";
+    let parts: Vec<Vec<u8>> = vec![pseudo_random(64 * 1024), pencil(33)];
+    let mut chunk_ids = Vec::new();
+    for part in &parts {
+        let resp = fx
+            .http
+            .post(fx.url("/blobs"))
+            .header("x-antfs-session", session)
+            .body(part.clone())
+            .send()
+            .await
+            .expect("upload chunk");
+        chunk_ids.push(header(&resp, "x-antfs-blob-id"));
+    }
+    let resp = fx
+        .http
+        .post(fx.url("/stitch"))
+        .header("x-antfs-session", session)
+        .json(&serde_json::json!({ "signedChunkIds": chunk_ids }))
+        .send()
+        .await
+        .expect("stitch");
+    assert_eq!(resp.status().as_u16(), 201);
+    let stitched = header(&resp, "x-antfs-blob-id");
+    assert_eq!(
+        fx.get_ok(&stitched).await,
+        parts.concat(),
+        "有位置信路径不受旋钮影响"
+    );
+    let head = fx
+        .http
+        .head(fx.url(&format!("/blobs/{stitched}")))
+        .send()
+        .await
+        .expect("head stitched");
+    assert_eq!(
+        header(&head, "x-antfs-blob-size").parse::<u64>().unwrap(),
+        parts.iter().map(|p| p.len()).sum::<usize>() as u64,
+        "有位行 HEAD 仍报逻辑大小"
+    );
+    assert_eq!(header(&head, "x-antfs-blob-stitched"), "true");
+}

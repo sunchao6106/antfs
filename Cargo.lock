@@ -197,6 +197,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "antfs-descriptor"
+version = "0.0.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "antfs-devcluster"
 version = "0.0.0"
 dependencies = [
@@ -227,6 +234,7 @@ version = "0.0.0"
 dependencies = [
  "antfs-blob",
  "antfs-config",
+ "antfs-descriptor",
  "antfs-master",
  "antfs-metric",
  "antfs-router",
@@ -354,6 +362,7 @@ version = "0.0.0"
 dependencies = [
  "antfs-blob",
  "antfs-config",
+ "antfs-descriptor",
  "antfs-master",
  "antfs-metric",
  "axum",

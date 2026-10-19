@@ -60,6 +60,8 @@ struct AppState {
     /// 未接 master 的单机模式(`master_addr` 为空):副本的**墓碑回收闸门**恒放行 —— 没有别的副本
     /// 可滞后。集群模式则只在 master 放行时开(见 [`crate::worker::tombstones_allowed`])。
     standalone: bool,
+    /// 存量回填(`store-composed-backfill`)的单飞闸:同一时刻至多一轮扫在本节点跑。
+    backfill_in_flight: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -171,6 +173,7 @@ impl StoreServer {
                 pool,
                 health,
                 standalone,
+                backfill_in_flight: Arc::new(AtomicBool::new(false)),
             },
             disks,
         })
@@ -217,6 +220,7 @@ impl StoreServer {
                 "/admin/scrub-control",
                 post(set_scrub_control).get(get_scrub_control),
             )
+            .route("/admin/backfill-composed", post(backfill_composed))
             .merge(data_plane)
             .with_state(self.state.clone())
     }
@@ -1107,6 +1111,190 @@ async fn get_scrub_control(State(st): State<AppState>) -> Response {
         paused: st.scrub_paused.load(Ordering::Relaxed),
     })
     .into_response()
+}
+
+/// `POST /admin/backfill-composed` 的响应:一轮存量回填的报告。
+#[derive(serde::Serialize, Default)]
+struct BackfillReport {
+    /// 参与的本地副本数(uptime 中注册在册的)。
+    replicas: u32,
+    /// 逐条过目的赢家条目总数(含跳过项)。
+    scanned: u64,
+    /// 通过候选过滤(未删、未过期、无位且 ≤ 描述符上限)进入甄别的条目数。
+    candidates: u64,
+    /// 置换落位的存量真描述符。
+    migrated: u64,
+    /// 来路上已有位(幂等重跑的常规形态)。
+    already: u64,
+    /// 赢家是墓碑(如实计数;回填绝不复活)。
+    deleted: u64,
+    /// MAGIC 形似但 parse 失败(普通对象,如 `ASTC` 前缀文件——**不落位**,是 ① 修复的前提)。
+    invalid: u64,
+    /// 赢家尚在 TTL 窗内但 expired 已真(留待压实回收,行为同今)。
+    expired: u64,
+    /// 读写失败(前 16 条,含 pid/key/错误)。
+    failed: Vec<BackfillFailure>,
+}
+
+/// 一条失败明细(报告里截前 [`MAX_BACKFILL_FAILURES`] 条,防超大响应体)。
+#[derive(serde::Serialize)]
+struct BackfillFailure {
+    partition_id: PartitionId,
+    key: String,
+    error: String,
+}
+
+const MAX_BACKFILL_FAILURES: usize = 16;
+
+/// 存量描述符回填(`store-composed-backfill`):对本节点全部副本做**一次性**同步扫,
+/// 把"目标已补、位未落"的存量描述符经引擎置换写补上 `FLAG_COMPOSED`(甄别 = 共享
+/// `antfs-descriptor` 的同一 parse,严格口径见 change design D3;**不校验 chunk 引用**,
+/// 行为奇偶校验:除 `ASTC` 前缀普通文件(不落位,供 frontend `composed_flag_only` 翻转
+/// 修复失真①)外,一切对象读回行为与回填前逐字节相同)。
+///
+/// 家风:单飞闸(并发 → 409);幂等可续跑 = 构造所得(重跑时已完成条目计 `already`,
+/// 被删条目计 `deleted`);**无需停写**(check-then-publish 在引擎写锁内原子,无复活
+/// 窗口);建议错峰执行(置换瞬时使每条候选记录字节翻倍,压实自然回收)。零新配置、
+/// 零新监控 —— 报告即响应,tracing 记每副本汇总与失败明细。
+async fn backfill_composed(State(st): State<AppState>) -> Response {
+    if st
+        .backfill_in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "a composed backfill sweep is already running on this node",
+        )
+            .into_response();
+    }
+    let replicas = st.replicas.clone();
+    let in_flight = st.backfill_in_flight.clone();
+    let result = tokio::task::spawn_blocking(move || run_composed_backfill(&replicas)).await;
+    in_flight.store(false, Ordering::Release);
+    match result {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("backfill sweep panicked: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 扫描本体(阻塞线程里跑):副本间串行、单副本内单遍过索引 —— 一次性运维动作,
+/// 写放大上界 = 候选描述符字节总量(每条 ≤ 1 MiB),与蜗牛家风无冲突。
+fn run_composed_backfill(replicas: &ReplicaManager) -> BackfillReport {
+    let mut rep = BackfillReport::default();
+    let mut handles = replicas.handles();
+    handles.sort_by_key(|(pid, _)| *pid);
+    let now_ms = crate::worker::now_epoch_ms();
+    for (pid, handle) in &handles {
+        let before = (
+            rep.scanned,
+            rep.migrated,
+            rep.already,
+            rep.invalid,
+            rep.deleted,
+            rep.expired,
+        );
+        let store = handle.store.clone();
+        store.for_each_entry_winner(|key, v| {
+            rep.scanned += 1;
+            if v.is_deleted() {
+                rep.deleted += 1;
+            } else if v.is_composed() {
+                rep.already += 1;
+            } else if v.is_expired_at(now_ms) {
+                rep.expired += 1;
+            } else if v.size_bytes() <= antfs_descriptor::MAX_BYTES {
+                match sweep_one(*pid, &store, &key) {
+                    SweepOutcome::CandidateMigrated => {
+                        rep.candidates += 1;
+                        rep.migrated += 1;
+                    }
+                    SweepOutcome::CandidateAlready => {
+                        rep.candidates += 1;
+                        rep.already += 1;
+                    }
+                    SweepOutcome::CandidateDeleted => {
+                        rep.candidates += 1;
+                        rep.deleted += 1;
+                    }
+                    SweepOutcome::CandidateInvalid => {
+                        rep.candidates += 1;
+                        rep.invalid += 1;
+                    }
+                    SweepOutcome::PlainBlob => {}
+                    SweepOutcome::Failed(err) => {
+                        if rep.failed.len() < MAX_BACKFILL_FAILURES {
+                            rep.failed.push(BackfillFailure {
+                                partition_id: *pid,
+                                key: hex::encode(key.as_bytes()),
+                                error: err,
+                            });
+                        }
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            partition_id = *pid,
+            scanned = rep.scanned - before.0,
+            migrated = rep.migrated - before.1,
+            already = rep.already - before.2,
+            invalid = rep.invalid - before.3,
+            deleted = rep.deleted - before.4,
+            expired = rep.expired - before.5,
+            "composed backfill sweep finished for replica"
+        );
+    }
+    rep.replicas = handles.len() as u32;
+    rep
+}
+
+/// 单条候选的甄别与置换:**MAGIC 形似才读入甄别**(非 `ASTC` 前缀的普通对象不进
+/// 甄别面 —— invalid 是"MAGIC 撞车"专列,不给全体小对象当噪音);parse 严格通过
+/// 才 `mark_composed`。
+enum SweepOutcome {
+    /// MAGIC 形似 + parse 通过 + 落位。
+    CandidateMigrated,
+    /// MAGIC 形似 + 位已在(索引快照与引擎判定之间的赛点,以引擎为准)。
+    CandidateAlready,
+    /// MAGIC 形似 + 落位时已被墓碑盖掉(引擎如实回报,不复活)。
+    CandidateDeleted,
+    /// MAGIC 形似但 parse 失败(如 `ASTC` 前缀普通文件——**不落位**,是 ① 修复的前提)。
+    CandidateInvalid,
+    /// 普通对象(非 MAGIC 前缀):不进甄别,计 scanned 即可。
+    PlainBlob,
+    Failed(String),
+}
+
+fn sweep_one(pid: PartitionId, store: &antfs_blob::BlobStore, key: &StoreKey) -> SweepOutcome {
+    let data = match store.get(key) {
+        Ok(d) => d,
+        // 过期窗口的赛点(rare):紧跟 mark 时引擎以墓碑/过期如实回报,不撒谎。
+        Err(e) => {
+            tracing::warn!(partition_id = pid, key = %hex::encode(key.as_bytes()), error = %e, "backfill read failed");
+            return SweepOutcome::Failed(e.to_string());
+        }
+    };
+    if !data.starts_with(antfs_descriptor::MAGIC) {
+        return SweepOutcome::PlainBlob;
+    }
+    if antfs_descriptor::parse(&data).is_err() {
+        return SweepOutcome::CandidateInvalid;
+    }
+    match store.mark_composed(*key) {
+        Ok(antfs_blob::MarkComposedOutcome::Migrated) => SweepOutcome::CandidateMigrated,
+        Ok(antfs_blob::MarkComposedOutcome::Already) => SweepOutcome::CandidateAlready,
+        Ok(antfs_blob::MarkComposedOutcome::Deleted) => SweepOutcome::CandidateDeleted,
+        Ok(antfs_blob::MarkComposedOutcome::NotFound) => {
+            // 索引快照与引擎判定之间的窄缝(如压实恰回收了过期项):如实不动。
+            SweepOutcome::CandidateInvalid
+        }
+        Err(e) => SweepOutcome::Failed(e.to_string()),
+    }
 }
 
 /// `POST /admin/request-control` 的请求体。
