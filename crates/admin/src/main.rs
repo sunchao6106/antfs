@@ -33,7 +33,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 打不开也只 warn(审计降级),不阻断启动。
         audit: Arc::new(AuditLog::open(&cfg.audit_path)),
         scrub_runs: std::sync::Arc::new(antfs_admin::scrub::ScrubRuns::default()),
+        scrub_schedule_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+    if cfg.scrub_schedule_enabled {
+        antfs_admin::scrub_schedule::spawn_scrub_schedule(
+            state.clone(),
+            cfg.scrub_schedule_interval_secs,
+        );
+        tracing::info!(
+            interval_secs = cfg.scrub_schedule_interval_secs,
+            "scheduled replica-comparison scrub enabled (shallow, one partition per tick)"
+        );
+    }
     let auth = AuthConfig {
         users: cfg.users.clone(),
         operator_token: cfg.operator_token.clone(),

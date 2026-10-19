@@ -326,6 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.dir.join("admin-audit.jsonl"),
         )),
         scrub_runs: std::sync::Arc::new(antfs_admin::scrub::ScrubRuns::default()),
+        scrub_schedule_paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let aauth = antfs_admin::server::AuthConfig {
         operator_token: OPERATOR_TOKEN.to_string(),

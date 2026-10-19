@@ -270,6 +270,9 @@ export function OpsTab({
                     <td>
                       <span className={`pill small ${runVerdict(t, r).cls}`}>{runVerdict(t, r).text}</span>
                       {r.deep && <span className="pill small">{t("scrubDeepTag")}</span>}
+                      {r.origin === "scheduled" && (
+                        <span className="pill small info">{t("scrubOriginScheduled")}</span>
+                      )}
                     </td>
                     <td>{r.divergence_count}</td>
                     <td className="mono">

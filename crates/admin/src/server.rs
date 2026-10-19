@@ -34,6 +34,8 @@ pub struct AppState {
     pub audit: Arc<AuditLog>,
     /// 最近若干轮 scrub 的紧凑摘要(进程内环形,重启即空)。
     pub scrub_runs: Arc<crate::scrub::ScrubRuns>,
+    /// 周期比对循环的运行期开关(不持久化,重启即恢复轮转);手动 scrub 端点不受它管。
+    pub scrub_schedule_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 通过鉴权的调用者(token 对应的身份;RBAC 用它门控,审计用它填 `actor`/`role`)。
@@ -163,6 +165,10 @@ pub fn build_router(state: AppState, auth: AuthConfig) -> Router {
         .route("/api/balance", get(get_balance))
         .route("/api/partitions/{id}/scrub", post(post_scrub))
         .route("/api/scrub", get(get_scrub_runs))
+        .route(
+            "/api/scrub-schedule-control",
+            get(get_scrub_schedule_control).post(post_scrub_schedule_control),
+        )
         .route("/api/balance/eval", post(post_balance_eval))
         .route("/api/balance/start", post(post_balance_start))
         .route("/api/balance/cancel", post(post_balance_cancel))
@@ -981,14 +987,40 @@ async fn post_scrub(
     st.metrics.api_requests.inc();
     st.metrics.ops.inc();
     let deep = p.deep.unwrap_or(0) != 0;
-    let detail = match st.master.partition_detail(id).await {
-        Ok(p) => p,
+    match run_scrub(&st, id, deep, crate::scrub::ScrubOrigin::Manual).await {
+        Ok(outcome) => Json(scrub_report_json(
+            id,
+            outcome.checked_at_ms,
+            deep,
+            crate::scrub::ScrubOrigin::Manual,
+            &outcome.facts,
+            &outcome.verdict,
+        ))
+        .into_response(),
         Err(Error::PartitionNotFound(_)) => {
-            return (StatusCode::NOT_FOUND, format!("partition {id} not found")).into_response()
+            (StatusCode::NOT_FOUND, format!("partition {id} not found")).into_response()
         }
-        Err(e) => return map_err(&st, e).into_response(),
-    };
+        Err(e) => map_err(&st, e).into_response(),
+    }
+}
 
+/// 一轮比对的产物(`run_scrub` 出口;`scrub_report_json` 与调度循环共用)。
+pub(crate) struct ScrubOutcome {
+    pub checked_at_ms: u64,
+    pub facts: Vec<crate::scrub::ReplicaFacts>,
+    pub verdict: crate::scrub::Verdict,
+}
+
+/// 比对核心(手动端点与周期调度共用):取分区详情 → 逐副本并发取素材 → 逻辑态比对 →
+/// 计数入指标 → 摘要入环形表(带 `origin`)。仅包网络/不存在错误向上;比对内部的单副本
+/// 失败按既有口径沉进 `facts`(`ok=false`,结论 `inconclusive`)。
+pub(crate) async fn run_scrub(
+    st: &AppState,
+    id: u32,
+    deep: bool,
+    origin: crate::scrub::ScrubOrigin,
+) -> Result<ScrubOutcome, Error> {
+    let detail = st.master.partition_detail(id).await?;
     let client = store_client::new_client();
     let mut set = tokio::task::JoinSet::new();
     for r in detail.replicas {
@@ -1019,6 +1051,7 @@ async fn post_scrub(
         inconclusive: verdict.inconclusive,
         partial: verdict.partial,
         divergence_count: verdict.divergences.len(),
+        origin,
         replicas: facts
             .iter()
             .map(|f| {
@@ -1031,11 +1064,59 @@ async fn post_scrub(
             })
             .collect(),
     });
-
-    Json(scrub_report_json(id, checked_at_ms, deep, &facts, &verdict)).into_response()
+    Ok(ScrubOutcome {
+        checked_at_ms,
+        facts,
+        verdict,
+    })
 }
 
 /// `GET /api/scrub`(viewer 可读):最近若干轮 scrub 的紧凑摘要(最新在前)。
+/// `POST|GET /api/scrub-schedule-control`:周期比对循环的运行期开关(仿 store 的 scrub-control)。
+///
+/// 只掐 `admin.scrub_schedule_enabled` 起的那条**定时腿**;手动 `POST /api/partitions/{id}/scrub`
+/// 永不受限(应急检查能力必须常在)。状态不持久化、不动轮转游标(恢复后从原处继续);
+/// 循环没开时置位无副作用,读回照样可见 —— 表达的是"运维意愿"。
+#[derive(serde::Deserialize)]
+struct ScrubScheduleControlBody {
+    paused: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ScrubScheduleControlResponse {
+    paused: bool,
+}
+
+async fn post_scrub_schedule_control(
+    State(st): State<AppState>,
+    Json(body): Json<ScrubScheduleControlBody>,
+) -> Response {
+    st.metrics.api_requests.inc();
+    st.metrics.ops.inc();
+    st.metrics.scrub_schedule_paused.set(i64::from(body.paused));
+    st.scrub_schedule_paused
+        .store(body.paused, std::sync::atomic::Ordering::Relaxed);
+    if body.paused {
+        tracing::info!("scheduled replica-comparison loop paused by operator");
+    } else {
+        tracing::info!("scheduled replica-comparison loop resumed by operator");
+    }
+    Json(ScrubScheduleControlResponse {
+        paused: body.paused,
+    })
+    .into_response()
+}
+
+async fn get_scrub_schedule_control(State(st): State<AppState>) -> Response {
+    st.metrics.api_requests.inc();
+    Json(ScrubScheduleControlResponse {
+        paused: st
+            .scrub_schedule_paused
+            .load(std::sync::atomic::Ordering::Relaxed),
+    })
+    .into_response()
+}
+
 async fn get_scrub_runs(State(st): State<AppState>) -> Response {
     st.metrics.api_requests.inc();
     let runs: Vec<serde_json::Value> = st
@@ -1047,6 +1128,7 @@ async fn get_scrub_runs(State(st): State<AppState>) -> Response {
                 "partition_id": r.partition_id,
                 "checked_at_ms": r.checked_at_ms,
                 "deep": r.deep,
+                "origin": r.origin.as_str(),
                 "consistent": r.consistent,
                 "inconclusive": r.inconclusive,
                 "partial": r.partial,
@@ -1200,6 +1282,7 @@ fn scrub_report_json(
     pid: u32,
     checked_at_ms: u64,
     deep: bool,
+    origin: crate::scrub::ScrubOrigin,
     facts: &[crate::scrub::ReplicaFacts],
     verdict: &crate::scrub::Verdict,
 ) -> serde_json::Value {
@@ -1255,6 +1338,7 @@ fn scrub_report_json(
         "partition_id": pid,
         "checked_at_ms": checked_at_ms,
         "deep": deep,
+        "origin": origin.as_str(),
         "replicas": replicas,
         "verdict": {
             "consistent": verdict.consistent,
@@ -1929,16 +2013,21 @@ mod tests {
 
     /// 与 [`app_with`] 相同,但注入指定的审计日志(审计相关测试用)。
     fn app_audited(master: Arc<FakeMaster>, auth: AuthConfig, audit: Arc<AuditLog>) -> Router {
+        build_router(state_with(master, audit), auth)
+    }
+
+    /// 测试用 AppState(循环类测试要拿**同一份** state —— 环形表/暂停闸与 router 共享)。
+    fn state_with(master: Arc<FakeMaster>, audit: Arc<AuditLog>) -> AppState {
         let registry = antfs_metric::Registry::new();
-        let state = AppState {
+        AppState {
             master,
             metrics: Arc::new(AdminMetrics::new(&registry).unwrap()),
             registry,
             grafana_url: "http://grafana.local".into(),
             audit,
             scrub_runs: Arc::new(crate::scrub::ScrubRuns::default()),
-        };
-        build_router(state, auth)
+            scrub_schedule_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     fn app_auth(auth: AuthConfig) -> Router {
@@ -3655,6 +3744,8 @@ mod tests {
         assert_eq!(status(&router, req).await, StatusCode::OK);
     }
 
+    // ── 周期比对调度(admin-scrub-schedule)──────────────────────────────────────
+
     /// 分页拉全:1200 个分区跨越 500/页的两页以上,合计与清单必须齐(空页/齐 total 提前止)。
     #[tokio::test]
     async fn layout_endpoint_pages_the_full_table() {
@@ -3675,5 +3766,144 @@ mod tests {
         let calls = master.take_calls();
         let partitions_calls = calls.iter().filter(|c| c.starts_with("partitions")).count();
         assert!(partitions_calls >= 3, "跨页必须多拍拉取(500/页): {calls:?}");
+    }
+
+    /// 真循环(1s tick)+ FakeMaster + 假 store:周期条目入环形表(origin=scheduled,经
+    /// `GET /api/scrub` 可见);掐停后两 tick 零增长、gauge 抬起;**手动端点在暂停期间照常**
+    /// 并且 origin=manual;恢复后循环继续。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schedule_loop_runs_pauses_and_spares_manual() {
+        let a = spawn_scrub_store(2, vec![("aa", false, 4)], 0).await;
+        let b = spawn_scrub_store(2, vec![("aa", false, 4)], 0).await;
+        let master = Arc::new(
+            FakeMaster::default()
+                .with_replica(101, &a)
+                .with_replica(102, &b),
+        );
+        let state = state_with(master, no_audit());
+        let router = build_router(
+            state.clone(),
+            AuthConfig {
+                users: Vec::new(),
+                operator_token: "op".into(),
+                viewer_token: "view".into(),
+            },
+        );
+        crate::scrub_schedule::spawn_scrub_schedule(state.clone(), 1);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if state
+                .scrub_runs
+                .snapshot()
+                .iter()
+                .any(|r| r.origin == crate::scrub::ScrubOrigin::Scheduled)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "30s 内循环应产出 scheduled 条目(1s tick): {:?}",
+                state.scrub_runs.snapshot()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // 周期条目经 /api/scrub 可见且带 origin。
+        let v = body_json(
+            &router,
+            Request::get("/api/scrub")
+                .header(header::AUTHORIZATION, "Bearer view")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            v["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["origin"] == "scheduled"),
+            "{v}"
+        );
+
+        // 掐停:POST(operator)→ gauge 抬起;两 tick(2.6s)内零增长。
+        let paused = Request::post("/api/scrub-schedule-control")
+            .header(header::AUTHORIZATION, "Bearer op")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"paused":true}"#))
+            .unwrap();
+        assert_eq!(status(&router, paused).await, StatusCode::OK);
+        assert_eq!(state.metrics.scrub_schedule_paused.get(), 1);
+        let froze_at = state.scrub_runs.snapshot().len();
+        tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+        assert_eq!(
+            state.scrub_runs.snapshot().len(),
+            froze_at,
+            "掐停后两个 tick 内不得有新条目"
+        );
+
+        // 暂停期间手动比对照常(应急检查不被没收),且 origin=manual。
+        let manual = Request::post("/api/partitions/3/scrub")
+            .header(header::AUTHORIZATION, "Bearer op")
+            .body(Body::empty())
+            .unwrap();
+        let mv = body_json(&router, manual).await;
+        assert_eq!(mv["origin"], "manual", "手动路径必须可用且可区分: {mv}");
+        assert_eq!(state.scrub_runs.snapshot().len(), froze_at + 1);
+
+        // 恢复:循环继续产出。
+        let resume = Request::post("/api/scrub-schedule-control")
+            .header(header::AUTHORIZATION, "Bearer op")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"paused":false}"#))
+            .unwrap();
+        assert_eq!(status(&router, resume).await, StatusCode::OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let n = state
+                .scrub_runs
+                .snapshot()
+                .iter()
+                .filter(|r| r.origin == crate::scrub::ScrubOrigin::Scheduled)
+                .count();
+            if n > 0 && state.scrub_runs.snapshot().len() > froze_at + 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "恢复后 30s 内循环应继续产出: {:?}",
+                state.scrub_runs.snapshot()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 控制端点的角色门:viewer 可读(200)、不可写(403);operator 写回显。
+    #[tokio::test]
+    async fn scrub_schedule_control_role_gates() {
+        let router = app_auth(AuthConfig {
+            users: Vec::new(),
+            operator_token: "op".into(),
+            viewer_token: "view".into(),
+        });
+        let get = Request::get("/api/scrub-schedule-control")
+            .header(header::AUTHORIZATION, "Bearer view")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, get).await, StatusCode::OK);
+        let post = Request::post("/api/scrub-schedule-control")
+            .header(header::AUTHORIZATION, "Bearer view")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"paused":true}"#))
+            .unwrap();
+        assert_eq!(status(&router, post).await, StatusCode::FORBIDDEN);
+        let op_post = Request::post("/api/scrub-schedule-control")
+            .header(header::AUTHORIZATION, "Bearer op")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"paused":true}"#))
+            .unwrap();
+        let v = body_json(&router, op_post).await;
+        assert_eq!(v["paused"], true, "写后回显: {v}");
     }
 }

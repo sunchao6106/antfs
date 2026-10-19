@@ -349,6 +349,8 @@ export interface ScrubRun {
   partition_id: number;
   checked_at_ms: number;
   deep: boolean;
+  /** 谁发起的:`manual`(运维手点)/ `scheduled`(周期调度循环)。 */
+  origin: string;
   consistent: boolean;
   inconclusive: boolean;
   partial: boolean;

@@ -1899,7 +1899,7 @@ placement 真实强制约束 + join 完整性(`same_node`/`unknown_node`/`unknow
 
 **验证**:admin lib **66/66**(layout 纯函数 5 新 + 端点 4 新:反查聚合含零副本节点与排序/
 三违规齐出且幽灵计入合计/viewer 200/1200 分区跨 500 页·页 1200 齐且拉取 ≥3 拍);workspace
-**76 套 748/0**(数字含上批 75 套 739 基础上 admin +5 网络路径用例… 全量口径见门禁输出);
+**75 套 748/0**(接前批 75 套 739 基础上新增 admin 5+9 件);
 clippy workspace 0;fmt 净(修 1 处 needless_update);`openspec validate` 过。**真集群验证**
 (devcluster 3 节点 3 分区 RF=3,`--admin-port 17312`):`GET /api/layout` 回 compliant=true、
 合计 3/9/3、每节点 3/3/3 且 replicas 升序、violations 空;坏 token 401;SPA 含新 tab。
@@ -1907,3 +1907,29 @@ UI:`npm run build` 过(tsc + vite singlefile)。
 
 **发运**:归档 `admin-layout-compliance`;docs:cluster.md §11 新契约行。运维残余剩两件
 (balance 判败中间态辅助 / composed 回填)+ admin 级比对周期化(另议)。
+
+## 步骤 74:admin-scrub-schedule —— 周期性跨副本比对(巡检周期化收口)
+
+**动机**:巡检两层周期化的后半件 —— store 侧 bit-rot 深扫已周期化(步 72,44df731),
+admin 侧跨副本逻辑比对仍靠手点(原 scrub 批已知边界记"另议")。本批补腿收口。
+
+**落地**:`post_scrub` 抽共享核心 `run_scrub(st, pid, deep, origin)`(手动/调度同管线,
+口径不会漂移);`scrub_schedule.rs` 循环(睡 interval → 暂停闸 → paged 取候选
+[healthy_replicas ≥ 2] → round-robin 一区 → 浅层比对,deep 恒否 —— bit-rot 归 store 侧,
+两层各司其职);ScrubRun/`GET /api/scrub`/响应增 `origin`(manual/scheduled,增量兼容);
+`GET|POST /api/scrub-schedule-control`(掐自动不动手动,gauge 同步);config 2 键
+(`scrub_schedule_enabled` 默认 false / `interval_secs` 默认 600,≥1);UI 巡检列表
+「周期」徽标 + hint 双语。节拍公式:全量覆盖周期 = 分区数 × 间隔(千分区 ≈ 7 天一轮)
+—— 慢即特性,与 store 侧蜗牛爬同哲学;只报警不修复(裁决不变)。
+
+**验证**:admin lib **73/73**(新增 6:config 默认锁 + 0 拒 / 候选过滤纯逻辑 / 真循环
+FakeMaster+假 store:周期条目 origin=scheduled 经 /api/scrub 可见、掐停两 tick 零增长
++ gauge、**暂停期手动比对照常且 origin=manual**、恢复续产 / 控制端点角色门
+viewer GET 200·POST 403·operator 回显);workspace **75 套 753/0**;clippy 0;fmt 净;
+`openspec validate` 过。真面(devcluster 真 admin 路由):控制端点操作/回显、
+`/api/scrub` 形状含 origin;循环行为由带真 HTTP fan-out 的集成用例覆盖。
+步 73"76 套"笔误本批顺修(→ 75 套 748)。
+
+**发运**:归档 `admin-scrub-schedule`;docs:cluster.md §11.1 两行 + §11.2 一行 +
+§11 路由段(调度语义/origin/单 admin 实例假设)。巡检周期化至此两层齐:store 字节态、
+admin 逻辑态。软件面存货仅剩 composed 存量回填(中件)+ balance 判败中间态提示(小件)。

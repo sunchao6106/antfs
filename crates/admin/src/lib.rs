@@ -10,6 +10,7 @@ pub mod layout;
 pub mod master_api;
 pub mod metrics;
 pub mod scrub;
+pub mod scrub_schedule;
 pub mod server;
 pub mod store_client;
 

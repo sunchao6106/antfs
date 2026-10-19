@@ -225,8 +225,28 @@ pub struct ScrubRun {
     pub inconclusive: bool,
     pub partial: bool,
     pub divergence_count: usize,
+    /// 这轮比对是谁发起的:运维手点(`/api/partitions/{id}/scrub`)还是周期调度循环。
+    pub origin: ScrubOrigin,
     /// 逐副本紧凑摘要:`(node_id, ok, live_records, live_bytes)`。
     pub replicas: Vec<(u64, bool, u64, u64)>,
+}
+
+/// 比对的发起来源(环形条目与响应里的 `origin` 字段)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubOrigin {
+    /// 运维经 `POST /api/partitions/{id}/scrub` 手点。
+    Manual,
+    /// `scrub_schedule` 循环定时触发(浅层,deep 恒否)。
+    Scheduled,
+}
+
+impl ScrubOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrubOrigin::Manual => "manual",
+            ScrubOrigin::Scheduled => "scheduled",
+        }
+    }
 }
 
 /// 最近若干轮的环形缓冲(进程内,不持久化 —— 重启即空,与 compaction 台账同口径)。
@@ -412,6 +432,7 @@ mod tests {
                 inconclusive: false,
                 partial: false,
                 divergence_count: 0,
+                origin: ScrubOrigin::Manual,
                 replicas: vec![],
             });
         }

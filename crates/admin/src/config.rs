@@ -2,7 +2,7 @@
 //!
 //! 字段名即 TOML key;默认值/范围须与 `impl Default` + `Validate` 对齐(CLAUDE.md §7)。
 
-use antfs_config::{one_of, ConfigError, Result, Validate};
+use antfs_config::{at_least, one_of, ConfigError, Result, Validate};
 use serde::Deserialize;
 
 /// 准入角色(配置 `[[admin.users]]` 的 `role` 取值真值;RBAC 与审计都以此为准)。
@@ -67,6 +67,14 @@ pub struct AdminConfig {
     pub cluster_secret: String,
     /// Grafana 外链(dashboard 里"查看指标"按钮);空 = 不显示。
     pub grafana_url: String,
+    /// **周期性跨副本比对**(admin 级一致性巡检调度)总开关;默认关。开启后本进程定时
+    /// 对健康分区逐个跑浅层比对(与手动 `POST /api/partitions/{id}/scrub` 同一条管线,deep 恒否),
+    /// 结果进既有环形表与指标(带 `origin=scheduled` 标);**只报警不修复**。
+    /// 运行期可用 `/api/scrub-schedule-control` 掐停(不动手动端点)。
+    pub scrub_schedule_enabled: bool,
+    /// 周期比对的节拍:两次比对之间的基础间隔(秒),每拍比对**一个**分区(蜗牛家风;
+    /// 全量覆盖周期 = 分区数 × 本值)。默认 600s ⇒ 千分区 ≈ 7 天一轮。
+    pub scrub_schedule_interval_secs: u64,
 }
 
 impl Default for AdminConfig {
@@ -80,6 +88,8 @@ impl Default for AdminConfig {
             audit_path: "./admin-audit.jsonl".to_string(),
             cluster_secret: String::new(),
             grafana_url: String::new(),
+            scrub_schedule_enabled: false,
+            scrub_schedule_interval_secs: 600,
         }
     }
 }
@@ -107,6 +117,12 @@ impl Validate for AdminConfig {
             }
             one_of(&format!("admin.users[{i}].role"), u.role.as_str(), &ROLES)?;
         }
+        // 间隔 0 = 忙转(每秒打满 master),与"周期比对"的意图背道而驰,当场拒。
+        at_least(
+            "admin.scrub_schedule_interval_secs",
+            self.scrub_schedule_interval_secs,
+            1,
+        )?;
         Ok(())
     }
 }
@@ -166,5 +182,25 @@ mod tests {
             assert_eq!(role.as_str(), name);
         }
         assert!(Role::parse("root").is_none());
+    }
+
+    /// 周期比对默认:关 / 600s。改动默认值必须显式改本测试(CLAUDE.md §5.1)。
+    #[test]
+    fn scrub_schedule_defaults_off_and_slow() {
+        let c = AdminConfig::default();
+        assert!(!c.scrub_schedule_enabled, "默认必须关");
+        assert_eq!(c.scrub_schedule_interval_secs, 600);
+        assert!(c.validate().is_ok());
+    }
+
+    /// 间隔 0(忙转)必须当场拒。
+    #[test]
+    fn scrub_schedule_interval_zero_rejected() {
+        let bad = AdminConfig {
+            scrub_schedule_interval_secs: 0,
+            ..Default::default()
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.scrub_schedule_interval_secs"), "{err}");
     }
 }
