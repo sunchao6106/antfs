@@ -55,9 +55,11 @@
 - devcluster 真面:裸描述符普通 PUT → 嗅探拼装 → 三 store 回填(migrated=3/invalid=3)
   → 置信拼装 + metadata composed=true → ASTC 普通件 502(旋钮未开)→ 二跑 migrated=0/
   already=3(幂等)。
-- 追加裁决(用户问询触发,design D7):ASTC 前缀**不随位去** —— 持久格式契约(旧读者
-  parse 首判 magic,先于 version 字节 ⇒ 删之即破坏 §3.4 前后兼容)+ 位/字节互证纵深 +
-  回填甄别漏斗依赖 + 4B/条收益不对称。位夺路由职,magic 留格式职。
+- 追加裁决(用户问询触发,design D7;同日复议修正):ASTC 前缀**不随位去** ——原稿
+  "旧版本二进制"前提被驳回(仓库无部署态旧二进制,如实收回);真实理由 = 旧**数据**后向
+  parse 认 v1 + 双 parse/迁移成本 vs 4 B 收益(简单优先,不做);位已独占路由职
+  (`composed_flag_only`),magic 只留格式校验职。格式 v2(纯位判)判别式可行而 收益不在,
+  通道在 version。
 - 文档-实现漂移顺修(问询扫描所得):store.md §12.13 残留①(admin 巡检周期化已由
   admin-scrub-schedule 落地)、frontend.md §11 待办遗留尾巴与被否决段"编解码已下沉
   antfs-descriptor"、design README 路线档 3 行"另立项"完结更正。
