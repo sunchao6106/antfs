@@ -28,6 +28,8 @@ pub struct RouterMetrics {
     pub compression_attempts: IntCounterVec,
     /// 压缩节省的字节数(orig − stored;只计 kept)。
     pub compression_saved_bytes: IntCounter,
+    /// 读拓扑重拉次数,label `reason`(ttl = 周期过期 / evict = 全副本不可达驱逐)。
+    pub topology_refreshes: IntCounterVec,
     /// blob 读请求数,label `outcome`。
     pub get_total: IntCounterVec,
     /// 读出的字节数(counter,只计成功)。
@@ -92,6 +94,12 @@ impl RouterMetrics {
                 registry,
                 "router_compression_saved_bytes_total",
                 "bytes saved by SDK compression (orig minus stored, kept only)",
+            )?,
+            topology_refreshes: counter_vec(
+                registry,
+                "router_topology_refreshes_total",
+                "read-topology refreshes (ttl expiry or all-replica-unreachable eviction)",
+                &["reason"],
             )?,
             get_total: counter_vec(
                 registry,

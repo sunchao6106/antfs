@@ -223,6 +223,39 @@ fn trim_segment(seg: &mut Segment, share: u32) -> bool {
 }
 
 /// antfs router(客户端 SDK)。可 `Arc` 共享给多任务并发使用。
+/// 读拓扑缓存条目(`router-read-topology-refresh`):副本列表 + 写入时刻(判 TTL 用)。
+#[derive(Clone, Debug)]
+struct TopoEntry {
+    replicas: Vec<ReplicaLoc>,
+    at: Instant,
+}
+
+impl TopoEntry {
+    fn now(replicas: Vec<ReplicaLoc>) -> Self {
+        TopoEntry {
+            replicas,
+            at: Instant::now(),
+        }
+    }
+
+    /// TTL 判定(`ttl_secs` 0 = 关,永不过期)。
+    fn fresh(&self, ttl_secs: u64, now: Instant) -> bool {
+        ttl_secs == 0 || now.duration_since(self.at).as_secs() < ttl_secs
+    }
+}
+
+/// 读拓扑缓存:`pid → 条目`(std 同步锁:读快照/写条目均为纳秒级拷贝)。
+type Topology = RwLock<HashMap<PartitionId, TopoEntry>>;
+
+/// 一次 R=1 读的三态。
+enum ReadOutcome {
+    Hit(Bytes),
+    /// 全副本 NotFound(纯 miss:对象不存在语义)。
+    AllMiss,
+    /// 其余失败形态(混合或全不可达)。
+    Failed(Error),
+}
+
 pub struct Router {
     cfg: RouterConfig,
     /// master 控制面客户端(tonic 方法需 `&mut self`,故加锁;调用频率 = 每号段一次,不构成瓶颈)。
@@ -238,8 +271,7 @@ pub struct Router {
     ///
     /// 缓存里存的是 **master 顺序 + `up` 优先**;延迟排序在**每次读**时另做(见
     /// [`Router::ordered_for_read`])—— 否则测量值变了、缓存里的顺序却一直是旧的。
-    topology: Arc<RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>>,
-    /// 每副本的观测延迟(读路由按它"先试快的")。
+    topology: Arc<Topology>,
     latency: Arc<LatencyTable>,
     metrics: Arc<RouterMetrics>,
 }
@@ -447,16 +479,43 @@ impl Router {
     ///
     /// 排序保证 `up` 的副本在前 —— 读路径(R=1)按顺序试,先试活着的。
     async fn replicas_for(&self, pid: PartitionId) -> Result<Vec<ReplicaLoc>> {
-        if let Some(rs) = self
-            .topology
-            .read()
-            .expect("topology lock poisoned")
-            .get(&pid)
-        {
-            if !rs.is_empty() {
-                return Ok(rs.clone());
+        // 命中且未过 TTL:直接用(router-read-topology-refresh;TTL 旋钮 = partition_refresh_secs)。
+        // std 读锁下只做克隆,不持锁 await(clippy::await_holding_lock)。
+        let cached: Option<TopoEntry> = {
+            let g = self.topology.read().expect("topology lock poisoned");
+            g.get(&pid).cloned()
+        };
+        if let Some(rs) = cached {
+            if !rs.replicas.is_empty() && rs.fresh(self.cfg.partition_refresh_secs, Instant::now())
+            {
+                return Ok(rs.replicas);
+            }
+            if !rs.replicas.is_empty() {
+                // TTL 到期:重拉(失败保旧表 —— 读可用性优先,陈旧好过没有)。
+                if let Ok(fresh) = self.lookup_partition(pid).await {
+                    self.metrics
+                        .topology_refreshes
+                        .with_label_values(&["ttl"])
+                        .inc();
+                    self.topology
+                        .write()
+                        .expect("topology lock poisoned")
+                        .insert(pid, TopoEntry::now(fresh.clone()));
+                    return Ok(fresh);
+                }
+                return Ok(rs.replicas);
             }
         }
+        let rs = self.lookup_partition(pid).await?;
+        self.topology
+            .write()
+            .expect("topology lock poisoned")
+            .insert(pid, TopoEntry::now(rs.clone()));
+        Ok(rs)
+    }
+
+    /// master 直查一分区副本列表(miss/TTL/驱逐共用;错误归一与旧 `replicas_for` 逐字对齐)。
+    async fn lookup_partition(&self, pid: PartitionId) -> Result<Vec<ReplicaLoc>> {
         let resp = self
             .master
             .lock()
@@ -477,10 +536,6 @@ impl Router {
         if rs.is_empty() {
             return Err(Error::Rejected(format!("partition {pid} has no replica")));
         }
-        self.topology
-            .write()
-            .expect("topology lock poisoned")
-            .insert(pid, rs.clone());
         Ok(rs)
     }
 
@@ -862,14 +917,65 @@ impl Router {
     pub async fn get(&self, key: &StoreKey) -> Result<Bytes> {
         let pid = key.partition_id();
         let replicas = self.ordered_for_read(&self.replicas_for(pid).await?);
+        match self.read_from_all(pid, key, &replicas).await {
+            ReadOutcome::Hit(b) => Ok(b),
+            ReadOutcome::AllMiss => {
+                // 纯 NotFound miss:对象不存在/已删语义,不驱逐不重拉(陈旧判断无从谈起)。
+                self.metrics
+                    .get_total
+                    .with_label_values(&["not_found"])
+                    .inc();
+                Err(Error::NotFound { pid })
+            }
+            // 穷尽全副本且非纯 NotFound(含不可达类)⇒ 拓扑疑似陈旧(router-read-topology-refresh):
+            // 驱逐 + 重拉一次;新列表与旧不同 ⇒ 本次读取重试一次(单请求有界)。
+            ReadOutcome::Failed(err) => {
+                self.metrics
+                    .topology_refreshes
+                    .with_label_values(&["evict"])
+                    .inc();
+                self.topology
+                    .write()
+                    .expect("topology lock poisoned")
+                    .remove(&pid);
+                if let Ok(fresh) = self.lookup_partition(pid).await {
+                    let changed = fresh != replicas;
+                    self.topology
+                        .write()
+                        .expect("topology lock poisoned")
+                        .insert(pid, TopoEntry::now(fresh.clone()));
+                    if changed {
+                        let ordered = self.ordered_for_read(&fresh);
+                        if let ReadOutcome::Hit(b) = self.read_from_all(pid, key, &ordered).await {
+                            return Ok(b);
+                        }
+                    }
+                }
+                self.metrics
+                    .get_total
+                    .with_label_values(&[err.kind()])
+                    .inc();
+                Err(err)
+            }
+        }
+    }
+
+    /// R=1 逐副本试读;三态:`Hit` / `AllMiss`(全员 NotFound)/ `Failed`(穷尽且含非
+    /// NotFound 失败 —— 混合或全不可达,驱逐重拉的触发面)。
+    async fn read_from_all(
+        &self,
+        pid: PartitionId,
+        key: &StoreKey,
+        replicas: &[ReplicaLoc],
+    ) -> ReadOutcome {
         let mut last: Option<Error> = None;
         let mut missing = 0usize;
-        for r in &replicas {
+        for r in replicas {
             match self.get_from(pid, key, &r.addr).await {
                 Ok(b) => {
                     self.metrics.get_total.with_label_values(&["ok"]).inc();
                     self.metrics.get_bytes.inc_by(b.len() as u64);
-                    return Ok(b);
+                    return ReadOutcome::Hit(b);
                 }
                 Err(e @ Error::NotFound { .. }) => {
                     missing += 1;
@@ -878,16 +984,10 @@ impl Router {
                 Err(e) => last = Some(e),
             }
         }
-        let err = if missing == replicas.len() {
-            Error::NotFound { pid }
-        } else {
-            last.unwrap_or(Error::NotFound { pid })
-        };
-        self.metrics
-            .get_total
-            .with_label_values(&[err.kind()])
-            .inc();
-        Err(err)
+        if missing == replicas.len() {
+            return ReadOutcome::AllMiss;
+        }
+        ReadOutcome::Failed(last.unwrap_or(Error::NotFound { pid }))
     }
 
     /// 下载到本地文件(流式,内存 = 单块)。
@@ -1100,7 +1200,7 @@ fn spawn_refresher(
     cfg: &RouterConfig,
     channel: Channel,
     ids: Weak<Mutex<IdCache>>,
-    topology: Arc<RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>>,
+    topology: Arc<Topology>,
     metrics: Arc<RouterMetrics>,
 ) {
     if cfg.partition_refresh_secs == 0 {
@@ -1147,7 +1247,7 @@ async fn sync_segments(
     master: &Mutex<MasterClient<Channel>>,
     cfg: &RouterConfig,
     metrics: &RouterMetrics,
-    topology: &RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>,
+    topology: &Topology,
 ) -> Result<()> {
     let order = list_writable(master).await?;
     let writable: HashSet<PartitionId> = order.iter().map(|w| w.pid).collect();
@@ -1246,7 +1346,7 @@ async fn list_writable(master: &Mutex<MasterClient<Channel>>) -> Result<Vec<Part
 fn segment_from_response(
     resp: GetBlobIdsResponse,
     metrics: &RouterMetrics,
-    topology: &RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>,
+    topology: &Topology,
 ) -> Result<Segment> {
     if !resp.ok {
         let GetBlobIdsResponse {
@@ -1274,7 +1374,7 @@ fn segment_from_response(
     topology
         .write()
         .expect("topology lock poisoned")
-        .insert(pid, sorted_replicas(resp.replicas));
+        .insert(pid, TopoEntry::now(sorted_replicas(resp.replicas)));
     Ok(Segment {
         pid,
         next: start,
@@ -1716,6 +1816,26 @@ fn map_master_error(error: &str, pid: PartitionId, leader_addr: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TopoEntry 的 TTL 判定(0 = 关;边界 = 过期)与驱逐纯语义。
+    #[test]
+    fn topo_entry_ttl_semantics() {
+        let reps = vec![ReplicaLoc {
+            node_id: 1,
+            disk_id: "d0".into(),
+            addr: "127.0.0.1:1".into(),
+            ..Default::default()
+        }];
+        let e = TopoEntry::now(reps);
+        // TTL 关(0)永新鲜;任何 TTL 下"现在"新鲜。
+        assert!(e.fresh(0, Instant::now()));
+        assert!(e.fresh(30, Instant::now()));
+        // 过边界即过期(29s 未到界仍新鲜,测试里时钟快进不 sleep)。
+        let later = Instant::now() + Duration::from_secs(31);
+        assert!(!e.fresh(30, later));
+        let just_under = Instant::now() + Duration::from_secs(29);
+        assert!(e.fresh(30, just_under));
+    }
 
     /// not-leader 归一为带 leader 提示的 NotLeader(master-leader-address);空提示 → None。
     #[test]

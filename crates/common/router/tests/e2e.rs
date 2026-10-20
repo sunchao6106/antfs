@@ -1135,3 +1135,88 @@ fn leader_id_of(nodes: &[MasterNode]) -> u64 {
         .current_leader
         .expect("has leader")
 }
+
+/// router-read-topology-refresh:两 reason 的 metric 证据 ——
+/// ttl(TTL 短旋钮轮询到重刷发生)/ evict(全员不可达分区触发驱逐)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topology_refresh_counts_ttl_and_evict_reasons() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
+    register_node(&node, 101, &addr_a).await;
+
+    let mut cfg = client_cfg(&grpc);
+    cfg.partition_refresh_secs = 1; // TTL 旋钮 1s(现批语义:读拓扑 TTL 同源)
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(cfg, &registry).await.unwrap();
+
+    // Live 副本分区:写入并读回,顺手填缓存。
+    let pid = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, pid).await;
+    let key = client.allocate_one().await.unwrap();
+    client
+        .put(key, bytes::Bytes::from_static(b"topo"))
+        .await
+        .unwrap();
+    assert_eq!(
+        client.get(&key).await.unwrap(),
+        bytes::Bytes::from_static(b"topo")
+    );
+
+    // TTL(1s)过后读同一分区 → reason=ttl 实增(轮询带 deadline,期限内容忍 TD 竞争)。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        let n = client
+            .metrics()
+            .topology_refreshes
+            .with_label_values(&["ttl"])
+            .get();
+        if n >= 1 || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        // 读触发 TTL 检查(miss 与 hit 都查缓存时刻);等待 TTL 走过用带 deadline 的短夜轮询。
+        let _ = client.get(&key).await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    assert!(
+        client
+            .metrics()
+            .topology_refreshes
+            .with_label_values(&["ttl"])
+            .get()
+            >= 1,
+        "TTL 到期须触发重拉(metric reason=ttl)"
+    );
+
+    // evict:注册全员不可达的分区(假地址、无 store),读必然全员失败 → 驱逐面。
+    register_node(&node, 977, "127.0.0.1:977").await;
+    let dead_pid = create_partition(&node, vec![placement(977)]).await;
+    // 取号直至拿到 dead_pid 的 key(该分区 RW、默认权重,发号轮转必至)。
+    let mut dead_key = None;
+    for _ in 0..64 {
+        let k = client.allocate_one().await.expect("allocate");
+        if k.partition_id() == dead_pid {
+            dead_key = Some(k);
+            break;
+        }
+    }
+    let dead_key = dead_key.expect("发号必须覆盖 dead 分区");
+    let before = client
+        .metrics()
+        .topology_refreshes
+        .with_label_values(&["evict"])
+        .get();
+    // 读:全员失败(Http)→ 驱逐(metric+1);重拉后列表相同(死拓扑无新世界)→ 原错误上抛。
+    let r = client.get(&dead_key).await;
+    assert!(r.is_err(), "全 dead 分区读必须失败");
+    let after = client
+        .metrics()
+        .topology_refreshes
+        .with_label_values(&["evict"])
+        .get();
+    assert_eq!(
+        after,
+        before + 1,
+        "全员不可达须触发一次驱逐重拉(reason=evict)"
+    );
+}

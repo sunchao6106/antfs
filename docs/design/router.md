@@ -159,6 +159,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_writable_partitions` | gauge | — | 个 | 本地**持有号段的分区数**(后台刷新后刷新;0 = 当前无可写分区) | 无 |
 | `router_compression_attempts_total` | counter | `outcome` | 次 | SDK 压缩三闸判定数(取值 `kept` / `too_small` / `low_ratio` / `disabled`,稳定契约) | `CompressionMetrics.*`(速率/比率族) |
 | `router_compression_saved_bytes_total` | counter | — | 字节 | 压缩节省字节数(`orig − stored`,只计 kept) | `CompressionMetrics.compressRate` 族近义 |
+| `router_topology_refreshes_total` | counter | `reason` | 次 | 读拓扑重拉次数(`ttl` = TTL 到期 / `evict` = 全副本不可达驱逐;`router-read-topology-refresh` 2026-10-20) | 无 |
 
 > **权重是否生效怎么观测(本次不新增指标)**:发号按写权重分配本身**不打点** —— 它是一条分配策略,不是故障。
 > 要核它是否生效,看这两处:`Router::write_weights() -> Vec<(PartitionId, u32)>`(当前生效的权重只读快照,pid 升序)
@@ -208,7 +209,11 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
       **单飞切换 master 通道**(1s 防抖,Mutex 内整体换 client)+ 重试一次,切主后配置指错自动
       恢复;无提示窗口期原样上抛供上层重试)。
 - [ ] 号段**后台预取**(D2 的双 buffer):现在按需取段,号段边界有 RPC 尖峰。
-- [ ] 读路由缓存 TTL / 失败后强制刷新。
+- [x] ~~读路由缓存 TTL / 失败后强制刷新~~ —— **已完结**(`router-read-topology-refresh`
+      2026-10-20:条目带时戳,TTL = `partition_refresh_secs`(与后台刷新共用旋钮,0=关)，
+      过期读前 Lookup 重拉(失败保旧表,读可用性优先);R=1 全副本失败且含不可达类 → 驱逐
+      该分区条目 + 重拉一次,新列表不同则本次读重试一次(单请求有界);纯 NotFound miss 不
+      驱逐。观测 `router_topology_refreshes_total{reason=ttl|evict}`)。
 - [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,frontend 的 `x-antfs-ttl-ms` 已是单次原子写)。
 - [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
 - [ ] **admin 手动权重入口 → master**:现在写权重只有"由容量现算"一个来源(`capacity_weight_permille`)。要做人工

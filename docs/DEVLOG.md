@@ -2181,3 +2181,21 @@ store.md §12.16。
   集成断言旧"raft 地址"语义改 gRPC 唯一真值 + 注册收敛轮询(禁 sleep,§5.6);
 - router:map_master_error 分类单测 + e2e `router_self_heals…`(3 节点 master,client
   故意连 follower → 首号自愈成功 → 二号直达)。**workspace 数字见提交 Testing Done**
+
+### 步 85(router-read-topology-refresh):读拓扑的 TTL 与全败驱逐
+
+**动机**:router.md §7 老待办 —— 读路由 topology 缓存无 TTL 无失效,副本搬迁后 R=1 的全部
+机会浪费在旧世界上。写路径有周期刷新与发号回填,读路径只在 miss 时查一次。
+
+**落地**:条目 `(Vec<ReplicaLoc>, Instant)`;TTL = `partition_refresh_secs`(语义同源,
+0=关;到期 Lookup 重拉,失败保旧表 —— 可用性优先);R=1 读**穷尽全副本且含不可达类**
+→ 驱逐 + Lookup 一次,新列表不同则本次读重试一次(单请求有界);纯 NotFound miss 不驱逐
+(陈旧与 miss 无从判别,保守)。新指标 `router_topology_refreshes_total{reason=ttl|evict}`。
+锁纪律:std 读锁只克隆,不持锁 await(clippy::await_holding_lock)。
+
+## Testing Done
+
+- lib 23(TTL 边界纯语义单测:0=关 / 29s 新鲜 / 31s 过期);e2e 新 1
+  `topology_refresh_counts_ttl_and_evict_reasons`(TTL 短旋钮轮询 metric{ttl}≥1;
+  dead 分区全员失败 → metric{evict} 恰 +1 且读仍上抛);**workspace 77 套 781/0;clippy 0;
+  fmt 净**。
