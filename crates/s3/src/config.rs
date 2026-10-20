@@ -2,7 +2,7 @@ use antfs_config::{at_least, Result, Validate};
 use antfs_router::RouterConfig;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct S3GatewayConfig {
     pub listen_addr: String,
@@ -81,7 +81,7 @@ fn is_plain_domain(domain: &str) -> bool {
 }
 
 /// S3 网关后台 GC(短删行保留期清理 + 孤儿 multipart TTL 回收)。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct GcConfig {
     pub enabled: bool,
@@ -116,7 +116,7 @@ impl Validate for GcConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct MetaStoreConfig {
     pub driver: String,

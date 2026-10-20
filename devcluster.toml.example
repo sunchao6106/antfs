@@ -68,3 +68,7 @@ disk_health = false
 # bench_concurrency = 32
 # bench_size = 4096
 # bench_read_ratio = 20
+
+# SDK 透明压缩(router-blob-compression):
+# frontend_compression_enabled = true        # 开关 frontend/S3 两个网关内嵌 router 的压缩
+# frontend_compression_algorithm = "gzip"    # gzip(默认)| zstd | lz4 | snappy

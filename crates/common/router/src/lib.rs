@@ -31,6 +31,7 @@
 //!
 //! blobId = 8 字节 `partitionId << 32 | objectId`([`antfs_blob::StoreKey`],大端),URL 里编成 16 位 hex。
 
+pub mod compression;
 pub mod config;
 pub mod error;
 pub mod metrics;
@@ -445,6 +446,38 @@ impl Router {
         self.put_keyed(key, data, expiration_ms, false).await
     }
 
+    /// SDK 压缩压缩口:三闸 + 帧封 + 指标(监控 outcome 标签即设计契约,见 router.md)。
+    fn compress_for_put(&self, data: Bytes) -> Bytes {
+        let cfg = &self.cfg;
+        // `connect()` 已过 Validate(算法名白名单):此处不变量成立,expect 属确证不变量例。
+        let algo = compression::algo_id_by_name(&cfg.compression_algorithm)
+            .expect("compression_algorithm validated in connect");
+        match compression::maybe_compress(
+            cfg.compression_enabled,
+            algo,
+            cfg.compression_level,
+            cfg.compression_min_size_bytes,
+            cfg.compression_min_ratio,
+            &data,
+        ) {
+            compression::Gate::Kept(frame, saved) => {
+                self.metrics
+                    .compression_attempts
+                    .with_label_values(&["kept"])
+                    .inc();
+                self.metrics.compression_saved_bytes.inc_by(saved);
+                frame
+            }
+            compression::Gate::Skipped(outcome) => {
+                self.metrics
+                    .compression_attempts
+                    .with_label_values(&[outcome])
+                    .inc();
+                data
+            }
+        }
+    }
+
     /// [`put_with_ttl`](Self::put_with_ttl) 的组合写形态:数据面置 `composed=true`,落库
     /// 记录带拼装描述符类型位(`POST /stitch` 描述符写口;仲裁语义与 plain 逐字一致)。
     pub async fn put_composed_with_ttl(
@@ -469,6 +502,8 @@ impl Router {
         expiration_ms: i64,
         composed: bool,
     ) -> Result<PutReport> {
+        // SDK 压缩put 三闸,一次判定供全部副本:扇出前的单点 = 复制带宽共收益。
+        let data = self.compress_for_put(data);
         let pid = key.partition_id();
         let replicas = self.replicas_for(pid).await?;
         let total = replicas.len();
@@ -558,6 +593,8 @@ impl Router {
         expiration_ms: i64,
         composed: bool,
     ) -> Result<(StoreKey, PutReport)> {
+        // SDK 压缩·put 三闸:auto 发号是网关写的主路径(与 put_keyed 对称,一次判定供全部副本)。
+        let data = self.compress_for_put(data);
         let mut key = self.allocate_one().await?;
         let mut first_err: Option<Error> = None;
         for attempt in 0..=MAX_STORE_FULL_RETRIES {
@@ -851,9 +888,16 @@ impl Router {
 
     async fn get_from(&self, pid: PartitionId, key: &StoreKey, addr: &str) -> Result<Bytes> {
         let resp = self.get_stream(pid, key, addr).await?;
-        resp.bytes().await.map_err(|source| Error::Http {
+        let raw = resp.bytes().await.map_err(|source| Error::Http {
             addr: addr.to_string(),
             source,
+        })?;
+        // 压缩帧透明解压(bulk 口):非帧原样透传;帧坏(伪 magic/未知算法/orig_len 不符)→
+        // 该副本按损坏处理,上层 get 的 R=1 循环会换下一副本重试。
+        compression::decode_frame(&raw).map_err(|detail| Error::ReplicaStatus {
+            addr: addr.to_string(),
+            status: 500,
+            detail,
         })
     }
 
@@ -1420,9 +1464,56 @@ async fn drain_to_file(
     metrics: &RouterMetrics,
 ) -> Result<u64> {
     use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(path).await?;
+
     let mut stream = resp.bytes_stream();
+    use bytes::BytesMut;
+    // 窥满 17B(不足帧头长的短 body 也按非帧处理);peek 期间多收的部分存 `carry`,
+    // 判定**之后**才决定去向 —— 不得在判帧前就把流引去解码管道。
+    let mut head = BytesMut::with_capacity(compression::FRAME_HEADER);
+    let mut carry: Vec<Bytes> = Vec::new();
+    while head.len() < compression::FRAME_HEADER {
+        match stream.next().await {
+            Some(chunk) => {
+                let chunk = chunk.map_err(|source| Error::Http {
+                    addr: addr.to_string(),
+                    source,
+                })?;
+                let want = compression::FRAME_HEADER - head.len();
+                if chunk.len() > want {
+                    head.extend_from_slice(&chunk[..want]);
+                    carry.push(chunk.slice(want..));
+                } else {
+                    head.extend_from_slice(&chunk);
+                }
+            }
+            None => break,
+        }
+    }
+    if compression::is_frame(&head) {
+        // 帧:多收部分依序首喂解码源(pipe 前置一段 spill ula)。
+        return drain_compressed(
+            &mut stream,
+            carry.first().cloned().unwrap_or_default(),
+            head.freeze(),
+            addr,
+            path,
+            metrics,
+        )
+        .await;
+    }
+    // 溢收的独立块(理论上单 chunk 溢出即走 carry[0] 单块)—— 防御:全部走非帧写出。
+    let spilled: Vec<Bytes> = carry;
+    // 非帧:普通直落盘(peek 出的 head 与溢收块补写)。
+    let mut file = tokio::fs::File::create(path).await?;
     let mut n = 0u64;
+    if !head.is_empty() {
+        n += head.len() as u64;
+        file.write_all(&head).await?;
+    }
+    for b in &spilled {
+        n += b.len() as u64;
+        file.write_all(b).await?;
+    }
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|source| Error::Http {
             addr: addr.to_string(),
@@ -1436,6 +1527,106 @@ async fn drain_to_file(
     metrics.get_total.with_label_values(&["ok"]).inc();
     metrics.get_bytes.inc_by(n);
     Ok(n)
+}
+
+/// 压缩帧 → 文件:解码线程(spawn_blocking)经**一条**有界通道接网络,内存 = 块级。
+/// `head`:已窥出的 17B 帧头;`first`:peek 期溢收的首块(无则空)。
+async fn drain_compressed(
+    stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+    first: bytes::Bytes,
+    head: bytes::Bytes,
+    addr: &str,
+    path: &Path,
+    _metrics: &RouterMetrics,
+) -> Result<u64> {
+    // 网络块 → 有界通道(容量 4);解码线程(下)阻塞拉取喂同步 Decoder,天然背压。
+    let (net_tx, net_rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
+    let dec_path = path.to_path_buf();
+    let decode = tokio::task::spawn_blocking(move || -> std::result::Result<u64, String> {
+        /// 网络通道 → `std::io::Read` 桥(帧头已被消费,源从 peek 余部续起)。
+        struct NetSource {
+            rx: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+            front: std::io::Cursor<bytes::Bytes>,
+        }
+        impl std::io::Read for NetSource {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                loop {
+                    if self.front.position() < self.front.get_ref().len() as u64 {
+                        return std::io::Read::read(&mut self.front, buf);
+                    }
+                    match self.rx.blocking_recv() {
+                        Some(Ok(b)) => self.front = std::io::Cursor::new(b),
+                        Some(Err(e)) => return Err(e),
+                        None => return Ok(0),
+                    }
+                }
+            }
+        }
+        let (mut decoder, orig_len, algo) = compression::streaming_decoder(
+            &head,
+            Box::new(NetSource {
+                rx: net_rx,
+                front: std::io::Cursor::new(first),
+            }),
+        )
+        .ok_or_else(|| "not a frame".to_string())?;
+        let mut file = std::fs::File::create(&dec_path).map_err(|e| format!("create: {e}"))?;
+        let mut produced = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            use std::io::Read as _;
+            let n = decoder
+                .read(&mut buf)
+                .map_err(|e| format!("{algo} decode: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            produced += n as u64;
+            if produced > orig_len {
+                return Err(format!(
+                    "{algo} decode produced {produced} > declared orig_len {orig_len}"
+                ));
+            }
+            std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
+        }
+        if produced != orig_len {
+            return Err(format!(
+                "{algo} decode produced {produced} < declared orig_len {orig_len}"
+            ));
+        }
+        file.sync_all().map_err(|e| format!("fsync: {e}"))?;
+        Ok(produced)
+    });
+
+    // async 侧:喂通道 + 收集解码结果(stream 错误优先上报)。
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|source| Error::Http {
+            addr: addr.to_string(),
+            source,
+        })?;
+        net_tx
+            .send(Ok(chunk))
+            .await
+            .map_err(|_| Error::ReplicaStatus {
+                addr: addr.to_string(),
+                status: 500,
+                detail: "decode worker exited early".to_string(),
+            })?;
+    }
+    drop(net_tx);
+    let produced = decode
+        .await
+        .map_err(|e| Error::ReplicaStatus {
+            addr: addr.to_string(),
+            status: 500,
+            detail: format!("decode join: {e}"),
+        })?
+        .map_err(|detail| Error::ReplicaStatus {
+            addr: addr.to_string(),
+            status: 500,
+            detail,
+        })?;
+    Ok(produced)
 }
 
 /// master 的业务性拒绝(`ok=false`)→ 归一错误。

@@ -24,6 +24,10 @@ pub struct RouterMetrics {
     pub put_replica_errors: IntCounterVec,
     /// 因分区写满(全副本 507)而换分区重试的次数(counter)。
     pub router_put_store_full_retries: IntCounter,
+    /// 压缩三闸判定计数,label `outcome`(kept / too_small / low_ratio / disabled)。
+    pub compression_attempts: IntCounterVec,
+    /// 压缩节省的字节数(orig − stored;只计 kept)。
+    pub compression_saved_bytes: IntCounter,
     /// blob 读请求数,label `outcome`。
     pub get_total: IntCounterVec,
     /// 读出的字节数(counter,只计成功)。
@@ -77,6 +81,17 @@ impl RouterMetrics {
                 registry,
                 "router_put_store_full_retries_total",
                 "put retries after all replicas reported partition full (507)",
+            )?,
+            compression_attempts: counter_vec(
+                registry,
+                "router_compression_attempts_total",
+                "SDK compression gate decisions per put",
+                &["outcome"],
+            )?,
+            compression_saved_bytes: counter(
+                registry,
+                "router_compression_saved_bytes_total",
+                "bytes saved by SDK compression (orig minus stored, kept only)",
             )?,
             get_total: counter_vec(
                 registry,

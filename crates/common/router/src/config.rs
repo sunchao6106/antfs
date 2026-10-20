@@ -10,7 +10,7 @@ use antfs_config::{at_least, Result, Validate};
 use serde::Deserialize;
 
 /// router(客户端 SDK)配置。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct RouterConfig {
     /// master 控制面 gRPC 地址(host:port)。
@@ -43,6 +43,21 @@ pub struct RouterConfig {
     /// 已不可写的分区,其本地号段被丢掉;新出现的可写分区,补一段加进缓存。
     /// **0 = 关闭**刷新(退回"只在号段耗尽时拉一次列表")。
     pub partition_refresh_secs: u64,
+    /// SDK 层透明数据压缩(`router-blob-compression`,对齐 Ambry `router.compression.enabled`):
+    /// 开启后 Bytes 形态写入过三闸(enabled / min_size / ratio)以**自描述帧**落盘 —— 帧头带
+    /// 算法号,集群可混存不同时期不同算法写的对象,读侧按帧自动解压。**默认 false = 行为
+    /// 与无该特性完全一致**;开启是运维决策(读 CPU 换盘/网带宽)。
+    pub compression_enabled: bool,
+    /// 压缩算法:`gzip`(默认)| `zstd` | `lz4` | `snappy`。改配置只影响**新写入**;
+    /// 旧对象按帧头算法号照常读回(算法演进不破坏可读性)。
+    pub compression_algorithm: String,
+    /// 压缩最小体量(字节):小于它的对象不试压(海量小文件为主体的仓,压无益)。
+    pub compression_min_size_bytes: usize,
+    /// 最小压缩比率(orig/compressed):试压不足此值即回落原文(熵数据自动出局)。
+    pub compression_min_ratio: f64,
+    /// 压缩级别:zstd 1..=19 / gzip 0..=9 / lz4、snappy 定档(忽略级别)。默认 1 = 速度面
+    /// (网关 CPU 是共享资源)。
+    pub compression_level: i32,
 }
 
 impl Default for RouterConfig {
@@ -54,6 +69,11 @@ impl Default for RouterConfig {
             id_segment_size: 1024,
             latency_aware_routing: true,
             partition_refresh_secs: 30,
+            compression_enabled: false,
+            compression_algorithm: "gzip".to_string(),
+            compression_min_size_bytes: 4096,
+            compression_min_ratio: 1.05,
+            compression_level: 1,
         }
     }
 }
@@ -68,6 +88,36 @@ impl Validate for RouterConfig {
         }
         at_least("router.request_timeout_secs", self.request_timeout_secs, 1)?;
         at_least("router.id_segment_size", self.id_segment_size, 1)?;
+        if !crate::compression::SUPPORTED_ALGOS.contains(&self.compression_algorithm.as_str()) {
+            return Err(antfs_config::ConfigError::invalid(
+                "router.compression_algorithm",
+                "must be one of: zstd, gzip, lz4, snappy",
+            ));
+        }
+        match self.compression_algorithm.as_str() {
+            "zstd" if !(1..=19).contains(&self.compression_level) => {
+                return Err(antfs_config::ConfigError::invalid(
+                    "router.compression_level",
+                    "zstd level must be in [1, 19]",
+                ));
+            }
+            "gzip" if !(0..=9).contains(&self.compression_level) => {
+                return Err(antfs_config::ConfigError::invalid(
+                    "router.compression_level",
+                    "gzip level must be in [0, 9]",
+                ));
+            }
+            _ => {}
+        }
+        if !(self.compression_min_ratio.is_finite()
+            && (1.0..=100.0).contains(&self.compression_min_ratio))
+        {
+            return Err(antfs_config::ConfigError::invalid(
+                "router.compression_min_ratio",
+                "must be in [1.0, 100.0]",
+            ));
+        }
+        // min_size 不设下限(0 = 全试压是合法运维选择);零长 body 恒走 too_small 闸。
         Ok(())
     }
 }

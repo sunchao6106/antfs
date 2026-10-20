@@ -117,6 +117,11 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router.id_segment_size` | u32 | `1024` | ≥1 | **均分时**每个可写分区一次向 master 申请的 blobId 个数(号段 N)。总预留 = 分区数 × 该值(SWRR 分配的**总**号码池;**实际按写权重配比**切成各分区份额)。越大越省 RPC、router 崩溃留下的空洞越大(空洞无害,D3) | 无(Ambry 的 id 是本地随机生成,无发号) |
 | `router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新**可写分区列表**的周期(秒):已不可写分区的号段被丢掉、新出现的可写分区补一段 | 无 |
 | `router.latency_aware_routing` | bool | `true` | — | **读路由按观测延迟排序副本**(慢盘处置的客户端侧那一半):读恒为 R=1(第一个成功即返回),故"先试哪个副本"直接决定读延迟。开着时记录每副本请求耗时的 EWMA,读时 **`up` 优先 → 延迟升序 → master 原序**;未测副本按"已测均值"当先验;无数据时是**恒等变换**。**只改顺序、不改候选集** ⇒ 不改变 W/R 与冲突解决语义。关掉用于定位/对照压测。详见 [`cluster.md` §9.3](./cluster.md) | 无 |
+| `router.compression_enabled` | bool | `false` | — | **SDK 透明压缩总闸**(`router-blob-compression`,2026-10-20):开 = Bytes 形态写入(`put`/`put_auto`/`put_composed` 族)过三闸后以自描述帧落盘(读侧自动解压),store 集群全程不感知;关(默认)= 逐字节零变化。开启是运维决策(读 CPU 换盘/网带宽) | `router.compression.enabled` |
+| `router.compression_algorithm` | String | `gzip` | `zstd` \| `gzip` \| `lz4` \| `snappy` | 压缩算法(算法号进帧头,集群可混存不同时期写入的对象;改配置只影响**新写入**) | `router.compression.*` 的算法族在其 Compression 接口注册表 |
+| `router.compression_min_size_bytes` | usize | `4096` | ≥0(0 视为 1) | 最小试压体量:小于它的对象不压(海量小文件为主体的仓,压无益且帧头 17B 即亏) | `router.compression.minimal.content.size` |
+| `router.compression_min_ratio` | f64 | `1.05` | [1.0, 100.0] | 最小压缩比率(orig/stored):试压不足即回落原文 —— 熵数据自动出局(无类型闸的语义替代) | `router.compression.minimal.ratio` |
+| `router.compression_level` | i32 | `1` | zstd 1..=19 / gzip 0..=9 / lz4、snappy 忽略 | 级别权衡:默认 1 = 速度面(网关 CPU 是共享资源) | Ambry 经 `CompressionLevel` 接口 |
 
 > **请求哪个 partition**:补段时先 `ListPartitions(state=RW)` 拿可写分区列表,再对**每个**分区显式点名
 > `partition_id` 申请一小批(master 复核该分区 RW 且**至少有一个副本**,否则 `ok=false` 只跳过该分区)。
@@ -151,6 +156,8 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`stat` 操作数 | `RouterMetrics.*OperationRate` |
 | `router_partition_refresh_total` | counter | `outcome` | 次 | 后台刷新可写分区列表的次数(失败为 `error`) | 无 |
 | `router_writable_partitions` | gauge | — | 个 | 本地**持有号段的分区数**(后台刷新后刷新;0 = 当前无可写分区) | 无 |
+| `router_compression_attempts_total` | counter | `outcome` | 次 | SDK 压缩三闸判定数(取值 `kept` / `too_small` / `low_ratio` / `disabled`,稳定契约) | `CompressionMetrics.*`(速率/比率族) |
+| `router_compression_saved_bytes_total` | counter | — | 字节 | 压缩节省字节数(`orig − stored`,只计 kept) | `CompressionMetrics.compressRate` 族近义 |
 
 > **权重是否生效怎么观测(本次不新增指标)**:发号按写权重分配本身**不打点** —— 它是一条分配策略,不是故障。
 > 要核它是否生效,看这两处:`Router::write_weights() -> Vec<(PartitionId, u32)>`(当前生效的权重只读快照,pid 升序)
@@ -159,6 +166,18 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 > `partition_refresh_secs` 的取值,而不是怀疑发号逻辑。
 
 ## 7. 与 Ambry 的差异 / 已知取舍 / 待办
+
+**SDK 透明压缩**(`router-blob-compression`,2026-10-20;详见 `openspec/changes/router-blob-compression/`):
+- **帧形态**:payload = `8B 魔数 \x89ANTFSZ1 | algo u8 | orig_len u64 | 编码流`(17B 头);
+  store 集群(记录/索引/CRC/复制/compaction)全程视帧为不透明字节 ⇒ **磁盘格式零改**;
+- **三闸**:`enabled → min_size(4096) → ratio(1.05)`,`put_keyed` 与 `put_auto_keyed`
+  两口对称接入(一次判定供全部副本);`put_file` v1 不压(取舍记档:海量小文件 +
+  网关自动分片每片走 Bytes 口全享压缩);
+- **算法族可配**(`gzip` 默认 / zstd / lz4 / snappy),算法号进帧头 —— 集群混存演进,
+  老帧永远读得动;`get` bulk 解压 / `get_file` 流式(channel + blocking 解码线程,
+  产出校验 = `orig_len`,不产截短文件);帧坏按副本损坏处理走 R=1 换重试;
+- **已知取舍**:REST HEAD 的 `x-antfs-blob-size` 对压缩对象呈 stored size(S3 层 HEAD
+  走 metastore 的 logical size 无感);`RouterConfig` 因 f64 字段退 `PartialEq`。
 
 **相对 Ambry 的差异(有意为之)**:
 1. **blobId 由 master 发号**(号段批处理 + Raft 水位),不是 router 本地随机铸 —— 见 `blobid-master-assign` D1–D4。

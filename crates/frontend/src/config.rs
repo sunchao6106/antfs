@@ -15,7 +15,7 @@ use serde::Deserialize;
 pub const AUTO_CHUNK_MAX_ALLOWED_BYTES: u64 = 1 << 30;
 
 /// frontend 配置。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct FrontendConfig {
     /// HTTP 监听地址(host:port)。

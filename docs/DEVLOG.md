@@ -2146,3 +2146,17 @@ store.md §12.16。
 
 ## Testing Done(store 17 套 221/0:既有 delete 幂等/404 用例不破;devcluster 真面日志
 证据见提交)
+
+### 步 83(router-blob-compression):SDK 层透明数据压缩,算法族可配(默认 gzip)
+
+**裁决链**:六本地开源系统调研(Ambry 上游 router 级压缩 / SeaweedFS needle 级自动 /
+其余无)→ 所有者定 Ambry 对齐路线;追加"算法可配(zstd/gzip/lz4/snappy)";终裁
+**默认 gzip**。**骨架**:自描述 17B 帧(`\x89ANTFSZ1`+algo+orig_len)使 **store 集群
+全程不感知**(磁盘格式零改,§3.4 免议;复制/compaction/CRC 全按字节不变公理);
+读侧两口(bulk 解压 / get_file 流式:单通道 + spawn_blocking 解码 + 产出校验)。
+
+**红毯**:put_keyed 与 put_auto_keyed 两口对称接线;三闸(enabled/min_size/ratio)+
+ 编码失败回落原文;帧坏按副本损坏(R=1 换副本);Codec ~9 个单测 + e2e 2 个 +
+ devcluster 两态真面(saved 520838 B 实增)。监控 2 项(§7 双表已同步)。
+
+## Testing Done(workspace 77 套 775/0;clippy 0;fmt 净;细节记 change 落地记录)

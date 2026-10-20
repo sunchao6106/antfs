@@ -911,3 +911,116 @@ async fn put_auto_retries_on_store_full_partition() {
         "至少一次命中已满分区触发换分区重试"
     );
 }
+
+/// router-blob-compression:三态语义(默认关逐字节零变化 / 开后表现为帧且读回恒等) +
+/// get_file 流式解压 + 复制(RF=2)下帧字节透传保持一致。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compression_roundtrip_disabled_default_and_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
+    register_node(&node, 101, &addr_a).await;
+    let pid = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, pid).await;
+
+    let compressible = || {
+        // 高重复可压体(min_size 之上的确切可压模式)。
+        let pat = b"compressible-pattern-0123456789-";
+        bytes::Bytes::from(
+            (0..64 * 1024)
+                .map(|i| pat[i % pat.len()])
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    // ── 态一:默认关 = 逐字节零变化(帧态 = 不存在)──
+    let registry = antfs_metric::Registry::new();
+    let off = Router::connect(client_cfg(&grpc), &registry).await.unwrap();
+    let k1 = off.allocate_one().await.unwrap();
+    let d1 = compressible();
+    off.put(k1, d1.clone()).await.expect("关态首写");
+    // 尺寸不缩(读回=写入;stored = 原文,admin 通道不做断言 —— get 恒等即可)。
+    assert_eq!(off.get(&k1).await.unwrap(), d1);
+    assert_eq!(
+        off.metrics()
+            .compression_attempts
+            .with_label_values(&["disabled"])
+            .get(),
+        1,
+        "关态应计 disabled 且不产生帧"
+    );
+
+    // ── 态二:开后 = 帧落盘 + bulk 读回恒等 ──
+    // 开态用默认算法(gzip,2026-10-20 所有者终裁)。
+    let mut cfg_on = client_cfg(&grpc);
+    cfg_on.compression_enabled = true;
+    assert_eq!(cfg_on.compression_algorithm, "gzip", "默认算法须为 gzip");
+    let registry_on = antfs_metric::Registry::new();
+    let on = Router::connect(cfg_on, &registry_on).await.unwrap();
+    let k2 = on.allocate_one().await.unwrap();
+    let d2 = compressible();
+    let report = on.put(k2, d2.clone()).await.expect("开态首写");
+    assert_eq!(report.acks, 1);
+    assert_eq!(on.get(&k2).await.unwrap(), d2, "bulk 口透明解压恒等");
+    let kept = on
+        .metrics()
+        .compression_attempts
+        .with_label_values(&["kept"])
+        .get();
+    let saved = on.metrics().compression_saved_bytes.get();
+    assert_eq!(kept, 1, "可压体过闸 kept");
+    assert!(saved > 65536 / 2, "节省过半(高度重复文本),got {saved}");
+
+    // ── 态三:get_file(流式口)对帧对象满地落盘恒等 ──
+    let dst = tmp.path().join("out.bin");
+    let n = on.get_file(&k2, &dst).await.expect("get_file");
+    assert_eq!(n, d2.len() as u64, "流式口产出 = 逻辑长度(orig_len)");
+    let read_back = std::fs::read(&dst).unwrap();
+    assert_eq!(read_back, d2);
+
+    // 同键零长前端(交叉):第二个小对象(低于 min_size)不压、原样 roundtrip。
+    let k3 = on.allocate_one().await.unwrap();
+    let tiny = bytes::Bytes::from_static(b"tiny-not-compressed");
+    on.put(k3, tiny.clone()).await.unwrap();
+    assert_eq!(on.get(&k3).await.unwrap(), tiny);
+    assert_eq!(
+        on.metrics()
+            .compression_attempts
+            .with_label_values(&["too_small"])
+            .get(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compression_survives_replication_frame_passthrough() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
+    let (_sb, addr_b) = start_store(&tmp.path().join("store-b"), 102).await;
+    register_node(&node, 101, &addr_a).await;
+    register_node(&node, 102, &addr_b).await;
+    // RF=2 ⇒ W=2:两副本都写;复制拉取(?replication=1)透传帧字节,两副本读回一致。
+    let pid = create_partition(&node, vec![placement(101), placement(102)]).await;
+    ensure_replica(&addr_a, pid).await;
+    ensure_replica(&addr_b, pid).await;
+
+    let mut cfg = client_cfg(&grpc);
+    cfg.compression_enabled = true;
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(cfg, &registry).await.unwrap();
+    let pat = b"replicated-compressible-content-";
+    let data = {
+        let mut v = Vec::with_capacity(128 * 1024);
+        for i in 0..128 * 1024 {
+            v.push(pat[i % pat.len()]);
+        }
+        bytes::Bytes::from(v)
+    };
+    let key = client.allocate_one().await.unwrap();
+    client
+        .put(key, data.clone())
+        .await
+        .expect("W=2 双副本帧写入");
+    assert_eq!(client.get(&key).await.unwrap(), data, "读回恒等");
+}
