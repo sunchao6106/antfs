@@ -25,10 +25,7 @@
 
 **antfs 取意「蚂蚁」:像蚂蚁一样,个体微小、数量惊人、协作可靠 —— 为海量小文件存储而生。**
 
-设计参考了 [LinkedIn Ambry](https://github.com/linkedin/ambry)、[SeaweedFS](https://github.com/seaweedfs/seaweedfs) 与 [CubeFS](https://github.com/cubefs/cubefs):小文件追加进 log、索引定位,O(1) 次磁盘寻道完成读写;集群元数据由内建 Raft 的 master 管理,不依赖外部协调组件(ZooKeeper / etcd)。分阶段推进:
-
-- **阶段一(已完成 —— v0.0.4 收官):忠实的 Rust 翻译** —— 对齐 Ambry 的架构与语义,先把功能 1:1 搬到 Rust(仅在等价前提下用现代实现,如 Binary Fuse 过滤器替 Bloom)。取舍裁决(照搬 / 有意偏差 / 后续再做的)归档见 [`openspec/changes/`](openspec/changes/)。
-- **阶段二(现阶段):在 Rust 版本之上做优化** —— 翻译完成、正确性已锁定,针对性能 / 并发 / 存储密度做改进。
+设计参考了 [LinkedIn Ambry](https://github.com/linkedin/ambry)、[SeaweedFS](https://github.com/seaweedfs/seaweedfs) 与 [CubeFS](https://github.com/cubefs/cubefs):小文件追加进 log、索引定位,O(1) 次磁盘寻道完成读写;集群元数据由内建 Raft 的 master 管理,不依赖外部协调组件(ZooKeeper / etcd)。忠实翻译先已收官:Ambry 架构与语义的 1:1 Rust 实现(仅等价前提下换现代实现,如 Binary Fuse 过滤器替 Bloom)于 **v0.0.4** 完成、正确性锁定,取舍裁决归档见 [`openspec/changes/`](openspec/changes/);此后在该基线上持续做**性能 / 并发 / 存储密度优化**,路线见 [`docs/design/README.md` 的「优化路线」](docs/design/README.md)。
 
 ## 特性
 
@@ -240,8 +237,8 @@ docker run --rm ghcr.io/sunchao6106/antfs:latest --run-bench router --bench-ops 
 - [x] router SDK + REST frontend
 - [x] admin web 控制台
 - [x] S3 兼容网关(对象 / multipart / SigV4 / 桶;MetaStore 外接 PostgreSQL / MySQL)
-- [x] 完成 Ambry 忠实翻译、锁定正确性(阶段一收官 —— v0.0.4;裁决归档于 `openspec/changes/`,PG 集成测试已进 CI 门)
-- [ ] 性能 / 并发 / 存储密度优化(第二阶段)
+- [x] 完成 Ambry 忠实翻译、锁定正确性(收官 —— v0.0.4;裁决归档于 `openspec/changes/`,PG 集成测试已进 CI 门)
+- [ ] 性能 / 并发 / 存储密度优化(持续进行,见[优化路线](docs/design/README.md))
 - [x] S3 多租户 ACL(私有桶跨租户 403 + 桶级存储配额已上线;版本控制、删除复活、计费与外部凭证源(LDAP/AD/OIDC/IAM 联邦)永久不做;虚拟主机路由 2026-10-15 翻案并当日落地(`s3.virtual_host_domain`,默认关),见 docs/design/s3.md 支持矩阵与「虚拟主机寻址」节)
 
 ## 参与贡献

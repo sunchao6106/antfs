@@ -221,7 +221,12 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
       收口:无位行恒按普通对象原字节返回,内容探测退役)。三选项推演与先例出处见
       `openspec/changes/blob-io-end-to-end/tasks.md` 待办首条。
 - [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**,`x-antfs-ttl-ms` 现为单次多数派写。
-- [ ] **store 侧真流式 GET**(把数据体整个读进内存的是 store;frontend 侧已落暂存再流式回)。
-- [ ] router 暴露单副本状态,让副本的 409(重复 `put` 命中已存在 key)能透传到 REST 层(现在收敛成 503;重复 `DELETE` 已幂等 204,不在此列)。
-- [ ] S3 兼容层(与 frontend 同层)。
-- [ ] 多租户:account/container + ACL + 配额(网关层)。
+- [ ] **读路径端到端流式**(根在引擎:`BlobStore::get / get_with_options` 返回整段 `Vec<u8>`,
+      store 数据面 `GET /partitions/{pid}/blobs/{key}` 一次性组包回 —— frontend 下载侧已
+      「落暂存再流式回」,故内存在界已由 store 决定。落地需引擎新增按 offset/size 的
+      reader 形读口 + store HTTP 分块流式响应)。
+- [ ] **单副本 409 透传**(`put` 撞已存在 key 时 store 回 409(`server.rs` 已 CONFLICT),
+      router `classify_err_status` 也已归一为 `Error::AlreadyExists` —— 差的是仲裁环:
+      quorum 失败终判把一切失败统一折叠进 `Error::Quorum` → gateway 503。需在失败终判
+      给确定性 409 单独出口(全部失败且皆为 409 时直接透传)。重复 `DELETE` 已幂等 204,
+      不在此列)。

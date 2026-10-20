@@ -25,10 +25,9 @@
 
 **antfs** takes its name from the **ant**: tiny individuals, astonishing numbers, reliable collaboration — exactly what a store for massive small files should be.
 
-The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [SeaweedFS](https://github.com/seaweedfs/seaweedfs), and [CubeFS](https://github.com/cubefs/cubefs): small files are appended into a log and located by an index, so reads and writes each cost **O(1) disk seeks**. Cluster metadata is managed by a master with a **built-in Raft** group — no external coordination service (ZooKeeper / etcd) required. The project moves in two phases:
+The design borrows from [LinkedIn Ambry](https://github.com/linkedin/ambry), [SeaweedFS](https://github.com/seaweedfs/seaweedfs), and [CubeFS](https://github.com/cubefs/cubefs): small files are appended into a log and located by an index, so reads and writes each cost **O(1) disk seeks**. Cluster metadata is managed by a master with a **built-in Raft** group — no external coordination service (ZooKeeper / etcd) required.
 
-- **Phase 1 (complete — exited at v0.0.4): a faithful Rust port** — mirror Ambry's architecture and semantics 1:1 in Rust, substituting modern implementations only where strictly equivalent (e.g. Binary Fuse filters in place of Bloom filters). Scope rulings (ported / deliberately diverged / deferred) are archived in [`openspec/changes/`](openspec/changes/).
-- **Phase 2 (current): optimize on top of the Rust base** — with the port complete and correctness locked down, push on performance, concurrency, and storage density.
+The faithful Rust port of Ambry (architecture and semantics 1:1, with strictly-equivalent modern substitutions such as Binary Fuse filters in place of Bloom filters) completed at v0.0.4, with correctness locked down; rulings are archived in [`openspec/changes/`](openspec/changes/). Work since then optimizes performance, concurrency, and storage density on top of that base — tracked in the [optimization roadmap](docs/design/README.md#优化路线2026-10-16-快照getobject-硬化收官后).
 
 ## Features
 
@@ -103,7 +102,7 @@ Layered reading: **gateways** (Frontend / S3) are stateless translators — ever
 Storage engine highlights:
 
 - **I/O**: synchronous blocking `std::fs` + buffered (OS page cache), aligned with original Ambry.
-  *Where* those blocking calls run changed in Phase 1: each disk owns a **bounded pool** (its own worker threads
+  *Where* those blocking calls run changed during the port: each disk owns a **bounded pool** (its own worker threads
   + a bounded queue), so one wedged disk can no longer drain the shared blocking pool and stall healthy disks;
   pool saturation fails fast with `503` + `Retry-After`. The IO primitive itself is untouched — no async/AIO.
   On top of that, each disk now has a **serviceability gate** (a wedged disk's requests fail fast instead of
@@ -249,8 +248,8 @@ The production target is Linux ext4. For fidelity, large-data, or performance te
 - [x] Router SDK + REST frontend
 - [x] Admin web dashboard
 - [x] S3-compatible gateway (objects / multipart / SigV4 / buckets, external PostgreSQL or MySQL MetaStore)
-- [x] Finish the faithful Ambry port and lock correctness (Phase 1 exit — v0.0.4; rulings archived under `openspec/changes/`, PG integration tests CI-gated)
-- [ ] Performance / concurrency / storage-density optimizations (Phase 2)
+- [x] Finish the faithful Ambry port and lock correctness (faithful-port exit — v0.0.4; rulings archived under `openspec/changes/`, PG integration tests CI-gated)
+- [ ] Performance / concurrency / storage-density optimizations (ongoing; see the [optimization roadmap](docs/design/README.md))
 - [x] Multi-tenant S3 ACL — private-bucket semantics (cross-tenant 403) + bucket-level storage quota shipped; versioning, undelete and billing permanently out of scope, and external credential sources (LDAP/AD/OIDC/IAM federation) are out too; virtual-host-style routing shipped the same day (reversal 2026-10-15, `s3.virtual_host_domain` off by default — see docs/design/s3.md)
 
 ## Contributing

@@ -1,6 +1,6 @@
 # 蚂蚁文件系统 (antfs) 设计总览
 
-用 Rust 重写**整个 Ambry**(不止存储引擎)。分阶段:**阶段一「忠实的 Rust 翻译」已于 v0.0.4 收官**(对齐 Ambry 架构与语义,仅在等价前提下用现代实现;取舍裁决见 `openspec/changes/`),**现阶段(阶段二)在 Rust 版本之上做优化**。大原则:**整体照搬 Ambry 架构,局部替换为业界最新最佳实现**。
+用 Rust 重写**整个 Ambry**(不止存储引擎)。忠实翻译(Ambry 架构与语义对齐,仅等价前提下换现代实现)已于 v0.0.4 收官,取舍裁决见 `openspec/changes/`;当前在此基础上做**优化与硬化**(见下「优化路线」)。大原则:**整体照搬 Ambry 架构,局部替换为业界最新最佳实现**。
 
 本目录按模块拆分设计文档,本文只放**跨模块的战略方向、系统层级与开发环境**;各模块细节见下方索引。
 
@@ -28,7 +28,7 @@
 - 「伪异步/盘 hang 泄漏线程」是**可用性/容错**层面问题,由集群层的磁盘健康检测 + 多副本兜底,不在引擎层硬换异步。
 - 每 Log **定容上界 + 写满自动滚动新 partition** 是设计锚点(本轮暂缓实现)。
 
-## 阶段二优化路线(2026-10-16 快照:GetObject 硬化收官后)
+## 优化路线(2026-10-16 快照:GetObject 硬化收官后)
 
 > 每项带证据源(档/日志/审计),防路线自己烂掉;**B2 EC 为用户明令暂缓项,重开须显式下令**;
 > versioning 计费 undelete 外部凭证源为永久拒绝族,永不在此列。排序 = 建议优先级。
@@ -38,7 +38,7 @@
 | 1 | S3 协议面补齐(小步快) | ~~条件 GET(`If-Match`/`If-None-Match`/`If-*` 族)+ `If-Range`;`?partNumber` 单片查询;ListObjectsV1 / GetBucketLocation 兼容形态(旧 SDK/迁移工具面)~~ ✅ 完成(`s3-read-compat`,2026-10-16:s3.md「条件读与读兼容面」节) | S3 审计 P1 菜单(`s3.md` 后续方向) |
 | 2 | flexible checksums | ~~CRC32/CRC32C/SHA 家族:PUT `x-amz-checksum-*` 验证 + aws-chunked trailer 已解析未验证的校验值承接(GET `?attributes` 的 `Checksum` 501 面随之开)~~ ✅ 完成(`s3-checksums`,2026-10-16:s3.md「灵活校验」节;multipart complete 级复合校验 ✅ 2026-10-19 收口(`s3-multipart-complete-checksum`:composite 推导/FULL_OBJECT 全验/per-part 持久化)) | `s3.md` 后续方向、`2026-10-16-s3-chunked-payload` 明示不验证面 |
 | 3 | 整型正确性补强 | ~~multipart 并发重传原子化~~ ✅ 已由 `s3-multipart-lifecycle`(commit fe2fc82)提前落地(retraction 留观行曾过时,本行更正);~~GC 死点崩溃窗兜底~~ ✅ 完成(`s3-reclaim-wal`,2026-10-16:s3.md「回收 WAL」节);~~frontend 描述符 composed 位置换嗅探~~ ✅ 完结(`blob-composed-flag` 2026-10-16:`FLAG_COMPOSED` 类型位 + 组合写口;`descriptor-drop-magic` 2026-10-19:位成为唯一类型判定,内容探测与回填旋钮全部退役,见 frontend.md §4/§11) | retraction 档「真留观」、`blob-io-end-to-end` 待办首条、DEVLOG 54 留观 |
-| 4 | 性能主轴(Phase 2 正题) | 真机复验三件(4 GiB 滚转 / frontend 折损形状 / 掉电冷读);frontend→router ~200µs 固定税工程减税(可选,多核真机外推折损 12-23%);flush 有界脏窗口 P2(APFS 限流耦合);S3 multipart GET 串行取片吞吐(每片一 RTT,观察 `s3_request_duration_seconds{op}`,瓶颈显现再预取) | `benchmark/BASELINE.md` 真机复验段、DEVLOG 46/49、`s3-range-streaming` 记档 |
+| 4 | 性能主轴(当前正题) | 真机复验三件(4 GiB 滚转 / frontend 折损形状 / 掉电冷读);frontend→router ~200µs 固定税工程减税(可选,多核真机外推折损 12-23%);flush 有界脏窗口 P2(APFS 限流耦合);S3 multipart GET 串行取片吞吐(每片一 RTT,观察 `s3_request_duration_seconds{op}`,瓶颈显现再预取) | `benchmark/BASELINE.md` 真机复验段、DEVLOG 46/49、`s3-range-streaming` 记档 |
 | 5 | 可运维性 | ✅ SSE 主钥轮换(2026-10-16:`--rotate-sse-key` 离线工具,s3.md「主钥轮换」节);✅ 桶策略 JSON 数据面授权(附于本批 S3 完结,用户 2026-10-19 指令;`s3-bucket-policy`:见 s3.md「桶策略」节);每请求 credentials/head_bucket 双查缓存(亚毫秒池化,升吞吐前不动);阈值标定 12 数真机落地(§9.4 流程已落,数据未采) | `s3.md` SSE 局限、DEVLOG 53 留观、`cluster.md` §9.4 |
 | 6 | 密度主轴(档位项) | B2 EC 冷层(D5,P1-A 路径已解锁:master 下发 + 段 owner 后台 worker + 校验分片走数据面)——**用户裁定暂缓** | `s3.md` 后续方向、cluster.md D5 |
 

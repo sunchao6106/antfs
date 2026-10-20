@@ -274,7 +274,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 游标重定位已补齐(见 §9.2):`FindToken` 带**段身份**(位置 + 代次),引擎做段身份校验、服务层做**副本 incarnation** 校验(两层),认不出即重置为从头重扫;sessionId 仍未落(重启后游标本就只在内存里,清零即从头)
 - [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction 换入、无重试循环、不引 `arc-swap`;并发测试守护)
 - [x] **存储模型简化:对象不可变 + 删除不可逆**(去掉复活/改 TTL/硬删;**段头 v2→v3**(每段 4B `key_prefix`;v3 起再带 4B 段代次 `generation`,见 §3)、**记录 v4**(24B 开销)、**索引 v2**(29B 条目)、复制合并改为**墓碑恒胜**;TTL 只在写入时定)—— 见 `openspec/changes/simplify-delete-model/`
-- [ ] 后台调度器(周期 compaction + 定时 persist 线程)—— **移出 store 层,归属抽象 blob-server 角色**(对齐 Ambry `CompactionManager`/`StorageManager`);store 只暴露 `compact*`/`flush` 机制
+- [x] ~~后台调度器(周期 compaction + 定时 persist)~~ —— **已落地为本地维护 worker**(`worker.rs`:flush 固定周期 + compaction「首跑钟点 + 周期」调度,`local_worker_enabled` 默认开;原「移出 store 层、归属抽象 blob-server 角色」的设想随 store server 落地作废,调度进 store server、判定进引擎层,见 §9.1)
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [x] **compaction 回收口径 + 候选集策略**(见 §9.1;`CompactPolicy{dead_ratio, now_ms, tombstone_retention_ms, tombstones_allowed}`:回收被取代的旧记录 + TTL 过期对象 + 过保留期墓碑(**还要过墓碑回收闸门**);墓碑删除时刻复用索引 `expiration_ms` 槽位,布局不变)—— 见 `openspec/changes/store-compaction-policy/`
 - [x] 每 Log 定容上界(store 层):`total_capacity`(per-replica 构造参数,对齐 Ambry `capacityInBytes`)+ 写满归一为 `Error::StoreFull` + 容量自省(`total_capacity`/`available_capacity`/`is_full`)。**「写满自动滚动新 partition」是集群/路由层职责,不在 store**
