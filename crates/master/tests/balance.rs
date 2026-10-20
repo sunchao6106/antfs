@@ -293,21 +293,29 @@ async fn balance_eval_start_executes_to_done() {
         .find(|n| n.config.node_id != leader.config.node_id)
         .expect("follower");
     let mut fclient = connect(follower).await;
-    let f = fclient
-        .eval_balance(EvalBalanceRequest {
-            version: 1,
-            cluster_secret: SECRET.into(),
-            max_moves: 0,
-        })
-        .await
-        .expect("eval on follower")
-        .into_inner();
-    assert!(
-        !f.ok && f.error == "not leader",
-        "got ok={} err={}",
-        f.ok,
-        f.error
-    );
+    // leader 的自报注册(leader_addr 唯一真值)经 Raft 异步收敛 —— 轮询带 deadline,禁 sleep(§5.6)。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let f = loop {
+        let f = fclient
+            .eval_balance(EvalBalanceRequest {
+                version: 1,
+                cluster_secret: SECRET.into(),
+                max_moves: 0,
+            })
+            .await
+            .expect("eval on follower")
+            .into_inner();
+        assert!(
+            !f.ok && f.error == "not leader",
+            "got ok={} err={}",
+            f.ok,
+            f.error
+        );
+        if !f.leader_addr.is_empty() || tokio::time::Instant::now() >= deadline {
+            break f;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     assert_eq!(
         f.leader_addr,
         leader.bound_grpc_addr().expect("bound grpc"),
