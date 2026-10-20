@@ -47,6 +47,21 @@ pub struct AdminUser {
     pub role: String,
 }
 
+/// admin 账号密码登录的 SQL 后端配置(`[admin.auth_db]` 表,形态对齐 S3 网关的
+/// `[s3.metastore]`)。
+///
+/// **`url` 空 = 特性关**:不连接、无新端点行为(静态令牌面独存,零行为逃生口)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct AdminAuthDbConfig {
+    /// SQL 驱动:`postgres` / `mysql`(**仅在 `url` 非空时校验**)。
+    pub driver: String,
+    /// 连接 URL;空 = 账号密码登录特性关。
+    pub url: String,
+    /// 连接池上限。
+    pub max_connections: u32,
+}
+
 /// admin web 服务配置。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -75,6 +90,8 @@ pub struct AdminConfig {
     /// 周期比对的节拍:两次比对之间的基础间隔(秒),每拍比对**一个**分区(蜗牛家风;
     /// 全量覆盖周期 = 分区数 × 本值)。默认 600s ⇒ 千分区 ≈ 7 天一轮。
     pub scrub_schedule_interval_secs: u64,
+    /// 账号密码登录的 SQL 后端(`admin-auth-db`);`url` 空 = 特性关(静态令牌面独存)。
+    pub auth_db: AdminAuthDbConfig,
 }
 
 impl Default for AdminConfig {
@@ -90,6 +107,7 @@ impl Default for AdminConfig {
             grafana_url: String::new(),
             scrub_schedule_enabled: false,
             scrub_schedule_interval_secs: 600,
+            auth_db: AdminAuthDbConfig::default(),
         }
     }
 }
@@ -121,6 +139,27 @@ impl Validate for AdminConfig {
         at_least(
             "admin.scrub_schedule_interval_secs",
             self.scrub_schedule_interval_secs,
+            1,
+        )?;
+        self.auth_db.validate()?;
+        Ok(())
+    }
+}
+
+impl Validate for AdminAuthDbConfig {
+    fn validate(&self) -> Result<()> {
+        // url 空 = 特性关:其余字段不 constrain(与"空 = 行为不变"的逃生口一致)。
+        if self.url.is_empty() {
+            return Ok(());
+        }
+        one_of(
+            "admin.auth_db.driver",
+            self.driver.as_str(),
+            &["postgres", "mysql"],
+        )?;
+        at_least(
+            "admin.auth_db.max_connections",
+            self.max_connections as u64,
             1,
         )?;
         Ok(())

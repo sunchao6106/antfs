@@ -1015,6 +1015,9 @@ client/frontend: 解析 partitionId → LookupPartition(master,可缓存;副本�
 | `admin.grafana_url` | String | `""` | — | Grafana 外链;空 = 不显示按钮 |
 | `admin.scrub_schedule_enabled` | bool | `false` | — | **周期性跨副本比对**(admin 级巡检调度)总开关;默认关。开启后每拍对**一个**健康分区(`healthy_replicas ≥ 2`)跑浅层比对(与手动 `POST /api/partitions/{id}/scrub` 同管线,`deep` 恒否 —— bit-rot 周期深扫归 store 侧 `scrub_background`);只报警不修复。运行期用 `/api/scrub-schedule-control` 掐停(不动手动端点)。**单 admin 实例假设**(多实例会重复比对,只读幂等无害) |
 | `admin.scrub_schedule_interval_secs` | u64 | `600` | ≥1 | 周期比对节拍:两拍间隔(秒),每拍一区;**全量覆盖周期 = 分区数 × 本值**(默认 600s ⇒ 千分区 ≈ 7 天一轮) |
+| `admin.auth_db.driver` | String | `"postgres"` | `"postgres"` \| `"mysql"`(仅 `url` 非空时校验) | 账号密码登录的 SQL 驱动(`admin-auth-db`;驱动形态对齐 `[s3.metastore]`) |
+| `admin.auth_db.url` | String | `""`(**空 = 特性关**) | 非空时须可连接(启动即连 + `sqlx::migrate!`,失败即退出) | 账号密码登录的 SQL 库连接 URL;**空 = 不连接、`/api/login` 回 501、静态令牌面独存(零行为逃生口)** |
+| `admin.auth_db.max_connections` | u32 | `10` | ≥ 1 | auth 库连接池上限 |
 
 ### 11.2 监控项清单(`AdminMetrics`)
 
@@ -1027,3 +1030,43 @@ client/frontend: 解析 partitionId → LookupPartition(master,可缓存;副本�
 | `admin_scrub_runs_total` | counter | 次 | 副本一致性巡检(scrub 对拍)运行轮数(手动 + 周期调度共用;分来源看 `GET /api/scrub` 各条 `origin`) |
 | `admin_scrub_divergences_total` | counter | 次 | 巡检发现的副本间摘要差异数 |
 | `admin_scrub_schedule_paused` | gauge | 0/1 | 周期比对循环被 `/api/scrub-schedule-control` 掐停(1 = 暂停;不持久化,重启即恢复) |
+| `admin_logins_total` | counter | 次 | 账号密码登录结果计数(label `result`:`success` / `invalid` / `locked`;`locked` 增长 = 登录面正被爆破;`admin-auth-db` 2026-10-20) |
+
+### 11.3 账号密码登录(`admin-auth-db`,2026-10-20)
+
+准入的第二形态,与 §11.1 的静态令牌面**并存**:用户名/口令存独立 SQL 库(postgres /
+mysql,`[admin.auth_db]`;**`url` 空 = 特性关**,登录端点 501,静态面不受任何影响)。
+
+**端点**(与既有 RBAC/审计同链:登录/登出/用户管理自动落审计;用户面 = operator
+专属 —— 名册只读 + 建删改密写):
+
+| 端点 | 面 | 语义 |
+|---|---|---|
+| `POST /api/login` | 公开(免 Bearer) | `{username, password}` → argon2id 验证 → 200 `{token, username, role, expires_at_ms}`;失败 401;**15min 窗 5 次失败 → 429 + `Retry-After: 60`**(锁判定先于验密,正确口令锁窗内同样被拒) |
+| `POST /api/logout` | 已登录(任意角色) | 吊销当前 Bearer 的会话;静态令牌持有者无会话 → 幂等 204 |
+| `GET /api/users` | operator | 用户名册(**不含口令散列**) |
+| `POST /api/users` | operator | `{username(1..=64), password(8..=128), role}`;重名 409 |
+| `PUT /api/users/{username}/password` | operator | 改口令(**既有会话不吊销**,按 TTL 自然到期;要立即失效全部会话 = 删号重建);无此人 404 |
+| `DELETE /api/users/{username}` | operator | 删号 + 其全部会话;无此人 404(幂等) |
+
+**会话语义**:
+- 令牌 256-bit(uuid ×2 hex),只在登录响应**出现一次**;库存形态 = `sha256(令牌)`
+  (`admin_sessions.token_hash` —— 库泄露不直接泄露可用令牌);
+- TTL **12h**(常量,无刷新语义);过期清理搭登录路径顺带 DELETE(登录低频,
+  无周期任务);共享 SQL 库的多实例部署下,会话跨实例有效(库存摘要,非进程态);
+- 会话查找 **JOIN `admin_users`** ⇒ **用户删除即全部会话失活**;
+- 冷启动引导:`antfs-admin --set-admin-password <username> [role]`(默认 operator;
+  口令走 **stdin 管道**,不落任何持久位置;存在即改密、不存在即建号)后退出,不启服务。
+
+**令牌解析序**:`Authorization: Bearer <t>` → 会话库(JOIN 取角色)→ **DB 故障静默
+回落静态令牌面**(它独立于 DB 存在)→ 静态三闸(原序不变)。静态面与 auth_db
+**皆空**且未配置 = 关校验(`local`,原语义)。
+
+**语义边界**(权衡序:安全 > 可用 > 性能):口令 argon2id 散列存储,**未知用户也做
+等开销哈希再拒**(防用户名枚举时序差);防爆破闸进程内(多实例各守一层;重启清零);
+活库实现(pg/mysql)只在 `TEST_ADMIN_POSTGRES_URL` / `TEST_ADMIN_MYSQL_URL` 环境活测
+(`#[ignore]`,同 S3 网关模式),逻辑面(登录/RBAC/失活)走 MockAuthStore 单测。
+
+库形态(`crates/admin/migrations/{postgres,mysql}/001_admin_auth.sql`,两表):
+`admin_users(username PK, password_hash, role, created_at)`、`admin_sessions
+(token_hash PK, username, created_at, expires_at)` + username 索引。

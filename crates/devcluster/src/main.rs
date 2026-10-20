@@ -327,6 +327,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )),
         scrub_runs: std::sync::Arc::new(antfs_admin::scrub::ScrubRuns::default()),
         scrub_schedule_paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // devcluster 保持静态令牌面(本地开发形态;账密登录归独立部署 + 真库)。
+        auth_db: None,
+        login_guard: std::sync::Arc::new(antfs_admin::auth_db::LoginGuard::default()),
     };
     let aauth = antfs_admin::server::AuthConfig {
         operator_token: OPERATOR_TOKEN.to_string(),

@@ -4,6 +4,7 @@
 //! `openspec/changes/admin-web/`。独立服务:master gRPC 客户端 + axum HTTP + operator 鉴权 + 内嵌 SPA。
 
 pub mod audit;
+pub mod auth_db;
 pub mod config;
 pub mod error;
 pub mod layout;

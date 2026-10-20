@@ -2259,3 +2259,39 @@ store.md §12.16。
   S3 断言全走 `wrap` 实际持有的那个 `S3Metrics` 实例,§6 纪律);
 - e2e 夹具 `meta_cache_ttl_secs: 0`(集成面保持真值直连,缓存语义由单测覆盖);
 - **workspace 77 套 794/0;clippy 0;fmt 净**(antfs-s3 lib 98 → 106)。
+
+### 步 89(admin-auth-db):admin 账号密码登录(独立 SQL 后端,pg/mysql)
+
+**动机**:admin 准入此前只有静态令牌面(`operator_token` / `viewer_token` /
+`[[admin.users]]` name-token-role)。所有者指示:账号密码 auth 接独立 SQL 库(地址
+单独配置、驱动形态对齐 `s3.metastore`、支持 postgres / mysql)。
+
+**落地**:
+- `[admin.auth_db]` 配置(驱动/url/池上限;**url 空 = 特性关**:登录端点 501,
+  静态令牌面独存 —— 零行为逃生口);
+- 迁移 001 双驱动:`admin_users` + `admin_sessions`(`token_hash` = sha256(会话
+  令牌)—— 库泄露不直接泄露可用令牌;username 索引);
+- `auth_db.rs`:`AuthStore` trait(用户/会话原语)+ pg/mysql 实现 + argon2id 口令
+  哈希(**未知用户等开销哈希再拒**,防枚举时序差);
+- 端点:`POST /api/login`(公开免 Bearer;**12h 会话**;防爆破闸 15min×5 → 429 +
+  `Retry-After: 60`,**锁先于验密**)/ `POST /api/logout`(吊销,幂等 204,viewer
+  可用)/ `GET|POST /api/users` + `PUT .../password` + `DELETE .../{u}`(operator
+  专属;**删号即全部会话失活** = JOIN 语义;改口令不吊销既有会话 —— 处置 = 删号
+  重建,记档);
+- 令牌解析序:**会话库优先 → DB 故障静默回落静态令牌面 → 两面皆空 = 关校验**
+  (原语义零变);
+- 冷启动引导:`antfs-admin --set-admin-password <u> [role]`(口令走 stdin 管道,
+  不落任何持久位置;存在改密/不存在建号)后退出;
+- 指标 `admin_logins_total{result=success|invalid|locked}`;登录/登出/用户管理
+  自动落既有审计中间件(登录失败记 `actor=anonymous`);devcluster 内嵌网关保持
+  静态面(`auth_db: None`),本地形态不变。
+
+## Testing Done
+
+- antfs-admin lib **83/0 + 2 ignored**(71 + 12 新:argon2 轮转/令牌形状/守卫窗
+  裁剪[免 sleep 倒拨,§5.6]/口令域 + 登录发会话过 `/api/me`、错误口令 401、5 败后
+  429+Retry-After、501 当 db 关[关校验面照旧]、logout 吊销、viewer 门控但可登出、
+  建号→登录→删号→会话失活、指标挂实例断言[§6]);
+- ignored = 活库 lifecycle(pg/mysql,`TEST_ADMIN_POSTGRES_URL` /
+  `TEST_ADMIN_MYSQL_URL`,同 S3 网关模式);
+- **workspace 77 套 806/0;clippy 0;fmt 净**。

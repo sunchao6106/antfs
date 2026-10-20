@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -36,6 +36,11 @@ pub struct AppState {
     pub scrub_runs: Arc<crate::scrub::ScrubRuns>,
     /// 周期比对循环的运行期开关(不持久化,重启即恢复轮转);手动 scrub 端点不受它管。
     pub scrub_schedule_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// 账号密码登录的 SQL 后端(`admin-auth-db`);`None` = 特性关(登录端点 501,
+    /// 静态令牌面独存)。
+    pub auth_db: Option<Arc<dyn crate::auth_db::AuthStore>>,
+    /// 登录防爆破闸(进程内;见 [`crate::auth_db::LoginGuard`])。
+    pub login_guard: Arc<crate::auth_db::LoginGuard>,
 }
 
 /// 通过鉴权的调用者(token 对应的身份;RBAC 用它门控,审计用它填 `actor`/`role`)。
@@ -105,6 +110,7 @@ impl AuthConfig {
 #[derive(Clone)]
 struct ApiLayers {
     auth: AuthConfig,
+    auth_db: Option<Arc<dyn crate::auth_db::AuthStore>>,
     audit: Arc<AuditLog>,
 }
 
@@ -117,12 +123,27 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// 请求 → 身份:关校验时 `local`;否则解析令牌(缺失/未知 → `None` → 401)。
-fn resolve_actor(auth: &AuthConfig, headers: &HeaderMap) -> Option<Actor> {
-    if auth.disabled() {
+/// 请求 → 身份:静态令牌与 auth_db **皆空** = 关校验(`local`);否则解析令牌 ——
+/// **会话库优先**,查库故障静默落静态令牌面(它独立于 DB 存在);缺失/未知 → `None` → 401。
+async fn resolve_actor(
+    auth: &AuthConfig,
+    auth_db: Option<&Arc<dyn crate::auth_db::AuthStore>>,
+    headers: &HeaderMap,
+) -> Option<Actor> {
+    if auth.disabled() && auth_db.is_none() {
         return Some(Actor::local());
     }
-    auth.resolve(bearer(headers)?)
+    let token = bearer(headers)?;
+    if let Some(db) = auth_db {
+        let hash = crate::auth_db::token_hash(token);
+        if let Ok(Some(sess)) = db.find_session(&hash).await {
+            return Some(Actor {
+                name: sess.username,
+                role: sess.role,
+            });
+        }
+    }
+    auth.resolve(token)
 }
 
 /// 写操作(与既有门控一致:非 GET 即写)。
@@ -132,7 +153,8 @@ fn is_write(method: &Method) -> bool {
 
 /// viewer 也不可读的端点:审计日志含操作者名与来源 IP,只对 operator 开放。
 fn operator_only_read(path: &str) -> bool {
-    path.starts_with("/api/audit")
+    // 审计日志含操作者名与来源 IP;用户名册暴露登录面用户名 —— 都只对 operator 开放。
+    path.starts_with("/api/audit") || path.starts_with("/api/users")
 }
 
 /// 需要落审计的请求:① 所有写操作;② `/api/me`(登录/鉴权成功与失败都记)。
@@ -145,10 +167,18 @@ fn audited(method: &Method, path: &str) -> bool {
 pub fn build_router(state: AppState, auth: AuthConfig) -> Router {
     let layers = ApiLayers {
         auth: auth.clone(),
+        auth_db: state.auth_db.clone(),
         audit: state.audit.clone(),
     };
     let api = Router::new()
         .route("/api/me", get(get_me))
+        // 账号密码登录面(`admin-auth-db`):login 公开(它就是"取令牌"的动作),
+        // logout/users 走 Bearer(会话令牌或静态令牌,由中间件统一解析)。
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{username}/password", put(set_user_password))
+        .route("/api/users/{username}", delete(delete_user))
         .route("/api/cluster", get(get_cluster))
         .route("/api/nodes", get(get_nodes))
         .route("/api/metrics", get(get_api_metrics))
@@ -204,14 +234,21 @@ async fn require_auth(
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let Some(actor) = resolve_actor(&layers.auth, req.headers()) else {
+    // 登录是唯一免令牌端点:它本身就是"取令牌"的动作(登录处理器自做账密校验)。
+    if req.method() == Method::POST && req.uri().path() == "/api/login" {
+        return next.run(req).await;
+    }
+    let Some(actor) = resolve_actor(&layers.auth, layers.auth_db.as_ref(), req.headers()).await
+    else {
         return (StatusCode::UNAUTHORIZED, "missing or invalid token").into_response();
     };
     if actor.role == Role::Viewer {
         if operator_only_read(req.uri().path()) {
             return (StatusCode::FORBIDDEN, "operator role required").into_response();
         }
-        if is_write(req.method()) {
+        // viewer 也允许登出:吊销自己的会话不是"写操作"(RBAC 语义豁免)。
+        let logout = req.method() == Method::POST && req.uri().path() == "/api/logout";
+        if is_write(req.method()) && !logout {
             return (StatusCode::FORBIDDEN, "viewer role is read-only").into_response();
         }
     }
@@ -230,7 +267,7 @@ async fn audit_requests(
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
     // 与 RBAC 同一套判定(同一个纯函数):未知令牌 → None,只是这里记成 anonymous 而不是 401。
-    let actor = resolve_actor(&layers.auth, req.headers());
+    let actor = resolve_actor(&layers.auth, layers.auth_db.as_ref(), req.headers()).await;
     let remote_addr = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -266,6 +303,222 @@ async fn audit_requests(
 
 async fn get_me(axum::Extension(actor): axum::Extension<Actor>) -> Response {
     Json(json!({ "role": actor.role.as_str() })).into_response()
+}
+
+// ── 账号密码登录(`admin-auth-db`)───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct SetPasswordRequest {
+    password: String,
+}
+
+fn auth_db_error(e: crate::auth_db::AuthDbError) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("auth db: {e}")).into_response()
+}
+
+fn not_configured() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "account auth not configured (admin.auth_db)",
+    )
+        .into_response()
+}
+
+fn deny_login(st: &AppState, username: &str) -> Response {
+    st.login_guard.record_failure(username);
+    st.metrics.logins.with_label_values(&["invalid"]).inc();
+    (StatusCode::UNAUTHORIZED, "invalid username or password").into_response()
+}
+
+/// `POST /api/login`:账号密码换会话令牌。防爆破闸(15min 窗 5 次失败 → 429)先于
+/// 验密;未知用户做**等开销哈希**再拒(防用户名枚举时序差)。
+async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
+    st.metrics.api_requests.inc();
+    let Some(db) = st.auth_db.as_ref() else {
+        return not_configured();
+    };
+    if st.login_guard.locked(&req.username) {
+        st.metrics.logins.with_label_values(&["locked"]).inc();
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed logins; retry later",
+        )
+            .into_response();
+        // from_static 对 ASCII 字面恒成立(不返回 Result)。
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        return resp;
+    }
+    match db.find_user(&req.username).await {
+        Err(e) => auth_db_error(e),
+        Ok(None) => {
+            // 等开销拒绝:对不存在用户也跑一次真哈希。
+            let _ = crate::auth_db::hash_password(&req.password);
+            deny_login(&st, &req.username)
+        }
+        Ok(Some(u)) => {
+            if !crate::auth_db::verify_password(&u.password_hash, &req.password) {
+                return deny_login(&st, &req.username);
+            }
+            st.login_guard.clear(&req.username);
+            st.metrics.logins.with_label_values(&["success"]).inc();
+            // 登录路径顺手清过期会话(单语句 DELETE;登录低频,不设周期任务)。
+            if let Err(e) = db.purge_expired_sessions(crate::auth_db::now_ms()).await {
+                tracing::warn!(error = %e, "purge expired sessions failed");
+            }
+            let token = crate::auth_db::new_session_token();
+            let created = crate::auth_db::now_ms();
+            let expires = created + crate::auth_db::SESSION_TTL_MS;
+            match db
+                .insert_session(
+                    &crate::auth_db::token_hash(&token),
+                    &u.username,
+                    created,
+                    expires,
+                )
+                .await
+            {
+                Err(e) => auth_db_error(e),
+                Ok(()) => Json(json!({
+                    "token": token,
+                    "username": u.username,
+                    "role": u.role.as_str(),
+                    "expires_at_ms": expires,
+                }))
+                .into_response(),
+            }
+        }
+    }
+}
+
+/// `POST /api/logout`:吊销当前 Bearer 对应的会话。静态令牌持有者无会话可删 —— 幂等 204。
+async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    st.metrics.api_requests.inc();
+    if let Some(db) = st.auth_db.as_ref() {
+        if let Some(token) = bearer(&headers) {
+            if let Err(e) = db.delete_session(&crate::auth_db::token_hash(token)).await {
+                tracing::warn!(error = %e, "delete session failed");
+            }
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/users`:用户名册(**不含口令散列**;operator 专属只读)。
+async fn list_users(State(st): State<AppState>) -> Response {
+    st.metrics.api_requests.inc();
+    let Some(db) = st.auth_db.as_ref() else {
+        return not_configured();
+    };
+    match db.list_users().await {
+        Err(e) => auth_db_error(e),
+        Ok(users) => Json(json!(users
+            .iter()
+            .map(|u| json!({
+                "username": u.username,
+                "role": u.role.as_str(),
+                "created_at_ms": u.created_at,
+            }))
+            .collect::<Vec<_>>()))
+        .into_response(),
+    }
+}
+
+/// `POST /api/users`:建用户(用户名 1..=64、口令 8..=128、角色 operator/viewer)。
+async fn create_user(State(st): State<AppState>, Json(req): Json<CreateUserRequest>) -> Response {
+    st.metrics.api_requests.inc();
+    let Some(db) = st.auth_db.as_ref() else {
+        return not_configured();
+    };
+    let Some(role) = Role::parse(&req.role) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "role must be `operator` or `viewer`",
+        )
+            .into_response();
+    };
+    if req.username.is_empty() || req.username.len() > crate::auth_db::USERNAME_MAX_LEN {
+        return (StatusCode::BAD_REQUEST, "username must be 1..=64 chars").into_response();
+    }
+    if let Err(msg) = crate::auth_db::validate_password(&req.password) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    match db.find_user(&req.username).await {
+        Err(e) => auth_db_error(e),
+        Ok(Some(_)) => (StatusCode::CONFLICT, "username already exists").into_response(),
+        Ok(None) => {
+            let hash = match crate::auth_db::hash_password(&req.password) {
+                Ok(h) => h,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("hash: {e}"))
+                        .into_response()
+                }
+            };
+            match db.create_user(&req.username, &hash, role).await {
+                Err(e) => auth_db_error(e),
+                Ok(()) => (
+                    StatusCode::CREATED,
+                    format!("user `{}` created", req.username),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
+/// `PUT /api/users/{username}/password`:改口令(既有会话不吊销,按 TTL 自然到期;
+/// 要立即失效全部会话 = 删号重建)。
+async fn set_user_password(
+    State(st): State<AppState>,
+    Path(username): Path<String>,
+    Json(req): Json<SetPasswordRequest>,
+) -> Response {
+    st.metrics.api_requests.inc();
+    let Some(db) = st.auth_db.as_ref() else {
+        return not_configured();
+    };
+    if let Err(msg) = crate::auth_db::validate_password(&req.password) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    let hash = match crate::auth_db::hash_password(&req.password) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("hash: {e}")).into_response(),
+    };
+    match db.set_password(&username, &hash).await {
+        Err(e) => auth_db_error(e),
+        // false = 用户不存在(或并发删除的窄缝):按 404 相处。
+        Ok(false) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// `DELETE /api/users/{username}`:删用户 + 其全部会话(operator 专属写)。
+async fn delete_user(State(st): State<AppState>, Path(username): Path<String>) -> Response {
+    st.metrics.api_requests.inc();
+    let Some(db) = st.auth_db.as_ref() else {
+        return not_configured();
+    };
+    if let Err(e) = db.delete_sessions_of_user(&username).await {
+        return auth_db_error(e);
+    }
+    match db.delete_user(&username).await {
+        Err(e) => auth_db_error(e),
+        Ok(false) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 /// master 错误 → HTTP 状态。
@@ -2034,6 +2287,8 @@ mod tests {
             audit,
             scrub_runs: Arc::new(crate::scrub::ScrubRuns::default()),
             scrub_schedule_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auth_db: None,
+            login_guard: Arc::new(crate::auth_db::LoginGuard::default()),
         }
     }
 
@@ -3918,5 +4173,384 @@ mod tests {
             .unwrap();
         let v = body_json(&router, op_post).await;
         assert_eq!(v["paused"], true, "写后回显: {v}");
+    }
+    // ── 账号密码登录面(`admin-auth-db`):MockAuthStore 走真 argon2 验密路径 ──
+
+    use crate::auth_db::{AuthResult, AuthSession, AuthUser};
+    use std::collections::HashMap;
+
+    struct MockAuthStore {
+        users: Mutex<HashMap<String, AuthUser>>,
+        sessions: Mutex<HashMap<String, AuthSession>>,
+    }
+
+    impl MockAuthStore {
+        /// 预置用户:口令以真 argon2 哈希存(登录路径的验密是真实的,不止桩返回)。
+        fn with_user(name: &str, pw: &str, role: Role) -> Arc<Self> {
+            let hash = crate::auth_db::hash_password(pw).expect("hash password");
+            let users = HashMap::from([(
+                name.to_string(),
+                AuthUser {
+                    username: name.to_string(),
+                    password_hash: hash,
+                    role,
+                    created_at: 0,
+                },
+            )]);
+            Arc::new(MockAuthStore {
+                users: Mutex::new(users),
+                sessions: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::auth_db::AuthStore for MockAuthStore {
+        async fn find_user(&self, username: &str) -> AuthResult<Option<AuthUser>> {
+            Ok(self.users.lock().unwrap().get(username).cloned())
+        }
+
+        async fn create_user(
+            &self,
+            username: &str,
+            password_hash: &str,
+            role: Role,
+        ) -> AuthResult<()> {
+            self.users.lock().unwrap().insert(
+                username.to_string(),
+                AuthUser {
+                    username: username.to_string(),
+                    password_hash: password_hash.to_string(),
+                    role,
+                    created_at: 0,
+                },
+            );
+            Ok(())
+        }
+
+        async fn set_password(&self, username: &str, password_hash: &str) -> AuthResult<bool> {
+            match self.users.lock().unwrap().get_mut(username) {
+                Some(u) => {
+                    u.password_hash = password_hash.to_string();
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+
+        async fn delete_user(&self, username: &str) -> AuthResult<bool> {
+            Ok(self.users.lock().unwrap().remove(username).is_some())
+        }
+
+        async fn list_users(&self) -> AuthResult<Vec<AuthUser>> {
+            let mut all: Vec<_> = self.users.lock().unwrap().values().cloned().collect();
+            all.sort_by(|a, b| a.username.cmp(&b.username));
+            Ok(all)
+        }
+
+        async fn insert_session(
+            &self,
+            stash: &str,
+            username: &str,
+            _created_ms: i64,
+            expires_ms: i64,
+        ) -> AuthResult<()> {
+            // 角色按用户行取(真库 JOIN 语义的 mock 等价)。
+            let role = self
+                .users
+                .lock()
+                .unwrap()
+                .get(username)
+                .map(|u| u.role)
+                .unwrap_or(Role::Viewer);
+            self.sessions.lock().unwrap().insert(
+                stash.to_string(),
+                AuthSession {
+                    username: username.to_string(),
+                    role,
+                    expires_at_ms: expires_ms,
+                },
+            );
+            Ok(())
+        }
+
+        async fn find_session(&self, stash: &str) -> AuthResult<Option<AuthSession>> {
+            let Some(s) = self.sessions.lock().unwrap().get(stash).cloned() else {
+                return Ok(None);
+            };
+            // 用户行消失即失活(JOIN 语义);过期同样视为不存在。
+            let user_alive = self.users.lock().unwrap().contains_key(&s.username);
+            Ok(
+                if user_alive && s.expires_at_ms > crate::auth_db::now_ms() {
+                    Some(s)
+                } else {
+                    None
+                },
+            )
+        }
+
+        async fn delete_session(&self, stash: &str) -> AuthResult<bool> {
+            Ok(self.sessions.lock().unwrap().remove(stash).is_some())
+        }
+
+        async fn delete_sessions_of_user(&self, username: &str) -> AuthResult<u64> {
+            let mut g = self.sessions.lock().unwrap();
+            let before = g.len();
+            g.retain(|_, s| s.username != username);
+            Ok((before - g.len()) as u64)
+        }
+
+        async fn purge_expired_sessions(&self, cutoff_ms: i64) -> AuthResult<u64> {
+            let mut g = self.sessions.lock().unwrap();
+            let before = g.len();
+            g.retain(|_, s| s.expires_at_ms > cutoff_ms);
+            Ok((before - g.len()) as u64)
+        }
+    }
+
+    fn app_login_store(store: Arc<MockAuthStore>) -> Router {
+        let mut st = state_with(Arc::new(FakeMaster::default()), no_audit());
+        st.auth_db = Some(store);
+        build_router(st, AuthConfig::default())
+    }
+
+    fn login_req(username: &str, password: &str) -> Request<Body> {
+        Request::post("/api/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"username":"{username}","password":"{password}"}}"#
+            )))
+            .unwrap()
+    }
+
+    fn bearer_req(method: &str, uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn login_token(router: &Router, username: &str, password: &str) -> String {
+        let resp = router
+            .clone()
+            .oneshot(login_req(username, password))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "login should succeed");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 << 10)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["token"]
+            .as_str()
+            .expect("token in login response")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn login_success_issues_session_reaching_api() {
+        let router = app_login_store(MockAuthStore::with_user(
+            "alice",
+            "pw-12345678",
+            Role::Operator,
+        ));
+        let token = login_token(&router, "alice", "pw-12345678").await;
+        // 会话令牌过 RBAC:Bearer 即会话,GET /api/me 由会话查询解析身份。
+        let me = router
+            .clone()
+            .oneshot(bearer_req("GET", "/api/me", &token))
+            .await
+            .unwrap();
+        assert_eq!(me.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_password_with_401() {
+        let router = app_login_store(MockAuthStore::with_user("bob", "pw-12345678", Role::Viewer));
+        let resp = router
+            .clone()
+            .oneshot(login_req("bob", "wrong-wrong-99"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_locks_after_repeated_failures() {
+        let router = app_login_store(MockAuthStore::with_user(
+            "carol",
+            "pw-12345678",
+            Role::Viewer,
+        ));
+        for _ in 0..5 {
+            let resp = router
+                .clone()
+                .oneshot(login_req("carol", "wrong-wrong-99"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        // 锁先于验密:第 6 次即便口令正确也 429,并带 Retry-After。
+        let resp = router
+            .clone()
+            .oneshot(login_req("carol", "pw-12345678"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn login_endpoint_reports_501_when_auth_db_off() {
+        // 静态全空(本地关校验形态)+ auth_db 未配 → 登录端点 501;其余管理面照旧 local。
+        let router = app_auth(AuthConfig::default());
+        let resp = router
+            .clone()
+            .oneshot(login_req("alice", "whatever-99"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let cluster = router
+            .clone()
+            .oneshot(Request::get("/api/cluster").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(cluster.status(), StatusCode::OK, "关校验面不受影响");
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_session() {
+        let router = app_login_store(MockAuthStore::with_user(
+            "dave",
+            "pw-12345678",
+            Role::Operator,
+        ));
+        let token = login_token(&router, "dave", "pw-12345678").await;
+        let out = status(&router, bearer_req("POST", "/api/logout", &token)).await;
+        assert_eq!(out, StatusCode::NO_CONTENT);
+        // 会话已吊销:同一令牌 GET /api/me → 401。
+        let me = status(&router, bearer_req("GET", "/api/me", &token)).await;
+        assert_eq!(me, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn viewer_session_cannot_manage_users_but_can_logout() {
+        let router = app_login_store(MockAuthStore::with_user("eve", "pw-12345678", Role::Viewer));
+        let token = login_token(&router, "eve", "pw-12345678").await;
+        // 用户名册 = operator 专属只读(用户名是登录面敏感信息)。
+        let get = status(&router, bearer_req("GET", "/api/users", &token)).await;
+        assert_eq!(get, StatusCode::FORBIDDEN);
+        // 建号 = 写操作,viewer 403。
+        let post = status(
+            &router,
+            Request::post("/api/users")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"x1","password":"pw-12345678","role":"operator"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(post, StatusCode::FORBIDDEN);
+        // 登出自己的会话不算写:viewer 允许 logout(204)。
+        let out = status(&router, bearer_req("POST", "/api/logout", &token)).await;
+        assert_eq!(out, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn user_lifecycle_create_login_delete_kills_session() {
+        let router = app_login_store(MockAuthStore::with_user(
+            "root",
+            "pw-root-1234",
+            Role::Operator,
+        ));
+        let root = login_token(&router, "root", "pw-root-1234").await;
+        // 建号(viewer)→ 立即可登录,会话角色取自建号载荷。
+        let created = status(
+            &router,
+            Request::post("/api/users")
+                .header(header::AUTHORIZATION, format!("Bearer {root}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"frank","password":"pw-frank-12","role":"viewer"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created, StatusCode::CREATED);
+        let frank = login_token(&router, "frank", "pw-frank-12").await;
+        assert_eq!(
+            status(&router, bearer_req("GET", "/api/me", &frank)).await,
+            StatusCode::OK
+        );
+        // 重名 → 409。
+        let dup = status(
+            &router,
+            Request::post("/api/users")
+                .header(header::AUTHORIZATION, format!("Bearer {root}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"frank","password":"pw-frank-12","role":"viewer"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(dup, StatusCode::CONFLICT);
+        // 删号 → 其会话立即失活(JOIN 语义)。
+        let del = status(&router, bearer_req("DELETE", "/api/users/frank", &root)).await;
+        assert_eq!(del, StatusCode::NO_CONTENT);
+        assert_eq!(
+            status(&router, bearer_req("GET", "/api/me", &frank)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // 删后改密 → 404。
+        let pw = status(
+            &router,
+            Request::put("/api/users/frank/password")
+                .header(header::AUTHORIZATION, format!("Bearer {root}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"pw-abcdef99"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pw, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn login_metrics_count_outcomes_on_wired_instance() {
+        // §6 纪律:断言挂在 router 上的那个 AdminMetrics 实例。
+        let registry = antfs_metric::Registry::new();
+        let metrics = Arc::new(AdminMetrics::new(&registry).unwrap());
+        let st = AppState {
+            master: Arc::new(FakeMaster::default()),
+            metrics: metrics.clone(),
+            registry,
+            grafana_url: String::new(),
+            audit: no_audit(),
+            scrub_runs: Arc::new(crate::scrub::ScrubRuns::default()),
+            scrub_schedule_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auth_db: Some(MockAuthStore::with_user(
+                "gina",
+                "pw-12345678",
+                Role::Operator,
+            )),
+            login_guard: Arc::new(crate::auth_db::LoginGuard::default()),
+        };
+        let router = build_router(st, AuthConfig::default());
+        let _ = router
+            .clone()
+            .oneshot(login_req("gina", "wrong-wrong-99"))
+            .await
+            .unwrap();
+        let _ = router
+            .clone()
+            .oneshot(login_req("gina", "pw-12345678"))
+            .await
+            .unwrap();
+        assert_eq!(metrics.logins.with_label_values(&["invalid"]).get(), 1);
+        assert_eq!(metrics.logins.with_label_values(&["success"]).get(), 1);
     }
 }

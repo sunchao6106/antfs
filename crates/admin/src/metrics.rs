@@ -1,6 +1,8 @@
 //! `AdminMetrics`:admin 服务打点(接 common/metric 的 `Registry`)。
 
-use antfs_metric::{counter, gauge, IntCounter, IntGauge, Registry, Result};
+use antfs_metric::{
+    counter, counter_vec, gauge, IntCounter, IntCounterVec, IntGauge, Registry, Result,
+};
 
 /// admin 服务指标集,构造时注册进传入 `Registry`。
 #[derive(Clone)]
@@ -15,6 +17,9 @@ pub struct AdminMetrics {
     pub scrub_divergences: IntCounter,
     /// 周期比对循环被 `/api/scrub-schedule-control` 掐停(1 = 暂停;不持久化,重启即恢复)。
     pub scrub_schedule_paused: IntGauge,
+    /// 账号密码登录(`admin-auth-db`)结果计数,label `result`:
+    /// `success` / `invalid`(凭证不符)/ `locked`(防爆破闸拒绝)。
+    pub logins: IntCounterVec,
 }
 
 impl AdminMetrics {
@@ -54,6 +59,12 @@ impl AdminMetrics {
                 registry,
                 "admin_scrub_schedule_paused",
                 "scheduled replica-comparison loop paused by operator (1 = paused)",
+            )?,
+            logins: counter_vec(
+                registry,
+                "admin_logins_total",
+                "account login attempts by outcome (success / invalid / locked)",
+                &["result"],
             )?,
         })
     }
