@@ -1250,3 +1250,71 @@ async fn id_prefetch_keeps_allocation_fluent_on_tiny_segments() {
         "真 master 下的预取须零错误"
     );
 }
+
+/// router-putfile-compression:put_file 三闸与 Bytes 口同语义 —— 高重复内容走流式帧
+/// 文件上传(读口解压恒等)、过小落体量闸原文直传、强熵落比率闸原文直传;监控三笔各记。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_file_compression_roundtrip_all_gates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
+    register_node(&node, 101, &addr_a).await;
+    let pid = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, pid).await;
+
+    let mut cfg = client_cfg(&grpc);
+    cfg.compression_enabled = true; // 算法取默认 gzip
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(cfg, &registry).await.unwrap();
+
+    // ① kept:高重复 128 KiB → 临时帧文件上传,读口解压恒等。
+    let pattern: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+    let src = tmp.path().join("kept.bin");
+    std::fs::write(&src, &pattern).unwrap();
+    let (key, _) = client.put_file(&src).await.expect("put_file kept");
+    let out = tmp.path().join("kept-out.bin");
+    let n = client.get_file(&key, &out).await.expect("get_file kept");
+    assert_eq!(n as usize, pattern.len(), "逻辑大小 = 原文件大小");
+    assert_eq!(std::fs::read(&out).unwrap(), pattern);
+
+    // ② too_small:100 B 落体量闸,原文直传。
+    let small = b"tiny-antfs-putfile-payload".to_vec();
+    let src2 = tmp.path().join("small.bin");
+    std::fs::write(&src2, &small).unwrap();
+    let (key2, _) = client.put_file(&src2).await.expect("put_file small");
+    let out2 = tmp.path().join("small-out.bin");
+    client.get_file(&key2, &out2).await.expect("get_file small");
+    assert_eq!(std::fs::read(&out2).unwrap(), small);
+
+    // ③ low_ratio:强熵 128 KiB 落比率闸,原文直传。
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let ent: Vec<u8> = (0..128 * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 33) as u8
+        })
+        .collect();
+    let src3 = tmp.path().join("ent.bin");
+    std::fs::write(&src3, &ent).unwrap();
+    let (key3, _) = client.put_file(&src3).await.expect("put_file entropy");
+    let out3 = tmp.path().join("ent-out.bin");
+    client
+        .get_file(&key3, &out3)
+        .await
+        .expect("get_file entropy");
+    assert_eq!(std::fs::read(&out3).unwrap(), ent);
+
+    // 三闸监控标签各记一笔(Bytes 口同款契约:kept / too_small / low_ratio)。
+    let attempts = |o: &str| {
+        client
+            .metrics()
+            .compression_attempts
+            .with_label_values(&[o])
+            .get()
+    };
+    assert!(attempts("kept") >= 1, "kept 至少一笔");
+    assert!(attempts("too_small") >= 1, "too_small 至少一笔");
+    assert!(attempts("low_ratio") >= 1, "low_ratio 至少一笔");
+}

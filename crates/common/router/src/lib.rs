@@ -675,6 +675,66 @@ impl Router {
         }
     }
 
+    /// `put_file` 的压缩预备:三闸与 Bytes 口([`compress_for_put`](Self::compress_for_put))
+    /// 同语义、同一套监控标签;全过 ⇒ 原文件**流式**预压进临时帧文件(内存恒 O(拷贝缓冲),
+    /// 不随文件大小涨),一次压制、多副本并 PUT 与 507 重试**共用**;任一闸未过或流压
+    /// io 失败 ⇒ 原文件直传。返回(实际上传路径, 帧文件 RAII 守护)。
+    async fn prepare_file_upload(
+        &self,
+        path: &Path,
+        len: u64,
+    ) -> (std::path::PathBuf, Option<tempfile::NamedTempFile>) {
+        let cfg = &self.cfg;
+        if !cfg.compression_enabled {
+            self.metrics
+                .compression_attempts
+                .with_label_values(&["disabled"])
+                .inc();
+            return (path.to_path_buf(), None);
+        }
+        if (len as usize) < cfg.compression_min_size_bytes.max(1) {
+            self.metrics
+                .compression_attempts
+                .with_label_values(&["too_small"])
+                .inc();
+            return (path.to_path_buf(), None);
+        }
+        // `connect()` 已过 Validate(算法名白名单):不变量成立,expect 属确证不变量例。
+        let algo = compression::algo_id_by_name(&cfg.compression_algorithm)
+            .expect("compression_algorithm validated in connect");
+        let orig = path.to_path_buf();
+        let level = cfg.compression_level;
+        let min_ratio = cfg.compression_min_ratio;
+        let out = match tokio::task::spawn_blocking(move || {
+            compression::compress_stream_to_temp(&orig, len, algo, level, min_ratio)
+        })
+        .await
+        {
+            Ok(v) => v,
+            // 单飞 join 失败(任务 panic 等,极罕见):回落原文 —— 压缩永不让写入失败。
+            Err(_) => compression::StreamedPut::Original { why: "io" },
+        };
+        match out {
+            compression::StreamedPut::Frame { temp, stored } => {
+                self.metrics
+                    .compression_attempts
+                    .with_label_values(&["kept"])
+                    .inc();
+                let saved = len.saturating_sub(stored);
+                self.metrics.compression_saved_bytes.inc_by(saved);
+                let p = temp.path().to_path_buf();
+                (p, Some(temp))
+            }
+            compression::StreamedPut::Original { why } => {
+                self.metrics
+                    .compression_attempts
+                    .with_label_values(&[why])
+                    .inc();
+                (path.to_path_buf(), None)
+            }
+        }
+    }
+
     /// [`put_with_ttl`](Self::put_with_ttl) 的组合写形态:数据面置 `composed=true`,落库
     /// 记录带拼装描述符类型位(`POST /stitch` 描述符写口;仲裁语义与 plain 逐字一致)。
     pub async fn put_composed_with_ttl(
@@ -874,6 +934,9 @@ impl Router {
     ) -> Result<(StoreKey, PutReport)> {
         let path = path.as_ref().to_path_buf();
         let len = tokio::fs::metadata(&path).await?.len();
+        // 压缩三闸一次判定(与 Bytes 口同语义/同监控):全过 ⇒ 流式预压临时帧文件,
+        // 全部副本与 507 换分区重试共用同一帧;`_frame` 守护持有到函数返回,自动清删。
+        let (upload, _frame) = self.prepare_file_upload(&path, len).await;
         let mut key = self.allocate_one().await?;
         let mut first_err: Option<Error> = None;
         for attempt in 0..=MAX_STORE_FULL_RETRIES {
@@ -884,7 +947,7 @@ impl Router {
             let futs = FuturesUnordered::new();
             for r in &replicas {
                 let addr = r.addr.clone();
-                let path = path.clone();
+                let path = upload.clone();
                 futs.push(async move {
                     let res = self
                         .put_file_to(pid, &key, &path, expiration_ms, &addr)

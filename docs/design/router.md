@@ -70,6 +70,11 @@ put(key, bytes): 解析 key 的高 32 位得 partitionId
 - **失败即报错,不偷偷换 partition 重写**:换分区重写会掩盖问题且可能与已部分写入的副本产生分叉;重试由调用方决定。
 - 变更类(`delete`)同样走多数派扇出。**TTL 只能在写入时给**:`put_with_ttl(key, data, expiration_ms)` / `put_file_with_ttl(path, expiration_ms)` 把绝对过期时刻(`expiration_ms`)随写一并扇出(单次多数派写);`put` / `put_file` 是 `NO_EXPIRATION`(常量由 `antfs_router` 再导出)的包装,等价于"永不过期"。写入之后**没有任何改 TTL 的接口**。
 - **`put_auto` / `put_auto_with_ttl`(内部发号 + 507 换分区重试)**:适用于上层**不关心落在哪个分区**的场景(frontend 小 body 上传、S3 网关)。内部 `allocate_one` → 多数派写 → 全副本 507 时摘掉该分区、重新发号到另一个分区重试(最多 `MAX_STORE_FULL_RETRIES=2` 次,共 3 次尝试),语义与 `put_file_with_ttl` 的重试逻辑完全一致,返回 `(StoreKey, PutReport)`。`put_with_ttl(key, data)` 的 key 由调用方预分配,因此无法换分区——只摘掉号段并返回 `StoreFull`。
+- **`put_file` 与压缩三闸同路**(`router-putfile-compression`,2026-10-20):压缩开启且过体量闸时,
+  先在客户端本地临时文件**流式预压**一个帧(17B 头 + 编码流,内存恒 O(拷贝缓冲),不随文件大小涨),
+  全部副本并行 PUT 与 507 换分区重试**共用同一帧文件**,结束后 RAII 自动清删;比率闸不过或流压
+  IO 失败则回落**原文件直传**(「每副本各自从文件流式读」语义不变)。监控标签与 Bytes 口共用一套
+  (含新增 `io` 回落)。
 
 ## 3. 读路径(R = 1)
 
@@ -157,7 +162,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`stat` 操作数 | `RouterMetrics.*OperationRate` |
 | `router_partition_refresh_total` | counter | `outcome` | 次 | 后台刷新可写分区列表的次数(失败为 `error`) | 无 |
 | `router_writable_partitions` | gauge | — | 个 | 本地**持有号段的分区数**(后台刷新后刷新;0 = 当前无可写分区) | 无 |
-| `router_compression_attempts_total` | counter | `outcome` | 次 | SDK 压缩三闸判定数(取值 `kept` / `too_small` / `low_ratio` / `disabled`,稳定契约) | `CompressionMetrics.*`(速率/比率族) |
+| `router_compression_attempts_total` | counter | `outcome` | 次 | SDK 压缩三闸判定数(取值 `kept` / `too_small` / `low_ratio` / `disabled` / `io`,稳定契约;`io` = `put_file` 流压 IO 失败回落原文,`router-putfile-compression` 2026-10-20) | `CompressionMetrics.*`(速率/比率族) |
 | `router_compression_saved_bytes_total` | counter | — | 字节 | 压缩节省字节数(`orig − stored`,只计 kept) | `CompressionMetrics.compressRate` 族近义 |
 | `router_topology_refreshes_total` | counter | `reason` | 次 | 读拓扑重拉次数(`ttl` = TTL 到期 / `evict` = 全副本不可达驱逐;`router-read-topology-refresh` 2026-10-20) | 无 |
 | `router_id_prefetch_errors_total` | counter | — | 次 | 号段后台预取失败数(成功不打 —— 成功即用耗尽次数的下降体现;`router-id-prefetch` 2026-10-20) | 无 |
@@ -173,9 +178,11 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 **SDK 透明压缩**(`router-blob-compression`,2026-10-20;详见 `openspec/changes/router-blob-compression/`):
 - **帧形态**:payload = `8B 魔数 \x89ANTFSZ1 | algo u8 | orig_len u64 | 编码流`(17B 头);
   store 集群(记录/索引/CRC/复制/compaction)全程视帧为不透明字节 ⇒ **磁盘格式零改**;
-- **三闸**:`enabled → min_size(4096) → ratio(1.05)`,`put_keyed` 与 `put_auto_keyed`
-  两口对称接入(一次判定供全部副本);`put_file` v1 不压(取舍记档:海量小文件 +
-  网关自动分片每片走 Bytes 口全享压缩);
+- **三闸**:`enabled → min_size(4096) → ratio(1.05)`,`put_keyed` / `put_auto_keyed` /
+  `put_file` 三口对称接入(一次判定供全部副本);`put_file` 为**流式临时帧文件**形态
+  (`router-putfile-compression`,2026-10-20:客户端先行把 17B 头 + 编码流压进本地临时
+  文件,内存恒 O(拷贝缓冲)、**全副本并行 PUT 与 507 换分区重试共用同一帧**,RAII 自动
+  清删;流压 IO 失败一律回落原文直传,`io` 标签计入监控行)—— 原「v1 不压」取舍就此收官;
 - **算法族可配**(`gzip` 默认 / zstd / lz4 / snappy),算法号进帧头 —— 集群混存演进,
   老帧永远读得动;`get` bulk 解压 / `get_file` 流式(channel + blocking 解码线程,
   产出校验 = `orig_len`,不产截短文件);帧坏按副本损坏处理走 R=1 换重试;

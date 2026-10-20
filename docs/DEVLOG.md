@@ -2217,3 +2217,24 @@ store.md §12.16。
 - lib 24(新增低水位探针/续段/落空丢弃/无段直插单测);e2e 18(新增
   `id_prefetch_keeps_allocation_fluent_on_tiny_segments`:4 号极小段连续 32 号全成功 +
   预取零错误);**workspace 77 套 783/0;clippy 0;fmt 净**。
+
+### 步 87(router-putfile-compression):put_file 压缩入口 —— v1 取舍收官
+
+**动机**:router.md §7 记档的取舍 ——「`put_file` v1 不压(海量小文件 + 网关分片走 Bytes 口)」
+—— 留下 SDK 两个写入口行为不对称:SDK 直传大文件(压测/backfill 场景)不享压缩。
+
+**落地**:`put_file_with_ttl` 进入重试环前一次三闸判定(与 Bytes 口同语义、同监控标签):
+全过 ⇒ `spawn_blocking` 内把原文件经 17B 头 + 编码流**逐块**压进本地临时文件
+(`tempfile::NamedTempFile`,内存恒 O(拷贝缓冲)),**全部副本并行 PUT 与 507 换分区重试共用
+同一帧**,RAII 守护持有至函数返回自动清删;比率闸不过/流压 IO 失败(含 spawn join 失败)一律
+回落**原文件直传**(`low_ratio` / `io` 标签)—— 压缩永不让写入失败。比率闸按「帧文件 vs 原文件」
+判定,与 Bytes 口同义。算法族四臂全接(zstd/gzip/lz4/snappy);lz4 显式 `finish()` 收尾
+(前批截尾教训);snap 无 `finish()` 用 `into_inner()`。
+
+## Testing Done
+
+- router lib 26(新增 `stream_compress_roundtrip_all_algos`:四算法 roundtrip + 熵回落 low_ratio +
+  零长 too_small;`stream_compress_io_failure_falls_back`:缺文件 io 回落);
+- e2e 19(新增 `put_file_compression_roundtrip_all_gates`:真 store 三闸走全 —— kept 128 KiB
+  帧上传读口解压恒等、100 B too_small 原文直传、128 KiB 强熵 low_ratio 原文直传,监控三笔各记);
+- **workspace 77 套 786/0;clippy 0;fmt 净**;tempfile 由 dev-dep 升为依赖(临时帧文件 RAII)。

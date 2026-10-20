@@ -24,6 +24,8 @@ lz4_flex = "0.11"
 snap = "1"
 hex = "0.4"
 futures = "0.3"
+# put_file 流式预压的临时文件(RAII 自动清删,压缩入口一次性写用)。
+tempfile = "3"
 
 [dev-dependencies]
 antfs-store = { path = "../../store" }

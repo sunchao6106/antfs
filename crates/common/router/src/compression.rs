@@ -10,6 +10,7 @@
 //! lz4/snappy 定档)。
 
 use bytes::{Bytes, BytesMut};
+use std::io::Write;
 
 /// 帧魔数:PNG 风格 8 字节;随机数据头碰概率 ~2^-64,误报面可忽略。
 pub const FRAME_MAGIC: [u8; 8] = *b"\x89ANTFSZ1";
@@ -128,6 +129,101 @@ pub fn maybe_compress(
     Gate::Kept(frame.freeze(), saved)
 }
 
+/// `put_file` 流式预压产物:三闸全过 ⇒ 帧已落临时文件;否则回落原文。
+/// outcome 标签与 Bytes 口(`maybe_compress`)同契约:`too_small` / `low_ratio` / `io`。
+pub(crate) enum StreamedPut {
+    /// 比率闸门通过:`stored` = 帧文件总长(17B 头 + 编码流),供.saved 与上传 Content-Length。
+    Frame {
+        temp: tempfile::NamedTempFile,
+        stored: u64,
+    },
+    /// 回落原文直传;`why` = 监控 outcome(`too_small` / `low_ratio` / `io`)。
+    Original { why: &'static str },
+}
+
+/// `put_file` 三闸的流式形态:enabled / min_size 由调用方先行判定;本函数把原文件经
+/// 17B 头 + 编码流**逐块**写临时文件(内存恒 O(拷贝缓冲),不随文件大小涨),比率闸门
+/// 按"帧文件 vs 原文件"判定 —— 与 Bytes 口同义。CPU/同步 IO 重 ⇒ 调用方须 spawn_blocking。
+/// 编码/IO 失败一律回落原文(压缩是优化,不得反客为主变写入失败,fold 成 `io`)。
+pub(crate) fn compress_stream_to_temp(
+    orig_path: &std::path::Path,
+    orig_len: u64,
+    algo: u8,
+    level: i32,
+    min_ratio: f64,
+) -> StreamedPut {
+    // min_size=0 视为 1:由调用方镜像 Bytes 口(min_size.max(1));
+    if orig_len < 1 {
+        return StreamedPut::Original { why: "too_small" };
+    }
+    let run = || -> std::io::Result<StreamedPut> {
+        let mut src = std::fs::File::open(orig_path)?;
+        let mut temp = tempfile::NamedTempFile::new()?;
+        temp.write_all(&FRAME_MAGIC)?;
+        temp.write_all(&[algo])?;
+        temp.write_all(&orig_len.to_le_bytes())?;
+        encode_file(algo, level, &mut src, &mut temp)?;
+        let stored = temp.as_file().metadata()?.len();
+        if (orig_len as f64) < min_ratio * stored as f64 {
+            return Ok(StreamedPut::Original { why: "low_ratio" });
+        }
+        Ok(StreamedPut::Frame { temp, stored })
+    };
+    match run() {
+        Ok(v) => v,
+        Err(_) => StreamedPut::Original { why: "io" },
+    }
+}
+
+/// 四算法族共用的同步流式编码(读一点写一点;`finish()` 显式收尾 —— lz4 系编码器
+/// 不显式 finish 会截尾,是前批真踩过的坑;之后 `flush` 确保落盘)。
+fn encode_file(
+    algo: u8,
+    level: i32,
+    src: &mut std::fs::File,
+    dst: &mut tempfile::NamedTempFile,
+) -> std::io::Result<()> {
+    match algo {
+        ALGO_ZSTD => {
+            let mut e = zstd::stream::write::Encoder::new(dst, level)?;
+            std::io::copy(src, &mut e)?;
+            let w = e.finish()?;
+            w.flush()?;
+        }
+        ALGO_GZIP => {
+            let mut e = flate2::write::GzEncoder::new(
+                dst,
+                flate2::Compression::new(level.clamp(0, 9) as u32),
+            );
+            std::io::copy(src, &mut e)?;
+            let w = e.finish()?;
+            w.flush()?;
+        }
+        ALGO_LZ4 => {
+            let mut e = lz4_flex::frame::FrameEncoder::new(dst);
+            std::io::copy(src, &mut e)?;
+            let w = e.finish()?;
+            w.flush()?;
+        }
+        ALGO_SNAPPY => {
+            let mut e = snap::write::FrameEncoder::new(dst);
+            std::io::copy(src, &mut e)?;
+            let w = e
+                .into_inner()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            w.flush()?;
+        }
+        other => {
+            let _ = other;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unknown compression algo id",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// payload 是否帧形态(长度 + 魔数)。
 pub fn is_frame(data: &[u8]) -> bool {
     data.len() >= FRAME_HEADER && data[..8] == FRAME_MAGIC
@@ -197,7 +293,7 @@ pub fn streaming_decoder(
 mod tests {
     use super::*;
 
-    fn text(n: usize) -> Bytes {
+    pub(super) fn text(n: usize) -> Bytes {
         // 高重复文本段:任何算法都显著可压。
         let pattern = b"antfs-compressible-pattern-with-redundancy-";
         Bytes::from(
@@ -340,5 +436,74 @@ mod probe {
             }
             Gate::Skipped(o) => panic!("skipped {}", o),
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    fn write_file(dir: &std::path::Path, name: &str, data: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    /// 确定性 xorshift 熵流:任何算法都压缩不动(过不了 1.05 比率闸)。
+    fn entropy(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 33) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stream_compress_roundtrip_all_algos() {
+        let dir = tempfile::tempdir().unwrap();
+        let pattern = super::tests::text(64 * 1024).to_vec();
+        for (name, algo) in [
+            ("zstd", ALGO_ZSTD),
+            ("gzip", ALGO_GZIP),
+            ("lz4", ALGO_LZ4),
+            ("snappy", ALGO_SNAPPY),
+        ] {
+            let orig = write_file(dir.path(), &format!("orig-{name}"), &pattern);
+            match compress_stream_to_temp(&orig, pattern.len() as u64, algo, 3, 1.05) {
+                StreamedPut::Frame { temp, stored } => {
+                    assert!(stored < pattern.len() as u64, "{name} 应有正收益");
+                    let frame = std::fs::read(temp.path()).unwrap();
+                    assert!(is_frame(&frame), "{name} 须为帧形态(17B 头 + 编码流)");
+                    let back = decode_frame(&Bytes::from(frame)).expect("{name} 解码");
+                    assert_eq!(&back[..], &pattern[..], "{name} 流式 roundtrip");
+                }
+                StreamedPut::Original { .. } => panic!("{name} 可压内容应 kept"),
+            }
+            let ent = write_file(dir.path(), &format!("ent-{name}"), &entropy(64 * 1024));
+            match compress_stream_to_temp(&ent, 64 * 1024, algo, 3, 1.05) {
+                StreamedPut::Original { why: "low_ratio" } => {}
+                StreamedPut::Original { why } => panic!("{name} 熵内容应 low_ratio,实为 {why}"),
+                StreamedPut::Frame { .. } => panic!("{name} 熵内容不应 kept"),
+            }
+        }
+        // 零长输入:体量闸形态(镜像 Bytes 口 min_size 语义;调用方通常更早拦下)。
+        let empty = write_file(dir.path(), "empty", b"");
+        assert!(matches!(
+            compress_stream_to_temp(&empty, 0, ALGO_ZSTD, 3, 1.05),
+            StreamedPut::Original { why: "too_small" }
+        ));
+    }
+
+    #[test]
+    fn stream_compress_io_failure_falls_back() {
+        let p = std::path::PathBuf::from("/definitely-not/existent-antfs-putfile-probe");
+        assert!(matches!(
+            compress_stream_to_temp(&p, 64 * 1024, ALGO_GZIP, 3, 1.05),
+            StreamedPut::Original { why: "io" }
+        ));
     }
 }
