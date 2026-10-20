@@ -2238,3 +2238,24 @@ store.md §12.16。
 - e2e 19(新增 `put_file_compression_roundtrip_all_gates`:真 store 三闸走全 —— kept 128 KiB
   帧上传读口解压恒等、100 B too_small 原文直传、128 KiB 强熵 low_ratio 原文直传,监控三笔各记);
 - **workspace 77 套 786/0;clippy 0;fmt 净**;tempfile 由 dev-dep 升为依赖(临时帧文件 RAII)。
+
+### 步 88(s3-meta-cache):S3 网关每请求双查缓存
+
+**动机**:每个数据面请求在路由分发前打两次 metastore —— `lookup_credential`(SigV4 验签)
++ `head_bucket`(authorize 授权门),每请求两跳 DB 往返;吞吐主线前置件(此前"升吞吐前
+不动"档)。
+
+**落地**:`CachingMetaStore` 装饰器(装配点 = `metastore::connect()` 之后;`wrap(ttl=0)`
+原样归还,零行为逃生口)缓存两条热路径:正负条目都缓存,负条目 5s;**本进程写路径即时
+失效**(凭证增删/桶四 set_* + 增删);跨实例 ≤ TTL 收敛(与 S3 最终一致同角);对象面
+一律穿透(读写一致性优先);容量 4096/图(扫过期→清空兜底)。配置
+`s3.metastore.meta_cache_ttl_secs`(默认 30,0=关);观测 `s3_meta_cache_lookups_total
+{kind, result}`。装配:独立二进制 + devcluster 内嵌网关(后者真面默认 30)。
+
+## Testing Done
+
+- antfs-s3 lib **106**(新增 8:命中/负缓存/删凭证失效/建凭证摘负缓存/桶写失效/建桶摘
+  负缓存/确定性过期[直构倒拨时刻,无 sleep]/ttl=0 身份原样归还 + 无缓存行为旁证;
+  S3 断言全走 `wrap` 实际持有的那个 `S3Metrics` 实例,§6 纪律);
+- e2e 夹具 `meta_cache_ttl_secs: 0`(集成面保持真值直连,缓存语义由单测覆盖);
+- **workspace 77 套 794/0;clippy 0;fmt 净**(antfs-s3 lib 98 → 106)。

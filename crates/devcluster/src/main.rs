@@ -485,6 +485,8 @@ async fn start_s3(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
             },
             url: url.to_string(),
             max_connections: 10,
+            // devcluster 同独立二进制默认:双查缓存开(30s),真面即验 hit/miss 观测。
+            meta_cache_ttl_secs: 30,
         },
         router: antfs_router::RouterConfig {
             master_addr: grpc_addr.to_string(),
@@ -519,6 +521,12 @@ async fn start_s3(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
             return None;
         }
     };
+    // 每请求双查缓存(s3-meta-cache):devcluster 网关与独立二进制同语义(ttl=0 不装配)。
+    let metastore = antfs_s3::metastore::cache::wrap(
+        metastore,
+        cfg.metastore.meta_cache_ttl_secs,
+        Arc::clone(&metrics),
+    );
     let state = antfs_s3::server::AppState {
         router,
         metastore,

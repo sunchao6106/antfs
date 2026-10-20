@@ -19,6 +19,7 @@ pub struct S3Metrics {
     pub gc_pending_backlog: antfs_metric::IntGauge,
     pub chunked_requests_total: antfs_metric::IntCounter,
     pub chunked_rejected_total: IntCounterVec,
+    pub meta_cache_lookups_total: IntCounterVec,
 }
 
 impl S3Metrics {
@@ -105,6 +106,12 @@ impl S3Metrics {
                 "s3_chunked_rejected_total",
                 "aws-chunked bodies rejected at declaration or decode (framing/signature/length/oversize)",
                 &["reason"],
+            )?,
+            meta_cache_lookups_total: counter_vec(
+                registry,
+                "s3_meta_cache_lookups_total",
+                "Per-request credential/bucket metastore lookups served by the s3-meta-cache layer",
+                &["kind", "result"],
             )?,
         })
     }

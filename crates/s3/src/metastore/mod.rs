@@ -194,5 +194,6 @@ pub async fn connect(cfg: &MetaStoreConfig) -> std::result::Result<Arc<dyn MetaS
     }
 }
 
+pub mod cache;
 pub mod mysql;
 pub mod pg;

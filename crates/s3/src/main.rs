@@ -24,6 +24,12 @@ async fn main() {
     let metastore = antfs_s3::metastore::connect(&cfg.metastore)
         .await
         .expect("connect metastore");
+    // 每请求双查缓存(`s3-meta-cache`):ttl = 0 时 wrap 原样归还,零行为零开销。
+    let metastore = antfs_s3::metastore::cache::wrap(
+        metastore,
+        cfg.metastore.meta_cache_ttl_secs,
+        Arc::clone(&metrics),
+    );
 
     let router = Arc::new(
         antfs_router::Router::connect(cfg.router.clone(), &registry)

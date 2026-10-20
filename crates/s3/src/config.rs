@@ -122,6 +122,9 @@ pub struct MetaStoreConfig {
     pub driver: String,
     pub url: String,
     pub max_connections: u32,
+    /// 网关每请求双查缓存 TTL(`s3-meta-cache`):auth 验签与授权门两跳的 metastore
+    /// 往返缓存;本进程写路径即时失效,跨实例 ≤ TTL 收敛。**0 = 关(不装配装饰器)**。
+    pub meta_cache_ttl_secs: u64,
 }
 
 impl Default for MetaStoreConfig {
@@ -130,6 +133,7 @@ impl Default for MetaStoreConfig {
             driver: "postgres".to_string(),
             url: "postgres://localhost:5432/antfs_s3".to_string(),
             max_connections: 20,
+            meta_cache_ttl_secs: 30,
         }
     }
 }
@@ -156,6 +160,12 @@ impl Validate for MetaStoreConfig {
             self.max_connections as u64,
             1,
         )?;
+        if self.meta_cache_ttl_secs > 3600 {
+            return Err(antfs_config::ConfigError::invalid(
+                "s3.metastore.meta_cache_ttl_secs",
+                "must be in [0, 3600]",
+            ));
+        }
         Ok(())
     }
 }

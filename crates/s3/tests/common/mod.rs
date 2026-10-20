@@ -550,6 +550,8 @@ impl S3Fixture {
             driver: driver.clone(),
             url: db_url.clone(),
             max_connections: 5,
+            // 集成面保持真值直连(缓存语义由 cache.rs 单测覆盖),不被 TTL 面遮蔽判定。
+            meta_cache_ttl_secs: 0,
         };
         let metastore = antfs_s3::metastore::connect(&metastore_cfg)
             .await
