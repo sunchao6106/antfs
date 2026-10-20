@@ -2095,3 +2095,29 @@ CI 的 2 核 runner 时序放大了撞车概率。这违反了本仓测试纪律
 - `cargo test --workspace` 77 套 765/0;clippy 0;fmt 净(见 48dbad2 之上的修复提交)
 - 竞态机理对照:修复前 = probe→close→之后 bind(TOCTOU 窗口,并行测试可双双拿到同一端口);
   修复后 = bind 即持有并写回,无窗口可撞
+
+### 步 80(router-conflict-surfacing):put 仲裁失败中的确定性 409 透传
+
+**动机**:frontend.md §11 老待办;调研实锤缺口仅在仲裁环一处 —— store 409(`Deleted |
+AlreadyExists → CONFLICT`)与 router 归一层(`classify_err_status → Error::AlreadyExists`)
+早已有,但 `put_keyed` / `put_auto_keyed` / `put_file` 环的失败终判把一切非 507 失败统一
+折叠进 `Quorum` → 网关 503。唯一"调用方确定性不可重试"的写失败被伪装成暂时性失败。
+
+**手术**(与 507 特判同构,最小面):
+- `all_already_exists(f)`:已收集失败非空且全部为 `AlreadyExists` → 返回首个报冲突地址;
+  判定只发生在 `reached()==false` 之后(`collect_majority` 该时必然全 settle ⇒ all =
+  除 ok 外全部),1 ok + 其余 409(W=2 首写后重发形态)仍判成立 —— 数据已在多数副本位;
+- 三处终判插入:**keyed** 507 判定后直接透传;**auto/put_file 环** 409 → 直接返回、
+  **不进 507 式换号重试**(新号撞旧号=号被复用,严重信号必须浮出,不许吞进循环);
+- frontend `router_status` 增 `AlreadyExists → 409`;S3 不加映射(覆盖写合法、无此错误族);
+- 顺带补课:`router/tests/e2e.rs` 是上批零竞态迁移的漏网文件(三层深路径,glob 未罩),
+  free_port 探测模式同批退役(0 端口 + bound 取回;宕机副本模拟地址改字面量)。
+
+**语义红线**(不动):409 **不**计多数派 ack(key 被占 ≠ 本次数据落位);混合失败保守
+Quorum;W/R 算法零改。
+
+## Testing Done
+
+- router lib 单测 17(新增判定矩阵 4 例:全 409/混合/无失败/1ok+409);e2e 13(新增
+  `duplicate_keyed_put_surfaces_conflict`:RF=2 首写 2/2 → 重发同 key → 断言
+  `AlreadyExists` 且读回仍首写内容);**workspace 77 套 767/0;clippy 0;fmt 净**

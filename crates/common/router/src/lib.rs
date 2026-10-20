@@ -510,6 +510,10 @@ impl Router {
             self.evict_partition(pid).await;
             return Err(Error::StoreFull { addr });
         }
+        // 全部(除 ok 外)副本都 409 = key 已被占/已删:确定性失败,透传冲突而非装可重试。
+        if let Some(addr) = all_already_exists(&f) {
+            return Err(Error::AlreadyExists { addr });
+        }
         Err(Error::Quorum {
             acks: f.ok.len(),
             required: f.required,
@@ -604,6 +608,11 @@ impl Router {
                     detail: f.detail(),
                 });
             }
+            // 全部(除 ok 外)副本都 409 = key 冲突:确定性失败直接透传,且**不换号重试** ——
+            // auto 发的新号撞旧号意味着号被复用(严重问题,见 `Error::AlreadyExists` 注释)。
+            if let Some(addr) = all_already_exists(&f) {
+                return Err(Error::AlreadyExists { addr });
+            }
             // 全部副本都 507 = 分区写满:摘掉该分区、换一个分区重试(最多 MAX_STORE_FULL_RETRIES 次)。
             if all_store_full(&f).is_some() && attempt < MAX_STORE_FULL_RETRIES {
                 self.metrics.router_put_store_full_retries.inc();
@@ -680,6 +689,11 @@ impl Router {
                     total: f.total,
                     detail: f.detail(),
                 });
+            }
+            // 全部(除 ok 外)副本都 409 = key 冲突:确定性失败直接透传,且**不换号重试** ——
+            // auto 发的新号撞旧号意味着号被复用(严重问题,见 `Error::AlreadyExists` 注释)。
+            if let Some(addr) = all_already_exists(&f) {
+                return Err(Error::AlreadyExists { addr });
             }
             // 全部副本都 507 = 分区写满:摘掉该分区、换一个分区重试(最多 MAX_STORE_FULL_RETRIES 次)。
             if all_store_full(&f).is_some() && attempt < MAX_STORE_FULL_RETRIES {
@@ -1200,6 +1214,23 @@ fn all_store_full<T>(f: &Fanout<T>) -> Option<String> {
         .then(|| f.failures[0].0.clone())
 }
 
+/// 全部已收集失败均为 409(AlreadyExists)= 确定性 key 冲写;返回首个报冲突的副本地址。
+///
+/// 口径与 [`all_store_full`] 一致(只看已收集失败;多数派未达时 `collect_majority` 必然
+/// 等全部 future settle,故 all = 除 ok 外全部副本报 409)。判定只在 `reached()==false`
+/// 之后调用:有 1 副本成功、其余全 409(如 W=2 得 1 ok + 2 409)仍判成立 —— 该场景
+/// 数据已在多数副本位,重试必然再撞,透传冲突比装可重试诚实。
+/// 部分失败为 409、部分为其它错误时维持 Quorum(判定不了就按暂时性失败处理)。
+fn all_already_exists<T>(f: &Fanout<T>) -> Option<String> {
+    if f.failures.is_empty() {
+        return None;
+    }
+    f.failures
+        .iter()
+        .all(|(_, e)| matches!(e, Error::AlreadyExists { .. }))
+        .then(|| f.failures[0].0.clone())
+}
+
 /// 副本位置排序:`up` 的在前(读路径按序试,先试活着的),同组保持 master 给的顺序。
 fn sorted_replicas(mut replicas: Vec<ReplicaLoc>) -> Vec<ReplicaLoc> {
     replicas.sort_by_key(|r| !r.up);
@@ -1709,6 +1740,53 @@ mod tests {
             );
         }
         assert!(c.take_weighted().is_none(), "分区 2 的段取完");
+    }
+
+    /// 全部失败为 409 = key 冲突;混合错误 / 无失败 ≠ 冲突(语义镜像 507 用例)。
+    #[test]
+    fn all_already_exists_detects_conflict() {
+        let conflict = |addr: &str| {
+            (
+                addr.to_string(),
+                Error::AlreadyExists {
+                    addr: addr.to_string(),
+                },
+            )
+        };
+        let silenced = |addr: &str| {
+            (
+                addr.to_string(),
+                Error::Silenced {
+                    addr: addr.to_string(),
+                    retry_after_secs: None,
+                },
+            )
+        };
+        let fanout = |ok: Vec<()>, failures: Vec<(String, Error)>, total: usize| Fanout {
+            ok,
+            failures,
+            total,
+            required: total / 2 + 1,
+        };
+
+        // 全部 409 → 冲突(返回首个报冲突的副本地址)。
+        assert_eq!(
+            all_already_exists(&fanout(vec![], vec![conflict("a:1"), conflict("b:1")], 2)),
+            Some("a:1".to_string())
+        );
+        // 409 + 其它错误混合 → 判不了,按 Quorum 处理。
+        assert!(
+            all_already_exists(&fanout(vec![], vec![conflict("a:1"), silenced("b:1")], 2))
+                .is_none()
+        );
+        // 无失败 → 不是冲突。
+        assert!(all_already_exists(&fanout(vec![(), ()], vec![], 2)).is_none());
+        // 有成功但多数派未达(1/2,如 W=2 首写后重发:两旧副本 409、一新鲜副本得 ok)
+        // → 仍是确定性冲突,透传。
+        assert_eq!(
+            all_already_exists(&fanout(vec![()], vec![conflict("b:1")], 2)),
+            Some("b:1".to_string())
+        );
     }
 
     /// 全部副本都 507 = 分区写满;部分 507 / 混合错误 / 无失败 ≠ 分区满。

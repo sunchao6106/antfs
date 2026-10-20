@@ -24,7 +24,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 | 方法 | 路径 | 请求 | 成功 | 失败 |
 |---|---|---|---|---|
-| `POST` | `/blobs` | body = blob 裸字节;可选 `x-antfs-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405)。body ≤ `max_body_bytes` 走单 blob;**超过且开启 `auto_chunk_enabled`(默认)时服务端自动分片**(见 §5,201 的 `x-antfs-blob-size` = 逻辑总量) | **201** + `Location: /blobs/{blobId}` + `x-antfs-blob-id: {16 hex}` + `x-antfs-blob-size: {n}` | 400(非法 session 头——分片路径校验;单 blob 直写路径无 id/会话参数)/ 413(超该路径上限:关自动分片 = `max_body_bytes`,开 = 片数 4096 × `auto_chunk_bytes`)/ 507(分区写满)/ 503(未达多数派) |
+| `POST` | `/blobs` | body = blob 裸字节;可选 `x-antfs-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405)。body ≤ `max_body_bytes` 走单 blob;**超过且开启 `auto_chunk_enabled`(默认)时服务端自动分片**(见 §5,201 的 `x-antfs-blob-size` = 逻辑总量) | **201** + `Location: /blobs/{blobId}` + `x-antfs-blob-id: {16 hex}` + `x-antfs-blob-size: {n}` | 400(非法 session 头——分片路径校验;单 blob 直写路径无 id/会话参数)/ 413(超该路径上限:关自动分片 = `max_body_bytes`,开 = 片数 4096 × `auto_chunk_bytes`)/ 409(keyed 写全副本冲突,`router-conflict-surfacing` 2026-10-20 透传;现 REST 路径未部署 keyed 写,契约预留)/ 507(分区写满)/ 503(未达多数派) |
 | `GET` | `/blobs/{blobId}` | — | **200** + 原始字节 | 404(所有副本都没有)/ 400(非法 id)/ 502(分片描述符损坏或片缺失)/ 503(副本不可达) |
 | `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-antfs-blob-size`/`-deleted`/`-expired`/`-expiration-ms`。**拼装对象额外带 `x-antfs-blob-stitched: true` + `x-antfs-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
 | `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑;**删除不可逆**;重复删**幂等**,仍 204) | 404 / 503 / 400 |
@@ -41,8 +41,10 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 - **副本状态码按语义透传**(不再一律 500):副本回的 `400/413/503/507` 分别映射成同名状态码 —— 这些是
   调用方可控的 payload/容量问题(如"对象太大放不进一个段"是 400、"分区写满"是 507),混进 500 会让
   调用方与压测误判成服务端故障。
-- ⚠ **409(冲突)在当前分层下大多不可达**:副本对「已存在 key(存活或已墓碑)的再次 `put`」回 409,
-  但 router 的多副本变更把单副本失败收敛成 `Quorum` → 本层**看不到**这个 409(表现为 503)。
+- **409(冲突)透传**(`router-conflict-surfacing` 2026-10-20):副本对「已存在 key(存活或已墓碑)的
+  再次 `put`」回 409;router 仲裁环对「多数派未达且已收集失败**全为** 409」透传为
+  `AlreadyExists` → 本层映射 409(与 store 数据面同码)。混合失败(409 + 网络/其它)仍按
+  `Quorum` → 503(判定不了就按暂时性失败,routers 保守)。409 **不计**多数派 ack。
   **`DELETE` 已幂等(2026-09-23 拍板)**:墓碑 key 的重复删由副本直接回 204(不写第二条墓碑)→ 多数派达成 → 本层 204;
   从未存在的 key 仍 404(经多数派聚合为 503,既有口径)。
 - **`x-antfs-*` 头命名**:前身沿用 Ambry 的 `x-ambry-*` 头名,2026-10 以 antfs 自有前缀**整体改名**——

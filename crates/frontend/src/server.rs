@@ -173,6 +173,9 @@ fn router_status(e: &RouterError) -> StatusCode {
         RouterError::NotFound { .. } => StatusCode::NOT_FOUND,
         // 分区写满:507 让调用方/压测一眼看出"该加分区了"(与 store 数据面同一约定),不混进 500。
         RouterError::StoreFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
+        // key 冲突(副本 409 透传,keyed 写全失败且皆为冲突):与 store 数据面同码,
+        // 调用方确定性不可重试 —— 不该归进 503 装作暂时性失败。
+        RouterError::AlreadyExists { .. } => StatusCode::CONFLICT,
         // 暂时性失败:未达多数派 / 副本不可达 / 被静默 / 路由到无副本节点 / 号段耗尽 / master 不可用。
         // 都可能自愈或换个副本就好,统一 503 让调用方重试。
         RouterError::Quorum { .. }
@@ -193,9 +196,9 @@ fn router_status(e: &RouterError) -> StatusCode {
             507 => StatusCode::INSUFFICIENT_STORAGE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
-        // 号被复用 / blobId 与目标分区不符 / 配置或传输层损坏:运维或数据损坏问题。
-        RouterError::AlreadyExists { .. }
-        | RouterError::PartitionMismatch { .. }
+        // (号段复用形态的 `AlreadyExists` 已在上方按 409 透传;此处不再列)
+        // blobId 与目标分区不符 / 配置或传输层损坏:运维或数据损坏问题。
+        RouterError::PartitionMismatch { .. }
         | RouterError::Config(_)
         | RouterError::Connect(_)
         | RouterError::Metric(_)
@@ -1246,10 +1249,10 @@ mod tests {
         ] {
             assert_eq!(router_status(&e), StatusCode::SERVICE_UNAVAILABLE, "{e}");
         }
-        // 号被复用 / 本地 IO:不是调用方能改的,归 500。
+        // key 冲突(副本 409 全败透传)→ 409(与 store 数据面同码);本地 IO:不是调用方能改的,归 500。
         assert_eq!(
             router_status(&E::AlreadyExists { addr: "a:1".into() }),
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::CONFLICT
         );
         assert_eq!(
             router_status(&E::Io(std::io::Error::other("x"))),

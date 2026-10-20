@@ -31,23 +31,12 @@ use tonic::transport::Channel;
 
 const SECRET: &str = "test-secret";
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local addr").port()
-}
-
-fn addr(port: u16) -> String {
-    format!("127.0.0.1:{port}")
-}
-
 /// 起单节点 master(自举 → 等自己当选 leader),返回节点与 gRPC 地址。
 async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
-    let raft_addr = addr(free_port());
-    let grpc_addr = addr(free_port());
     let cfg = MasterConfig {
         node_id: 1,
-        raft_addr: raft_addr.clone(),
-        grpc_addr: grpc_addr.clone(),
+        raft_addr: "127.0.0.1:0".to_string(),
+        grpc_addr: "127.0.0.1:0".to_string(),
         data_dir: dir.to_string_lossy().into_owned(),
         initial_members: vec![1],
         cluster_secret: SECRET.to_string(),
@@ -63,6 +52,7 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         .await
         .expect("start master");
     node.serve().expect("serve master");
+    let raft_addr = node.bound_raft_addr().expect("bound raft");
     node.initialize(BTreeMap::from([(1, BasicNode::new(raft_addr))]))
         .await
         .expect("initialize");
@@ -71,6 +61,7 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         .metrics(|m| m.current_leader == Some(1), "leader elected")
         .await
         .expect("leader elected");
+    let grpc_addr = node.bound_grpc_addr().expect("bound grpc");
     (node, grpc_addr)
 }
 
@@ -86,11 +77,10 @@ async fn start_store_with(
     partition_capacity_bytes: u64,
     segment_size_bytes: u64,
 ) -> (StoreServer, String) {
-    let http_addr = addr(free_port());
     let cfg = StoreServerConfig {
         node_id,
         data_dirs: vec![dir.to_string_lossy().into_owned().into()],
-        http_addr: http_addr.clone(),
+        http_addr: "127.0.0.1:0".to_string(),
         master_addr: String::new(),
         partition_capacity_bytes,
         max_body_bytes: 8 << 20,
@@ -110,6 +100,7 @@ async fn start_store_with(
     )
     .expect("start store");
     srv.serve().await.expect("serve store");
+    let http_addr = srv.bound_http_addr().expect("bound http");
     (srv, http_addr)
 }
 
@@ -275,8 +266,8 @@ async fn write_survives_one_dead_replica_and_read_fails_over() {
     register_node(&node, 101, &addr_a).await;
     register_node(&node, 102, &addr_b).await;
 
-    // 第三个副本指向**没有监听**的端口(模拟宕机节点)。
-    let dead_addr = addr(free_port());
+    // 第三个副本指向**没有监听**的地址(模拟宕机节点;节点 id 占端口,零 probe)。
+    let dead_addr = "127.0.0.1:103".to_string();
     register_node(&node, 103, &dead_addr).await;
 
     // RF=3 → 多数派 2:2 真 + 1 死 恰好够写。
@@ -323,6 +314,49 @@ async fn single_replica_partition_requires_one_ack() {
         .expect("RF=1 必须写得进");
     assert_eq!((report.total, report.required, report.acks), (1, 1, 1));
     assert_eq!(client.get(&key).await.expect("get"), data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_keyed_put_surfaces_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let dir_a = tmp.path().join("store-a");
+    let dir_b = tmp.path().join("store-b");
+    let (_sa, addr_a) = start_store(&dir_a, 101).await;
+    let (_sb, addr_b) = start_store(&dir_b, 102).await;
+    register_node(&node, 101, &addr_a).await;
+    register_node(&node, 102, &addr_b).await;
+
+    // RF=2 → W=2:首写在两副本都成功;重发同 key ⇒ 两副本一律 409、无 ok ⇒ 多数派
+    // 未达且失败全为冲突 —— 断言 SDK 把它透传成 AlreadyExists 而非折叠成 Quorum(503 面)。
+    let pid = create_partition(&node, vec![placement(101), placement(102)]).await;
+    ensure_replica(&addr_a, pid).await;
+    ensure_replica(&addr_b, pid).await;
+
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(client_cfg(&grpc), &registry)
+        .await
+        .expect("connect");
+    let key = client.allocate_one().await.expect("allocate");
+    let first = client
+        .put(key, bytes::Bytes::from_static(b"first"))
+        .await
+        .expect("首写必须双副本成功");
+    assert_eq!((first.total, first.required, first.acks), (2, 2, 2));
+
+    let err = client
+        .put(key, bytes::Bytes::from_static(b"second"))
+        .await
+        .expect_err("重发同 key 必须失败");
+    match &err {
+        antfs_router::Error::AlreadyExists { .. } => {}
+        other => panic!("期望 AlreadyExists(409 透传),得到 {other:?}"),
+    }
+    // 读回仍是首写内容(key 已被占,冲突不覆盖)。
+    assert_eq!(
+        client.get(&key).await.expect("get"),
+        bytes::Bytes::from_static(b"first")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

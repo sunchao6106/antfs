@@ -93,7 +93,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `id_exhausted` | 该 partition 的 u32 objectId 空间耗尽 | **封存该分区**(绝不复用号) |
 | `http` | 数据面连不上/超时 | 副本不可达;换副本或等它恢复 |
 | `status` | 副本返回非预期状态码 | 见 detail |
-| `already_exists` | 副本返回 409 | 新号段却被判已存在 → **号被复用**(blobId 永久占用),属严重问题,必须查(重复 `DELETE` 已幂等回 204,不再产生 409) |
+| `already_exists` | 副本返回 409 | keyed 写「多数派未达且已收集失败全为 409」时仲裁环直接透传(`router-conflict-surfacing` 2026-10-20,混合失败仍 Quorum);auto 路径出现 = **号被复用**(严重问题,不换号重试、直接尖叫)。重复 `DELETE` 已幂等回 204,不产生 409 |
 | `store_full` | 副本返回 507 | 该分区写满 → 加分区(别当 500 忽略) |
 | `no_replica` | 副本返回 404「no replica for partition」 | 路由到了不持有该分区的节点 |
 | `silenced` | 副本返回 503 + `Retry-After` | 运维**请求静默**止血,不是故障 |
