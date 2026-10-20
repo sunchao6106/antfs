@@ -1024,3 +1024,114 @@ async fn compression_survives_replication_frame_passthrough() {
         .expect("W=2 双副本帧写入");
     assert_eq!(client.get(&key).await.unwrap(), data, "读回恒等");
 }
+
+/// master-leader-address:client 故意指向 follower → 发号收 not-leader →
+/// 单飞切换 master 通道并重试成功;后续发号直达 leader 不再走自愈路径。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn router_self_heals_when_master_addr_points_at_follower() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (nodes, grpc_addrs) = start_three_node_master(tmp.path()).await;
+    let follower_entry = grpc_addrs
+        .iter()
+        .find(|(id, _)| *id != leader_id_of(&nodes))
+        .expect("follower exists")
+        .clone();
+
+    // (可选)注册一个数据节点 + 分区,让发号有 RW 分区可用(直接 Raft 写,不经 gRPC)。
+    let leader = nodes
+        .iter()
+        .find(|n| n.config.node_id == leader_id_of(&nodes))
+        .unwrap();
+    register_node(leader, 101, "127.0.0.1:101").await;
+    let pid = create_partition(leader, vec![placement(101)]).await;
+
+    // 前置:等 follower 的 leader 提示可得(自报注册经 Raft 异步收敛;轮询带 deadline,禁 sleep)。
+    {
+        use antfs_master::pb::GetBlobIdsRequest;
+        let mut probe = MasterClient::connect(format!("http://{}", follower_entry.1))
+            .await
+            .expect("probe connect");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = probe
+                .get_blob_ids(GetBlobIdsRequest {
+                    version: 1,
+                    cluster_secret: SECRET.to_string(),
+                    count: 4,
+                    partition_id: Some(pid),
+                })
+                .await
+                .expect("probe rpc")
+                .into_inner();
+            if !r.leader_addr.is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    // router 连 follower(master 配置指错):首号触发 not-leader 自愈。
+    let mut cfg = client_cfg(&follower_entry.1);
+    cfg.id_segment_size = 4;
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(cfg, &registry).await.unwrap();
+    let key = client.allocate_one().await.expect("自愈后发号必须成功");
+    assert_eq!(key.partition_id(), pid, "号段来自已建分区");
+    // 后续发号直达 leader(通道已切,不再 not-leader)。
+    let k2 = client.allocate_one().await.expect("切换后发号稳定");
+    assert_ne!(key, k2, "号不重复");
+}
+
+/// 三节点 master 集群(0 端口 + bound 取回;成员地址用 raft bound),等选出 leader。
+/// 返回 (节点, (node_id, grpc_addr) 列表)。
+async fn start_three_node_master(tmp: &std::path::Path) -> (Vec<MasterNode>, Vec<(u64, String)>) {
+    use openraft::BasicNode;
+    let mut nodes = Vec::new();
+    let mut members = std::collections::BTreeMap::new();
+    let mut grpc_addrs = Vec::new();
+    for id in 1u64..=3 {
+        let dir = tmp.join(format!("master-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = antfs_master::config::MasterConfig {
+            node_id: id,
+            raft_addr: "127.0.0.1:0".to_string(),
+            grpc_addr: "127.0.0.1:0".to_string(),
+            data_dir: dir.to_string_lossy().into_owned(),
+            initial_members: vec![1, 2, 3],
+            cluster_secret: SECRET.to_string(),
+            partition_capacity_bytes: 64 << 20,
+            segment_capacity_bytes: 8 << 20,
+            id_alloc_segment_size: 4,
+            id_alloc_raft_batch_multiple: 2,
+            reconcile_startup_grace_secs: 0,
+            ..Default::default()
+        };
+        let registry = antfs_metric::Registry::new();
+        let node = MasterNode::start(cfg, &registry)
+            .await
+            .expect("start master");
+        node.serve().expect("serve master");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
+        grpc_addrs.push((id, node.bound_grpc_addr().expect("bound grpc")));
+        nodes.push(node);
+    }
+    nodes[0].initialize(members).await.expect("initialize");
+    for n in &nodes {
+        n.raft
+            .wait(Some(Duration::from_secs(15)))
+            .metrics(|m| m.current_leader.is_some(), "leader elected")
+            .await
+            .expect("leader elected within timeout");
+    }
+    (nodes, grpc_addrs)
+}
+
+fn leader_id_of(nodes: &[MasterNode]) -> u64 {
+    nodes[0]
+        .raft
+        .metrics()
+        .borrow()
+        .current_leader
+        .expect("has leader")
+}

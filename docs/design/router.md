@@ -88,7 +88,8 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | kind | 触发 | 含义 / 处置 |
 |---|---|---|
 | `connect` / `rpc` | 连不上 master / gRPC 传输或状态错误 | 检查 `router.master_addr` 是否指向 leader |
-| `rejected` | master 明确 `ok=false`(非传输错误) | 文案里带原因(如 "not leader …") |
+| `not_leader` | master 是 follower 而发号打到它(`master-leader-address` 2026-10-20) | 回执带 leader 的 gRPC 提示;router 发号路径**自愈**:单飞切换 master 通道(1s 防抖)并重试一次,切主后指错配置自动恢复;无提示(注册窗口)原样上抛 |
+| `rejected` | master 明确 `ok=false`(非传输错误) | 文案里带原因(如配额/维护等业务性拒绝) |
 | `no_writable_partition` | 集群没有可写(RW)分区 | 建分区 / 把分区解封 |
 | `id_exhausted` | 该 partition 的 u32 objectId 空间耗尽 | **封存该分区**(绝不复用号) |
 | `http` | 数据面连不上/超时 | 副本不可达;换副本或等它恢复 |
@@ -201,9 +202,11 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
   实际规模有限;十万级分区需要换 O(log n) 结构(见待办)。
 
 **待办**:
-- [ ] **leader 重定向**:master 现在回填的 `leader_addr` 是 **raft 内部地址**(membership 里存的是 `RaftInternal` 端口),
-  不能直接当 gRPC 端用 → SDK 目前**不自动改拨**,只把地址写进错误文案。修法:membership 之外另存 grpc 地址,或由
-  调用方在前面挂一层转发。**这是既有写 RPC 的共性问题,不只本 SDK。**
+- [x] ~~leader 重定向~~ —— **已完结**(`master-leader-address` 2026-10-20:master 节点启动自报
+      gRPC 端点进状态机(幂等 upsert,可丢可重建),`leader_addr` 回填以自报表为**唯一真值**
+      (所有者裁定:无历史包袱,不做 raft 地址回退/缺字段容错);router 发号遇 `NotLeader{hint}`
+      **单飞切换 master 通道**(1s 防抖,Mutex 内整体换 client)+ 重试一次,切主后配置指错自动
+      恢复;无提示窗口期原样上抛供上层重试)。
 - [ ] 号段**后台预取**(D2 的双 buffer):现在按需取段,号段边界有 RPC 尖峰。
 - [ ] 读路由缓存 TTL / 失败后强制刷新。
 - [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,frontend 的 `x-antfs-ttl-ms` 已是单次原子写)。

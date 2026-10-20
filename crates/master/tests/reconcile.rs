@@ -1288,17 +1288,25 @@ async fn maintenance_pauses_reconcile_until_disabled() {
         .find(|n| n.config.node_id == follower_id)
         .unwrap();
     let mut fclient = connect(follower).await;
-    let f = set_maintenance(&mut fclient, false, false).await;
-    assert!(
-        !f.ok && f.error == "not leader",
-        "got ok={} err={}",
-        f.ok,
-        f.error
-    );
+    // leader 的自报注册(leader_addr 唯一真值)经 Raft 异步收敛 —— 轮询带 deadline,禁 sleep。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let f = loop {
+        let f = set_maintenance(&mut fclient, false, false).await;
+        assert!(
+            !f.ok && f.error == "not leader",
+            "got ok={} err={}",
+            f.ok,
+            f.error
+        );
+        if !f.leader_addr.is_empty() || tokio::time::Instant::now() >= deadline {
+            break f;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     assert_eq!(
         f.leader_addr,
-        leader.bound_raft_addr().expect("bound raft"),
-        "follower must redirect to the leader"
+        leader.bound_grpc_addr().expect("bound grpc"),
+        "follower must redirect to the leader (gRPC 唯一真值,master-leader-address)"
     );
 
     // 数据节点:101/102/104 心跳存活;103 从不心跳 → 失联(该分区欠副本)。

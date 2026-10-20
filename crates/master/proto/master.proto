@@ -58,7 +58,7 @@ message RegisterRequest {
 message RegisterResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;      // 非 leader 时回填,供 client 重定向
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
 }
 
@@ -170,7 +170,7 @@ message CreatePartitionsRequest {
 message CreatePartitionsResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;        // 非 leader 时回填
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
   repeated uint32 partition_ids = 5;
 }
@@ -227,7 +227,7 @@ message GetBlobIdsRequest {
 message GetBlobIdsResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;      // 非 leader 时回填,供 client 重定向
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
   uint32 partition_id = 5;     // 号段所属分区(blobId 高 32bit)
   uint64 start_object_id = 6;  // 号段起点(blobId 低 32bit);u32 语义用 uint64 承载,避免 uint32 回绕歧义
@@ -245,7 +245,7 @@ message DecommissionRequest {
 message DecommissionResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
   repeated uint32 affected_partitions = 5; // 拒绝时:下线后会掉到 RF 以下且无落点补齐的分区
 }
@@ -298,7 +298,7 @@ message SetPartitionStateRequest {
 message SetPartitionStateResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
 }
 
@@ -320,7 +320,7 @@ message RepairPartitionRequest {
 message RepairPartitionResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;        // 非 leader 时回填
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
   uint64 added_node_id = 5;      // 成功时:新副本落点
   string added_disk_id = 6;
@@ -339,7 +339,7 @@ message MoveReplicaRequest {
 message MoveReplicaResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;        // 非 leader 时回填
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
   uint64 to_node_id = 5;         // 成功时:实际落点(自动选择时回填)
   string to_disk_id = 6;
@@ -375,7 +375,7 @@ message SetMaintenanceRequest {
 message SetMaintenanceResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
 }
 
@@ -394,7 +394,7 @@ message EvalBalanceRequest {
 message EvalBalanceResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3; // 非 leader 时回填
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
   BalancePlan plan = 5;   // 评估结果(status = PREVIEW;无搬迁需求时 moves 为空)
 }
@@ -408,7 +408,7 @@ message StartBalanceRequest {
 message StartBalanceResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
 }
 
@@ -421,7 +421,7 @@ message CancelBalanceRequest {
 message CancelBalanceResponse {
   uint32 version = 1;
   bool ok = 2;
-  string leader_addr = 3;
+  string leader_addr = 3; // 非 leader 时回填 leader 的 gRPC 地址(唯一真值:节点自报注册;未收敛窗口为空)
   string error = 4;
 }
 

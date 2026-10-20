@@ -185,8 +185,9 @@ fn router_status(e: &RouterError) -> StatusCode {
         | RouterError::IdExhausted(_)
         | RouterError::NoWritablePartition
         | RouterError::Master(_) => StatusCode::SERVICE_UNAVAILABLE,
-        // master 明确业务性拒绝(非 leader / 未知分区 / 分区不可写):调用方改不了,也不是本层 bug。
-        RouterError::Rejected(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // master 明确业务性拒绝(非 leader 自愈重试后仍失败 / 未知分区 / 分区不可写):调用方改不了,
+        // 也不是本层 bug —— NotLeader 上抛到这里 = router 自愈已尽(防抖压制或提示不可用),503 让调用方稍后再试。
+        RouterError::NotLeader { .. } | RouterError::Rejected(_) => StatusCode::SERVICE_UNAVAILABLE,
         // 副本返回的状态码:**与 store 数据面一致地透传**调用方可控的那几类 —— 400/413 是 payload 问题、
         // 507 是容量问题、503 是暂时不可用;其余才算意料之外,归 500(契约:以上各类之外 → 500)。
         RouterError::ReplicaStatus { status, .. } => match *status {

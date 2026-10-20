@@ -224,6 +224,29 @@ pub struct MasterNode {
     bound: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
 }
 
+/// master 节点自报循环【serve() 内 spawn】:把本节点的 gRPC 端点注册进状态机(幂等 upsert)。
+/// 选主未收敛时 500ms 起指数退避(封顶 5s);注册成功即退出 —— 数据可丢可重建,故无退出守卫。
+fn spawn_register_endpoint(raft: Raft<TypeConfig>, node_id: NodeId, grpc_addr: String) {
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_millis(500);
+        loop {
+            match raft
+                .client_write(MasterCommand::RegisterMasterEndpoint {
+                    node_id,
+                    grpc_addr: grpc_addr.clone(),
+                })
+                .await
+            {
+                Ok(_) => return,
+                Err(_) => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    });
+}
+
 impl MasterNode {
     /// 打开存储、构建 Raft、装配节点(不建 gRPC 监听;监听见 [`serve`](Self::serve))。
     pub async fn start(
@@ -337,6 +360,12 @@ impl MasterNode {
         grpc_listener.set_nonblocking(true)?;
         // 端口 0(内核分配)时,真实地址只有此处能拿到 —— 绑定成功即写回,取回零竞态。
         self.write_bound(&raft_listener, &grpc_listener)?;
+        // 自报注册(`master-leader-address`):把"可直接连接的 gRPC 地址"写进状态机 ——
+        // leader 提示的唯一真值。单飞退避重试(幂等 upsert ⇒ 重试安全);选主未收敛的窗口里
+        // 持续重试,收敛一次即完成退出。用 bound 地址(端口 0 的内核分配值也对)。
+        if let Some(g) = self.bound_grpc_addr() {
+            spawn_register_endpoint(self.raft.clone(), self.config.node_id, g);
+        }
         tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(
                 tokio::net::TcpListener::from_std(raft_listener)
@@ -1367,16 +1396,19 @@ impl MasterService {
         }
     }
 
-    /// 当前 leader 的对外地址(从 raft membership 里取 Node.addr)。
+    /// 当前 leader 的对外 gRPC 地址(`master-leader-address`):
+    /// **唯一真值 = 状态机 `master_endpoints`**(节点自报;所有者裁定 2026-10-20:无历史包袱、
+    /// 不做 membership raft 地址回退)。自报未收敛的窗口期返回 `None` —— 调用方拿到"无提示"的
+    /// not-leader 后重试即可,自报循环秒级收敛。
     fn leader_addr(&self) -> Option<String> {
-        let m = self.raft.metrics().borrow().clone();
-        let leader = m.current_leader?;
-        let addrs: BTreeMap<u64, String> = m
-            .membership_config
-            .nodes()
-            .map(|(id, n)| (*id, n.addr.clone()))
-            .collect();
-        addrs.get(&leader).cloned()
+        let leader = self.raft.metrics().borrow().current_leader?;
+        self.sm_data
+            .read()
+            .expect("sm_data lock poisoned")
+            .state
+            .master_endpoints
+            .get(&leader)
+            .cloned()
     }
 
     /// 发号失败响应:统一 `ok=false` + 失败计数 + 回填 leader 地址(写路径,非 leader 时 client 据此重定向)。
@@ -3095,6 +3127,7 @@ mod tests {
             next_incarnation: 10,
             object_next: BTreeMap::new(),
             nodes,
+            master_endpoints: BTreeMap::new(),
             partitions,
             policy: Policy::default(),
             decommissioning: BTreeSet::new(),
@@ -3261,6 +3294,7 @@ mod tests {
             next_incarnation: 2,
             object_next: BTreeMap::new(),
             nodes,
+            master_endpoints: BTreeMap::new(),
             partitions,
             policy: Policy::default(),
             decommissioning: BTreeSet::new(),

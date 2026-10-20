@@ -469,6 +469,7 @@ fn apply_is_deterministic_and_assignments_advance_by_one() {
         "next_partition_id": 1,
         "object_next": {},
         "nodes": {},
+        "master_endpoints": {},
         "partitions": {
             "0": {
                 "replication_factor": 1,
@@ -648,13 +649,21 @@ async fn three_node_cluster_agrees_on_incarnations() {
         .find(|n| n.config.node_id != leader_id)
         .expect("a follower");
     let mut follower_client = connect(&follower.bound_grpc_addr().expect("bound grpc")).await;
-    let rejected = assign(&mut follower_client, pid, 101).await;
-    assert!(!rejected.ok, "follower 不得自行发号");
-    assert_eq!(rejected.error, "not leader");
+    // leader 自报注册异步收敛:轮询带 deadline(禁 sleep,§5.6)。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let rejected = loop {
+        let rejected = assign(&mut follower_client, pid, 101).await;
+        assert!(!rejected.ok, "follower 不得自行发号");
+        assert_eq!(rejected.error, "not leader");
+        if !rejected.leader_addr.is_empty() || tokio::time::Instant::now() >= deadline {
+            break rejected;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     assert_eq!(
         rejected.leader_addr,
-        leader.bound_raft_addr().expect("bound raft"),
-        "必须回填 leader 地址供重定向"
+        leader.bound_grpc_addr().expect("bound grpc"),
+        "必须回填 leader 的 gRPC 地址(master-leader-address 唯一真值)"
     );
     assert_eq!(rejected.incarnation, 0, "被拒时 incarnation 为 0(未发号)");
     assert_eq!(snapshot(follower), want, "被拒的请求不得改动状态机");

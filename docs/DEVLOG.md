@@ -2160,3 +2160,24 @@ store.md §12.16。
  devcluster 两态真面(saved 520838 B 实增)。监控 2 项(§7 双表已同步)。
 
 ## Testing Done(workspace 77 套 775/0;clippy 0;fmt 净;细节记 change 落地记录)
+
+### 步 84(master-leader-address):leader 以 gRPC 地址自报 + router 自愈重定向
+
+**动机**:router.md §7 老待办 —— membership 只存 raft 内部地址,`leader_addr` 回
+"用不了的端口",切主后全部 router 配置要人改;发号写路径的非 leader 拒绝是常态路径而
+不是异常。
+
+**落地**:master `serve()` 后自报循环(Raft 幂等 upsert,退避 500ms→5s,收敛即退);
+状态机 `master_endpoints` 是 `leader_addr` 的**唯一真值**(所有者在提案 review 中终裁:
+系统无部署态历史包袱 —— 不做 serde(default) 缺字段容错、不回退 raft 地址;负向单测
+`stored_state_without_master_endpoints_fails_loudly` 钉死严契约);router 新
+`Error::NotLeader{detail, leader_addr}`,发号路径自愈:单飞切换 master channel
+(1s 防抖 + Mutex 整体换 client)+ 重试一次。
+
+## Testing Done
+
+- master 11→**12 套 157**:新增 upsert 幂等单测 + 旧快照负向单测;4 个"缺字段可读"
+  fixture 补 `master_endpoints`(被测语义是**其余字段**缺省,严 字段另钉);3 处
+  集成断言旧"raft 地址"语义改 gRPC 唯一真值 + 注册收敛轮询(禁 sleep,§5.6);
+- router:map_master_error 分类单测 + e2e `router_self_heals…`(3 节点 master,client
+  故意连 follower → 首号自愈成功 → 二号直达)。**workspace 数字见提交 Testing Done**

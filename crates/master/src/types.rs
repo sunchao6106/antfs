@@ -129,6 +129,11 @@ pub struct MasterState {
     pub object_next: BTreeMap<PartitionId, ObjectId>,
     /// 自注册固化的节点身份 + 容量。
     pub nodes: BTreeMap<NodeId, NodeInfo>,
+    /// master 节点自报的对外 gRPC 地址(`RegisterMasterEndpoint`,`master-leader-address`):
+    /// membership 只存 raft 内部地址,这张表是 leader 提示的**唯一**真值(所有者裁定 2026-10-20:
+    /// 系统无部署态历史包袱,不做旧快照容错/fallback)。**可丢可重建**(`serve()` 后自报循环收敛),
+    /// 无恢复依赖;自报未收敛的窗口期 leader 提示为空,由调用方重试。
+    pub master_endpoints: BTreeMap<NodeId, String>,
     /// 分区放置(应然)。M1 空。
     pub partitions: BTreeMap<PartitionId, PartitionInfo>,
     /// 集群策略。
@@ -189,6 +194,7 @@ impl Default for MasterState {
             next_incarnation: default_next_incarnation(),
             object_next: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            master_endpoints: BTreeMap::new(),
             partitions: BTreeMap::new(),
             policy: Policy::default(),
             decommissioning: BTreeSet::new(),
@@ -308,6 +314,11 @@ impl MasterState {
             MasterCommand::RegisterNode { node_id, info } => {
                 // 幂等覆盖:同 node_id 再注册以最新上报为准,不产生重复记录。
                 self.nodes.insert(*node_id, info.clone());
+                MasterResponse::Registered
+            }
+            MasterCommand::RegisterMasterEndpoint { node_id, grpc_addr } => {
+                // 幂等 upsert:重试/重放安全(自报循环依赖此性质)。
+                self.master_endpoints.insert(*node_id, grpc_addr.clone());
                 MasterResponse::Registered
             }
             MasterCommand::CreatePartition {
@@ -526,6 +537,8 @@ pub enum MasterCommand {
     },
     /// 固化(或覆盖)一个节点的身份 + 容量。
     RegisterNode { node_id: NodeId, info: NodeInfo },
+    /// master 节点自报对外 gRPC 地址(幂等 upsert;发号重定向的提示来源)。
+    RegisterMasterEndpoint { node_id: NodeId, grpc_addr: String },
     /// 建分区:分配 id + 写入已选定的副本放置(选盘在 leader 侧先算,见 `placement`)。
     CreatePartition {
         replication_factor: u8,
@@ -1063,6 +1076,8 @@ mod tests {
             "next_partition_id": 3,
             "object_next": {},
             "nodes": {},
+            "master_endpoints": {},
+            "master_endpoints": {},
             "partitions": {},
             "policy": { "default_replication_factor": 3 },
             "decommissioning": [],
@@ -1128,6 +1143,7 @@ mod tests {
             "next_partition_id": 1,
             "object_next": {},
             "nodes": {},
+            "master_endpoints": {},
             "partitions": {},
             "policy": { "default_replication_factor": 3 },
             "decommissioning": []
@@ -1145,6 +1161,7 @@ mod tests {
             "next_partition_id": 2,
             "object_next": {},
             "nodes": {},
+            "master_endpoints": {},
             "partitions": {},
             "policy": { "default_replication_factor": 3 },
             "decommissioning": [],
@@ -1166,6 +1183,7 @@ mod tests {
             "next_partition_id": 2,
             "object_next": {},
             "nodes": {},
+            "master_endpoints": {},
             "partitions": {},
             "policy": { "default_replication_factor": 3 },
             "decommissioning": [],
@@ -1175,6 +1193,65 @@ mod tests {
         });
         let s: MasterState = serde_json::from_value(old_json).expect("old format must deserialize");
         assert_eq!(s.balance, None, "missing balance must default to None");
+    }
+
+    /// `RegisterMasterEndpoint` 幂等 upsert(自报循环依赖重试安全)。
+    #[test]
+    fn register_master_endpoint_is_idempotent_upsert() {
+        let mut s = MasterState::default();
+        assert!(matches!(
+            s.apply_command(&MasterCommand::RegisterMasterEndpoint {
+                node_id: 1,
+                grpc_addr: "127.0.0.1:7101".into(),
+            }),
+            MasterResponse::Registered
+        ));
+        assert!(matches!(
+            s.apply_command(&MasterCommand::RegisterMasterEndpoint {
+                node_id: 1,
+                grpc_addr: "127.0.0.1:9999".into(), // 换地址覆盖(节点重启换端口)
+            }),
+            MasterResponse::Registered
+        ));
+        assert!(matches!(
+            s.apply_command(&MasterCommand::RegisterMasterEndpoint {
+                node_id: 2,
+                grpc_addr: "127.0.0.1:7902".into(),
+            }),
+            MasterResponse::Registered
+        ));
+        assert_eq!(
+            s.master_endpoints.get(&1).map(String::as_str),
+            Some("127.0.0.1:9999")
+        );
+        assert_eq!(
+            s.master_endpoints.get(&2).map(String::as_str),
+            Some("127.0.0.1:7902")
+        );
+    }
+
+    /// 所有者裁定(2026-10-20,master-leader-address):系统**无部署态历史包袱** ——
+    /// `master_endpoints` 不做缺字段容错,缺字段必须**响亮失败**(其余 serde(default) 字段
+    /// 的缺省契约不受影响,见上方四测)。
+    #[test]
+    fn stored_state_without_master_endpoints_fails_loudly() {
+        let bad = serde_json::json!({
+            "next_partition_id": 1,
+            "object_next": {},
+            "nodes": {},
+            "partitions": {},
+            "policy": { "default_replication_factor": 3 },
+            "decommissioning": [],
+            "moving": [],
+            "maintenance": false,
+            "pause_autogrow": false
+        });
+        let r: Result<MasterState, _> = serde_json::from_value(bad);
+        let err = r.expect_err("missing master_endpoints must fail loudly");
+        assert!(
+            err.to_string().contains("master_endpoints"),
+            "err mentions the field: {err}"
+        );
     }
 
     fn preview_plan(plan_id: u64) -> BalancePlanRecord {

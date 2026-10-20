@@ -33,6 +33,16 @@ pub enum Error {
     #[error("master rejected: {0}")]
     Rejected(String),
 
+    /// master 是 follower 而本路由把请求打向了它(发号等写路径)。`leader_addr` 是 follower
+    /// 回填的 leader gRPC 地址(节点自报注册的唯一真值;注册窗口期为 `None` 调用方重试)。
+    /// router 内建自愈:发号路径遇带提示的 NotLeader 会单飞切换 master 通道并重试一次
+    ///(`master-leader-address`);其余路径原样上抛供上层处置。
+    #[error("master is not the leader ({detail}); leader: {leader_addr:?}")]
+    NotLeader {
+        detail: String,
+        leader_addr: Option<String>,
+    },
+
     /// 没有可写分区(集群未建分区 / 全是 RO/SEALED / 无可达副本)。
     #[error("no writable partition")]
     NoWritablePartition,
@@ -111,6 +121,7 @@ impl Error {
             Error::HttpClient(_) => "http_client",
             Error::Master(_) => "rpc",
             Error::Rejected(_) => "rejected",
+            Error::NotLeader { .. } => "not_leader",
             Error::NoWritablePartition => "no_writable_partition",
             Error::IdExhausted(_) => "id_exhausted",
             Error::Http { .. } => "http",

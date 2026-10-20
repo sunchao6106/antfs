@@ -310,8 +310,8 @@ async fn balance_eval_start_executes_to_done() {
     );
     assert_eq!(
         f.leader_addr,
-        leader.bound_raft_addr().expect("bound raft"),
-        "follower must redirect to the leader"
+        leader.bound_grpc_addr().expect("bound grpc"),
+        "follower must redirect to the leader (gRPC 唯一真值,master-leader-address)"
     );
 
     // max_moves=1 → 截断为 1 条(顺带覆盖截断语义;随后重新 eval 覆盖该计划)。

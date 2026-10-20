@@ -447,13 +447,23 @@ async fn follower_refuses_allocation_and_reports_leader() {
     let pid = create_partition(&leader, vec![placement(101)]).await;
 
     // 向 follower 发号:必须拒绝并回填 leader 地址(由 client 重定向)。
+    // leader 的自报注册(leader_addr 的唯一真值)经 Raft 异步收敛 —— 确定性轮询带 deadline,
+    // 不许 sleep(§5.6)。
     let mut client = connect(&grpc[&follower_id]).await;
-    let r = get_ids(&mut client, Some(pid), SEGMENT).await;
-    assert!(!r.ok);
-    assert_eq!(r.error, "not leader");
-    assert!(
-        !r.leader_addr.is_empty(),
-        "非 leader 必须回填 leader 地址供重定向"
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let r = loop {
+        let r = get_ids(&mut client, Some(pid), SEGMENT).await;
+        assert!(!r.ok);
+        assert_eq!(r.error, "not leader");
+        if !r.leader_addr.is_empty() || tokio::time::Instant::now() >= deadline {
+            break r;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let want = leader.bound_grpc_addr().expect("bound grpc");
+    assert_eq!(
+        r.leader_addr, want,
+        "非 leader 必须回填 leader 的 gRPC 地址(master-leader-address 唯一真值)"
     );
 }
 

@@ -375,6 +375,20 @@ message MasterDirective {
 - [x] **Assign 交互对齐 SeaweedFS**:master 发 id + 位置,client 直连存储节点走 HTTP 写(D2/D4);master 不碰数据字节。
 - [x] **Q7 blobId 的对象标识**:blobId = 64bit = `partitionId`(高32) + `objectId`(低32);**objectId = master 按 partition 单调号段发号**(号段批处理不进 per-object 写路径,Raft 水位持久化容忍空洞永不复用)。见 §8 + `openspec/changes/blobid-master-assign`。
 
+### 7.7a master 节点的 gRPC 端点自报(`master-leader-address`,2026-10-20)
+
+- **动机**:membership 只存 raft 内部地址,`leader_addr` 长期回"用不了的端口"(router.md §7 旧
+  待办"leader 重定向"),切主后所有 router 配置须人工改;
+- **机制**:每个 master 在 `serve()` 后经 Raft 命令 `RegisterMasterEndpoint{node_id, grpc_addr}`
+  自报(幂等 upsert,500ms 起指数退避至 5s,收敛一次即退出);状态机字段
+  `master_endpoints`(`MasterState`,**唯一真值**;注册数据可丢可重建);
+- **所有者裁定(2026-10-20)**:系统无部署态历史包袱 —— 不做旧快照缺字段容错(无
+  `serde(default)`,缺字段响亮失败,`stored_state_without_master_endpoints_fails_loudly`
+  钉住)也不回退 membership raft 地址(注册窗口期 `leader_addr` 为空,调用方重试);
+- **消费**:`leader_addr()`(发号/运维回执)以自报表为准;router 发号遇 `NotLeader{hint}`
+  单飞切换 master 通道并重试一次(1s 防抖)—— 详见 `router.md` 错误表;
+- **无新配置/新监控**(自报用既有 `grpc_addr`;注册循环次数不观测 —— 收敛是瞬时态)。
+
 ### 7.7 M1 配置项清单 / 监控项清单(CLAUDE.md §7 必须项)
 
 > 与 `crates/master` 的 `impl Default`+`Validate`(配置)、指标注册处(监控)逐项对齐;改代码即改表。

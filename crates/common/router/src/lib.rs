@@ -227,6 +227,8 @@ pub struct Router {
     cfg: RouterConfig,
     /// master 控制面客户端(tonic 方法需 `&mut self`,故加锁;调用频率 = 每号段一次,不构成瓶颈)。
     master: Mutex<MasterClient<Channel>>,
+    /// 上次自愈切换 master 通道的时刻(ms):1s 防抖,抗选主中期 hint 抖动。
+    last_retarget_ms: std::sync::atomic::AtomicU64,
     http: reqwest::Client,
     /// 号段池。**锁跨取段的 `await` 持有**:号段边界单飞,避免并发调用各取一段。
     ///
@@ -298,6 +300,7 @@ impl Router {
         );
         Ok(Router {
             cfg,
+            last_retarget_ms: std::sync::atomic::AtomicU64::new(0),
             master: Mutex::new(MasterClient::new(channel)),
             http,
             ids,
@@ -339,6 +342,27 @@ impl Router {
 
     /// 申请一个 blobId:本地号段里**按写权重**取(零 RPC);所有分区的号段都取完才对齐一次可写分区列表。
     pub async fn allocate_one(&self) -> Result<StoreKey> {
+        match self.allocate_one_inner().await {
+            // 自愈:master 是 follower(配置指错/已切主)且回执带 leader 的 gRPC 提示 →
+            // 单飞切换 master 通道后**重试一次**;仍失败则原样上抛(调用方/运维可见 hint)。
+            Err(Error::NotLeader {
+                leader_addr: Some(hint),
+                ..
+            }) => {
+                if self.retarget_master(&hint) {
+                    self.allocate_one_inner().await
+                } else {
+                    Err(Error::NotLeader {
+                        detail: "retarget suppressed by debounce".into(),
+                        leader_addr: Some(hint),
+                    })
+                }
+            }
+            r => r,
+        }
+    }
+
+    async fn allocate_one_inner(&self) -> Result<StoreKey> {
         let mut cache = self.ids.lock().await;
         if let Some(key) = cache.take_weighted() {
             return Ok(key);
@@ -352,6 +376,41 @@ impl Router {
         )
         .await?;
         cache.take_weighted().ok_or(Error::NoWritablePartition)
+    }
+
+    /// master 通道整体切换(自愈重定向):1s 防抖窗口内只切一次(hint 抖动/选主中期不放大);
+    /// 切换 = `Mutex<MasterClient>` 整体换新 channel,并发发号方天然串行化。**只换写通道**:
+    /// refresher 的 ListPartitions 是只读、follower 可服务,无需热切。
+    fn retarget_master(&self, hint: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self
+            .last_retarget_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if now.saturating_sub(last) < 1000 {
+            return false;
+        }
+        self.last_retarget_ms
+            .store(now, std::sync::atomic::Ordering::Release);
+        let channel = match Endpoint::from_shared(format!("http://{hint}")).map_err(Error::Connect)
+        {
+            Ok(e) => e
+                .timeout(Duration::from_secs(self.cfg.request_timeout_secs))
+                .connect_lazy(),
+            Err(_) => return false,
+        };
+        let new_client = MasterClient::new(channel);
+        // 无 await 争锁的同步切换:交错等待中的发号方会在锁恢复后自然用新 client。
+        if let Ok(mut guard) = self.master.try_lock() {
+            *guard = new_client;
+            true
+        } else {
+            // 有人持锁(发号在途):放弃本轮切换 —— 该次调用上抛 NotLeader,调用方重试时
+            // 防抖窗口已过、下一轮再切(自愈收敛不丢)。
+            false
+        }
     }
 
     /// 申请 `count` 个 blobId(按分区**写权重**取,可能跨多个分区)。
@@ -1190,7 +1249,13 @@ fn segment_from_response(
     topology: &RwLock<HashMap<PartitionId, Vec<ReplicaLoc>>>,
 ) -> Result<Segment> {
     if !resp.ok {
-        return Err(map_master_error(&resp.error, resp.partition_id));
+        let GetBlobIdsResponse {
+            error,
+            partition_id,
+            leader_addr,
+            ..
+        } = &resp;
+        return Err(map_master_error(error, *partition_id, leader_addr));
     }
     if resp.count == 0 {
         return Err(Error::Rejected(
@@ -1630,11 +1695,15 @@ async fn drain_compressed(
 }
 
 /// master 的业务性拒绝(`ok=false`)→ 归一错误。
-fn map_master_error(error: &str, pid: PartitionId) -> Error {
+///
+/// `not leader` 单独归一为 [`Error::NotLeader`](发号路径据此自愈重定向;`leader_addr` 由调用点
+/// 传入 —— follower 回填的 gRPC 地址,注册窗口期为空)。
+fn map_master_error(error: &str, pid: PartitionId, leader_addr: &str) -> Error {
     if error.contains("not leader") {
-        Error::Rejected(format!(
-            "master is not the leader ({error}); point client.master_addr at the leader"
-        ))
+        Error::NotLeader {
+            detail: error.to_string(),
+            leader_addr: (!leader_addr.is_empty()).then(|| leader_addr.to_string()),
+        }
     } else if error.contains("no writable partition") {
         Error::NoWritablePartition
     } else if error.contains("exhausted") {
@@ -1647,6 +1716,29 @@ fn map_master_error(error: &str, pid: PartitionId) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// not-leader 归一为带 leader 提示的 NotLeader(master-leader-address);空提示 → None。
+    #[test]
+    fn map_master_error_classifies_not_leader_with_hint() {
+        match map_master_error("not leader", 0, "127.0.0.1:7101") {
+            Error::NotLeader { leader_addr, .. } => {
+                assert_eq!(leader_addr.as_deref(), Some("127.0.0.1:7101"))
+            }
+            other => panic!("want NotLeader, got {other:?}"),
+        }
+        match map_master_error("not leader", 0, "") {
+            Error::NotLeader { leader_addr, .. } => assert_eq!(leader_addr, None),
+            other => panic!("want NotLeader, got {other:?}"),
+        }
+        assert!(matches!(
+            map_master_error("no writable partition", 0, ""),
+            Error::NoWritablePartition
+        ));
+        assert!(matches!(
+            map_master_error("whatever else", 3, ""),
+            Error::Rejected(_)
+        ));
+    }
 
     /// 滚动升级读接缝:旧 store 的 metadata JSON 无 composed 字段 → false 不炸;
     /// 新 store 回 true。
