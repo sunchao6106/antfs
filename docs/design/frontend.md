@@ -227,8 +227,9 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
       `read_range` 切片原语 + 数据面 GET 分块流(512 KiB 过每盘有界池,单请求内存 =
       单块,与对象大小无关);`?replication=1` 复制读保持整读原路含 CRC;细节见
       ``store.md`` §12.15)。
-- [ ] **单副本 409 透传**(`put` 撞已存在 key 时 store 回 409(`server.rs` 已 CONFLICT),
-      router `classify_err_status` 也已归一为 `Error::AlreadyExists` —— 差的是仲裁环:
-      quorum 失败终判把一切失败统一折叠进 `Error::Quorum` → gateway 503。需在失败终判
-      给确定性 409 单独出口(全部失败且皆为 409 时直接透传)。重复 `DELETE` 已幂等 204,
-      不在此列)。
+- [x] ~~单副本 409 透传~~ —— **已完结**(`router-conflict-surfacing` 2026-10-20:仲裁环
+      失败终判新增 `all_already_exists` 特判(与 507 特判同构),已收集失败全为冲突 →
+      透传 `Error::AlreadyExists`;混合失败保守 Quorum;409 不计 ack;`router_status`
+      增 `AlreadyExists → 409`(现 REST 路径无 keyed 写,契约面预留)。**勾销注记
+      (2026-10-20 补):40e8f0a 落地时只改了 §2/§4,本条勾销漏改 —— 文档落后于代码
+      一小时,本次补正。**(重复 `DELETE` 已幂等 204,不在此列)。
