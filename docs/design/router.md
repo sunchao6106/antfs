@@ -228,6 +228,12 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
       驱逐。观测 `router_topology_refreshes_total{reason=ttl|evict}`)。
 - [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,frontend 的 `x-antfs-ttl-ms` 已是单次原子写)。
 - [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
+- [ ] **上传路径零本地临时盘(全链路,所有者指示事后做)**:① 客户端 `put_file` 压缩的帧文件
+      (`tempfile::NamedTempFile`,落 TMPDIR,详见 §7 SDK 透明压缩);② 服务端 > 1 MiB 带 CL 的
+      PUT 暂存 `<data_dir>/tmp/`(见 `store.md` 数据面端点·"流式 PUT"条目)。前置条件:store 补
+      chunked(无 CL)流式落盘路径;压缩比率闸语义重裁决(采样启发[SeaweedFS 派,判错认栽] /
+      两遍确定性[CPU 1+N] / 放弃诚实比率);多副本并传的编码流形态(CPU×N vs 共享帧)。
+      方案矩阵(B0-B4:现状/尺寸分档/帧目录可配/完全流式)已呈所有者,**待定**。
 - [ ] **admin 手动权重入口 → master**:现在写权重只有"由容量现算"一个来源(`capacity_weight_permille`)。要做人工
   压权重,路径是 admin → master 写进同一处 → 同一个 `write_weight` 字段下发,**客户端零改动**(router 只当相对权重用)。
 - [ ] **SWRR 的 O(n) → O(log n)**:分区数上千时每次发号遍历在册分区不划算,需要换堆 / 树的加权调度结构。当前
