@@ -566,7 +566,13 @@ store server(一个进程 / 一台数据节点)
   请求快失败 `503 + Retry-After`,含拉复制读/`replica-metadata`/`segments`;`/metrics` 与 `/admin/**` **永不被挡**)
   + **IO 看门狗**(闭包内 syscall 计时,不受探测开关约束)。详见 [`store.md` §12.12](./store.md)。
   **master 侧 D4/D5/D6 仍待续**(见下面「待续」)。
-- [ ] **store 需补 `drop`**:关闭 + 删 partition-replica 目录、回收磁盘。
+- [x] ~~**store 需补 `drop`**:关闭 + 删 partition-replica 目录、回收磁盘~~ —— **已完结**(S2 即落地,
+      纯文档滞后):`ReplicaManager::drop_replica`(先摘句柄 + 等在飞 drain → 删整目录;句柄已在时按盘定位、
+      已被 OFFLINE 摘时扫盘找残留目录,不留孤儿副本;幂等 —— 重复 DROPPED 指令/重放安全返回 `false`);
+      心跳消费 `MasterDirective` 的 `DROPPED` 臂摘数据的同步 IO offload 到阻塞池;真实删除才计数
+      `store_server_replicas_dropped_total`。证据:单测 `drop_replica_deletes_dir_and_is_idempotent` +
+      OFFLINE 不删/挂回不换代、DROPPED 删后代际换新(`replica.rs` 内嵌测试)+ 真 HTTP 集成
+      `tests/replica_drop.rs`(真心跳流批内幂等)+ 搬迁后删源(`tests/compaction_replication.rs`)。
 
 ### 9.1 实现状态 + 配置/监控清单(CLAUDE.md §7 必须项)
 
