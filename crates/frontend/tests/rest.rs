@@ -27,23 +27,12 @@ const DISK: &str = "d0";
 /// 默认单请求 body 上限(与 `StoreServerConfig::default` 的同名项对齐,够 3 MiB 走通流式上传)。
 const MAX_BODY_BYTES: u64 = 8 << 20;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local addr").port()
-}
-
-fn addr(port: u16) -> String {
-    format!("127.0.0.1:{port}")
-}
-
 /// 起单节点 master(自举 → 等自己当选 leader)。
 async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
-    let raft_addr = addr(free_port());
-    let grpc_addr = addr(free_port());
     let cfg = MasterConfig {
         node_id: 1,
-        raft_addr: raft_addr.clone(),
-        grpc_addr: grpc_addr.clone(),
+        raft_addr: "127.0.0.1:0".to_string(),
+        grpc_addr: "127.0.0.1:0".to_string(),
         data_dir: dir.to_string_lossy().into_owned(),
         initial_members: vec![1],
         cluster_secret: SECRET.to_string(),
@@ -61,6 +50,7 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         .await
         .expect("start master");
     node.serve().expect("serve master");
+    let raft_addr = node.bound_raft_addr().expect("bound raft");
     node.initialize(BTreeMap::from([(1u64, BasicNode::new(raft_addr))]))
         .await
         .expect("initialize");
@@ -69,16 +59,16 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         .metrics(|m| m.current_leader == Some(1), "leader elected")
         .await
         .expect("leader elected");
+    let grpc_addr = node.bound_grpc_addr().expect("bound grpc");
     (node, grpc_addr)
 }
 
 /// 起一个真数据节点(刻意**不接 master**:注册走测试直连 Raft,避免心跳噪声与等待)。
 async fn start_store(node_id: u64, dir: &std::path::Path) -> (StoreServer, String) {
-    let http_addr = addr(free_port());
     let cfg = StoreServerConfig {
         node_id,
         data_dirs: vec![dir.to_string_lossy().into_owned().into()],
-        http_addr: http_addr.clone(),
+        http_addr: "127.0.0.1:0".to_string(),
         master_addr: String::new(),
         partition_capacity_bytes: 64 << 20,
         max_body_bytes: MAX_BODY_BYTES,
@@ -97,6 +87,7 @@ async fn start_store(node_id: u64, dir: &std::path::Path) -> (StoreServer, Strin
     )
     .expect("start store");
     srv.serve().await.expect("serve store");
+    let http_addr = srv.bound_http_addr().expect("bound http");
     (srv, http_addr)
 }
 
@@ -191,7 +182,8 @@ impl Fixture {
         cors_origins: Vec<String>,
     ) -> Fixture {
         let cfg = FrontendConfig {
-            listen_addr: addr(free_port()),
+            // 端口 0:bind 由内核分配真址(见 start_with_frontend 内 bind 后写回)。
+            listen_addr: "127.0.0.1:0".to_string(),
             max_body_bytes,
             cors_allowed_origins: cors_origins,
             ..Default::default()
@@ -221,7 +213,9 @@ impl Fixture {
         // 副本清单里出现、但不在 101..=103 的节点 = 假节点(无监听端口),模拟宕机副本。
         for node_id in replica_nodes {
             if !store_addrs.contains_key(node_id) {
-                register_node(&master, *node_id, &addr(free_port())).await;
+                // 宕机副本模拟:占位地址(节点 id 当端口),无人监听即"不可达"。
+                let fake = format!("127.0.0.1:{node_id}");
+                register_node(&master, *node_id, &fake).await;
             }
         }
         let pid = create_partition(
@@ -238,7 +232,7 @@ impl Fixture {
         // ---- frontend(真端口 + 真 SDK)----
         let registry = antfs_metric::Registry::new();
         let mut cfg = cfg;
-        cfg.listen_addr = addr(free_port());
+        cfg.listen_addr = "127.0.0.1:0".to_string();
         cfg.router = RouterConfig {
             master_addr: grpc_addr,
             cluster_secret: SECRET.to_string(),
@@ -255,7 +249,10 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)
             .await
             .expect("bind frontend");
-        let frontend_addr = cfg.listen_addr.clone();
+        let frontend_addr = listener
+            .local_addr()
+            .expect("bound frontend addr")
+            .to_string();
         let router = build_router(state);
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;

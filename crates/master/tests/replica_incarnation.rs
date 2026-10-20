@@ -35,25 +35,17 @@ use tonic::transport::Channel;
 const SECRET: &str = "test-secret";
 const DISK: &str = "d0";
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local addr").port()
-}
-
-fn base_config(id: u64, dir: &Path, members: Vec<u64>) -> (MasterConfig, String) {
-    let raft_addr = format!("127.0.0.1:{}", free_port());
-    let grpc_addr = format!("127.0.0.1:{}", free_port());
-    let cfg = MasterConfig {
+fn base_config(id: u64, dir: &Path, members: Vec<u64>) -> MasterConfig {
+    MasterConfig {
         node_id: id,
-        raft_addr: raft_addr.clone(),
-        grpc_addr,
+        raft_addr: "127.0.0.1:0".to_string(),
+        grpc_addr: "127.0.0.1:0".to_string(),
         data_dir: dir.to_string_lossy().into_owned(),
         initial_members: members,
         cluster_secret: SECRET.to_string(),
         reconcile_startup_grace_secs: 0,
         ..Default::default()
-    };
-    (cfg, raft_addr)
+    }
 }
 
 fn placement(node_id: NodeId, disk: &str) -> ReplicaPlacement {
@@ -68,13 +60,13 @@ fn placement(node_id: NodeId, disk: &str) -> ReplicaPlacement {
 
 /// 起一个单节点 master(自举 → 等自己当选 leader)。
 async fn solo_master(dir: &Path) -> (MasterNode, String) {
-    let (cfg, raft_addr) = base_config(1, dir, vec![1]);
-    let grpc_addr = cfg.grpc_addr.clone();
+    let cfg = base_config(1, dir, vec![1]);
     let registry = Registry::new();
     let node = MasterNode::start(cfg, &registry)
         .await
         .expect("start solo master");
     node.serve().expect("serve");
+    let raft_addr = node.bound_raft_addr().expect("bound raft");
     node.initialize(BTreeMap::from([(1, BasicNode::new(raft_addr))]))
         .await
         .expect("initialize");
@@ -83,6 +75,7 @@ async fn solo_master(dir: &Path) -> (MasterNode, String) {
         .metrics(|m| m.current_leader == Some(1), "solo leader elected")
         .await
         .expect("leader elected");
+    let grpc_addr = node.bound_grpc_addr().expect("bound grpc");
     (node, grpc_addr)
 }
 
@@ -523,11 +516,12 @@ async fn three_node_cluster_agrees_on_incarnations() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let (cfg, raft_addr) = base_config(id, &dir, vec![1, 2, 3]);
-        raft_addrs.insert(id, BasicNode::new(raft_addr));
+        let cfg = base_config(id, &dir, vec![1, 2, 3]);
         let registry = Registry::new();
         let node = MasterNode::start(cfg, &registry).await.expect("start node");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        raft_addrs.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0]
@@ -590,7 +584,7 @@ async fn three_node_cluster_agrees_on_incarnations() {
         .expect("move replica");
 
     // 经 gRPC 申领一个新身份(leader-only 写)。
-    let mut client = connect(&leader.config.grpc_addr).await;
+    let mut client = connect(&leader.bound_grpc_addr().expect("bound grpc")).await;
     let reassigned = assign(&mut client, pid, 101).await;
     assert!(reassigned.ok, "assign must succeed: {}", reassigned.error);
 
@@ -653,12 +647,13 @@ async fn three_node_cluster_agrees_on_incarnations() {
         .iter()
         .find(|n| n.config.node_id != leader_id)
         .expect("a follower");
-    let mut follower_client = connect(&follower.config.grpc_addr).await;
+    let mut follower_client = connect(&follower.bound_grpc_addr().expect("bound grpc")).await;
     let rejected = assign(&mut follower_client, pid, 101).await;
     assert!(!rejected.ok, "follower 不得自行发号");
     assert_eq!(rejected.error, "not leader");
     assert_eq!(
-        rejected.leader_addr, leader.config.raft_addr,
+        rejected.leader_addr,
+        leader.bound_raft_addr().expect("bound raft"),
         "必须回填 leader 地址供重定向"
     );
     assert_eq!(rejected.incarnation, 0, "被拒时 incarnation 为 0(未发号)");

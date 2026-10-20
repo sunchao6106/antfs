@@ -84,6 +84,8 @@ pub struct StoreServer {
     config: StoreServerConfig,
     state: AppState,
     disks: DiskManager,
+    /// `serve()` 绑定后的真实 `http_addr`;端口写 0 时由内核分配,绑定前为 `None`(取回零竞态)。
+    bound_http: std::sync::Mutex<Option<String>>,
 }
 
 impl StoreServer {
@@ -173,8 +175,17 @@ impl StoreServer {
                 standalone,
             },
             disks,
+            bound_http: std::sync::Mutex::new(None),
         })
     }
+    /// `serve()` 绑定后的实际 http 地址(配置端口 0 时为内核分配值;未 serve 则 `None`)。
+    pub fn bound_http_addr(&self) -> Option<String> {
+        self.bound_http
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// axum 路由(测试可直接拿去 `oneshot`;生产用 [`serve`](Self::serve))。
     ///
     /// 数据面路由先合并再挂两层:内层 `DefaultBodyLimit`(按 [`StoreServerConfig::max_body_bytes`]),
@@ -224,6 +235,9 @@ impl StoreServer {
     /// 绑定 `http_addr` 后台运行数据面 + (若配置)接入 master 的注册/心跳 + (若开启)主动磁盘探测。
     pub async fn serve(&self) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(&self.config.http_addr).await?;
+        // 端口 0(内核分配)时,真实地址只有此处能拿到 —— 绑定成功即写回,取回零竞态。
+        *self.bound_http.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(listener.local_addr()?.to_string());
         let router = self.router();
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;

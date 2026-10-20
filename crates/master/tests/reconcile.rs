@@ -13,14 +13,6 @@ use openraft::BasicNode;
 
 const SECRET: &str = "test-secret";
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
     MasterConfig {
         node_id: id,
@@ -51,11 +43,12 @@ fn cfg(id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
     }
 }
 
-fn data_node(rack: &str) -> NodeInfo {
+fn data_node(id: u64, rack: &str) -> NodeInfo {
     NodeInfo {
         dc: "dc1".into(),
         rack: rack.into(),
-        addr: format!("127.0.0.1:{}", free_port()),
+        // 假地址仅作拓扑记账(测试无真 store 连它),用节点 id 占端口,零 probe。
+        addr: format!("127.0.0.1:{id}"),
         disks: BTreeMap::from([(
             "d0".to_string(),
             antfs_master::types::DiskSpec {
@@ -117,11 +110,12 @@ async fn reconcile_transitions_and_rereplication() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg(id, &dir, free_port(), free_port());
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg(id, &dir, 0, 0);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -145,7 +139,7 @@ async fn reconcile_transitions_and_rereplication() {
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: id,
-                info: data_node(rack),
+                info: data_node(id, rack),
             })
             .await
             .expect("register data node");
@@ -185,9 +179,12 @@ async fn reconcile_transitions_and_rereplication() {
         other => panic!("unexpected: {other:?}"),
     };
 
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
 
     // (a) 转移下发:101 上报 pid current=BOOTSTRAP(≠target ACTIVE)→ 响应含转移指令。
     let mut hb101 = client
@@ -255,11 +252,12 @@ async fn decommission_evacuates_replicas_add_before_remove() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg(id, &dir, free_port(), free_port());
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg(id, &dir, 0, 0);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -281,7 +279,7 @@ async fn decommission_evacuates_replicas_add_before_remove() {
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: id,
-                info: data_node(rack),
+                info: data_node(id, rack),
             })
             .await
             .expect("register");
@@ -319,16 +317,19 @@ async fn decommission_evacuates_replicas_add_before_remove() {
         other => panic!("unexpected: {other:?}"),
     };
 
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
 
     // 全部 4 个数据节点心跳保持存活(含被下线的 103),并**各自如实上报自己的副本为 `ACTIVE`**。
     //
     // 为什么必须报 ACTIVE:删源闸门已统一 —— 两条 evacuation 路径都要求"数得上的每一份**已追平**"
     // 才允许删源(否则会把还在 `BOOTSTRAP` 的那份算成已有数据,可能删掉盘上唯一一份可用数据)。
     // 上线的 `DecommissionNode` 在真实集群里也是这么工作的:store 会持续上报 `current_state`。
-    let grpc = leader.config.grpc_addr.clone();
+    let grpc = leader.bound_grpc_addr().expect("bound grpc");
     let keepalive = tokio::spawn(async move {
         let mut c = MasterClient::connect(format!("http://{grpc}"))
             .await
@@ -420,11 +421,12 @@ async fn repair_and_move_replica_validation() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg_no_reconcile(id, &dir, free_port(), free_port());
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg_no_reconcile(id, &dir, 0, 0);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -446,7 +448,7 @@ async fn repair_and_move_replica_validation() {
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: id,
-                info: data_node(rack),
+                info: data_node(id, rack),
             })
             .await
             .expect("register");
@@ -484,9 +486,12 @@ async fn repair_and_move_replica_validation() {
         other => panic!("unexpected: {other:?}"),
     };
 
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
     for id in [101u64, 102, 103, 104] {
         let mut hb = client
             .heartbeat(tokio_stream::iter(vec![beat(id, vec![])]))
@@ -689,11 +694,12 @@ async fn move_replica_completes_add_before_remove() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg(id, &dir, free_port(), free_port());
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg(id, &dir, 0, 0);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -715,7 +721,7 @@ async fn move_replica_completes_add_before_remove() {
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: id,
-                info: data_node(rack),
+                info: data_node(id, rack),
             })
             .await
             .expect("register");
@@ -753,9 +759,12 @@ async fn move_replica_completes_add_before_remove() {
         other => panic!("unexpected: {other:?}"),
     };
 
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
     // 104 暂不心跳(不是候选):此时 move 无落点。
     for id in [101u64, 102, 103] {
         let mut hb = client
@@ -871,11 +880,12 @@ async fn assign_lookup_counters_and_cluster_gauges() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg(id, &dir, free_port(), free_port()); // reconcile 1s 周期、grace 0
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg(id, &dir, 0, 0); // reconcile 1s 周期、grace 0
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -891,9 +901,12 @@ async fn assign_lookup_counters_and_cluster_gauges() {
         .iter()
         .find(|n| n.config.node_id == leader_id)
         .unwrap();
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
 
     // 尚无分区:assign 必失败(ok=false);lookup 不存在的分区 → not found。两者都计入 requests。
     let a = client
@@ -918,7 +931,7 @@ async fn assign_lookup_counters_and_cluster_gauges() {
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: id,
-                info: data_node(rack),
+                info: data_node(id, rack),
             })
             .await
             .expect("register");
@@ -1056,12 +1069,13 @@ async fn start_masters(tmp: &std::path::Path, grace: u64) -> Vec<MasterNode> {
     for id in 1u64..=3 {
         let dir = tmp.join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut c = cfg(id, &dir, free_port(), free_port());
+        let mut c = cfg(id, &dir, 0, 0);
         c.reconcile_startup_grace_secs = grace;
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -1089,7 +1103,8 @@ fn leader_of(nodes: &[MasterNode]) -> &MasterNode {
 }
 
 async fn connect(node: &MasterNode) -> MasterClient<tonic::transport::Channel> {
-    MasterClient::connect(format!("http://{}", node.config.grpc_addr))
+    let addr = node.bound_grpc_addr().expect("bound grpc");
+    MasterClient::connect(format!("http://{addr}"))
         .await
         .expect("connect")
 }
@@ -1100,7 +1115,7 @@ async fn register_data_nodes(leader: &MasterNode, ids: &[(u64, &str)]) {
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: *id,
-                info: data_node(rack),
+                info: data_node(*id, rack),
             })
             .await
             .expect("register data node");
@@ -1281,7 +1296,8 @@ async fn maintenance_pauses_reconcile_until_disabled() {
         f.error
     );
     assert_eq!(
-        f.leader_addr, leader.config.raft_addr,
+        f.leader_addr,
+        leader.bound_raft_addr().expect("bound raft"),
         "follower must redirect to the leader"
     );
 
@@ -2034,11 +2050,12 @@ async fn heartbeat_directive_carries_partition_states() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg(id, &dir, free_port(), free_port());
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg(id, &dir, 0, 0);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -2060,7 +2077,7 @@ async fn heartbeat_directive_carries_partition_states() {
         .raft
         .client_write(MasterCommand::RegisterNode {
             node_id: 101,
-            info: data_node("rA"),
+            info: data_node(101, "rA"),
         })
         .await
         .expect("register data node");
@@ -2083,9 +2100,12 @@ async fn heartbeat_directive_carries_partition_states() {
         other => panic!("unexpected: {other:?}"),
     };
 
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
 
     // 新分区默认 RW:该节点上报承载副本 → 指令里必须带 (pid, RW)。
     let d = send_beat(&mut client, 101, vec![replica(pid, "ACTIVE", 0)]).await;
@@ -2151,11 +2171,12 @@ async fn cluster_with_spare(tmp: &std::path::Path) -> Vec<MasterNode> {
     for id in 1u64..=3 {
         let dir = tmp.join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg_fast_liveness(id, &dir, free_port(), free_port());
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg_fast_liveness(id, &dir, 0, 0);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -2176,7 +2197,7 @@ async fn cluster_with_spare(tmp: &std::path::Path) -> Vec<MasterNode> {
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: id,
-                info: data_node(rack),
+                info: data_node(id, rack),
             })
             .await
             .expect("register data node");
@@ -2233,9 +2254,12 @@ async fn liveness_debounce_absorbs_a_single_missed_beat_but_still_detects_real_d
     // 唯一备选只剩 104 —— 断言因此是**确定**的(不用猜 placement 在平票时选谁)。
     let pid = create_partition_on(leader, &[101, 102, 103]).await;
 
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
 
     // 三个节点各上报一次(让它们在软状态里"在册",并如实报出各自的副本);此后只有 101/102 继续上报。
     for id in [101u64, 102, 103] {
@@ -2267,7 +2291,7 @@ async fn liveness_debounce_absorbs_a_single_missed_beat_but_still_detects_real_d
 
     // 101/102 持续心跳(在后台跑,保证它们不会跟着一起过期)。
     // 先把地址拷成 owned String —— `spawn` 要求 `'static`,不能借住 `nodes`。
-    let grpc_addr = leader.config.grpc_addr.clone();
+    let grpc_addr = leader.bound_grpc_addr().expect("bound grpc");
     let keepalive = tokio::spawn(async move {
         let mut c = MasterClient::connect(format!("http://{grpc_addr}"))
             .await
@@ -2352,9 +2376,12 @@ async fn rereplication_budget_throttles_a_node_death_but_never_stalls() {
         v
     };
 
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
     // 三个节点各上报一次(在册 + 如实报副本);此后 103 静止,101/102 保持心跳。
     for id in [101u64, 102, 103] {
         let replicas = pids
@@ -2383,7 +2410,7 @@ async fn rereplication_budget_throttles_a_node_death_but_never_stalls() {
             .into_inner();
         hb.message().await.expect("recv").expect("directive");
     }
-    let grpc_addr = leader.config.grpc_addr.clone();
+    let grpc_addr = leader.bound_grpc_addr().expect("bound grpc");
     let keepalive = tokio::spawn(async move {
         let mut c = MasterClient::connect(format!("http://{grpc_addr}"))
             .await
@@ -2466,8 +2493,8 @@ async fn bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_ac
         std::fs::create_dir_all(&dir).unwrap();
         let c = MasterConfig {
             node_id: id,
-            raft_addr: format!("127.0.0.1:{}", free_port()),
-            grpc_addr: format!("127.0.0.1:{}", free_port()),
+            raft_addr: "127.0.0.1:0".to_string(),
+            grpc_addr: "127.0.0.1:0".to_string(),
             data_dir: dir.to_string_lossy().into_owned(),
             initial_members: vec![1, 2, 3],
             cluster_secret: SECRET.to_string(),
@@ -2481,10 +2508,11 @@ async fn bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_ac
             disk_evac_max_in_flight: 1,
             ..Default::default()
         };
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -2505,14 +2533,14 @@ async fn bad_disk_evacuation_copies_first_and_removes_only_after_successor_is_ac
             .raft
             .client_write(MasterCommand::RegisterNode {
                 node_id: id,
-                info: data_node(rack),
+                info: data_node(id, rack),
             })
             .await
             .expect("register");
     }
     // RF=2 落在 (101,d0)/(102,d0):(101,d0) 判坏后,候选只有 103/104(平票取小 ⇒ 103)。
     let pid = create_partition_on(leader, &[101, 102]).await;
-    let grpc = leader.config.grpc_addr.clone();
+    let grpc = leader.bound_grpc_addr().expect("bound grpc");
 
     let sm = leader.sm_data.clone();
 

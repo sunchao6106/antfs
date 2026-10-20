@@ -21,14 +21,6 @@ const DISK_CAPACITY: u64 = 1_000_000_000_000;
 const DISK_FREE: u64 = 900_000_000_000;
 const NODE: u64 = 101;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// 单节点 master:关掉调谐(宽限期极长),只观察心跳通路的增量行为。
 fn cfg(node_id: u64, dir: &std::path::Path, raft: u16, grpc: u16) -> MasterConfig {
     MasterConfig {
@@ -108,16 +100,14 @@ async fn start_cluster(
 ) -> (MasterNode, MasterClient<tonic::transport::Channel>) {
     std::fs::create_dir_all(dir).unwrap();
     let registry = antfs_metric::Registry::new();
-    let node = MasterNode::start(cfg(1, dir, free_port(), free_port()), &registry)
+    let node = MasterNode::start(cfg(1, dir, 0, 0), &registry)
         .await
         .expect("start");
     node.serve().expect("serve");
-    node.initialize(BTreeMap::from([(
-        1,
-        BasicNode::new(node.config.raft_addr.clone()),
-    )]))
-    .await
-    .expect("initialize");
+    let raft_addr = node.bound_raft_addr().expect("bound raft");
+    node.initialize(BTreeMap::from([(1, BasicNode::new(raft_addr))]))
+        .await
+        .expect("initialize");
     node.raft
         .wait(Some(Duration::from_secs(15)))
         .metrics(|m| m.current_leader.is_some(), "leader")
@@ -129,7 +119,8 @@ async fn start_cluster(
             info: NodeInfo {
                 dc: "dc1".into(),
                 rack: "rA".into(),
-                addr: format!("127.0.0.1:{}", free_port()),
+                // 假地址仅作拓扑记账,用节点 id 占端口,零 probe。
+                addr: format!("127.0.0.1:{NODE}"),
                 disks: BTreeMap::from([(
                     "d0".to_string(),
                     antfs_master::types::DiskSpec {
@@ -141,9 +132,12 @@ async fn start_cluster(
         })
         .await
         .expect("register data node");
-    let client = MasterClient::connect(format!("http://{}", node.config.grpc_addr))
-        .await
-        .expect("connect");
+    let client = MasterClient::connect(format!(
+        "http://{}",
+        node.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect");
     (node, client)
 }
 

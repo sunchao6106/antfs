@@ -2070,3 +2070,28 @@ curl 超时属运维调参面。
 - 历史档案(DEVLOG 47-77 步、openspec 历版归档)按"改记不改史"保留;本步为最新裁决
 
 ## 发运
+
+### 步 79:测试端口零竞态 —— serve() 支持端口 0 + 绑定写回(CI 两连败根修)
+
+**动机**:CI 连续两次红(48dbad2 Ubuntu `master/tests/reconcile.rs` 的
+`maintenance_pauses_reconcile_until_disabled`,b409c28 的 s3 集成 `common/mod.rs`),
+都是 `serve: AddrInUse` —— **与被测改动无关**的 flake。本地全绿纯粹是时序侥幸。
+
+**根因链**:16 处测试用 `free_port()`(临时 `TcpListener::bind(127.0.0.1:0)` 拿号 → 关闭
+→ 之后才真正 serve)。probe 与真 bind 之间是 TOCTOU 窗口,cargo test 默认并行,同二进制内
+两个测试先后 probe 到**同一端口**(内核顺序分配)→ 后者真 bind 时 `AddrInUse`。
+CI 的 2 核 runner 时序放大了撞车概率。这违反了本仓测试纪律(§5.6 确定性,禁 sleep/竞态侥幸)。
+
+**修法(机制级,非补丁级)**:`serve()` 本就是"返回前完成 bind"(DEVLOG 50)—— 顺势让
+**bind 后把真实地址写回**:
+- `MasterNode` 增 `bound`(Arc&lt;Mutex&lt;Option&lt;(raft, grpc)&gt;&gt;)字段 + `bound_raft_addr()` /
+  `bound_grpc_addr()`;serve 内两 listener bind 成功即写回。
+- `StoreServer` 同:`bound_http_addr()`。
+- 测试面 16 处全改 `*:0` + serve 后取回 —— 端口所有权从"探测再碰运气"变成"bind 即持有",
+  竞态窗口**从机制上归零**,不靠时序。锁临界区仅一次赋值(poison 不变量 → into_inner 惯用法)。
+
+## Testing Done
+
+- `cargo test --workspace` 77 套 765/0;clippy 0;fmt 净(见 48dbad2 之上的修复提交)
+- 竞态机理对照:修复前 = probe→close→之后 bind(TOCTOU 窗口,并行测试可双双拿到同一端口);
+  修复后 = bind 即持有并写回,无窗口可撞

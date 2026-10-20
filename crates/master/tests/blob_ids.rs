@@ -33,18 +33,11 @@ const MULTIPLE: u32 = 2;
 /// 号段 4 × 倍数 2 → 每次抬水位预留 8 个号。
 const BATCH: u32 = SEGMENT * MULTIPLE;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local addr").port()
-}
-
-fn base_config(id: u64, dir: &Path, members: Vec<u64>) -> (MasterConfig, String, String) {
-    let raft_addr = format!("127.0.0.1:{}", free_port());
-    let grpc_addr = format!("127.0.0.1:{}", free_port());
+fn base_config(id: u64, dir: &Path, members: Vec<u64>) -> MasterConfig {
     let cfg = MasterConfig {
         node_id: id,
-        raft_addr: raft_addr.clone(),
-        grpc_addr: grpc_addr.clone(),
+        raft_addr: "127.0.0.1:0".to_string(),
+        grpc_addr: "127.0.0.1:0".to_string(),
         data_dir: dir.to_string_lossy().into_owned(),
         initial_members: members,
         cluster_secret: SECRET.to_string(),
@@ -54,17 +47,18 @@ fn base_config(id: u64, dir: &Path, members: Vec<u64>) -> (MasterConfig, String,
         id_alloc_raft_batch_multiple: MULTIPLE,
         ..Default::default()
     };
-    (cfg, raft_addr, grpc_addr)
+    cfg
 }
 
 /// 起一个单节点 master(自举 → 等自己当选 leader),返回节点与 gRPC 地址。
 async fn solo_master(dir: &Path) -> (MasterNode, String) {
-    let (cfg, raft_addr, grpc_addr) = base_config(1, dir, vec![1]);
+    let cfg = base_config(1, dir, vec![1]);
     let registry = Registry::new();
     let node = MasterNode::start(cfg, &registry)
         .await
         .expect("start solo master");
     node.serve().expect("serve");
+    let raft_addr = node.bound_raft_addr().expect("bound raft");
     node.initialize(BTreeMap::from([(1, BasicNode::new(raft_addr))]))
         .await
         .expect("initialize");
@@ -73,6 +67,7 @@ async fn solo_master(dir: &Path) -> (MasterNode, String) {
         .metrics(|m| m.current_leader == Some(1), "solo leader elected")
         .await
         .expect("leader elected");
+    let grpc_addr = node.bound_grpc_addr().expect("bound grpc");
     (node, grpc_addr)
 }
 
@@ -410,12 +405,14 @@ async fn follower_refuses_allocation_and_reports_leader() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let (cfg, raft_addr, grpc_addr) = base_config(id, &dir, vec![1, 2, 3]);
-        members.insert(id, BasicNode::new(raft_addr));
-        grpc.insert(id, grpc_addr.clone());
+        let cfg = base_config(id, &dir, vec![1, 2, 3]);
         let registry = Registry::new();
         let node = MasterNode::start(cfg, &registry).await.expect("start node");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
+        let grpc_addr = node.bound_grpc_addr().expect("bound grpc");
+        grpc.insert(id, grpc_addr.clone());
         nodes.push((node, grpc_addr));
     }
     nodes[0].0.initialize(members).await.expect("initialize");

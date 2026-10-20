@@ -28,14 +28,6 @@ fn used_of(pid: u32) -> u64 {
     (pid as u64 + 1) * 10_000
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn cfg(
     id: u64,
     dir: &std::path::Path,
@@ -78,11 +70,12 @@ async fn start_masters(tmp: &std::path::Path, move_timeout_secs: u64) -> Vec<Mas
     for id in 1u64..=3 {
         let dir = tmp.join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = cfg(id, &dir, free_port(), free_port(), move_timeout_secs);
-        members.insert(id, BasicNode::new(c.raft_addr.clone()));
+        let c = cfg(id, &dir, 0, 0, move_timeout_secs);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(c, &registry).await.expect("start");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        members.insert(id, BasicNode::new(raft_addr));
         nodes.push(node);
     }
     nodes[0].initialize(members).await.expect("initialize");
@@ -110,7 +103,8 @@ fn leader_of(nodes: &[MasterNode]) -> &MasterNode {
 }
 
 async fn connect(node: &MasterNode) -> MasterClient<tonic::transport::Channel> {
-    MasterClient::connect(format!("http://{}", node.config.grpc_addr))
+    let addr = node.bound_grpc_addr().expect("bound grpc");
+    MasterClient::connect(format!("http://{addr}"))
         .await
         .expect("connect")
 }
@@ -121,7 +115,7 @@ async fn register_data_nodes(leader: &MasterNode) {
         let info = NodeInfo {
             dc: "dc1".into(),
             rack: format!("r{}", (b'A' + i as u8) as char),
-            addr: format!("127.0.0.1:{}", free_port()),
+            addr: format!("127.0.0.1:{id}"),
             disks: BTreeMap::from([(
                 "d0".to_string(),
                 DiskSpec {
@@ -315,7 +309,8 @@ async fn balance_eval_start_executes_to_done() {
         f.error
     );
     assert_eq!(
-        f.leader_addr, leader.config.raft_addr,
+        f.leader_addr,
+        leader.bound_raft_addr().expect("bound raft"),
         "follower must redirect to the leader"
     );
 

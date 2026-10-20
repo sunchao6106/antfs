@@ -14,11 +14,6 @@ use openraft::BasicNode;
 
 const SECRET: &str = "test-secret";
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local addr").port()
-}
-
 fn node_config(id: u64, dir: &std::path::Path, raft_port: u16, grpc_port: u16) -> MasterConfig {
     MasterConfig {
         node_id: id,
@@ -59,11 +54,12 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     for id in 1u64..=3 {
         let dir = tmp.path().join(format!("n{id}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = node_config(id, &dir, free_port(), free_port());
-        raft_addrs.insert(id, BasicNode::new(cfg.raft_addr.clone()));
+        let cfg = node_config(id, &dir, 0, 0);
         let registry = antfs_metric::Registry::new();
         let node = MasterNode::start(cfg, &registry).await.expect("start node");
         node.serve().expect("serve");
+        let raft_addr = node.bound_raft_addr().expect("bound raft");
+        raft_addrs.insert(id, BasicNode::new(raft_addr));
         registries.insert(id, registry);
         nodes.push(node);
     }
@@ -130,9 +126,12 @@ async fn three_node_cluster_elects_leader_and_registers_node() {
     }
 
     // 控制面 gRPC:ListNodes 与 GetClusterState 可读到注册结果。
-    let mut client = MasterClient::connect(format!("http://{}", leader.config.grpc_addr))
-        .await
-        .expect("connect leader gRPC");
+    let mut client = MasterClient::connect(format!(
+        "http://{}",
+        leader.bound_grpc_addr().expect("bound grpc")
+    ))
+    .await
+    .expect("connect leader gRPC");
     let list = client
         .list_nodes(ListNodesRequest { version: 1 })
         .await
@@ -291,12 +290,12 @@ async fn get_metrics_exports_prometheus_text() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("n1");
     std::fs::create_dir_all(&dir).unwrap();
-    let cfg = node_config(1, &dir, free_port(), free_port());
-    let raft_addr = cfg.raft_addr.clone();
-    let grpc_addr = cfg.grpc_addr.clone();
+    let cfg = node_config(1, &dir, 0, 0);
     let registry = antfs_metric::Registry::new();
     let node = MasterNode::start(cfg, &registry).await.expect("start");
     node.serve().expect("serve");
+    let raft_addr = node.bound_raft_addr().expect("bound raft");
+    let grpc_addr = node.bound_grpc_addr().expect("bound grpc");
     // 单成员集群自举。
     node.initialize(BTreeMap::from([(1u64, BasicNode::new(raft_addr))]))
         .await

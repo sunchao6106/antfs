@@ -219,6 +219,9 @@ pub struct MasterNode {
     pub placement_epoch: Arc<AtomicU64>,
     /// placement 派生索引(心跳侧 `node -> pids`;见 [`PlacementIndex`])。
     pub placement_index: PlacementIndex,
+    /// `serve()` 绑定后的真实地址 `(raft, grpc)`;端口写 0 时由内核分配,绑定前为 `None`。
+    /// 测试并行的确定性端口由此取回(probe-then-bind 的 TOCTOU 竞态曾致 CI 随机 `AddrInUse`)。
+    bound: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
 }
 
 impl MasterNode {
@@ -262,6 +265,7 @@ impl MasterNode {
             registry: registry.clone(),
             placement_epoch,
             placement_index: PlacementIndex::default(),
+            bound: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -272,6 +276,37 @@ impl MasterNode {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.raft.initialize(members).await?;
         Ok(())
+    }
+
+    fn write_bound(
+        &self,
+        raft: &std::net::TcpListener,
+        grpc: &std::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bound = (
+            raft.local_addr()?.to_string(),
+            grpc.local_addr()?.to_string(),
+        );
+        *self.bound.lock().unwrap_or_else(|e| e.into_inner()) = Some(bound);
+        Ok(())
+    }
+
+    /// `serve()` 绑定后的实际 raft 地址(配置端口 0 时为内核分配值;未 serve 则 `None`)。
+    pub fn bound_raft_addr(&self) -> Option<String> {
+        self.bound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(raft, _)| raft.clone())
+    }
+
+    /// `serve()` 绑定后的实际 gRPC 地址(配置端口 0 时为内核分配值;未 serve 则 `None`)。
+    pub fn bound_grpc_addr(&self) -> Option<String> {
+        self.bound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, grpc)| grpc.clone())
     }
 
     /// 绑定并后台运行两个 gRPC 服务:`RaftInternal`(raft_addr)与 `Master`(grpc_addr)。
@@ -300,6 +335,8 @@ impl MasterNode {
         raft_listener.set_nonblocking(true)?;
         let grpc_listener = std::net::TcpListener::bind(grpc_addr)?;
         grpc_listener.set_nonblocking(true)?;
+        // 端口 0(内核分配)时,真实地址只有此处能拿到 —— 绑定成功即写回,取回零竞态。
+        self.write_bound(&raft_listener, &grpc_listener)?;
         tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(
                 tokio::net::TcpListener::from_std(raft_listener)

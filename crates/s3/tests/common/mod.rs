@@ -63,23 +63,12 @@ const URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 
 // ── cluster bootstrap (mirrors crates/frontend/tests/rest.rs) ────────────────────────────────
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local addr").port()
-}
-
-fn addr(port: u16) -> String {
-    format!("127.0.0.1:{port}")
-}
-
 /// Start a single-node master (bootstrap → wait until it elects itself leader).
 async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
-    let raft_addr = addr(free_port());
-    let grpc_addr = addr(free_port());
     let cfg = MasterConfig {
         node_id: 1,
-        raft_addr: raft_addr.clone(),
-        grpc_addr: grpc_addr.clone(),
+        raft_addr: "127.0.0.1:0".to_string(),
+        grpc_addr: "127.0.0.1:0".to_string(),
         data_dir: dir.to_string_lossy().into_owned(),
         initial_members: vec![1],
         cluster_secret: SECRET.to_string(),
@@ -96,6 +85,7 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         .await
         .expect("start master");
     node.serve().expect("serve master");
+    let raft_addr = node.bound_raft_addr().expect("bound raft");
     node.initialize(BTreeMap::from([(1u64, BasicNode::new(raft_addr))]))
         .await
         .expect("initialize");
@@ -104,17 +94,17 @@ async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
         .metrics(|m| m.current_leader == Some(1), "leader elected")
         .await
         .expect("leader elected");
+    let grpc_addr = node.bound_grpc_addr().expect("bound grpc");
     (node, grpc_addr)
 }
 
 /// Start a real data node (deliberately not pointed at the master: registration goes through a
 /// direct Raft write so there is no heartbeat noise to wait on).
 async fn start_store(node_id: u64, dir: &std::path::Path) -> (StoreServer, String) {
-    let http_addr = addr(free_port());
     let cfg = StoreServerConfig {
         node_id,
         data_dirs: vec![dir.to_string_lossy().into_owned().into()],
-        http_addr: http_addr.clone(),
+        http_addr: "127.0.0.1:0".to_string(),
         master_addr: String::new(),
         partition_capacity_bytes: 64 << 20,
         max_body_bytes: MAX_BODY_BYTES,
@@ -133,6 +123,7 @@ async fn start_store(node_id: u64, dir: &std::path::Path) -> (StoreServer, Strin
     )
     .expect("start store");
     srv.serve().await.expect("serve store");
+    let http_addr = srv.bound_http_addr().expect("bound http");
     (srv, http_addr)
 }
 
@@ -584,7 +575,8 @@ impl S3Fixture {
         } else {
             None
         };
-        let s3_addr = addr(free_port());
+        // 端口 0:bind 由内核分配真址,绑定成功后回填(零 probe 竞态)。
+        let s3_addr = "127.0.0.1:0".to_string();
         let cfg = S3GatewayConfig {
             listen_addr: s3_addr.clone(),
             region: REGION.to_string(),
@@ -614,6 +606,10 @@ impl S3Fixture {
         let listener = tokio::net::TcpListener::bind(&s3_addr)
             .await
             .expect("bind s3 gateway");
+        let s3_addr = listener
+            .local_addr()
+            .expect("bound s3 gateway addr")
+            .to_string();
         let app = build_app(state.clone());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app.into_make_service()).await;
@@ -672,12 +668,15 @@ impl S3Fixture {
         &mut self,
         new_master: std::sync::Arc<antfs_s3::sse::MasterKey>,
     ) {
-        let addr_str = addr(free_port());
         let mut state = self.state.clone();
         state.sse = Some(new_master);
-        let listener = tokio::net::TcpListener::bind(&addr_str)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind s3 gateway");
+        let addr_str = listener
+            .local_addr()
+            .expect("bound s3 gateway addr")
+            .to_string();
         let app = build_app(state.clone());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app.into_make_service()).await;
