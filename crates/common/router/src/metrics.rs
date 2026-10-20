@@ -30,6 +30,8 @@ pub struct RouterMetrics {
     pub compression_saved_bytes: IntCounter,
     /// 读拓扑重拉次数,label `reason`(ttl = 周期过期 / evict = 全副本不可达驱逐)。
     pub topology_refreshes: IntCounterVec,
+    /// 号段后台预取失败次数(成功不打:成功的预取自然体现在耗尽次数下降)。
+    pub prefetch_errors: IntCounter,
     /// blob 读请求数,label `outcome`。
     pub get_total: IntCounterVec,
     /// 读出的字节数(counter,只计成功)。
@@ -100,6 +102,11 @@ impl RouterMetrics {
                 "router_topology_refreshes_total",
                 "read-topology refreshes (ttl expiry or all-replica-unreachable eviction)",
                 &["reason"],
+            )?,
+            prefetch_errors: counter(
+                registry,
+                "router_id_prefetch_errors_total",
+                "background id-segment prefetch failures (spike-smoothing enhancement, not correctness)",
             )?,
             get_total: counter_vec(
                 registry,

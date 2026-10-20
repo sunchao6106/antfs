@@ -160,6 +160,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_compression_attempts_total` | counter | `outcome` | 次 | SDK 压缩三闸判定数(取值 `kept` / `too_small` / `low_ratio` / `disabled`,稳定契约) | `CompressionMetrics.*`(速率/比率族) |
 | `router_compression_saved_bytes_total` | counter | — | 字节 | 压缩节省字节数(`orig − stored`,只计 kept) | `CompressionMetrics.compressRate` 族近义 |
 | `router_topology_refreshes_total` | counter | `reason` | 次 | 读拓扑重拉次数(`ttl` = TTL 到期 / `evict` = 全副本不可达驱逐;`router-read-topology-refresh` 2026-10-20) | 无 |
+| `router_id_prefetch_errors_total` | counter | — | 次 | 号段后台预取失败数(成功不打 —— 成功即用耗尽次数的下降体现;`router-id-prefetch` 2026-10-20) | 无 |
 
 > **权重是否生效怎么观测(本次不新增指标)**:发号按写权重分配本身**不打点** —— 它是一条分配策略,不是故障。
 > 要核它是否生效,看这两处:`Router::write_weights() -> Vec<(PartitionId, u32)>`(当前生效的权重只读快照,pid 升序)
@@ -208,7 +209,11 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
       (所有者裁定:无历史包袱,不做 raft 地址回退/缺字段容错);router 发号遇 `NotLeader{hint}`
       **单飞切换 master 通道**(1s 防抖,Mutex 内整体换 client)+ 重试一次,切主后配置指错自动
       恢复;无提示窗口期原样上抛供上层重试)。
-- [ ] 号段**后台预取**(D2 的双 buffer):现在按需取段,号段边界有 RPC 尖峰。
+- [x] ~~号段后台预取~~ —— **已完结**(`router-id-prefetch` 2026-10-20:发号时段位进入低水位
+      (剩余 < ¼ 段长或 ≤ 2 号)→ 单飞预取同分区一段(同区一拍一次,失败静默计数
+      `router_id_prefetch_errors_total`);回填**无缝续段**(master 连号恰对上即零空洞续,
+      对不上保守丢弃不造额外空洞),拓扑条目顺带刷新;耗尽的同步补段路径原样保留 = 正确性
+      零依赖)。
 - [x] ~~读路由缓存 TTL / 失败后强制刷新~~ —— **已完结**(`router-read-topology-refresh`
       2026-10-20:条目带时戳,TTL = `partition_refresh_secs`(与后台刷新共用旋钮,0=关)，
       过期读前 Lookup 重拉(失败保旧表,读可用性优先);R=1 全副本失败且含不可达类 → 驱逐

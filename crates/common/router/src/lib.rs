@@ -92,10 +92,16 @@ pub struct BlobStat {
 /// 一个分区上已从 master 取回、尚未发完的 blobId 号段。
 struct Segment {
     pid: PartitionId,
+    /// 本段起始号(发 master 的 `start_object_id`;号段后台预取的低水位分母)。
+    start: u32,
     /// 下一个待发号(含);`next >= end` 即已取完。
     next: u32,
     end: u32,
 }
+
+/// 号段后台预取(`router-id-prefetch`)的低水位:段剩余量 < 1/4 段长发起补号。
+/// 剩余 ≤ 2 号恒触发(极小段也平滑);预取失败静默,下一拍水位仍在自然再试。
+const PREFETCH_MIN_REMAIN: u32 = 2;
 
 /// 号段池:**每个可写分区各持一段**(段大小按写权重配比),取号时在它们之间**按写权重**轮转。
 #[derive(Default)]
@@ -166,6 +172,35 @@ impl IdCache {
             self.credit.remove(&pid);
         }
         Some(key)
+    }
+
+    /// 号段低水位探针(`router-id-prefetch`):任意分区段剩余量 < 1/4 段长(或剩余 ≤ 2 号)
+    /// 返回该 pid —— 调用方单飞补号,平滑号段耗尽时的同步 RPC 尖峰。
+    fn low_water_pid(&self) -> Option<PartitionId> {
+        self.segments
+            .values()
+            .find(|s| {
+                let remain = s.end - s.next;
+                let len = s.end.saturating_sub(s.start).max(1);
+                remain > 0
+                    && (remain <= PREFETCH_MIN_REMAIN || u64::from(remain) * 4 < u64::from(len))
+            })
+            .map(|s| s.pid)
+    }
+
+    /// 预取回填:目标分区已有段 ⇒ **无缝续段**(裸号位;master 连续发号,恰好对上 —— 得到
+    /// 不对上即放弃,保守不产生空洞);无段 ⇒ 直接插入(耗尽后预取到位的形态)。
+    /// topological 的附带刷新(segment_from_response 已做)不重复。
+    fn extend_segment(&mut self, seg: Segment) {
+        if let Some(cur) = self.segments.get_mut(&seg.pid) {
+            if cur.end == seg.next {
+                // master 发号连续性:恰是本段之后整段补足 ⇒ 直接续(零空洞)。
+                cur.end = seg.end;
+            }
+            // else:并发期间段已被耗尽/被 507 摘除 ⇒ 丢弃该预算(保守:多余号即空洞,可控)。
+        } else {
+            self.segments.insert(seg.pid, seg);
+        }
     }
 
     /// 分区写满(全副本 507)后把它从本地号段池里摘掉:段、权重、信用一并清除。
@@ -259,7 +294,7 @@ enum ReadOutcome {
 pub struct Router {
     cfg: RouterConfig,
     /// master 控制面客户端(tonic 方法需 `&mut self`,故加锁;调用频率 = 每号段一次,不构成瓶颈)。
-    master: Mutex<MasterClient<Channel>>,
+    master: Arc<Mutex<MasterClient<Channel>>>,
     /// 上次自愈切换 master 通道的时刻(ms):1s 防抖,抗选主中期 hint 抖动。
     last_retarget_ms: std::sync::atomic::AtomicU64,
     http: reqwest::Client,
@@ -274,6 +309,8 @@ pub struct Router {
     topology: Arc<Topology>,
     latency: Arc<LatencyTable>,
     metrics: Arc<RouterMetrics>,
+    /// 号段后台预取在飞分区(`router-id-prefetch`):同区一拍一次,单飞任务独占写回。
+    prefetching: Arc<std::sync::Mutex<std::collections::HashSet<PartitionId>>>,
 }
 
 /// 一次多数派扇出的结果。
@@ -332,8 +369,9 @@ impl Router {
         );
         Ok(Router {
             cfg,
+            prefetching: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             last_retarget_ms: std::sync::atomic::AtomicU64::new(0),
-            master: Mutex::new(MasterClient::new(channel)),
+            master: Arc::new(Mutex::new(MasterClient::new(channel))),
             http,
             ids,
             topology,
@@ -397,6 +435,11 @@ impl Router {
     async fn allocate_one_inner(&self) -> Result<StoreKey> {
         let mut cache = self.ids.lock().await;
         if let Some(key) = cache.take_weighted() {
+            // 号段后台预取:当前段进入低水位 → 单飞补同分区(min(剩余,段容))号,
+            // 不阻塞本次发号(失败静默,下一拍水位仍在自然再试)。
+            if let Some(pid) = cache.low_water_pid() {
+                self.spawn_prefetch(pid);
+            }
             return Ok(key);
         }
         sync_segments(
@@ -408,6 +451,46 @@ impl Router {
         )
         .await?;
         cache.take_weighted().ok_or(Error::NoWritablePartition)
+    }
+
+    /// 号段预取单飞(`router-id-prefetch`):同区一拍一次(prefetching 布防);补号量取
+    /// `id_segment_size` 段容。任务持字段 Arc 副本(Router 本就以上层 Arc 共享,无需自引);
+    /// 失败计数 `prefetch_errors` 且静默 —— 预取是平滑号段边界尖峰的增强,不是正确性依赖。
+    fn spawn_prefetch(&self, pid: PartitionId) {
+        {
+            let mut g = self.prefetching.lock().expect("prefetching lock poisoned");
+            if g.contains(&pid) {
+                return;
+            }
+            g.insert(pid);
+        }
+        let size = self.cfg.id_segment_size;
+        let ids = Arc::clone(&self.ids);
+        let master = Arc::clone(&self.master);
+        let cfg = self.cfg.clone();
+        let metrics = Arc::clone(&self.metrics);
+        let topology = Arc::clone(&self.topology);
+        let prefetching = Arc::clone(&self.prefetching);
+        tokio::spawn(async move {
+            let mut client = master.lock().await.clone();
+            let req = GetBlobIdsRequest {
+                version: PROTO_VERSION,
+                cluster_secret: cfg.cluster_secret.clone(),
+                count: size,
+                partition_id: Some(pid),
+            };
+            match client.get_blob_ids(req).await {
+                Ok(resp) => {
+                    if let Ok(seg) = segment_from_response(resp.into_inner(), &metrics, &topology) {
+                        let mut cache = ids.lock().await;
+                        cache.extend_segment(seg);
+                    }
+                }
+                Err(_) => metrics.prefetch_errors.inc(),
+            }
+            let mut g = prefetching.lock().expect("prefetching lock poisoned");
+            g.remove(&pid);
+        });
     }
 
     /// master 通道整体切换(自愈重定向):1s 防抖窗口内只切一次(hint 抖动/选主中期不放大);
@@ -1377,6 +1460,7 @@ fn segment_from_response(
         .insert(pid, TopoEntry::now(sorted_replicas(resp.replicas)));
     Ok(Segment {
         pid,
+        start,
         next: start,
         end: start.saturating_add(resp.count),
     })
@@ -1817,6 +1901,93 @@ fn map_master_error(error: &str, pid: PartitionId, leader_addr: &str) -> Error {
 mod tests {
     use super::*;
 
+    /// 号段低水位探针与预取回填(`router-id-prefetch`)。
+    #[test]
+    fn low_water_and_extend_segment_semantics() {
+        let mut c = IdCache {
+            order: vec![PartitionWeight { pid: 0, weight: 1 }],
+            ..Default::default()
+        };
+        // 段 [0,4):取 1 号后剩 3(>¼ 段长 1)→ 不触发;剩 1(≤2 恒触发)→ 触发。
+        c.segments.insert(
+            0,
+            Segment {
+                pid: 0,
+                start: 0,
+                next: 1,
+                end: 4,
+            },
+        );
+        assert!(c.low_water_pid().is_none(), "3/4 残量不触发");
+        c.segments.insert(
+            0,
+            Segment {
+                pid: 0,
+                start: 0,
+                next: 3,
+                end: 4,
+            },
+        );
+        assert_eq!(c.low_water_pid(), Some(0), "剩余 ≤2 恒触发");
+
+        // 大段 [0,100):剩 < ¼(×4 < len)触发;25% 恰不触发(< 严格)。
+        c.segments.insert(
+            0,
+            Segment {
+                pid: 0,
+                start: 0,
+                next: 99,
+                end: 100,
+            },
+        );
+        assert_eq!(c.low_water_pid(), Some(0), "1 号残量 < ¼ 段长");
+        c.segments.insert(
+            0,
+            Segment {
+                pid: 0,
+                start: 0,
+                next: 25,
+                end: 100,
+            },
+        );
+        assert!(c.low_water_pid().is_none(), "恰 ¼ 不触发(严格 <)");
+
+        // 续段:当前段 [4,8) 耗尽(next==end==8),预取回 [8,12) ⇒ next 恰对上 → 无缝续。
+        c.segments.insert(
+            0,
+            Segment {
+                pid: 0,
+                start: 4,
+                next: 8,
+                end: 8,
+            },
+        );
+        c.extend_segment(Segment {
+            pid: 0,
+            start: 8,
+            next: 8,
+            end: 12,
+        });
+        assert_eq!(c.segments[&0].end, 12, "连续号无缝续段(零空洞)");
+        // 落空:回段 next 对不上([9,13))⇒ 丢弃(保守,不造空洞)。
+        c.extend_segment(Segment {
+            pid: 0,
+            start: 9,
+            next: 9,
+            end: 13,
+        });
+        assert_eq!(c.segments[&0].end, 12, "不连续预算丢弃");
+        // 无段(耗尽后被 507 摘除/预取晚到):直接插(新段形态)。
+        c.segments.remove(&0);
+        c.extend_segment(Segment {
+            pid: 0,
+            start: 9,
+            next: 9,
+            end: 13,
+        });
+        assert_eq!(c.segments[&0].end, 13, "无段时直接插入");
+    }
+
     /// TopoEntry 的 TTL 判定(0 = 关;边界 = 过期)与驱逐纯语义。
     #[test]
     fn topo_entry_ttl_semantics() {
@@ -1992,6 +2163,7 @@ mod tests {
     fn seg(pid: PartitionId, start: u32, count: u32) -> Segment {
         Segment {
             pid,
+            start,
             next: start,
             end: start + count,
         }

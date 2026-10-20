@@ -2199,3 +2199,21 @@ store.md §12.16。
   `topology_refresh_counts_ttl_and_evict_reasons`(TTL 短旋钮轮询 metric{ttl}≥1;
   dead 分区全员失败 → metric{evict} 恰 +1 且读仍上抛);**workspace 77 套 781/0;clippy 0;
   fmt 净**。
+
+### 步 86(router-id-prefetch):号段后台预取 —— 边界 RPC 尖峰的平滑
+
+**动机**:router.md §7 老待办 —— 按需取段使号段边界出现同步 RPC 尖峰(段尾的几次发号
+会撞上一次 master 往返)。
+
+**落地**:发号命中时段进入低水位(剩余 < ¼ 段长或 ≤ 2 号)→ 单飞任务预取同分区一段
+(同区一拍一次;`id_segment_size` 段容);回填**无缝续段** —— master 发号连续,预取段的
+`start` 恰为本段 `end` 时直接续尾(零空洞),对不上保守丢弃(不造额外空洞);无段形态
+直接插。**正确性零依赖**:号段耗尽的同步 `sync_segments` 原样保留,预取失败静默计数
+(`router_id_prefetch_errors_total`)。副收益:预取响应顺带刷新读拓扑条目
+(`segment_from_response` 复用)。
+
+## Testing Done
+
+- lib 24(新增低水位探针/续段/落空丢弃/无段直插单测);e2e 18(新增
+  `id_prefetch_keeps_allocation_fluent_on_tiny_segments`:4 号极小段连续 32 号全成功 +
+  预取零错误);**workspace 77 套 783/0;clippy 0;fmt 净**。

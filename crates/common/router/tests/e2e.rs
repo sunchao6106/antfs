@@ -1220,3 +1220,33 @@ async fn topology_refresh_counts_ttl_and_evict_reasons() {
         "全员不可达须触发一次驱逐重拉(reason=evict)"
     );
 }
+
+/// router-id-prefetch:极小段(id_segment_size=4)下连续高频发号 —— 预取续段/耗尽同步补
+/// 两条路都通(行为不复发"必然停顿失败");预取错误恒 0,发完无 in-flight 残留。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn id_prefetch_keeps_allocation_fluent_on_tiny_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
+    register_node(&node, 101, &addr_a).await;
+    let pid = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, pid).await;
+
+    let mut cfg = client_cfg(&grpc);
+    cfg.id_segment_size = 4; // 每段仅 4 号:号段边界高频出现,预取平滑面全暴露
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(cfg, &registry).await.unwrap();
+
+    // 连续 32 个号:预取(续段)/同步补任一路径必须供给 —— 任一失败即 NoWritable 上抛。
+    let mut keys = Vec::new();
+    for _ in 0..32 {
+        keys.push(client.allocate_one().await.expect("发号必须连续可用"));
+    }
+    assert_eq!(keys.len(), 32);
+    assert!(keys.windows(2).all(|w| w[0] != w[1]), "号互不重复");
+    assert_eq!(
+        client.metrics().prefetch_errors.get(),
+        0,
+        "真 master 下的预取须零错误"
+    );
+}
