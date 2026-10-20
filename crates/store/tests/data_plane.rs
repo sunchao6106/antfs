@@ -1653,3 +1653,52 @@ async fn segment_endpoint_addresses_segments_by_identity() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// store-read-streaming:大对象(跨多块)GET 逐块拼回字节恒等 + 盘维度 get 带宽落账。
+#[tokio::test]
+async fn streaming_get_roundtrips_large_object_across_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 2 MiB 记录须 < 段容(8 MiB);体量跨 4 块(512 KiB)流式。
+    let srv = server_with(tmp.path(), store_config(8 << 20), 8 << 20, 2 * 1024 * 1024);
+    let router = srv.router();
+    create_replica(&router).await;
+
+    let len = 2 * 1024 * 1024usize;
+    let data: Vec<u8> = (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let key = data_key(0x5157);
+    let put = Request::put(format!("/partitions/0/blobs/{key}"))
+        .header("content-length", len.to_string())
+        .body(Body::from(data.clone()))
+        .unwrap();
+    let resp = router.clone().oneshot(put).await.unwrap();
+    let status = resp.status();
+    let rbody = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "put failed: {}",
+        String::from_utf8_lossy(&rbody)
+    );
+
+    // GET:真消费流(逐块收集),拼接须与写入逐字节一致。
+    let get = Request::get(format!("/partitions/0/blobs/{key}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(get).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.len(), len, "流式体总长恒等");
+    assert_eq!(body.to_vec(), data, "流式 GET 逐字节恒等");
+
+    // 盘维度带宽(Drop 落账,有界等待终态)。
+    let disk = tmp
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let want = format!(r#"store_server_disk_bytes_total{{disk_id="{disk}",op="get"}} {len}"#);
+    metrics_wait(&router, &want).await;
+}

@@ -1364,3 +1364,35 @@ bytes/bad_records_total` + `scrub_background_paused` gauge)。
 [`cluster.md` §11.1](./cluster.md));② 小副本每 tick 全量重扫(预算钳幅 ≤64 MiB/拍,无害但
 批次计数增长快);③ 游标内存态,重启重扫(幂等);④ 带伤启动的副本被巡到时 `bad_records`
 会持续报(盘上坏字节不删不改是设计,见 §12.10 残留边界)。
+
+### 12.15 数据面 GET 分块流式(store-read-streaming,2026-10-20)
+
+**动机**:端到端读路径内存上界卡在 store 组包侧 —— 引擎 `get` 内部 `read_full_record`
+一次 `vec![0; total]` 整条分配,HTTP 层一次性挂响应体;而中游(router `get_file →
+bytes_stream()` 逐块落盘)与下游(frontend 暂存流式回)早已是流式。
+
+**实现**:
+- 引擎新增公开原语 `BlobStore::read_range(key, offset, len)`:24B 记录头同口径校验
+  (magic/version/key/墓碑位),数据体仅搬 `[offset, offset+len)` 切片;**不重验整条
+  CRC**(切片不构成 CRC 覆盖单元 —— bit-rot 防线由复制整读 CRC + 后台 scrub 承担,
+  记录头每块重验);`offset+len` 越界 → Corrupt。
+- 数据面:首 stat(经每盘池)定 404/总长 → `Body::from_stream` 逐块(512 KiB
+  `READ_CHUNK_BYTES`)经**每盘有界池**推进;单请求内存 = 单块,与对象大小无关;
+  每块重新走索引定位(不跨 compaction 缓存旧 offset,段生命周期由 `Inner` 快照持住)。
+- 指标口径(零新增):`get_total`/`get_bytes` 照旧;`blob_request_duration` 直方图在
+  流首按总长分桶 observe;`disk_bytes_total` 经 `OpTimer`(随流持有,Drop 落账)——
+  `disk_request_duration` 语义 = **含传输的端到端时长**。
+- **`?replication=1` 复制读保持原整读路径**(`get_with_options`,含过期数据体 + 整条
+  CRC):复制契约一字不动。
+- 语义差异记档:不可读对象(不存在/已删/已过)404 时点从"整读后"提前到"流首";
+  流中途对象被删/被 compaction 回收 → 连接中断(响应头已发;连接即一致性边界,
+  客户端可换副本重试 —— R=1 语义)。
+
+### 12.16 数据面删除审计日志(2026-10-20)
+
+`DELETE /partitions/{pid}/blobs/{key}` **接收即**打 `info` 级结构化日志:
+`tracing::info!(partition_id, blob_id, client_ip, "blob delete requested")` —
+删除是破坏性操作,幂等重删每请求一记(比"谁删成了"更宽的审计口径);"谁"取连接对端
+IP(`into_make_service_with_connect_info`;发起方名义身份在 gateway 层
+SigV4/owner,store 只见直连对端)。无连接信息(测试 mock/非 make-service 路径)→
+`client_ip=unknown`。

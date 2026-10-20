@@ -240,7 +240,11 @@ impl StoreServer {
             Some(listener.local_addr()?.to_string());
         let router = self.router();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         if self.config.disk_health_enabled {
@@ -1315,6 +1319,7 @@ async fn get_blob(
     Query(params): Query<GetParams>,
 ) -> Response {
     let t = OpTimer::start(&st.metrics, "get", st.slow_op_threshold);
+    let started = std::time::Instant::now();
     let Some(key) = parse_key(&key_hex) else {
         return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
     };
@@ -1324,27 +1329,126 @@ async fn get_blob(
     let store = handle.store.clone();
     let t = t.with_disk(&handle.disk_id);
     // replication=1:复制读,连**已过期**对象的数据体也返回(供接收方忠实 apply)。
+    // 复制契约含整条 CRC 校验(引擎 `read_full_record` decode 全验),本批刻意保持整读原路径。
     // 已删除对象的数据体读不到了(墓碑不保留旧记录指针),复制靠 peer 间的墓碑元数据即可。
     let for_repl = params.replication.unwrap_or(0) != 0;
     let disk = t.disk_id().to_string();
+    if for_repl {
+        return match st
+            .pool
+            .run(&disk, "get", move || store.get_with_options(&key, true))
+            .await
+        {
+            Ok(Ok(data)) => {
+                let len = data.len() as u64;
+                st.metrics.get_total.inc();
+                st.metrics.get_bytes.inc_by(len);
+                t.set_bytes(len);
+                st.metrics
+                    .blob_request_duration
+                    .with_label_values(&["get", size_bucket(len)])
+                    .observe(t.elapsed());
+                (StatusCode::OK, data).into_response()
+            }
+            Ok(Err(
+                antfs_blob::Error::NotFound
+                | antfs_blob::Error::Deleted
+                | antfs_blob::Error::Expired,
+            )) => StatusCode::NOT_FOUND.into_response(),
+            Ok(Err(e)) => {
+                record_err(&st.metrics, err_kind(&e));
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
+            }
+            Err(reject) => pool_reject_response(&st.metrics, "get", reject),
+        };
+    }
+    // 普通读:流首 stat(池内)定 404/长度,数据体逐块流式(store-read-streaming):
+    // 单请求内存 = 单块缓冲,与对象大小无关;404 时机从"整读后"提前到"流首"。
+    let stat_store = store.clone();
+    let stat_key = key;
     match st
         .pool
-        .run(&disk, "get", move || store.get_with_options(&key, for_repl))
+        .run(&disk, "get", move || stat_store.stat(&stat_key))
         .await
     {
-        Ok(Ok(data)) => {
-            let len = data.len() as u64;
+        Ok(Ok(meta)) if !meta.deleted && !meta.expired => {
+            let len = meta.data_len;
+            // 盘维度字节带宽(timer Drop 时 inc):现在设定,随流持有;流发完/丢弃(oneshot 断连)均落账。
+            t.set_bytes(len);
+            let sr = StreamingRead {
+                store,
+                key,
+                offset: 0,
+                remain: len,
+                pool: st.pool.clone(),
+                disk: disk.clone(),
+                timer: t,
+                bytes_done: None,
+            };
+            let metrics_arc = st.metrics.clone();
+            let stream = async_stream::stream! {
+                let mut s = sr;
+                while s.remain > 0 {
+                    let take = READ_CHUNK_BYTES.min(s.remain);
+                    let store = s.store.clone();
+                    let key = s.key;
+                    let off = s.offset;
+                    let res = s
+                        .pool
+                        .run(&s.disk, "get", move || store.read_range(&key, off, take))
+                        .await;
+                    match res {
+                        Ok(Ok(bytes)) if !bytes.is_empty() => {
+                            s.offset += take;
+                            s.remain -= take;
+                            yield Ok(bytes::Bytes::from(bytes));
+                        }
+                        Ok(Ok(_)) => {
+                            // remain>0 却读到空:引擎违背长度契约,按损坏断流(不产生部分 200 的假成功)。
+                            yield Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "empty read within alive byte range",
+                            ));
+                            break;
+                        }
+                        Ok(Err(antfs_blob::Error::Deleted))
+                        | Ok(Err(antfs_blob::Error::Expired))
+                        | Ok(Err(antfs_blob::Error::NotFound)) => {
+                            // 流中途对象被删/被回收(与索引快照分歧):中途断流(响应头已发,无法改 404;
+                            // 连接即一致性边界,客户端可重试 R=1 其它副本)。
+                            yield Err(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "object removed mid-stream",
+                            ));
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            yield Err(std::io::Error::other(format!("{e}")));
+                            break;
+                        }
+                        Err(reject) => {
+                            // 盘池拒(有界队列满 503 语句同步):同样以流错误兜底;量已由池侧 metrics 记。
+                            record_err(&metrics_arc, "io");
+                            yield Err(std::io::Error::other(format!("disk pool: {reject:?}")));
+                            break;
+                        }
+                    }
+                }
+            };
+            // 计数语义:请求级(每 GET 一次 get_total;字节 = 总长;duration 在流尾 Drop 计入)。
             st.metrics.get_total.inc();
             st.metrics.get_bytes.inc_by(len);
-            t.set_bytes(len);
-            // 成功路径才按返回数据长度分桶 observe(404 等早退不算)。
+            // duration 口径(与 design 记档一致):直方图在流首按总长分桶 observe —— stat 完成
+            // 即知成败与长度标签,放流首以免"断连后连直方图都没有"的双重失真。
             st.metrics
                 .blob_request_duration
                 .with_label_values(&["get", size_bucket(len)])
-                .observe(t.elapsed());
-            (StatusCode::OK, data).into_response()
+                .observe(started.elapsed().as_secs_f64());
+            let _ = metrics_arc;
+            axum::body::Body::from_stream(stream).into_response()
         }
-        Ok(Err(
+        Ok(Ok(_))
+        | Ok(Err(
             antfs_blob::Error::NotFound | antfs_blob::Error::Deleted | antfs_blob::Error::Expired,
         )) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
@@ -1353,6 +1457,25 @@ async fn get_blob(
         }
         Err(reject) => pool_reject_response(&st.metrics, "get", reject),
     }
+}
+
+/// 流式 GET 的单块大小:块走每盘有界池(与其它盘操作同轨),块越大盘吞吐越好、
+/// 响应首字节越晚;512 KiB 与主流对象(64 KiB-1 MiB)的自然块量级对齐。
+const READ_CHUNK_BYTES: u64 = 512 * 1024;
+
+/// 流式 GET 的游标状态:每块经盘池 `read_range` 推进;`OpTimer` 随流持有 ——
+/// 流尾(发完/断连)Drop 落点,`disk_request_duration` 语义 = 含传输的端到端时长。
+struct StreamingRead {
+    store: Arc<antfs_blob::BlobStore>,
+    key: StoreKey,
+    offset: u64,
+    remain: u64,
+    pool: Arc<crate::disk_pool::DiskPools>,
+    disk: String,
+    #[allow(dead_code)]
+    timer: OpTimer,
+    #[allow(dead_code)]
+    bytes_done: Option<u64>,
 }
 
 /// blob 元数据(不读数据体)的 JSON 响应。`antfs_blob` 不依赖 serde,故在此定义镜像 DTO。
@@ -1646,11 +1769,27 @@ fn parse_segment_name(s: &str) -> Option<antfs_blob::LogSegmentName> {
 async fn delete_blob(
     State(st): State<AppState>,
     Path((pid, key_hex)): Path<(PartitionId, String)>,
+    client: std::result::Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
 ) -> Response {
     let _t = OpTimer::start(&st.metrics, "delete", st.slow_op_threshold);
     let Some(key) = parse_key(&key_hex) else {
         return (StatusCode::BAD_REQUEST, "key must be 8 bytes (16 hex)").into_response();
     };
+    // 删除是破坏性操作:接收即留审计痕迹(谁删什么;幂等重删每请求都记)。
+    // client_ip 取连接对端(经 `into_make_service_with_connect_info` 注入);测试 mock/无连接 → unknown。
+    let client_ip = match client {
+        Ok(info) => info.ip().to_string(),
+        Err(_) => "unknown".to_string(),
+    };
+    tracing::info!(
+        partition_id = pid,
+        blob_id = %key_hex,
+        client_ip,
+        "blob delete requested"
+    );
     let Some(handle) = st.replicas.get(pid) else {
         return (StatusCode::NOT_FOUND, "no replica for partition").into_response();
     };

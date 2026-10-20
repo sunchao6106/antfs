@@ -2121,3 +2121,28 @@ Quorum;W/R 算法零改。
 - router lib 单测 17(新增判定矩阵 4 例:全 409/混合/无失败/1ok+409);e2e 13(新增
   `duplicate_keyed_put_surfaces_conflict`:RF=2 首写 2/2 → 重发同 key → 断言
   `AlreadyExists` 且读回仍首写内容);**workspace 77 套 767/0;clippy 0;fmt 净**
+
+### 步 81(store-read-streaming):读路径端到端流式 —— store 组包瓶颈根除
+
+**动机**:`benchmark/BASELINE.md` 与 frontend.md §11 老待办。中游(router
+`bytes_stream`)/下游(frontend 暂存)早已流式,唯独 store:引擎 `read_full_record`
+`vec![0; total]` 整条分配 + HTTP 一次组包。
+
+**手术详录见 `openspec/changes/store-read-streaming/`**:引擎 `read_range`(24B 头校验
++ 切片搬,不重验整条 CRC —— 防线=复制整读+scrub,每块头重验);数据面首 stat →
+512 KiB 块过每盘池;`?replication=1` 复制契约整读原路 ZERO 改;OpTimer 随流持有。
+
+## Testing Done(blob 125 / store 221:read_range 矩阵+四切分拼段恒等、2 MiB×4 块流式
+GET 字节恒等+盘带宽落账;workspace 77 套 769/0;clippy 0;fmt 净;devcluster 64 MiB
+真面闭环见提交)
+
+### 步 82:数据面删除审计日志(用户令 2026-10-20)
+
+`DELETE` 接收即打 `info!(partition_id, blob_id, client_ip)` — 破坏性操作留"谁删了
+什么"的审计痕迹(幂等重删每请求一记);"谁"= 连接对端 IP
+(`into_make_service_with_connect_info`;gateway 层下也只见直连对端 —— 名义身份
+在 SigV4/owner,归 gateway 日志)。无连接 mock → unknown。琐碎级未立 openspec,记
+store.md §12.16。
+
+## Testing Done(store 17 套 221/0:既有 delete 幂等/404 用例不破;devcluster 真面日志
+证据见提交)
