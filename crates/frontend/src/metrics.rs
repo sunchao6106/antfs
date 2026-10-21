@@ -39,6 +39,10 @@ pub struct FrontendMetrics {
     pub upload_auto_chunk_chunks_total: IntCounter,
     /// 自动分片中途失败后发起的孤儿片回收删除**尝试**数(best-effort,删除本身可能未成功)。
     pub upload_auto_chunk_orphan_deletes_total: IntCounter,
+    /// 边收边分片(④)上传失败后**触发回收**的次数(事件计数;逐片的删除尝试数看
+    /// `upload_auto_chunk_orphan_deletes_total`)。与"先暂存后切片"时代的净差:断流/崩溃窗
+    /// 可能已有片入库,此数 + 孤儿删除数是孤儿压力面的观测位。
+    pub upload_chunk_cleanups_total: IntCounter,
     /// 下载请求数(`GET /blobs/{blobId}`),label `outcome`。
     pub download_total: IntCounterVec,
     /// 下载返回的字节数(counter,只计成功;拼装对象按描述符里各片长度求和)。
@@ -84,6 +88,11 @@ impl FrontendMetrics {
                 registry,
                 "frontend_upload_auto_chunk_orphan_deletes_total",
                 "best-effort orphan chunk deletes issued after failed auto-chunked uploads",
+            )?,
+            upload_chunk_cleanups_total: counter(
+                registry,
+                "frontend_upload_chunk_cleanups_total",
+                "stream-chunked uploads that triggered orphan-chunk cleanup on failure",
             )?,
             download_total: counter_vec(
                 registry,

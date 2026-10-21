@@ -28,6 +28,11 @@ const DISK: &str = "d0";
 const MAX_BODY_BYTES: u64 = 8 << 20;
 
 /// 起单节点 master(自举 → 等自己当选 leader)。
+/// TMPDIR 快照互斥:进程内测试并发,而"下载大对象"会用 `get_file` 短暂创建 frontend 暂存
+/// 文件(`antfs-frontend-*`),零临时文件计数用例必须与它们错峰,否则快照读到别人的中转
+/// (假阴性)。持锁期间不做任何等待,只做快照与上传。
+static TMPDIR_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn solo_master(dir: &std::path::Path) -> (MasterNode, String) {
     let cfg = MasterConfig {
         node_id: 1,
@@ -366,6 +371,7 @@ fn pseudo_random(len: usize) -> Vec<u8> {
 /// 且大对象走的是"落暂存 + 流式回"的路径。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uploads_and_downloads_three_mib_roundtrip() {
+    let _tmpdir_guard = TMPDIR_GUARD.lock().await;
     let fx = Fixture::quorum_cluster().await;
     let data = pseudo_random(3 * 1024 * 1024);
     let blob_id = fx.upload(&data).await;
@@ -1424,4 +1430,218 @@ fn id_bytes(hex_id: &str) -> [u8; 8] {
     let mut out = [0u8; 8];
     out.copy_from_slice(&raw);
     out
+}
+
+// ── 13b:④ 边收边分片(零本地临时盘、断流清理、窗口语义)──────────────────────────────────
+
+/// 系统临时目录中 frontend 前缀暂存文件计数(上传路径已零文件;仅下载大对象仍走既有中转)。
+fn frontend_tempfile_count() -> usize {
+    std::fs::read_dir(std::env::temp_dir())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("antfs-frontend-")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// ④ 行为一:大档上传(有声明 + 无声明两路)全程**零本地临时文件** —— 决定窗 + 流式分片
+/// 直接入集群,系统临时目录前后计数不变。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_uploads_create_no_local_files() {
+    let _tmpdir_guard = TMPDIR_GUARD.lock().await;
+    let fx = auto_chunk_fixture().await;
+    let before = frontend_tempfile_count();
+
+    let data = pseudo_random(300 * 1024);
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("declared big post");
+    assert_eq!(resp.status().as_u16(), 201, "声明大档必须 201");
+    let declared_id = header(&resp, "x-antfs-blob-id");
+
+    let raw = chunked_upload_raw(&fx.frontend, &pseudo_random(300 * 1024)).await;
+    assert!(
+        raw.starts_with("HTTP/1.1 201"),
+        "无声明大 POST 也必须 201:\n{raw}"
+    );
+
+    let after = frontend_tempfile_count();
+    assert_eq!(
+        before, after,
+        "上传路径不得在系统临时目录创建任何文件(before={before}, after={after})"
+    );
+
+    assert_eq!(
+        fx.get_ok(&declared_id).await,
+        data,
+        "零文件路径的读回必须逐字节一致"
+    );
+}
+
+/// ④ 行为二:断流回收。声明 300 KiB(大档、片 96 KiB)只发 200 KiB 即断开 → 400;
+/// 已入库 2 片被逐一墓碑(cleanup 事件 1 / 孤儿删除尝试 2),指标断言挂实际接入的
+/// `Registry`(CLAUDE.md §6)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_upload_short_body_cleans_acked_chunks() {
+    let fx = auto_chunk_fixture().await;
+    let mut sock = tokio::net::TcpStream::connect(&fx.frontend)
+        .await
+        .expect("connect frontend");
+    sock.write_all(
+        format!(
+            "POST /blobs HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            fx.frontend,
+            300 * 1024
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write request head");
+    sock.write_all(&pseudo_random(200 * 1024))
+        .await
+        .expect("write short body");
+    sock.shutdown().await.expect("half-close: 断流");
+    let mut out = Vec::new();
+    sock.read_to_end(&mut out)
+        .await
+        .expect("read response to EOF");
+    let raw = String::from_utf8_lossy(&out).to_string();
+    assert!(
+        raw.starts_with("HTTP/1.1 400"),
+        "欠发断流必须 400,实际:\n{raw}"
+    );
+
+    let dumped = antfs_metric::gather(&fx.registry).expect("gather frontend registry");
+    assert!(
+        dumped.contains("frontend_upload_chunk_cleanups_total 1"),
+        "清理事件恰一次:\n{dumped}"
+    );
+    assert!(
+        dumped.contains("frontend_upload_auto_chunk_orphan_deletes_total 2"),
+        "200KiB/96KiB 已入库 2 片,逐片删除尝试恰 2:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("frontend_upload_auto_chunk_total{outcome=\"ok\"}"),
+        "失败轮不该有成功样本:\n{dumped}"
+    );
+
+    // 同一夹具后续上传照常(断流不污染状态)。
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .body(pseudo_random(300 * 1024))
+        .send()
+        .await
+        .expect("post after failure");
+    assert_eq!(resp.status().as_u16(), 201, "失败后的上传必须照常");
+}
+
+/// ④ 行为三:无声明长度的**窗口语义** —— 100 KiB(< max 256 KiB)chunked 发送,EOF 在
+/// 决定窗内 → 单 blob(非拼装,与旧中转路径"≤ max 为单 blob"契约一致)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_body_within_window_is_single_blob() {
+    let fx = auto_chunk_fixture().await;
+    let data = pseudo_random(100 * 1024);
+
+    let raw = chunked_upload_raw(&fx.frontend, &data).await;
+    assert!(
+        raw.starts_with("HTTP/1.1 201"),
+        "窗口内无声明上传必须 201:\n{raw}"
+    );
+    let id = header_from_raw(&raw, "x-antfs-blob-id");
+    assert_eq!(fx.get_ok(&id).await, data, "读回逐字节一致");
+
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{id}")))
+        .send()
+        .await
+        .expect("head window blob");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        resp.headers().get("x-antfs-blob-stitched").is_none(),
+        "窗口内 EOF = 单 blob,不得拼装"
+    );
+}
+
+/// ④ 行为四:中档(声递交 1 MiB < 2 MiB ≤ max 8 MiB)有界内存整收 → 单 blob(非拼装)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn medium_declared_upload_is_single_blob() {
+    let _tmpdir_guard = TMPDIR_GUARD.lock().await;
+    let fx = Fixture::start(8 << 20, &[101, 102], Vec::new()).await;
+    let data = pseudo_random(2 * 1024 * 1024);
+
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("medium post");
+    assert_eq!(resp.status().as_u16(), 201, "中档上传必须 201");
+    assert_eq!(
+        header(&resp, "x-antfs-blob-size"),
+        format!("{}", data.len()),
+        "中档 = 单 blob,size 即数据体 "
+    );
+    let id = header(&resp, "x-antfs-blob-id");
+
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{id}")))
+        .send()
+        .await
+        .expect("head medium blob");
+    assert!(
+        resp.headers().get("x-antfs-blob-stitched").is_none(),
+        "中档单 blob 不得拼装"
+    );
+    assert_eq!(fx.get_ok(&id).await, data, "中档读回逐字节一致");
+}
+
+/// ④ 行为五:session 头不合法(含控制字节)时 400 提前于任何片入库(reqwest 客户端侧
+/// 就拒不可打印头,故走裸 socket 真穿到服务端的 `session_of`)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_session_rejects_before_any_chunk() {
+    let fx = auto_chunk_fixture().await;
+    let mut sock = tokio::net::TcpStream::connect(&fx.frontend)
+        .await
+        .expect("connect frontend");
+    // 超长 session(70,000 > 描述符 u16 域上限 65,535):头字节全合法(hyper 放行),
+    // 服务端 `session_of` 在任何片入库之前 400。
+    let session = "a".repeat(70_000);
+    let head = format!(
+        "POST /blobs HTTP/1.1\r\nHost: {}\r\nx-antfs-session: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        fx.frontend,
+        session,
+        300 * 1024
+    );
+    // session 校验先于读体:只发头 + 半关,响应即 400(避免"早响应 + 未消费请求体"的
+    // 连接 RST 竞态 —— 服务端不欠任何未读字节)。
+    sock.write_all(head.as_bytes()).await.expect("write head");
+    sock.shutdown().await.expect("half-close");
+    let mut out = Vec::new();
+    sock.read_to_end(&mut out)
+        .await
+        .expect("read response to EOF");
+    let raw = String::from_utf8_lossy(&out).to_string();
+    assert!(
+        raw.starts_with("HTTP/1.1 400"),
+        "超长 session 必须在入库前 400,实际:\n{raw}"
+    );
+
+    let dumped = antfs_metric::gather(&fx.registry).expect("gather frontend registry");
+    assert!(
+        !dumped.contains("orphan_deletes_total 1"),
+        "不得有任何孤儿删除尝试(零片入库):\n{dumped}"
+    );
 }

@@ -2408,3 +2408,28 @@ TTL 的会话对象、内容=片位表;描述符落正名才发布;清扫器只�
 ## Testing Done(docs-only)
 
 - 零 `.rs` diff;openspec validate 过;CI/Docker 全量绿。
+
+### 步 95(upload-zero-spool):④ 网关边收边分片 —— 实施
+
+**改动**(`crates/frontend/src/server.rs`):`upload()` 分档重写 —— 小(≤1 MiB)不动;中
+(声递交 ≤ max)有界 `to_bytes` 整收**核验一致才写**;大/无 CL 走新 `stream_upload`(决定窗 =
+`max_body_bytes`:EOF 窗内=单 blob;越窗或声明即大转分片模式,攒满 `auto_chunk_bytes` 即
+`put` 一片,EOF 对账 + 描述符)。session 头先校验(400 早于任何片入库;声明大档在入口、
+自适应在转档时点)。`auto_chunk_store`/`stage_body` 撤(我的孤儿);`TempFile` 仅供下载中转。
+断流/超发/欠发/片写失败 → `chunked_fail`:cleanup 事件计数 + `cleanup_acked_chunks` 逐片墓碑
++ 失败侧 auto_chunk 计数。**网关不再调 `put_file` ⇒ A2(压缩帧临时文件)从网关路径消失**。
+
+**测试**(+5,`tests/rest.rs` 13b 节):零 TMPDIR 快照(与"大对象 GET 用暂存"的并行用例
+互斥锁 TMPDIR_GUARD —— 进程内测试并发的跨用例隔离,不动既有断言);断流短读(裸 socket
+半关)→ 400 + cleanup=1/孤儿删 2(指标挂实例 §6)+ 失败后上传照常;窗内 chunked=单 blob
+(HEAD 无 stitch);中档 2 MiB=单 blob;超长 session(70,000>65,535)→ 400 零片入库
+(裸 socket;不可打印头会被 Hyper 客户端/服务端层先行拦截,故用"合法但超长"分支)。
+既有 413(关自动分片)/总量上限预检/TTL/507 静默重试用例原样全过(契约零变)。
+
+**门禁**:frontend 11+23;**workspace 77 套 811/0**;clippy 0;fmt 净。零旋钮零配置变更
+(§5.1 不动既有默认);监控 +1(见 frontend.md §9)。
+
+## Testing Done
+
+- `cargo test --workspace`:77 套 811 passed / 0 failed;`cargo clippy --workspace
+  --all-targets` 0 告警;`cargo fmt --check` 净;6 轮 rest.rs 并发复跑零 flake(互斥锁后)。

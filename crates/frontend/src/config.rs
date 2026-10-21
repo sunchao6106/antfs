@@ -10,8 +10,8 @@ use antfs_config::{at_least, Result, Validate};
 use antfs_router::RouterConfig;
 use serde::Deserialize;
 
-/// 自动分片单片大小上限(1 GiB):单片在写路径上是**驻留内存的读-写缓冲**(见 server.rs
-/// `auto_chunk_store`),必须给它一个内存意义上的硬顶。4096 片 × 1 GiB = 总量上限 4 TiB。
+/// 自动分片单片大小上限(1 GiB):单片在写路径上是**驻留内存的读写缓冲**(见 server.rs
+/// `stream_upload` 的分片模式),必须给它一个内存意义上的硬顶。4096 片 × 1 GiB = 总量上限 4 TiB。
 pub const AUTO_CHUNK_MAX_ALLOWED_BYTES: u64 = 1 << 30;
 
 /// frontend 配置。

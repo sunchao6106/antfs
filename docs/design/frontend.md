@@ -58,7 +58,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 | 端点 | 内部动作 |
 |---|---|
-| `POST /blobs` | 小 body(≤ 1 MiB):`put_auto_with_ttl(bytes, expiration_ms)`(**内部发号 + 分区满 507 自动换分区重试**,最多 2 次);大 body(> 1 MiB 或无 Content-Length):`put_file_with_ttl(path, expiration_ms)`(同样内部发号 + 507 重试)。**body > `max_body_bytes` 且开启自动分片**:`auto_chunk_store`(§5)。三条路径写行为对称(**W = 副本数/2+1**,收满即返回,其余靠拉复制补) |
+| `POST /blobs` | 小 body(≤ 1 MiB):`put_auto_with_ttl(bytes, expiration_ms)`(**内部发号 + 分区满 507 自动换分区重试**,最多 2 次);中 body(声明 ≤ `max_body_bytes`):有界内存整收 + `put_auto_with_ttl`(核验一致才写);**超过(自动分片开)或无声明长度**:`stream_upload` 决定窗 + 边收边分片(§5,④,零本地文件)。三条路径写行为对称(**W = 副本数/2+1**,收满即返回,其余靠拉复制补) |
 | `GET /blobs/{id}` | `get(&key)`(**R=1**,副本按 `up` 排序,首个 200 即返回) |
 | `HEAD /blobs/{id}` | `stat(&key)`(元数据不读数据体) |
 | `DELETE` | `delete`(多数派写墓碑,**不可逆**) |
@@ -104,33 +104,40 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 
 ## 5. 流式、自动分片与 body 上限
 
-- 上传**分档**(阈值 `INLINE_BODY_MAX` = 1 MiB,常量):≤ 1 MiB 走**内存路径**(`Router::put_auto_with_ttl(Bytes, ...)`,内部发号 + 507 换分区重试,内存上界 =
-  在途请求数 × 1 MiB);> 1 MiB(或未声明长度)才**落暂存文件 + `Router::put_file_with_ttl` 流式**,**内存不随文件大小涨**。
-  两条路径的 507 重试行为**完全对称**(最多 2 次换分区),不存在"小 body 不重试"的不一致。
-  分档原因:每个小对象都落一个暂存文件会多出 `create/write/close/unlink` 的元数据开销,实测把 PUT p50 从 ~1ms
-  拖到 ~9ms(release,4 KiB × 并发 32)。暂存文件放系统临时目录,成功/失败都删。
-- `frontend.max_body_bytes`:**单 blob 路径的上限**。有 `Content-Length` 时先校验;chunked(无 `Content-Length`)
-  时边收边计数,超了 → 413。未开自动分片时它就是 `/blobs` 的硬上限(超 → 413,不读 body);
-  开启后超过它的 body 转入自动分片(见下条)。**部署对齐要求**:单 blob 与片走同一条数据面 PUT,故
+- 上传**分档**(④ 边收边分片,upload-zero-spool 2026-10-21;阈值 `INLINE_BODY_MAX` = 1 MiB,常量):≤ 1 MiB 走
+  **内存路径**(`Router::put_auto_with_ttl(Bytes, ...)`,内部发号 + 507 换分区重试,内存上界 = 在途请求数 × 1 MiB);
+  1 MiB < 声明 ≤ `max_body_bytes` 走**有界内存整收**(声明核验一致才写,内存上界 = 在途数 × `max_body_bytes`,与
+  S3 网关同口径);超过(自动分片开)或无声明长度走 [`stream_upload`] 的**决定窗 + 流式分片**(内存 = 窗口 +
+  单片,不随对象大小涨)。三条路径的 507 重试行为**完全对称**(最多 2 次换分区)。
+  分档原因:每次落系统临时目录文件多出 `create/write/close/unlink` 的元数据开销,实测把 PUT p50 从 ~1ms 拖到
+  ~9ms(release,4 KiB × 并发 32)—— **上传已全档零本地临时文件**(旧"上传落暂存文件"机制退役;下载大对象的
+  中转保留,见"读方向"条)。
+- `frontend.max_body_bytes`:**单 blob 路径的上限 + 无声明接收的决定窗**。有 `Content-Length` 时先校验
+  (声明超上限 → 413 不读体);chunked(无 `Content-Length`)时边收边计数:关自动分片,超过它 → 413
+  且**零片入库**(硬上限原样);开自动分片,越窗部分转入边收边分片,413 的判据移到**总量上限**
+  (片数 4096 × 单片)——此时若干片可能已入库,413 后逐片墓碑尽力回收(孤儿残余 = ④ 裁决接受)。**部署对齐要求**:单 blob 与片走同一条数据面 PUT,故
   `store_server.max_body_bytes` 必须 ≥ `frontend.max_body_bytes`(单 blob 不被数据面 413)且
   ≥ `frontend.auto_chunk_bytes`(片同理;devcluster 两侧同为 16 MiB)。
-- **服务端自动分片**(2026-10 起,默认开,`frontend.auto_chunk_enabled` / `auto_chunk_bytes`):
+- **服务端自动分片**(2026-10 起,默认开,`frontend.auto_chunk_enabled` / `auto_chunk_bytes`;④ 改为**边收边分片**):
   `POST /blobs` 的 body(声明或实收)超过 `max_body_bytes` 时:
-  1. **先整体落暂存并校验**(复用既有暂存路径,上限 = 片数 4096 × 单片,超 → 413)—— 客户端中途断流/谎报
-     长度时**一片都不写**就失败,不产生孤儿;
-  2. 从暂存文件**按 `auto_chunk_bytes` 顺序切片,逐片 `put_auto_with_ttl`**(顺序写:并发扇出会把
-     "单片内存"乘以片数在途,先不做);片与描述符**同 TTL**,整个逻辑对象一体过期(HEAD 可见
-     `expired` / `expiration-ms`);
-  3. 编**同 `/stitch` 的描述符**(session = 请求带的 `x-antfs-session`,缺省空)也当普通 blob 写入;
+  1. **决定窗** = `max_body_bytes`:无声明路径 EOF 在窗内 ⇒ 单 blob(核验后写);越窗即转分片模式
+     (buf 自头切片,片边界语义同前)。有声明的大档直接进分片模式且 session 头**先校验**(400 早于
+     任何片入库);声明 > 片数 4096 × 单片(总量上限)在预检处 413,不读 body;
+  2. 攒满 `auto_chunk_bytes` 即 `put_auto_with_ttl` **一片**(顺序写:并发扇出会把"单片内存"乘以片数
+     在途,先不做);片与描述符**同 TTL**,整个逻辑对象一体过期(HEAD 可见 `expired` / `expiration-ms`);
+  3. **EOF 对账**(实收 == 声明)后编**同 `/stitch` 的描述符**(session = 请求带的 `x-antfs-session`,缺省空)
+     也当普通 blob 写入;
   4. 201 返回**描述符的 blobId** + `x-antfs-blob-size: 逻辑总量`;`GET`/`HEAD` 走 §4 的既有透明拼装,
      客户端不感知分片。
-  **中途失败**:对已 ack 的片逐个写墓碑**尽力回收**(best-effort:删失败只记日志 + 指标,不影响回报调用方的
-  原错误;片若已落少数副本,墓碑多数派 + 拉复制"墓碑恒胜"会盖掉)。**重试安全**:重试拿到一套全新 blobId,
-  与失败轮互不相扰。**内存**:单片(= `auto_chunk_bytes`,校验限 1..=1 GiB,顺序写同一块缓冲)+ 暂存期
-  一个 64 KiB 块,不随对象大小涨。**落盘**:暂存 1 份(先写满总量再切片读回)+ 每片各 1 次数据面写
-  (上一条"内存换磁盘"的代价,自动分片按片数放大)。
-  **已知取舍**:超大 body 会先整体占掉体量等大的系统临时目录空间,总量上限(默认 4096 × 4 MiB = 16 GiB)
-  同时也是暂存空间的界 —— 大 body 场景建议给临时目录单独的卷;另见 §4 末条(删描述符留孤儿片)。
+  **中途失败**(断流/超发/欠发/片或描述符写失败):对已 ack 的片逐个写墓碑**尽力回收**(best-effort:删失败
+  只记日志 + 指标,不影响回报调用方的原错误;片若已落少数副本,墓碑多数派 + 拉复制"墓碑恒胜"会盖掉)。
+  **重试安全**:重试拿到一套全新 blobId,与失败轮互不相扰。
+  **内存**:决定窗 + 单片(= `auto_chunk_bytes`,校验限 1..=1 GiB),不随对象大小涨;**本地落盘**:零。
+  **与旧"先暂存后切片"的净语义差(所有者裁决 ④ 已接受)**:客户端断流时可能已有若干片入库(旧路径整包
+  校验后才写,零孤儿);**网关崩溃窗孤儿片无清扫面**(frontend 无名世界、无对账源)。缓解路线留观 =
+  `openspec/changes/upload-zero-spool/` design §9.3(PENDING 会话小对象方案;行业取证 Ambry/SeaweedFS/
+  CubeFS 对照见其 §10)。观测:`frontend_upload_chunk_cleanups_total`(事件)+ 配套 orphan 计数。
+  **总量上限**(默认 4096 × 4 MiB = 16 GiB)不再是暂存空间的界(没有暂存了),只是分片数的界。
 - **读方向**:大对象(> 1 MiB)先经 SDK 落到暂存文件再**流式**回给客户端,小对象才整体读回
   —— 故 **frontend 侧内存不随对象大小涨**。**但 store 侧的 `GET` 仍把数据体整个读进内存**(真流式 GET 是 store 的待办,
   见 §11),所以端到端内存上界仍由 store 决定(自动分片的 `GET` 同样受此限:逐片 `get`、内存 = 单片)。
@@ -196,6 +203,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend_upload_auto_chunk_total` | counter | `outcome` | 次 | 走服务端自动分片路径的上传请求数(成功在 handler 记、失败在 upload 的分片出口记),`upload_total` 的子集 | 无(语义上 Ambry 把 chunk 计数放在 router 层) |
 | `frontend_upload_auto_chunk_chunks_total` | counter | — | 片 | **成功**的自动分片上传写入的数据片数(不含描述符) | 无 |
 | `frontend_upload_auto_chunk_orphan_deletes_total` | counter | — | 次 | 自动分片中途失败后发起的孤儿片回收删除**尝试**数(best-effort,可能未删成) | 无 |
+| `frontend_upload_chunk_cleanups_total` | counter | — | 次 | 边收边分片(④)上传失败后**触发**孤儿片回收的事件数(逐片删除尝试数看上行;观测断流后的孤儿压力面) | 无 |
 | `frontend_download_total` | counter | `outcome` | 次 | 下载请求数 | `FrontendMetrics.getBlobRequestMetrics` |
 | `frontend_download_bytes_total` | counter | — | 字节 | 下载字节数(成功;拼装对象按描述符里各片长度求和) | 无 |
 | `frontend_delete_total` | counter | `outcome` | 次 | 删除请求数 | `FrontendMetrics.deleteBlobRequestMetrics` |

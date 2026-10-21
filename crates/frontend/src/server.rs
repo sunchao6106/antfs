@@ -7,12 +7,15 @@
 //! 两条与"无状态"直接相关的设计:
 //! - **分片拼装(`POST /stitch`)不用服务端 session 表**:拼装关系写进一个**描述符 blob**
 //!   (见 [`encode_descriptor`]),片本身是普通 blob,`GET` 读到描述符即逐片流式拼装;
-//! - **上传先落暂存文件再提交**:SDK 的流式写口是 `put_file(path)`,代价是一次额外落盘(与 store
-//!   数据面同一取舍),换来 frontend 内存不随对象大小涨(CLAUDE.md §5.3)。
+//! - **上传零本地临时盘(④边收边分片,upload-zero-spool 2026-10-21)**:内存决定窗(=
+//!   `max_body_bytes`)+ 流式分片直入集群,内存不随对象大小涨(CLAUDE.md §5.3)且全程
+//!   不写任何本地文件;代价 = 网关崩溃窗可能留下无人认领的孤儿片(所有者裁决 ④ 已接受,
+//!   缓解路线见该 change 设计档)。
 //!
-//! **服务端自动分片**(`POST /blobs` body > `max_body_bytes` 且开启 `auto_chunk_enabled`):先
-//! 暂存整包校验,再按 `auto_chunk_bytes` 切片逐片入库存,最后写拼装描述符并返回其 blobId ——
-//! `GET`/`HEAD` 走既有的描述符透明拼装路径,客户端无感知(见 [`upload`])。
+//! **服务端自动分片**(`POST /blobs` body > `max_body_bytes` 且开启 `auto_chunk_enabled`):
+//! 边收边按 `auto_chunk_bytes` 切片逐片入库,EOF 对账(总量 == 声明、片数上限)后写拼装
+//! 描述符并返回其 blobId —— `GET`/`HEAD` 走既有的描述符透明拼装路径,客户端无感知(见
+//! [`upload`] / [`stream_upload`])。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -326,7 +329,7 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 ///
 /// 分片上传的**片就是普通 blob**(带 `x-antfs-session` 也不改变写入路径),片清单由客户端自己记
 /// —— frontend 无状态(D3)。可选头 `x-antfs-ttl-ms` 见 [`upload`]。
-/// body 超过 `max_body_bytes` 且开启自动分片时,切片+描述符路径见 [`auto_chunk_store`]。
+/// body 超过 `max_body_bytes` 且开启自动分片时,切片+描述符路径见 [`stream_upload`]。
 async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_UPLOAD);
     match upload(&st, req).await {
@@ -373,9 +376,9 @@ struct Uploaded {
     auto_chunks: Option<u32>,
 }
 
-/// 上传实现:边界校验 → body ≤ `max_body_bytes` 时走单 blob 路径(小进内存 / 大落暂存流式,行为
-/// 与自动分片之前完全一致);超过(且开启自动分片)→ 暂存整包后切片多次上传(见 [`auto_chunk_store`])
-/// → 写入时定 TTL(`x-antfs-ttl-ms`,缺省不过期)。
+/// 上传实现:边界校验 → 声明 ≤ `max_body_bytes` 走单 blob 路径(≤ 1 MiB 小档内存直进;
+/// 中档有界内存整收、核验一致才写)→ 超过(且开启自动分片)或无声明长度走 [`stream_upload`]
+/// (④ 边收边分片,零本地文件)→ 写入时定 TTL(`x-antfs-ttl-ms`,缺省不过期)。
 async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
     // 先解析 TTL 头:非法立即 400,不白读一遍 body。
     let expiration_ms = ttl_header(req.headers())?.unwrap_or(NO_EXPIRATION);
@@ -419,45 +422,29 @@ async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
                 auto_chunks: None,
             }
         }
-        _ => {
-            // 大 body(或未声明长度):先**整体**落暂存并校验长度,再决定单 blob 写或分片。
-            // 先暂存后切片是刻意取舍(与单 blob 大对象同一哲学):① 客户端中途断流/谎报长度时,
-            // 在写任何一片进集群**之前**就失败,不产生孤儿;② 暂存复用既有的边收边计路径。
-            let staging = TempFile::create();
-            let written =
-                stage_body(req.into_body(), staging.path(), declared, total_limit).await?;
-            if written <= st.max_body_bytes {
-                let (key, _report) = st
-                    .router
-                    .put_file_with_ttl(staging.path(), expiration_ms)
-                    .await?;
-                Uploaded {
-                    key,
-                    len: written,
-                    auto_chunks: None,
-                }
-            } else {
-                // written > max_body_bytes:自动分片开启才可能到这(关闭时暂存上限即 max,已 413)。
-                let session = session_of(session)?;
-                let done = match auto_chunk_store(
-                    st,
-                    staging.path(),
-                    written,
-                    expiration_ms,
-                    session.as_deref(),
-                )
+        // 中档(1 MiB < 声明 ≤ max):有界内存整收,声明核验一致才写 —— 该档失败零孤儿。
+        // 内存上界 = 并发数 × max_body_bytes(与 S3 网关同口径)。
+        Some(len) if len <= st.max_body_bytes => {
+            let cap = usize::try_from(st.max_body_bytes).unwrap_or(usize::MAX);
+            let bytes = axum::body::to_bytes(req.into_body(), cap)
                 .await
-                {
-                    Ok(done) => done,
-                    Err(e) => {
-                        // 成功侧在 handler 记;失败在此记,两处合成该 counter 的全集。
-                        fail(&st.metrics, &st.metrics.upload_auto_chunk_total, &[], &e);
-                        return Err(e);
-                    }
-                };
-                done
+                .map_err(|_| Error::Invalid("body read failed".into()))?;
+            // `to_bytes` 不看 `Content-Length` 头,必须自己核(短读/超读都不得当成功写)。
+            if bytes.len() as u64 != len {
+                return Err(Error::Invalid(format!(
+                    "body shorter than Content-Length ({} < {len})",
+                    bytes.len()
+                )));
+            }
+            let (key, _report) = st.router.put_auto_with_ttl(bytes, expiration_ms).await?;
+            Uploaded {
+                key,
+                len,
+                auto_chunks: None,
             }
         }
+        // 大档(声明 > max,须 auto_chunk 开)或无声明长度:④ 边收边分流 —— 零本地文件。
+        _ => stream_upload(st, req.into_body(), declared, expiration_ms, session).await?,
     };
     Ok(result)
 }
@@ -481,84 +468,182 @@ fn session_of(raw: Option<HeaderValue>) -> Result<Option<String>, Error> {
     Ok(Some(text))
 }
 
-/// 把已暂存的大对象(> `max_body_bytes`)按 `auto_chunk_bytes` 切片**逐片**入库,最后写拼装描述符
-/// (同 [`stitch_inner`] 的描述符,`GET`/`HEAD` 用既有的透明拼装路径读回),返回描述符的 key 与总量。
+/// 大 body / 无声明长度的流式上传(④ 边收边分片,upload-zero-spool):**内存决定窗** =
+/// `max_body_bytes` —— EOF 在窗内 ⇒ 单 blob(声明核验一致才写,该分支零孤儿);一旦越窗
+/// (或声明即 > max)转**分片模式**:以 `auto_chunk_bytes` 为片长、攒满即 `put` 一片,EOF 后
+/// 对账(总量 == 声明;声明 ≤ 4096 × 片长已在入口 413)再写拼装描述符。内存 = 窗口 + 单片
+/// 缓冲(不随对象大小涨),**全程零本地文件**。
 ///
-/// 持久性口径(CLAUDE.md §3.3):
+/// 持久性/失败口径(CLAUDE.md §3.3,对齐被替换的先暂存后切片路径):
 /// - 每片与描述符都是**一次多数派写**(`put_auto_with_ttl`,内部发号 + 507 换分区重试);
-/// - 中途失败(某片或描述符没写进去)→ 对**已 ack** 的片逐个写墓碑尽力回收(见 [`cleanup_acked_chunks`]),
-///   回报调用方原错误;调用方重试安全 —— 重试拿到一套全新 blobId,与本轮不相扰,不产生可见的重复对象;
-/// - 内存 = 单片(一个驻留的读写缓冲,大小 = `auto_chunk_bytes`,不随对象大小涨)。
-async fn auto_chunk_store(
+/// - 断流 / 超发 / 欠发 / 某片或描述符写失败 → 已 ack 片逐个写墓碑尽力回收
+///   ([`cleanup_acked_chunks`])后回原错误;调用方重试拿到全新 blobId,互不相扰;
+/// - 与"先暂存后切片"的净语义差 = **网关崩溃窗孤儿片**(无人认领、暂无清扫面;所有者裁决
+///   ④ 接受,缓解路线 = upload-zero-spool design §9.3)。`auto_chunk_enabled` 关闭时窗口即
+///   硬上限:溢出 413 且零片入库(旧契约原样)。
+async fn stream_upload(
     st: &AppState,
-    staged: &Path,
-    total: u64,
+    body: Body,
+    declared: Option<u64>,
     expiration_ms: i64,
-    session: Option<&str>,
+    session: Option<HeaderValue>,
 ) -> Result<Uploaded, Error> {
-    let chunk_count = match u32::try_from(total.div_ceil(st.auto_chunk_bytes)) {
-        Ok(n) if n as usize <= MAX_CHUNKS => n,
-        // 暂存上限已保证 ≤ MAX_CHUNKS;真到这(将来改上限口径)也走 413,不静默写装不下的描述符。
-        _ => {
-            return Err(Error::TooLarge {
-                len: total,
-                max: auto_chunk_total_limit(st.auto_chunk_bytes),
-            })
+    // 声明即大档:session 头校验在任何片入库之前(与旧路径同一 400 位点);自适应路径在转档时校验。
+    let mut session_raw = session;
+    let mut session_val: Option<String> = None;
+    let mut chunked = declared.map(|d| d > st.max_body_bytes).unwrap_or(false);
+    if chunked {
+        session_val = session_of(session_raw.take())?;
+    }
+    // 片长/窗口 ∈ usize 由 config Validate 保证(auto_chunk_bytes ≤ 1 GiB、max_body ≥ 1)。
+    let window = st.max_body_bytes;
+    let chunk_len =
+        usize::try_from(st.auto_chunk_bytes).expect("auto_chunk_bytes is validated to ≤ 1 GiB");
+    let mut buf: bytes::BytesMut = bytes::BytesMut::new();
+    let mut written: u64 = 0;
+    let mut chunks: Vec<DescriptorChunk> = Vec::new();
+    let mut acked: Vec<StoreKey> = Vec::new();
+    let total_limit = if st.auto_chunk_enabled {
+        auto_chunk_total_limit(st.auto_chunk_bytes)
+    } else {
+        st.max_body_bytes
+    };
+    let mut stream = body.into_data_stream();
+    let aborted: Option<Error> = 'outer: loop {
+        match stream.next().await {
+            None => break None, // EOF:单 blob / 收口残片在循环外统一处理
+            Some(Err(e)) => {
+                break Some(Error::Invalid(format!("body stream: {e}")));
+            }
+            Some(Ok(bytes)) => {
+                written += bytes.len() as u64;
+                buf.extend_from_slice(&bytes);
+                // 超发(实收 > 声明)与无声明的总量上限:到头即断,不再多读多写。
+                if let Some(d) = declared {
+                    if written > d {
+                        break Some(Error::Invalid("body longer than Content-Length".into()));
+                    }
+                }
+                if declared.is_none() && written > total_limit {
+                    break Some(Error::TooLarge {
+                        len: written,
+                        max: total_limit,
+                    });
+                }
+                if !chunked {
+                    if written <= window {
+                        continue; // 决定窗内:EOF 前不入库、无片可清
+                    }
+                    // 越窗 ⇒ 转分片模式(buf 自头部切片,与既有片边界语义一致)。
+                    chunked = true;
+                    match session_of(session_raw.take()) {
+                        Ok(s) => session_val = s,
+                        Err(e) => break Some(e),
+                    }
+                }
+                // 攒满即出片:片长恒定;残片留给 EOF 收口。
+                while buf.len() >= chunk_len {
+                    if chunks.len() >= MAX_CHUNKS {
+                        break 'outer Some(Error::TooLarge {
+                            len: written,
+                            max: total_limit,
+                        });
+                    }
+                    let chunk = buf.split_to(chunk_len).freeze();
+                    match st.router.put_auto_with_ttl(chunk, expiration_ms).await {
+                        Ok((key, _report)) => {
+                            chunks.push(DescriptorChunk {
+                                id: key,
+                                size: chunk_len as u64,
+                                expiration_ms,
+                            });
+                            acked.push(key);
+                        }
+                        Err(e) => break 'outer Some(Error::Router(e)),
+                    }
+                }
+            }
         }
     };
-    // 复读暂存:文件按构造恰好有 total 字节(stage_body 校验过长度),读不满/读超 = 本地 IO 错误。
-    let mut file = tokio::fs::File::open(staged).await?;
-    // 单片读写缓冲:配置校验保证 auto_chunk_bytes ∈ [1, 1 GiB](任何测试/生产平台可分配)。
-    let chunk_usize = usize::try_from(st.auto_chunk_bytes)
-        .expect("auto_chunk_bytes is validated to at most 1 GiB");
-    let mut buf = vec![0u8; chunk_usize];
-    let mut chunks: Vec<DescriptorChunk> = Vec::with_capacity(chunk_count as usize);
-    let mut acked: Vec<StoreKey> = Vec::with_capacity(chunk_count as usize);
-    let mut remaining = total;
-    while remaining > 0 {
-        let want = remaining.min(st.auto_chunk_bytes);
-        let want_usize = usize::try_from(want).expect("want ≤ auto_chunk_bytes ≤ 1 GiB");
-        file.read_exact(&mut buf[..want_usize]).await?;
-        let (key, _report) = match st
-            .router
-            .put_auto_with_ttl(Bytes::copy_from_slice(&buf[..want_usize]), expiration_ms)
-            .await
-        {
-            Ok(ok) => ok,
-            Err(e) => {
-                let e = Error::Router(e);
-                cleanup_acked_chunks(st, &acked).await;
-                return Err(e);
-            }
+    // 分片模式的失败出口:清理 + 失败侧 auto_chunk 计数(窗口阶段失败 = 普通上传失败,不走此口)。
+    async fn chunked_fail(st: &AppState, acked: &[StoreKey], e: Error) -> Error {
+        if !acked.is_empty() {
+            st.metrics.upload_chunk_cleanups_total.inc();
+            cleanup_acked_chunks(st, acked).await;
+        }
+        fail(&st.metrics, &st.metrics.upload_auto_chunk_total, &[], &e);
+        e
+    }
+    if let Some(e) = aborted {
+        return if chunked {
+            Err(chunked_fail(st, &acked, e).await)
+        } else {
+            Err(e)
         };
-        chunks.push(DescriptorChunk {
-            id: key,
-            size: want,
-            expiration_ms,
+    }
+    // EOF:先对账(欠发 = 断流的等价类),再决定单 blob / 残片 + 描述符。
+    if let Some(d) = declared {
+        if written != d {
+            let e = Error::Invalid(format!(
+                "body shorter than Content-Length ({written} < {d})"
+            ));
+            return if chunked {
+                Err(chunked_fail(st, &acked, e).await)
+            } else {
+                Err(e)
+            };
+        }
+    }
+    if !chunked {
+        // 窗口内 EOF = 单 blob(含无声明中小体量与空 body;声明核验已过)。
+        let len = written;
+        let data = buf.split().freeze();
+        let (key, _report) = st.router.put_auto_with_ttl(data, expiration_ms).await?;
+        return Ok(Uploaded {
+            key,
+            len,
+            auto_chunks: None,
         });
-        acked.push(key);
-        remaining -= want;
+    }
+    if !buf.is_empty() {
+        if chunks.len() >= MAX_CHUNKS {
+            return Err(chunked_fail(
+                st,
+                &acked,
+                Error::TooLarge {
+                    len: written,
+                    max: total_limit,
+                },
+            )
+            .await);
+        }
+        let size = buf.len() as u64;
+        let chunk = buf.split().freeze();
+        match st.router.put_auto_with_ttl(chunk, expiration_ms).await {
+            Ok((key, _report)) => {
+                chunks.push(DescriptorChunk {
+                    id: key,
+                    size,
+                    expiration_ms,
+                });
+                acked.push(key);
+            }
+            Err(e) => return Err(chunked_fail(st, &acked, Error::Router(e)).await),
+        }
     }
     // 描述符与片同 TTL:整个逻辑对象一起过期(与单 blob 的 TTL 读行为对称)。
-    let result = async {
-        let descriptor = encode_descriptor(session.unwrap_or("").as_bytes(), &chunks)?;
-        let (key, _report) = st
-            .router
-            .put_auto_composed_with_ttl(Bytes::from(descriptor), expiration_ms)
-            .await?;
-        Ok::<StoreKey, Error>(key)
-    }
-    .await;
-    match result {
-        Ok(key) => Ok(Uploaded {
+    let descriptor = encode_descriptor(session_val.as_deref().unwrap_or("").as_bytes(), &chunks)?;
+    match st
+        .router
+        .put_auto_composed_with_ttl(Bytes::from(descriptor), expiration_ms)
+        .await
+    {
+        Ok((key, _report)) => Ok(Uploaded {
             key,
-            len: total,
-            auto_chunks: Some(chunk_count),
+            len: written,
+            auto_chunks: Some(u32::try_from(chunks.len()).expect("chunks ≤ MAX_CHUNKS")),
         }),
-        Err(e) => {
-            cleanup_acked_chunks(st, &acked).await;
-            Err(e)
-        }
+        Err(e) => Err(chunked_fail(st, &acked, Error::Router(e)).await),
     }
 }
 
@@ -1053,7 +1138,7 @@ fn unique_suffix() -> String {
 
 /// 暂存文件(系统临时目录):**无论成功失败**都在 drop 时删掉。
 ///
-/// 上传(SDK 要完整字节的 `put` → 用流式的 `put_file`)与下载大对象(用 `get_file`)都借它落地。
+/// **下载大对象的中转**(`GET` 的 `get_file` 流式落盘);上传路径不经此(④ 边收边分片,零本地文件)。
 struct TempFile {
     path: PathBuf,
 }
@@ -1086,51 +1171,6 @@ impl Drop for TempFile {
             ),
         }
     }
-}
-
-/// 把请求体**流式**落到暂存文件(内存 = 单块),返回实际字节数。
-///
-/// - 有 `Content-Length`:超过 `max_body_bytes` → 413(调用方已在读 body 前挡过一道,这里兜住超发);
-/// - 无 `Content-Length`(chunked):边收边计数,超限立即停手 → 413;
-/// - 中途断流/与声明长度不符 → 400(该次上传不产生任何可见对象)。
-async fn stage_body(
-    body: Body,
-    path: &Path,
-    declared: Option<u64>,
-    max_body_bytes: u64,
-) -> Result<u64, Error> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(path).await?;
-    let mut stream = body.into_data_stream();
-    let mut written = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| Error::Invalid(format!("body stream: {e}")))?;
-        written += chunk.len() as u64;
-        if written > max_body_bytes {
-            return Err(Error::TooLarge {
-                len: written,
-                max: max_body_bytes,
-            });
-        }
-        if let Some(declared) = declared {
-            if written > declared {
-                return Err(Error::Invalid("body longer than Content-Length".into()));
-            }
-        }
-        file.write_all(&chunk).await?;
-    }
-    // 只 flush 到 OS(不 fsync):暂存文件只是**传输中转**,不是持久化边界 —— 数据真正被 ack 是在
-    // router 把记录写进 store 日志之后(其持久化边界仍是日志的周期 flush)。对中转文件做 fsync
-    // 不改变任何持久性语义,却把每次上传变成一次同步落盘(macOS 上实测 PUT p50 从 ~1ms 涨到 ~250ms)。
-    file.flush().await?;
-    if let Some(declared) = declared {
-        if written != declared {
-            return Err(Error::Invalid(format!(
-                "body shorter than Content-Length ({written} < {declared})"
-            )));
-        }
-    }
-    Ok(written)
 }
 
 #[cfg(test)]
