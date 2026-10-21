@@ -1,6 +1,6 @@
 # store-server-heartbeat 设计(S2:接入集群 + 磁盘监控)
 
-承 cluster.md §9/§7,照搬 Ambry 两级磁盘监控(调研见会话记录)。
+承 cluster.md §9/§7,参考 Ambry 两级磁盘监控(调研见会话记录)。
 
 ## 1. 依赖与契约
 
@@ -23,7 +23,7 @@ store-server 依赖 `master` crate,复用其 `pb`(`master_client::MasterClient`�
 | `ACTIVE` / `BOOTSTRAP` | `ensure_replica`(幂等建/开 BlobStore) | `ACTIVE`(S2 无真实 bootstrap,建好即 ACTIVE;真实追平留 S3) |
 | `OFFLINE` / `DROPPED` | 关闭 replica(从 map 移除;删目录留后续 `drop`) | 不再上报 |
 
-## 4. 磁盘监控(照搬 Ambry 两级)
+## 4. 磁盘监控(参考 Ambry 两级)
 
 ### 4.1 被动(driven by IO errors,真正触发再复制)
 - Phase 1 已给 `BlobStore` 补 `io_error_count`/阈值自关/`set_io_error_hook`。

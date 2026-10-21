@@ -11,7 +11,7 @@
 > `router` 的详细设计(写读路径、错误契约、配置/监控清单)**不只属于本文件**:见 [`router.md`](./router.md);
 > `frontend`(`crates/frontend`)与 `benchmark/router` 都依赖它,W/R 逻辑只有一份实现。
 
-原则:**照搬 Ambry 的形状(每模块一个 `*Config` / `*Metrics`,handle 存成字段),实现换成 Rust 生态最佳库**,不手搬
+原则:**参考 Ambry 的形状(每模块一个 `*Config` / `*Metrics`,handle 存成字段),实现换成 Rust 生态最佳库**,不手搬
 `VerifiableProperties`(字符串 getter + 手写区间校验)与 Dropwizard(客户端 EWMA/reservoir)这些 Java 包袱。
 
 > 注:两个 crate 现名 `antfs-config` / `antfs-metric`(早期叫 `config` / `metric`,lib 名已随改名变为

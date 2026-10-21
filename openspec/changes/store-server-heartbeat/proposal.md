@@ -2,7 +2,7 @@
 
 S1 让数据节点能本地存取 blob,但**与 master 脱节**:master 不知道它存在、不能把 placement 落到它、盘坏了也无人再复制。S2 把 store server 接进集群控制面(cluster.md §9 + §7):注册 + 心跳 + 消费 master 指令 + 磁盘健康监控。
 
-磁盘健康**照搬 Ambry 两级**(见调研):**被动**——Phase 1 已给 `store` 引擎补的连续 IO-error 自关 + 回调,store server 把回调翻译成"该 replica `current_state=ERROR`"上报 master,直接喂**已实现的 M3 失联/异常再复制**;**主动**——周期写读校删探测盘(带超时抓 hang),健康随心跳上报。
+磁盘健康**参考 Ambry 两级**(见调研):**被动**——Phase 1 已给 `store` 引擎补的连续 IO-error 自关 + 回调,store server 把回调翻译成"该 replica `current_state=ERROR`"上报 master,直接喂**已实现的 M3 失联/异常再复制**;**主动**——周期写读校删探测盘(带超时抓 hang),健康随心跳上报。
 
 ## What Changes
 

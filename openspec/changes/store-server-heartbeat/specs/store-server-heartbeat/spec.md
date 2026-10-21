@@ -1,6 +1,6 @@
 # store-server-heartbeat
 
-数据节点接入集群 + 磁盘健康监控(承 cluster.md §9,照搬 Ambry 两级)。**EC 仍锁定。**
+数据节点接入集群 + 磁盘健康监控(承 cluster.md §9,参考 Ambry 两级)。**EC 仍锁定。**
 
 ## ADDED Requirements
 

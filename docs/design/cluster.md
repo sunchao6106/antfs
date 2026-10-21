@@ -185,7 +185,7 @@ RoutingIndex   map<PartitionId, [ 存活副本位置 ]>                         
 >
 > **增量心跳(M7,对齐 SeaweedFS digest 心跳)**:稳态下 store 每拍只带**变化项 + 摘除项 + `replica_digest`**(覆盖全部持有副本的 XOR 摘要,`master::digest` FNV-1a 口径,store/master 同一函数);master 按软状态重算比对,不符回 `resend_full_report` 要求下一拍全量(一拍内自愈);首拍/重连恒全量(覆盖 leader 切换后软状态重建);store 见到 `delta_report_supported` 握手才切增量(旧 master 会把增量当全集规划 → transition 风暴)。master 每拍处理随之降为 O(本节点副本数):软状态节点索引(上)+ placement 派生 `node → pids` 索引(`placement_epoch` 懒重建,稳态零重建)喂 `plan_transitions`,下行 `partition_states` 按连接级 last_sent 只发变化(store 端本就是逐条合并语义;闸门值仍每拍重算,不缓存)。
 
-### 7.2 副本状态机(忠实照搬 Ambry `ReplicaState`)
+### 7.2 副本状态机(忠实参考 Ambry `ReplicaState`)
 
 ```
                    ┌───────────────────────────────┐
@@ -578,7 +578,7 @@ store server(一个进程 / 一台数据节点)
 
 **S1(数据节点骨架 + 数据面)已实现**(`crates/store`,见 `openspec/changes/store-server/`):`DiskManager`(`statfs` 探真实容量,Q1)、`ReplicaManager`(按 partition 管 `BlobStore`,幂等)、`DataHttpServer`(axum `PUT`/`GET`;引擎调用自 D1/N4 起经**每盘有界池** offload,`spawn_blocking` 仅剩 `ensure_replica` 等少数外围路径)。过集成测试(put/get 往返 + 409/404/400)+ 单测(statfs、ensure_replica 幂等)。**不接 master / 不复制 / 不含 EC(暂不解锁)**。
 
-**S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控照搬 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报;**每盘至多一发在飞探测**——超时后不再叠加新探测、改收它的迟到结果,见 [store.md §12.11](./store.md))。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
+**S2(接入集群 + 磁盘监控)已实现**(见 `openspec/changes/store-server-heartbeat/`):`RegisterNode` 启动注册 + 双向流心跳(上报盘 `statfs` 余量 + 各 replica `current_state` + 盘 `health`)+ ReplicaLifecycle(消费 `MasterDirective.transitions`:ACTIVE/BOOTSTRAP→建 replica,OFFLINE/DROPPED→关);**磁盘监控参考 Ambry 两级**——被动(`store` 引擎连续 IO-error 自关 + hook → replica `current_state=ERROR` → 心跳上报 → **master reconcile 再复制**;master `plan_rereplication` 已纳入 ERROR 副本)、主动(`DiskHealthCheck` 周期 write/read/verify/delete + 超时,默认关,随心跳上报;**每盘至多一发在飞探测**——超时后不再叠加新探测、改收它的迟到结果,见 [store.md §12.11](./store.md))。过集成测试(注册→放置指令→建 replica→HTTP put/get)+ 单测(errored 再复制、健康探测、lifecycle)。
 
 - 数据面端点(`crates/store`):`PUT`/`GET`(S1)+ `DELETE`(变更类,见 `openspec/changes/store-server-mutations/`,承 store 引擎语义 + 状态码映射;**删除不可逆**,见 `openspec/changes/simplify-delete-model/`)+ `GET .../replica-metadata` 与 blob 读 `?replication=1`(拉复制,见下 S3a)+ `GET /metrics`(Prometheus 文本导出,无鉴权)+ `POST /admin/partitions/{pid}/compact`(手动触发该分区本地副本全库 compact,对齐 Ambry `TriggerCompaction`;响应 JSON `{live_bytes, dead_bytes, segments_before, segments_after}`,无本地副本 → 404)。
   - **`PUT ...?expiration_ms=<i64>`:建对象时**即带 TTL**(分片上传的孤儿回收需要"出生即带 TTL");`&composed=true`(`blob-composed-flag`)另落拼装描述符类型位(记录/索引 flags 的 bit 4,布局不变)。
