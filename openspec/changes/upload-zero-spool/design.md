@@ -243,7 +243,14 @@ start);大对象 30s 慢速传输期间并发 1 KiB PUT ack 延迟对照组(I5 �
 - 今日"先整包中转"= 任意失败**零孤儿**;④ 后:**断流且进程活着** ⇒ 墓碑清理兜(个别墓碑
   失败留孤儿);**进程崩溃窗** ⇒ 已入库片无人认领(frontend 无 metastore/无 GC)。
   窗口 = 在途上传 × 已写片量;频率 = 网关崩溃于上传中(低)。
-- 留观缓解(不在本批,档此):描述符先行 / 断流 WAL(类比 s3-reclaim-wal)/ 低频孤儿清扫。
+- 留观缓解(不在本批,档此;行业取证见 §10,2026-10-21 五仓源码调研):
+  - **首选(根治):会话登记** —— Ambry「MySQL 会话表」的集群内等价物:上传开始先落一条
+    PENDING 会话小对象(内容 = 预分配的全部片位;自带兜底 TTL,如 2h),描述符成功落正名
+    才算发布;清扫器只需扫"半路死掉的会话对象"→ 按其片位表逐一墓碑。孤儿从"不可知"变
+    "可对账";TTL 兜底保证清扫器自身也死了系统仍自愈。
+  - 另两流派:元数据树可见孤儿 + 周期/手动清扫(SeaweedFS 派)、过期会话协议清扫
+    (CubeFS 派)—— 两者都以"有个名字面"为前提;frontend /blobs 是无名世界,故映射首选
+    会话登记路线。Ambry 的"先 TTL 后延长"在 antfs 不可移植(TTL 只写时定,对象不可变)。
 
 ### 9.4 监控
 
@@ -285,3 +292,24 @@ start);大对象 30s 慢速传输期间并发 1 KiB PUT ack 延迟对照组(I5 �
 **上行叠加账(如实)**:经 frontend 的开压缩 10 MiB 上传最多踩 A1+A2+A3(三份临时拷贝);
 关压缩仍有 A1+A3(两份)。经 S3 的 ≤ 4 MiB 对象只有 A3 一份;> 4 MiB 走 multipart,每片
 ≤ 4 MiB,内存分片 + 每片过 A3。**"零临时盘"在同一对象上的真实含义 = 把所在路径上的 A* 全消。**
+
+## 10. 附录:孤儿处理的行业取证(2026-10-21,五仓本地源码,行号级)
+
+> 问题:上传分片已入存储、最终"发布物"没落地(断流/崩溃/被弃),谁回收?对
+> ~/code/opensource 下五个系统逐一取证。
+
+| 系统 | 会话/分片在哪 | abort(有感知) | 崩溃孤儿 | 过期(无人来收) | 流派映射 |
+|---|---|---|---|---|---|
+| **Ambry**(e3de3ed) | 分片=普通 blob;会话=MySQL named-blob 表(前端,S3 兼容面) | abort 删会话 | 完成路径 **TTL 先行**:入库带兜底 TTL(默认 **25h**,`permanent.named.blob.initial.put.ttl`,FrontendConfig.java:399),元数据库写成功才 `updateBlobTtl→无限期`(CompleteUploadHandler:262,带重试)——写失败孤儿**自带死期** | **周期清扫**:FrontendRestRequestService.java:264-283 `NamedBlobsCleanupRunner`(`scheduleAtFixedRate`,默认 **7 天**一跑:分页拉 stale 记录→`router.deleteBlob`→软删行;runner 防 Throwable(scheduleAtFixedRate 一抛全停的 Java 坑,加 uncaught 计数);config 开关/排除容器、排除账号/时延;失败留次轮) | **会话表 + TTL 兜底 + 周期清扫**(最完备) |
+| **SeaweedFS**(fork,s3api) | 分片=**filer 元数据树可见文件** `<bucket>/.uploads/<uploadId>/`(s3_constants.go:25,`.uploads`);网关单 PUT 纯流式(handler put.go:413 `putToFiler`,缺省 8MiB 块直送 filer) | abort 删子树(routedUploadRemoval) | 孤儿**可见**(元数据树里 lease 可列)但网关无自动扫 | ①手动运维:`shell s3.clean.uploads -timeAgo 1.5h`(command_s3_clean_uploads.go:36,**Crtime 判老**;"删不动的留给下一轮",防误删已完结共享块);②lifecycle 规则 `AbortIncompleteMultipartUpload`(lifecycle_xml/types.go:51;worker=每日 meta-log replay,s3lifecycle/DESIGN.md) | **孤儿可见 + 双清扫(手动命令/规则 worker)** |
+| **CubeFS**(e286733d) | 会话与分片=metanode 元数据面(MultipartInfo/分片 inode,数据直进展存区,无网关本地盘) | abort=会话删除 | 会话在元数据面,可查询 | **协议级**:proto OpGetExpiredMultipart(packet.go:178;metanode partition_op_multipart.go:26 `GetExpiredMultipart(days)`;sdk/meta api.go:362 `BatchGetExpiredMultipart(prefix, days)`)——**树内无自动调用方**(运维面触发) | **过期会话查询协议 + 外部清扫** |
+| **FastDFS** | 上传先写**临时名**,成功 `rename` 正名(storage_service.c:2355 区);无 S3/multipart | 写失败即 unlink(storage_service.c:400 自动删;dio.c:218/632) | 崩溃遗留=未 rename 的临时名文件,未见自动扫(UNVERIFIED) | 无 | **写失败自删 + 完成原子发布**(C 派) |
+| **sdfs**(本地 C++/Java 分体仓) | 删除即 **rename 墓碑**:`dir + ".tmp." + rand`(FileOperation.cpp:841),桶级改名(store ServiceHandler:756) | — | — | — | **trash-rename(同 MinIO 派)** |
+
+**对 antfs 的三句话结论**:
+1. **孤儿在所难免的前提 = 分片先行;成熟系统的分水岭在于"孤儿可对账"**(会话表/可见目录/元数据协议)—— antfs 的 S3 网关有 metastore 天然可对账;frontend /blobs 是无名世界,/root/方案见 §9.3 首选(PENDING 会话小对象 = Ambry 会话表的集群内等价物)。
+2. **兜底 TTL** 是唯一"无需任何清扫器也能自愈"的流派,但 Ambry 的"完成后延长 TTL"依赖其
+   `updateBlobTtl` 语义;antfs 对象不可变、TTL 只写时定 —— 想吃这口红利的对应物也只能做在
+   PENDING 会话对象上(会话带兜底 TTL;正名对象永不过期,不受影响)。
+3. 均无网关本地盘证词(SeaweeFS 网关全流式;CubeFS 分片直达数据面) —— 与我们④-ii 的
+   流式取向互为佐证。

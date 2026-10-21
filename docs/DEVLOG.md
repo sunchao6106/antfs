@@ -2382,3 +2382,29 @@ spec 增「网关上传零暂存」契约(三场景);tasks 0b 勾、3b 具体化
 ## Testing Done(docs-only)
 
 - 零 `.rs` diff;`openspec validate upload-zero-spool` 过;CI/Docker 全量绿。
+
+### 步 94(upload-zero-spool):孤儿处理的五仓源码调研(行业取证)
+
+**触发**:所有者问——这种孤儿(上传分片入库、发布物未落)其它开源文件系统有没有、怎么处理、
+源码层面取证(~/code/opensource 下仓)。后台探索代理配置失灵(model 不可用)全灭,改直查。
+
+**结论**(design.md §10 附录,行号级):
+- **Ambry**:会话=MySQL 表;完成路径 TTL 先行(默认 25h,库写成功才 updateBlobTtl→∞,
+  孤儿自带死期)+ 周期清扫 NamedBlobsCleanupRunner(7 天一跑,scheduleAtFixedRate 全停坑
+  全防)—— 最完备流派。
+- **SeaweedFS**:分片=元数据树可见文件 .uploads/<id>/;网关全流式;清双轨 = 手动 shell
+  s3.clean.uploads -timeAgo(Crtime 判老,删不动留次轮)+ lifecycle AbortIncompleteMultipart
+  Upload(每日 meta-log replay worker);卷层崩溃尾巴由 compaction 收。
+- **CubeFS**:会话进 metanode 元数据面;GetExpiredMultipart 协议级查询(天龄参数),
+  树内无自动调用方(运维面触发)。
+- **FastDFS**:写失败即 unlink + 完成后 rename 原子发布(C 派);崩溃遗留未见自动清。
+- **本地 sdfs**:删除=rename .tmp.* 墓碑(trash-rename 流派,同 MinIO)。
+
+**映射**:分水岭 = "孤儿可对账"。antfs S3 网关有 metastore 天然对账;frontend 无名世界 →
+§9.3 缓解首选升格为 **PENDING 会话小对象方案**(Ambry 会话表的集群内等价物:上传先落带兜底
+TTL 的会话对象、内容=片位表;描述符落正名才发布;清扫器只扫死会话)。Ambry "TTL 后延长"
+不可移植(antfs 对象不可变、TTL 写时定),兜底 TTL 只能作用于 PENDING 会话对象。
+
+## Testing Done(docs-only)
+
+- 零 `.rs` diff;openspec validate 过;CI/Docker 全量绿。
