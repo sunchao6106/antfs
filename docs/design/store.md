@@ -1025,6 +1025,10 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 其它口径:目录不存在时由启动挂载创建(嵌套路径也建)、启动时清掉遗留 `*.tmp`;各盘 `tmp/` 仍照旧清理
 (升级前留下的残渣不会复活、也不会被当成数据)。**留空 = 默认,既有落点不变**(CLAUDE.md §5.1 不擅改默认)。
 
+> **后续方向**:「暂存文件」本身已被 `upload-zero-spool` 方案(见 `openspec/changes/upload-zero-spool/`)
+> 列为待消除项 —— A 段落地后本机制退役(`staging_dir` knob 保留解析、文档标 deprecated,初版经
+> `put_stream_direct` 灰度闸共存)。**裁决前的当下,本节口径继续有效**。
+
 口径边界(如实记录):
 
 - 全是**请求级**数字,不是块设备 IOPS/带宽;引擎内部 IO(flush / compaction / 入向复制 apply)尚未归口到盘维度,

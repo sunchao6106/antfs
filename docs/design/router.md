@@ -233,7 +233,10 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
       PUT 暂存 `<data_dir>/tmp/`(见 `store.md` 数据面端点·"流式 PUT"条目)。前置条件:store 补
       chunked(无 CL)流式落盘路径;压缩比率闸语义重裁决(采样启发[SeaweedFS 派,判错认栽] /
       两遍确定性[CPU 1+N] / 放弃诚实比率);多副本并传的编码流形态(CPU×N vs 共享帧)。
-      方案矩阵(B0-B4:现状/尺寸分档/帧目录可配/完全流式)已呈所有者,**待定**。
+      方案已设计归档:[`openspec/changes/upload-zero-spool/`](../../openspec/changes/upload-zero-spool/)
+      —— B 段(Router 内存帧 + 上界回落原文)与 A 段(store log 预留区直写 + 大小分道,替代暂存),
+      **待所有者三裁决点**(①spill 语义 ②A 道型 ③实施顺序)。原"前置 chunked 落盘/采样/两遍"路线
+      在该 design.md §4 否决矩阵逐条给出否决理由(并发预留与 HOL 论证落档)。
 - [ ] **admin 手动权重入口 → master**:现在写权重只有"由容量现算"一个来源(`capacity_weight_permille`)。要做人工
   压权重,路径是 admin → master 写进同一处 → 同一个 `write_weight` 字段下发,**客户端零改动**(router 只当相对权重用)。
 - [ ] **SWRR 的 O(n) → O(log n)**:分区数上千时每次发号遍历在册分区不划算,需要换堆 / 树的加权调度结构。当前

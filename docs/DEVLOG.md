@@ -2295,3 +2295,29 @@ store.md §12.16。
 - ignored = 活库 lifecycle(pg/mysql,`TEST_ADMIN_POSTGRES_URL` /
   `TEST_ADMIN_MYSQL_URL`,同 S3 网关模式);
 - **workspace 77 套 806/0;clippy 0;fmt 净**。
+
+### 步 90(upload-zero-spool):上传路径零临时盘 —— 方案设计(未实施)
+
+**触发**:所有者要"上传路径零临时盘 方案设计"(router.md §7 TODO 的正式答卷;原 B0-B4
+存亡矩阵收敛)。
+
+**事实链**(行号级取证):① 客户端墙 = `compress_stream_to_temp` → TMPDIR
+`NamedTempFile`(诚实比率 + 一帧供 N 副本/507 重试共用;源文件本就在盘,额外盘耗全来自
+"再压一份");② 服务端墙 = `put_blob` CL>1MiB → `StagedFile`(写锁/网络解耦 +
+小对象 p50 1ms→9ms 实测教训的产物);③ 引擎 `reserve()` 不推 `data_end`、弃单零成本自愈,
+但**单写者不变量 + data_end 前缀游标 = 并发预留结构性不存在**、单道直写必 HOL。
+
+**收敛方案**:B(Router 内存帧,`Bytes` + 8MiB 可配上界,超界 spill 回落原文,标签
+`spill`;跨副本 Arc clone 免文件 op,TMPDIR 依赖清零)+ A-ii(store **大小分道** log
+预留区直写:lane 专属段 K=1 预留/道、`put_lanes` 默认 2;小对象直行道一行不改;abort
+恒尾回卷零空洞;seal 1MiB 阈 ≈ 0.02% 损耗,密度摊销同今;写放大 2×→1×;磁盘格式与
+崩溃语义零变,§3.4 红线逐项走查表落档)。否决矩阵 ×7(单道流式/两遍/采样/全内存/
+tmpfs/lane 回收/chunked 升级)各带理由。不变量 I1-I6 = 验收底线。
+
+**产物**:openspec/changes/upload-zero-spool 四件套(任务 0/9,裁决门未开)。
+**验证**:`openspec validate upload-zero-spool` 过;零代码(测试/clippy/fmt 空转不动)。
+
+## Testing Done(docs-only)
+
+- 本 commit 零 `.rs` diff;CI 全量绿 + Docker 绿(同基线);裁决点三呈(①spill 语义
+  ②A 道型 ③顺序),代码落地待批后另批执行。
