@@ -22,13 +22,16 @@ pub struct FrontendConfig {
     pub listen_addr: String,
     /// 单请求 body 上限(字节)。
     ///
-    /// **默认 4 MiB**:开启自动分片(默认)时,超过此大小的 body 自动切片多次上传(见 `auto_chunk_enabled`);
-    /// 关闭时超过即 413,客户端应走分片上传(`POST /blobs` × N → `POST /stitch`)。
+    /// **默认 4 MiB**:这是**内部分档界**(≤ 它走"内存整收"的中档;超过转边收边分片),
+    /// 对客户端不再是"被拒与被切"的分界 —— 契约分界只有一个:公共上限
+    /// `[upload] max_object_bytes`(见 [`FrontendToml::upload`],REST 与 S3 网关共用一处)。
     pub max_body_bytes: u64,
-    /// 开启服务端自动分片:`POST /blobs` 的 body 超过 `max_body_bytes` 时,服务端边收边按
-    /// `auto_chunk_bytes` 切片逐片入库,最后写拼装描述符并返回其 blobId(客户端无感知)。
-    /// 关闭则恢复旧契约:超过 `max_body_bytes` 一律 413。
-    pub auto_chunk_enabled: bool,
+    /// 边收边分片的**孤儿收账簿目录**(Ambry「MySQL 会话表 + 定期清扫」的本地等价物)。
+    ///
+    /// **空 = 不记账不清扫**(④ 已接受的崩溃窗孤儿无兜底);非空 = 启动建目录(失败即
+    /// 拒启)、分片上传逐片记账、启动与每 10 分钟清扫超时孤儿会话(作废其片并删账)。
+    /// 账簿语义与已知残余见 `docs/design/frontend.md` §5。
+    pub upload_session_wal_dir: std::path::PathBuf,
     /// 自动分片的单片大小(字节)。总量上限 = 4096 片 × 该值(描述符的片数上限,见 server.rs `MAX_CHUNKS`)。
     ///
     /// 默认 4 MiB(与 `max_body_bytes` 默认同值 = "单 blob 的常态大小");部署时须保证
@@ -46,9 +49,9 @@ impl Default for FrontendConfig {
     fn default() -> Self {
         FrontendConfig {
             listen_addr: "127.0.0.1:7400".to_string(),
-            // 4 MiB:超过此大小默认自动分片(POST /blobs 边收边切);关闭自动分片时客户端须手动分片。
+            // 内部分档界(中档"内存整收"的上限;超过转边收边分片)。
             max_body_bytes: 4 * 1024 * 1024,
-            auto_chunk_enabled: true,
+            upload_session_wal_dir: std::path::PathBuf::new(),
             auto_chunk_bytes: 4 * 1024 * 1024,
             cors_allowed_origins: Vec::new(),
             router: RouterConfig::default(),
@@ -66,6 +69,29 @@ impl Default for FrontendConfig {
 pub struct FrontendToml {
     /// `[frontend]` 表。
     pub frontend: FrontendConfig,
+    /// `[upload]` 公共表(与 S3 网关共用一个值:单文件上传上限;来自 `common.toml` 或
+    /// 自家文件,一处配置两边生效 —— 2026-10-21 所有者裁决)。默认 16 GiB。
+    pub upload: antfs_config::UploadConfig,
+}
+
+impl FrontendToml {
+    /// 整份装配校验:自家字段 + 公共上限 + **跨界检查**(公共上限 ≤ 4096 × 片宽,
+    /// 物理天花板来自拼装描述符的片数容量;要更大单文件须先调大片宽)。
+    pub fn validate_all(&self) -> Result<()> {
+        self.frontend.validate()?;
+        self.upload.validate()?;
+        let cap = antfs_descriptor::MAX_CHUNKS as u64 * self.frontend.auto_chunk_bytes;
+        if self.upload.max_object_bytes > cap {
+            return Err(antfs_config::ConfigError::invalid(
+                "common.max_object_bytes",
+                format!(
+                    "exceeds descriptor capacity: {} chunks x frontend.auto_chunk_bytes = {cap}; increase auto_chunk_bytes first",
+                    antfs_descriptor::MAX_CHUNKS
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Validate for FrontendConfig {
@@ -121,12 +147,20 @@ mod tests {
         let cfg = FrontendConfig::default();
         assert_eq!(cfg.listen_addr, "127.0.0.1:7400");
         assert_eq!(cfg.max_body_bytes, 4 * 1024 * 1024);
-        assert!(cfg.auto_chunk_enabled, "默认开启服务端自动分片");
+        assert_eq!(
+            cfg.upload_session_wal_dir,
+            std::path::PathBuf::new(),
+            "默认不记账不清扫"
+        );
         assert_eq!(cfg.auto_chunk_bytes, 4 * 1024 * 1024);
         assert!(cfg.cors_allowed_origins.is_empty(), "默认不挂 CORS 层");
         cfg.validate().expect("默认配置必须自洽");
         // 内嵌 router 子表回落到 `RouterConfig` 默认值。
         assert_eq!(cfg.router, RouterConfig::default());
+        // 公共上限层:FrontendToml 默认(顶层 [upload] 表缺省)与 S3 网关共用同一默认。
+        let toml = FrontendToml::default();
+        assert_eq!(toml.upload.max_object_bytes, 16 * 1024 * 1024 * 1024);
+        toml.validate_all().expect("默认整份必须自洽");
     }
 
     #[test]
@@ -146,6 +180,7 @@ mod tests {
         assert!(cfg.validate().is_err(), "0 字节单片必须拒");
         cfg.auto_chunk_bytes = AUTO_CHUNK_MAX_ALLOWED_BYTES + 1;
         assert!(cfg.validate().is_err(), "单片超出硬顶必须拒");
+        // 单片硬顶 1 GiB × 4096 片 = 4 TiB ≥ 默认上限,恒 OK。
         cfg.auto_chunk_bytes = AUTO_CHUNK_MAX_ALLOWED_BYTES;
         assert!(cfg.validate().is_ok(), "单片恰在硬顶合法");
 
@@ -167,21 +202,47 @@ mod tests {
         assert!(cfg.validate().is_err(), "router.master_addr 为空必须拒");
     }
 
+    /// 公共上限与片宽的跨界检查(挂在 FrontendToml::validate_all,须两表在同一装配里)。
+    #[test]
+    fn shared_upload_cap_cross_checks_with_chunk_width() {
+        let mut toml = FrontendToml::default();
+        toml.frontend.auto_chunk_bytes = 4096; // 容量 = 4096 × 4 KiB = 16 MiB
+        toml.upload.max_object_bytes = 16 * 1024 * 1024 + 1;
+        assert!(
+            toml.validate_all().is_err(),
+            "公共上限超出 4096 × 片宽必须拒(先调大片宽)"
+        );
+        toml.upload.max_object_bytes = 16 * 1024 * 1024;
+        toml.validate_all().expect("恰在容量上合法");
+
+        // 上限为 0 由公共层自校验拒绝。
+        toml.upload.max_object_bytes = 0;
+        assert!(toml.validate_all().is_err(), "0 上限必须拒");
+    }
+
     #[test]
     fn parses_nested_tables() {
         let toml: FrontendToml = antfs_config::Loader::new()
             .with_inline_toml(
                 "[frontend]\nlisten_addr = \"127.0.0.1:7500\"\nmax_body_bytes = 4096\n\
-                 auto_chunk_enabled = false\nauto_chunk_bytes = 1024\n\n\
+                 auto_chunk_bytes = 1024\n\
+                 upload_session_wal_dir = \"/var/lib/antfs/frontend-sessions\"\n\n\
+                 [upload]\nmax_object_bytes = 1048576\n\n\
                  [frontend.router]\nmaster_addr = \"127.0.0.1:7999\"\nid_segment_size = 8\n",
             )
             .load()
             .expect("[frontend] / [frontend.router] 子表必须能反序列化");
-        let cfg = toml.frontend;
-        cfg.validate().expect("配置必须自洽");
+        let cfg = toml.frontend.clone();
+        let upload = toml.upload.clone();
+        toml.validate_all().expect("整份配置必须自洽");
         assert_eq!(cfg.listen_addr, "127.0.0.1:7500");
         assert_eq!(cfg.max_body_bytes, 4096);
-        assert!(!cfg.auto_chunk_enabled);
+        assert_eq!(
+            cfg.upload_session_wal_dir,
+            std::path::PathBuf::from("/var/lib/antfs/frontend-sessions")
+        );
+        // 顶层公共表 [upload] 与 [frontend] 并存解析(公共上限挂 FrontendToml 层)。
+        assert_eq!(upload.max_object_bytes, 1048576);
         assert_eq!(cfg.auto_chunk_bytes, 1024);
         assert_eq!(cfg.router.master_addr, "127.0.0.1:7999");
         assert_eq!(cfg.router.id_segment_size, 8);

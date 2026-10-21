@@ -76,6 +76,25 @@ pub async fn put_object(
         .get::<crate::auth::chunked::ChunkedTrailers>()
         .cloned();
 
+    // 公共单文件上限([upload] 表,与 REST 网关同一值):声明超限不读 body 直接 413。
+    // aws-chunked 场景以 `x-amz-decoded-content-length`(真实对象尺寸)为准,普通请求
+    // 用 `Content-Length`。
+    {
+        let declared = req
+            .headers()
+            .get("x-amz-decoded-content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .or_else(|| {
+                req.headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            });
+        if declared.is_some_and(|d| d > st.max_object_bytes) {
+            return Err(S3Error::EntityTooLarge);
+        }
+    }
     let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
 
     // checksum 收集/验证:分帧 trailer 在 body EOF 后才齐;sink 为空(非分帧请求)

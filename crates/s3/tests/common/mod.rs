@@ -604,6 +604,12 @@ impl S3Fixture {
             registry,
             config: Arc::new(cfg),
             sse: master_key,
+            // limits e2e(tests/limits.rs)设 TEST_S3_MAX_OBJECT_BYTES 起「小上限」夹具;
+            // 其余二进制不设 → 默认 16 GiB(公共 [upload] 表口径,与 frontend 一致)。
+            max_object_bytes: std::env::var("TEST_S3_MAX_OBJECT_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16 * 1024 * 1024 * 1024),
         };
         let listener = tokio::net::TcpListener::bind(&s3_addr)
             .await

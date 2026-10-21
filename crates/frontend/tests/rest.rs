@@ -179,8 +179,8 @@ struct Fixture {
 
 impl Fixture {
     /// 起集群并建一个分区:`replica_nodes` 是放置的节点清单,其中**真实存在**的节点会建出本地副本;
-    /// `max_body_bytes` 为 frontend 的 body 上限;`cors_origins` 空 = 不挂 CORS 层;
-    /// 自动分片走 `FrontendConfig` 默认(开启,4 MiB 片)。
+    /// `max_body_bytes` 为 frontend 的内部分档界;`cors_origins` 空 = 不挂 CORS 层;
+    /// 恒切(片宽走 `FrontendConfig` 默认 4 MiB);单文件公共上限走默认 16 GiB。
     async fn start(
         max_body_bytes: u64,
         replica_nodes: &[u64],
@@ -193,12 +193,17 @@ impl Fixture {
             cors_allowed_origins: cors_origins,
             ..Default::default()
         };
-        Fixture::start_with_frontend(cfg, replica_nodes).await
+        Fixture::start_with_frontend(cfg, antfs_config::UploadConfig::default(), replica_nodes)
+            .await
     }
 
-    /// [`Fixture::start`] 的完全自定配置版(自动分片等边界用例用):`listen_addr` 与
+    /// [`Fixture::start`] 的完全自定配置版(恒切/公共上限边界用例用):`listen_addr` 与
     /// `router.master_addr` 由夹具接管(端口/GRPC 地址只有它知道),其余按传入值。
-    async fn start_with_frontend(cfg: FrontendConfig, replica_nodes: &[u64]) -> Fixture {
+    async fn start_with_frontend(
+        cfg: FrontendConfig,
+        upload: antfs_config::UploadConfig,
+        replica_nodes: &[u64],
+    ) -> Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (master, grpc_addr) = solo_master(&tmp.path().join("master")).await;
 
@@ -248,7 +253,7 @@ impl Fixture {
             ..Default::default()
         };
         cfg.validate().expect("frontend config");
-        let state = AppState::from_config(&cfg, &registry)
+        let state = AppState::from_config(&cfg, &upload, &registry)
             .await
             .expect("frontend state");
         let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)
@@ -713,42 +718,46 @@ async fn bad_requests_are_rejected_with_400() {
     );
 }
 
-// ── 7:body 上限(413;自动分片**关闭**时的契约)──────────────────────────────────────────────
+// ── 7:单文件上限(413;恒切契约的分界线,公共 [upload] 表)───────────────────────────────────
 
-/// 自动分片关闭时,超过 `frontend.max_body_bytes` 的 body → 413:
-/// ① 有 `Content-Length` 时在读 body **之前**就拒(裸 socket 只发头,判定与客户端是否继续发体无关);
-/// ② chunked(无 `Content-Length`)时边收边计数,超了即停。
-/// 同时验证**恰好等于上限**能正常上传(边界不加不减)。
-/// (开启时的上限语义见 §13:转自动分片;非 413 的行为有一致性钉住用例。)
+/// 单文件上限超线 → 413(REST 与 S3 吃同一个公共值):
+/// ① 有 `Content-Length` 声明超限:读 body **之前**就拒(裸 socket 只发头,判定与客户端是否
+///    继续发体无关);
+/// ② chunked(无声明长度)边收边计数,越线即停(若干片可能已入库,由断流清理路径兜,见 §13b);
+/// ③ **恰好等于上限**合法(1 MiB 档 + 256 KiB 片 ⇒ 恰 2 MiB 的对象走分片路径,照样 201)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn body_limit_is_enforced_with_413() {
-    const LIMIT: u64 = 1 << 20;
+async fn object_limit_is_enforced_with_413() {
+    // 单文件上限 2 MiB(公共表);分档界 1 MiB;片宽 256 KiB。
+    const OBJECT_LIMIT: u64 = 2 << 20;
     let cfg = FrontendConfig {
-        max_body_bytes: LIMIT,
-        auto_chunk_enabled: false,
+        max_body_bytes: 1 << 20,
+        auto_chunk_bytes: 256 * 1024,
         ..Default::default()
     };
-    let fx = Fixture::start_with_frontend(cfg, &[101, 102]).await;
+    let upload = antfs_config::UploadConfig {
+        max_object_bytes: OBJECT_LIMIT,
+    };
+    let fx = Fixture::start_with_frontend(cfg, upload, &[101, 102]).await;
 
-    // ① 声明长度超限:server 不读 body 就回 413。
+    // ① 声明超限:不读 body 直接 413。
     assert_eq!(
-        declared_length_status(&fx.frontend, LIMIT + 1).await,
+        declared_length_status(&fx.frontend, OBJECT_LIMIT + 1).await,
         413,
-        "Content-Length 超限必须 413"
+        "声明超单文件上限必须 413"
     );
-    // ② chunked 超限:边收边计数,同样 413。
+    // ② 无声明长度:边收边计数,越线 413(已入库片由清理路径兜)。
     assert_eq!(
-        chunked_over_limit_status(&fx.frontend, LIMIT).await,
+        chunked_over_limit_status(&fx.frontend, OBJECT_LIMIT).await,
         413,
-        "chunked 超限必须 413"
+        "chunked 越单文件上限必须 413"
     );
-    // ③ 恰好等于上限:正常写入。
-    let data = pseudo_random(LIMIT as usize);
+    // ③ 恰好等于上限:正常写入(> 分档界 ⇒ 走分片路径,照样 201 + 读回一致)。
+    let data = pseudo_random(OBJECT_LIMIT as usize);
     let blob_id = fx.upload(&data).await;
     assert_eq!(
         fx.get_ok(&blob_id).await,
         data,
-        "上限内的上传必须成功且一致"
+        "恰在上限内的上传必须成功且一致"
     );
 }
 
@@ -1071,7 +1080,7 @@ async fn auto_chunk_fixture() -> Fixture {
         auto_chunk_bytes: 96 * 1024,
         ..Default::default()
     };
-    Fixture::start_with_frontend(cfg, &[101, 102]).await
+    Fixture::start_with_frontend(cfg, antfs_config::UploadConfig::default(), &[101, 102]).await
 }
 
 /// 大 body(300 KiB > 256 KiB)一次 POST 搞定:201 + `x-antfs-blob-size` 是**逻辑总量**(不是描述符
@@ -1203,17 +1212,21 @@ async fn auto_chunk_honors_ttl_and_chunked_upload_without_length() {
 /// (助手只发头不发体,能在超时内拿到响应本身就是"预检先拒"的证明)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_chunk_total_limit_is_enforced_with_413() {
-    // 片 1 KiB → 总量上限 = 4096 KiB = 4 MiB(比 max_body 更大的另一道闸)。
+    // 片 1 KiB、分档界 1 KiB;公共单文件上限显式 = 4096 KiB = 4 MiB(恰 = 描述符容量天花板,
+    // 与片数保底同值,把两道闸合一道钉住)。
     let cfg = FrontendConfig {
         max_body_bytes: 1024,
         auto_chunk_bytes: 1024,
         ..Default::default()
     };
-    let fx = Fixture::start_with_frontend(cfg, &[101, 102]).await;
+    let upload = antfs_config::UploadConfig {
+        max_object_bytes: 4096 * 1024,
+    };
+    let fx = Fixture::start_with_frontend(cfg, upload, &[101, 102]).await;
     assert_eq!(
         declared_length_status(&fx.frontend, 4096 * 1024 + 1).await,
         413,
-        "超过 4096 片 × 单片的总量必须 413"
+        "超过单文件上限(= 4096 片 × 片宽)必须 413"
     );
 }
 
@@ -1643,5 +1656,60 @@ async fn invalid_session_rejects_before_any_chunk() {
     assert!(
         !dumped.contains("orphan_deletes_total 1"),
         "不得有任何孤儿删除尝试(零片入库):\n{dumped}"
+    );
+}
+
+/// ⑥ 收账簿(裁决 2026-10-21「已入库垃圾要删」的承载):启用 `upload_session_wal_dir`
+/// 后,大对象上传的完整弧落账(start + 逐片 chunk + commit);账簿与在途行为解耦
+/// (上传/读回不受影响)。清扫逻辑的四类会话判定见 `upload_wal.rs` 单测,本 e2e 钉的是
+/// 「网关路径确实全程记账」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wal_records_committed_session() {
+    let wal_dir = tempfile::tempdir().expect("wal dir");
+    let cfg = FrontendConfig {
+        max_body_bytes: 256 * 1024,
+        auto_chunk_bytes: 96 * 1024,
+        upload_session_wal_dir: wal_dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let fx =
+        Fixture::start_with_frontend(cfg, antfs_config::UploadConfig::default(), &[101, 102]).await;
+
+    let data = pseudo_random(300 * 1024);
+    let resp = fx
+        .http
+        .post(fx.url("/blobs"))
+        .body(data.clone())
+        .send()
+        .await
+        .expect("big post");
+    assert_eq!(resp.status().as_u16(), 201, "落账开启时上传照常");
+    let blob_id = header(&resp, "x-antfs-blob-id");
+    assert_eq!(fx.get_ok(&blob_id).await, data, "读回照常");
+
+    // 写线程异步排干:判据 = commit 行已落盘(带超时轮询,非固定 sleep)。
+    let path = wal_dir.path().join("upload-sessions.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let text = loop {
+        let text = std::fs::read_to_string(&path).expect("读账簿");
+        if text.contains("commit") {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "commit 行未在期限内落账:\n{text}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(text.contains("\"k\":\"start\""), "会话开启行:\n{text}");
+    assert_eq!(
+        text.matches("\"k\":\"chunk\"").count(),
+        4,
+        "96×3 + 12 = 4 片逐片记账:\n{text}"
+    );
+    assert_eq!(
+        text.matches("\"k\":\"commit\"").count(),
+        1,
+        "恰一次 commit(清扫器此后永不作废这批片):\n{text}"
     );
 }

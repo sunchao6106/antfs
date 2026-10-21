@@ -2433,3 +2433,42 @@ TTL 的会话对象、内容=片位表;描述符落正名才发布;清扫器只�
 
 - `cargo test --workspace`:77 套 811 passed / 0 failed;`cargo clippy --workspace
   --all-targets` 0 告警;`cargo fmt --check` 净;6 轮 rest.rs 并发复跑零 flake(互斥锁后)。
+
+### 步 96(upload-zero-spool):恒切 + 公共单文件上限(REST/S3 双闸)+ 孤儿收账簿(Ambry 式)
+
+**触发**:所有者连环裁决 —— ①"开关废掉,恒定切,由网关切,分片大小网关配,默认 4 MiB";
+②"单文件最大大小限制 REST & S3 一致,都生效";③"S3 单传受单文件上限,multipart 完成也受";
+④"已入库垃圾要删,按 Ambry 做法"(= 会话表 + 定期清扫);⑤"router 层下沉方案固化到设计文档";
+⑥"公共limit收进公共配置,防漂移";⑦"没用的配置直接删,无兼容包袱"。
+
+**落地(12 个 crate 文件 + 3 文档 + 3 新文件)**:
+- **公共层**:`antfs-config` 新增 `UploadConfig`(顶层 `[upload]` 表,`max_object_bytes` 默认 16 GiB
+  = 4096 × 4 MiB);两个网关二进制的加载链**先读可选 `common.toml`**(公共表一处改两边生效,
+  防漂移 = 裁决⑥)。
+- **frontend**:①`auto_chunk_enabled` **字段整删**(无兼容包袱;恒切 = 唯一行为);
+  ②契约分界只一条:公共单文件上限(声明超限读 body 前 413;无声明边收边超 → 已入库片逐片
+  墓碑回收后 413);③**孤儿收账簿** `upload_session_wal.rs`(新):单写者线程逐行 fsync JSONL
+  (start → 逐片 chunk → commit 描述符落库 → abort 核销);扫描:启动即一拍 + 每 10 分钟;
+  判老 = 最后记账 6h 无终态 → 逐片墓碑 + 核销 + compact(2048 阈);崩溃回放
+  (截断尾行容忍/sid 接续/烂行跳不毒化);④`FrontendError`(Router/Wal/Metrics 三变体,
+  WAL 目录不可用启动即拒);⑤清扫任务(`sweep_uploads` + `spawn_upload_sweeper`);⑥e2e 新增
+  WAL 落账断言。
+- **S3**:`put_object` 声明预检闸(x-amz-decoded-content-length优先 → CL 兜底)+ complete 合计
+  对账闸(session 保留不动)→ 双 413 EntityTooLarge;`tests/limits.rs` 新 e2e(专用二进制
+  设 `TEST_S3_MAX_OBJECT_BYTES` 起小上限夹具,同 vhost 先例)。
+- **docs**:frontend.md(§3 恒切+公共上限 413 / §5 恒切+收账簿 / §8 auto_chunk_enabled 行删 +
+  [upload] 表行 + upload_session_wal_dir 行 / §9 清扫×2 行);common.md(§1.2 网关公共表段 +
+  §1.3 跨网关公共表行非零例外);s3.md(配置清单 [upload] 行 + 不变量段从"multipart 总量无上界"
+  改为"公共单文件上限双闸收口");openspec proposal 裁决⑤-⑧ / design 新增 §11(收账已实施参数
+  与残余)+ §12(router 下沉开工单 = 下批方向,含共存矩阵与任务切分)/ tasks 3c 勾 + 3d 增 /
+  spec 网关 requirement 改恒切+公共上限+收账(单行长行 SHALL)+ 新 S3 双闸 requirement。
+
+## Testing Done
+
+- frontend lib **16/0**(4 upload_wal 单测:四类会话判定/崩溃回放 sid 接续/截断尾容忍/瘦身
+  = 三轮复跑零 flake)+ e2e rest **24/0**(+1 `wal_records_committed_session`:start+4 片 chunk+commit
+  行全程落账,写线程异步排干以内容轮询等);
+- S3 **106/0** 42 ignored(+`tests/limits.rs` 双闸 2 用例,#[ignore] 活库同惯例);
+- antfs-config 新增 2 单测(UploadConfig 默认/解析);
+- 文档双表一致性 = frontend.md §8 配置 5 行新增/删减 + §9 监控 2 行新增;
+  common.md §1.2/§1.3; s3.md 配置/不变量行 —— 含 `[upload]` 公共表行(CLAUDE.md §7 双表纪律)。

@@ -39,8 +39,10 @@
 //! ```
 
 mod error;
+pub mod upload;
 
 pub use error::{ConfigError, Result};
+pub use upload::UploadConfig;
 
 use config_rs::{Config, Environment, File, FileFormat};
 use serde::de::DeserializeOwned;

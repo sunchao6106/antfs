@@ -1,6 +1,5 @@
 //! frontend 二进制入口:加载配置 → 连 router SDK → 起 HTTP 服务。
 
-use antfs_config::Validate;
 use antfs_frontend::config::FrontendToml;
 use antfs_frontend::server::{build_router, AppState};
 
@@ -10,16 +9,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 配置文件/环境变量都带 `frontend` 表名(`frontend.toml` 的 `[frontend]` 表、
     // `AMBRY_FRONTEND__LISTEN_ADDR`),故顶层收进 [`FrontendToml`] 再取表。
+    // 加载链先读可选共享文件 `common.toml`(公共 `[upload]` 表:REST 与 S3 网关共用的
+    // 单文件上限,一处改两边生效),自家 `frontend.toml` 的同键后读覆盖。
     let loaded: FrontendToml = antfs_config::Loader::new()
+        .with_file("common.toml", false)
         .with_file("frontend.toml", false)
         .with_env_prefix("AMBRY")
         .load()
         .unwrap_or_default();
-    let cfg = loaded.frontend;
-    cfg.validate()?;
+    // 整份校验:自家字段 + 公共上限 + 跨界(上限 ≤ 4096 × 片宽)。
+    loaded.validate_all()?;
+    let cfg = loaded.frontend.clone();
 
     let registry = antfs_metric::Registry::new();
-    let state = AppState::from_config(&cfg, &registry).await?;
+    let state = AppState::from_config(&cfg, &loaded.upload, &registry).await?;
     let router = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;

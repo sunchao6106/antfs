@@ -28,6 +28,9 @@ pub struct AppState {
     /// `s3-sse` 主钥(None = 未部署 → 带 SSE 头的写 501;读侧行描述符 None 的对象
     /// 永不触此面)。
     pub sse: Option<Arc<crate::sse::MasterKey>>,
+    /// 公共单文件上限(`[upload]` 表,与 REST 网关同一值):PutObject 的声明预检闸 +
+    /// multipart 完成时按 manifest 所列各片尺寸合计的对账闸(2026-10-21 裁决)。
+    pub max_object_bytes: u64,
 }
 
 #[derive(Deserialize, Default)]

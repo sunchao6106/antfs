@@ -14,7 +14,8 @@
 pub mod config;
 pub mod metrics;
 pub mod server;
+pub mod upload_wal;
 
 pub use config::{FrontendConfig, FrontendToml};
 pub use metrics::FrontendMetrics;
-pub use server::{build_router, AppState, Error};
+pub use server::{build_router, AppState, Error, FrontendError};

@@ -12,7 +12,7 @@
 //!   不写任何本地文件;代价 = 网关崩溃窗可能留下无人认领的孤儿片(所有者裁决 ④ 已接受,
 //!   缓解路线见该 change 设计档)。
 //!
-//! **服务端自动分片**(`POST /blobs` body > `max_body_bytes` 且开启 `auto_chunk_enabled`):
+//! **服务端自动分片(恒切,2026-10-21 裁决)**(`POST /blobs` body > `max_body_bytes` 必切):
 //! 边收边按 `auto_chunk_bytes` 切片逐片入库,EOF 对账(总量 == 声明、片数上限)后写拼装
 //! 描述符并返回其 blobId —— `GET`/`HEAD` 走既有的描述符透明拼装路径,客户端无感知(见
 //! [`upload`] / [`stream_upload`])。
@@ -232,39 +232,145 @@ pub struct AppState {
     pub metrics: Arc<FrontendMetrics>,
     /// `/metrics` 用的注册表(与 [`AppState::metrics`] 接入的是同一个)。
     pub registry: antfs_metric::Registry,
-    /// 单请求 body 上限(字节);开启自动分片后,"单 blob 路径"仍以它为界,超过者转分片。
+    /// 内部分档界(有声明且 ≤ 它 = "内存整收"中档;超过转边收边分片;不再是契约线)。
     pub max_body_bytes: u64,
-    /// 服务端自动分片开关(body > `max_body_bytes` 时切片;关则 413)。
-    pub auto_chunk_enabled: bool,
-    /// 自动分片单片大小(字节;配置校验保证 1..=1 GiB)。
+    /// **公共单文件上限**(恒切契约的分界线;与 S3 网关共用同一值,来自 `[upload]` 表)。
+    pub max_object_bytes: u64,
+    /// 自动分片单片大小(字节;配置校验保证 1..=1 GiB,默认 4 MiB)。
     pub auto_chunk_bytes: u64,
     /// CORS 允许来源;空 = 不挂 CORS 层。
     pub cors_allowed_origins: Vec<String>,
+    /// 孤儿收账簿(`None` = 未启用,④ 崩溃窗孤儿无兜底;启用后有清扫任务,见 [`upload_wal`])。
+    pub upload_wal: Option<Arc<crate::upload_wal::UploadWal>>,
+}
+
+/// frontend 装配错误:router 连不上 / 收账簿目录不可用 / 指标注册失败 —— **启动即失败**,
+/// 拒绝静默降级(孤儿兜底是承诺过的功能,静默关掉比报错更危险)。
+#[derive(Debug)]
+pub enum FrontendError {
+    Router(RouterError),
+    Wal(std::io::Error),
+    Metrics(String),
+}
+
+impl From<RouterError> for FrontendError {
+    fn from(e: RouterError) -> Self {
+        FrontendError::Router(e)
+    }
+}
+
+impl std::fmt::Display for FrontendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrontendError::Router(e) => write!(f, "router connect: {e}"),
+            FrontendError::Wal(e) => write!(f, "upload session wal: {e}"),
+            FrontendError::Metrics(e) => write!(f, "metrics register: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FrontendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FrontendError::Router(e) => Some(e),
+            FrontendError::Wal(e) => Some(e),
+            FrontendError::Metrics(_) => None,
+        }
+    }
 }
 
 impl AppState {
-    /// 按配置装配:连 router SDK(懒连接 master)+ 注册指标。
+    /// 按配置装配:连 router SDK(懒连接 master)+ 注册指标 + 可选孤儿收账簿
+    /// (启用 = 目录可用性启动校验 + 清扫任务随即展开:启动即扫一拍,此后周期拍)。
     pub async fn from_config(
         cfg: &FrontendConfig,
+        upload: &antfs_config::UploadConfig,
         registry: &antfs_metric::Registry,
-    ) -> Result<Self, RouterError> {
+    ) -> Result<Self, FrontendError> {
         let router = Arc::new(BlobRouter::connect(cfg.router.clone(), registry).await?);
+        let metrics = Arc::new(
+            FrontendMetrics::new(registry).map_err(|e| FrontendError::Metrics(e.to_string()))?,
+        );
+        let upload_wal = if cfg.upload_session_wal_dir.as_os_str().is_empty() {
+            None
+        } else {
+            let wal = crate::upload_wal::UploadWal::open(cfg.upload_session_wal_dir.clone())
+                .await
+                .map_err(FrontendError::Wal)?;
+            spawn_upload_sweeper(wal.clone(), router.clone(), metrics.clone());
+            Some(wal)
+        };
         Ok(AppState {
             router,
-            metrics: Arc::new(FrontendMetrics::new(registry)?),
+            metrics,
             registry: registry.clone(),
             max_body_bytes: cfg.max_body_bytes,
-            auto_chunk_enabled: cfg.auto_chunk_enabled,
+            max_object_bytes: upload.max_object_bytes,
             auto_chunk_bytes: cfg.auto_chunk_bytes,
             cors_allowed_origins: cfg.cors_allowed_origins.clone(),
+            upload_wal,
         })
     }
 }
 
-/// 自动分片路径收下的总量上限 = 片数上限(`MAX_CHUNKS`)× 单片大小(更大者描述符装不下;
-/// `Content-Length` 预检与暂存计数两处各拦一道)。配置已把单片限在 ≤1 GiB,乘积无 u64 溢出(≤4 TiB)。
-fn auto_chunk_total_limit(auto_chunk_bytes: u64) -> u64 {
-    MAX_CHUNKS as u64 * auto_chunk_bytes
+/// 孤儿清扫一拍:超时会话逐片墓碑(全删成 → 会话核销;有失败留下一拍重试),
+/// 收尾请求账簿瘦身;拍数与墓碑数入指标。
+async fn sweep_uploads(
+    wal: &Arc<crate::upload_wal::UploadWal>,
+    router: &Arc<BlobRouter>,
+    metrics: &Arc<FrontendMetrics>,
+) {
+    metrics.upload_sweeper_runs_total.inc();
+    let now = crate::upload_wal::now_ms();
+    for session in wal.scan_stale(now).await {
+        let mut ok = true;
+        for blob_id in &session.chunk_ids {
+            let key = match parse_blob_id(blob_id) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        blob_id = %blob_id,
+                        error = %e,
+                        "sweeper: 账簿片 id 无法解析,跳过该行"
+                    );
+                    continue;
+                }
+            };
+            match router.delete(&key).await {
+                Ok(_report) => metrics.upload_sweeper_tombstones_total.inc(),
+                Err(e) => {
+                    ok = false;
+                    tracing::warn!(
+                        blob_id = %blob_id,
+                        error = %e,
+                        "sweeper: 孤儿片墓碑失败,留待下一拍"
+                    );
+                }
+            }
+        }
+        if ok {
+            wal.record_abort(session.sid, now).await;
+        }
+    }
+    wal.compact_maybe().await;
+}
+
+/// 清扫任务:`interval` 首拍立即(= 启动即扫),此后每 [`upload_wal::SWEEP_INTERVAL_SECS`] 一拍;
+/// 进程退出随运行时消亡。
+fn spawn_upload_sweeper(
+    wal: Arc<crate::upload_wal::UploadWal>,
+    router: Arc<BlobRouter>,
+    metrics: Arc<FrontendMetrics>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+            crate::upload_wal::SWEEP_INTERVAL_SECS,
+        ));
+        loop {
+            tick.tick().await;
+            sweep_uploads(&wal, &router, &metrics).await;
+        }
+    });
 }
 
 /// 建路由:`/blobs*` 与 `/stitch` 是对象接口,`/metrics` 是 Prometheus 抓取口(无鉴权,抓取惯例),
@@ -274,11 +380,8 @@ fn auto_chunk_total_limit(auto_chunk_bytes: u64) -> u64 {
 /// 边收边计数,`DefaultBodyLimit` 只是流式读的兜底);`/stitch` 的 JSON 体重持 `max_body_bytes`
 /// (无分片路径,放大它只是让恶意请求能白写更多信息)。
 pub fn build_router(state: AppState) -> Router {
-    let blobs_limit = if state.auto_chunk_enabled {
-        auto_chunk_total_limit(state.auto_chunk_bytes)
-    } else {
-        state.max_body_bytes
-    };
+    // `/blobs` 的兜底字节上限 = 公共单文件上限(恒切;裸体由 handler 边收边计数)。
+    let blobs_limit = state.max_object_bytes;
     let router = Router::new()
         .route(
             "/blobs",
@@ -386,11 +489,8 @@ async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
     let session = req.headers().get(HEADER_SESSION).cloned();
     let declared = content_length(&req);
     // 该路径收得下的总量:关自动分片 = `max_body_bytes`(超 → 413,旧契约);开 = 分片总量上限。
-    let total_limit = if st.auto_chunk_enabled {
-        auto_chunk_total_limit(st.auto_chunk_bytes)
-    } else {
-        st.max_body_bytes
-    };
+    // 恒切契约的单文件上限 = 公共值([upload] 表,REST 与 S3 同一处);声明超限在读体前 413。
+    let total_limit = st.max_object_bytes;
     if let Some(len) = declared {
         if len > total_limit {
             return Err(Error::TooLarge {
@@ -443,7 +543,7 @@ async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
                 auto_chunks: None,
             }
         }
-        // 大档(声明 > max,须 auto_chunk 开)或无声明长度:④ 边收边分流 —— 零本地文件。
+        // 大档(声明 > max)或无声明长度:恒切(④)边收边分片 —— 零本地文件。
         _ => stream_upload(st, req.into_body(), declared, expiration_ms, session).await?,
     };
     Ok(result)
@@ -478,9 +578,9 @@ fn session_of(raw: Option<HeaderValue>) -> Result<Option<String>, Error> {
 /// - 每片与描述符都是**一次多数派写**(`put_auto_with_ttl`,内部发号 + 507 换分区重试);
 /// - 断流 / 超发 / 欠发 / 某片或描述符写失败 → 已 ack 片逐个写墓碑尽力回收
 ///   ([`cleanup_acked_chunks`])后回原错误;调用方重试拿到全新 blobId,互不相扰;
-/// - 与"先暂存后切片"的净语义差 = **网关崩溃窗孤儿片**(无人认领、暂无清扫面;所有者裁决
-///   ④ 接受,缓解路线 = upload-zero-spool design §9.3)。`auto_chunk_enabled` 关闭时窗口即
-///   硬上限:溢出 413 且零片入库(旧契约原样)。
+/// - 与"先暂存后切片"的净语义差 = **网关崩溃窗孤儿片**(无人认领)—— 裁决演进(2026-10-21):
+///   恒切无开关;启用 [`upload_wal`](crate::upload_wal) 收账簿后,超时孤儿会话由清扫任务
+///   自动回收(Ambry 式收账;残余风险与窗口见该模块注释);未启用 = ④ 无兜底语义。
 async fn stream_upload(
     st: &AppState,
     body: Body,
@@ -489,11 +589,17 @@ async fn stream_upload(
     session: Option<HeaderValue>,
 ) -> Result<Uploaded, Error> {
     // 声明即大档:session 头校验在任何片入库之前(与旧路径同一 400 位点);自适应路径在转档时校验。
+    // 孤儿收账簿(未配置 = None,语义 = ④ 无兜底):begin → 逐片 chunk → 描述符 commit → 失败 abort。
+    let wal = st.upload_wal.clone();
+    let mut tracked: Option<u64> = None;
     let mut session_raw = session;
     let mut session_val: Option<String> = None;
     let mut chunked = declared.map(|d| d > st.max_body_bytes).unwrap_or(false);
     if chunked {
         session_val = session_of(session_raw.take())?;
+        if let Some(w) = &wal {
+            tracked = Some(w.begin(crate::upload_wal::now_ms()).await);
+        }
     }
     // 片长/窗口 ∈ usize 由 config Validate 保证(auto_chunk_bytes ≤ 1 GiB、max_body ≥ 1)。
     let window = st.max_body_bytes;
@@ -503,11 +609,8 @@ async fn stream_upload(
     let mut written: u64 = 0;
     let mut chunks: Vec<DescriptorChunk> = Vec::new();
     let mut acked: Vec<StoreKey> = Vec::new();
-    let total_limit = if st.auto_chunk_enabled {
-        auto_chunk_total_limit(st.auto_chunk_bytes)
-    } else {
-        st.max_body_bytes
-    };
+    // 恒切:总量上限 = 公共单文件上限;分片数的物理保底(4096)由发送环另带帽。
+    let total_limit = st.max_object_bytes;
     let mut stream = body.into_data_stream();
     let aborted: Option<Error> = 'outer: loop {
         match stream.next().await {
@@ -540,6 +643,9 @@ async fn stream_upload(
                         Ok(s) => session_val = s,
                         Err(e) => break Some(e),
                     }
+                    if let Some(w) = &wal {
+                        tracked = Some(w.begin(crate::upload_wal::now_ms()).await);
+                    }
                 }
                 // 攒满即出片:片长恒定;残片留给 EOF 收口。
                 while buf.len() >= chunk_len {
@@ -552,6 +658,14 @@ async fn stream_upload(
                     let chunk = buf.split_to(chunk_len).freeze();
                     match st.router.put_auto_with_ttl(chunk, expiration_ms).await {
                         Ok((key, _report)) => {
+                            if let (Some(w), Some(sid)) = (wal.as_ref(), tracked) {
+                                w.record_chunk(
+                                    sid,
+                                    &hex::encode(key.as_bytes()),
+                                    crate::upload_wal::now_ms(),
+                                )
+                                .await;
+                            }
                             chunks.push(DescriptorChunk {
                                 id: key,
                                 size: chunk_len as u64,
@@ -566,7 +680,16 @@ async fn stream_upload(
         }
     };
     // 分片模式的失败出口:清理 + 失败侧 auto_chunk 计数(窗口阶段失败 = 普通上传失败,不走此口)。
-    async fn chunked_fail(st: &AppState, acked: &[StoreKey], e: Error) -> Error {
+    async fn chunked_fail(
+        st: &AppState,
+        wal: &Option<Arc<crate::upload_wal::UploadWal>>,
+        tracked: Option<u64>,
+        acked: &[StoreKey],
+        e: Error,
+    ) -> Error {
+        if let (Some(w), Some(sid)) = (wal, tracked) {
+            w.record_abort(sid, crate::upload_wal::now_ms()).await;
+        }
         if !acked.is_empty() {
             st.metrics.upload_chunk_cleanups_total.inc();
             cleanup_acked_chunks(st, acked).await;
@@ -576,7 +699,7 @@ async fn stream_upload(
     }
     if let Some(e) = aborted {
         return if chunked {
-            Err(chunked_fail(st, &acked, e).await)
+            Err(chunked_fail(st, &wal, tracked, &acked, e).await)
         } else {
             Err(e)
         };
@@ -588,7 +711,7 @@ async fn stream_upload(
                 "body shorter than Content-Length ({written} < {d})"
             ));
             return if chunked {
-                Err(chunked_fail(st, &acked, e).await)
+                Err(chunked_fail(st, &wal, tracked, &acked, e).await)
             } else {
                 Err(e)
             };
@@ -609,6 +732,8 @@ async fn stream_upload(
         if chunks.len() >= MAX_CHUNKS {
             return Err(chunked_fail(
                 st,
+                &wal,
+                tracked,
                 &acked,
                 Error::TooLarge {
                     len: written,
@@ -621,6 +746,14 @@ async fn stream_upload(
         let chunk = buf.split().freeze();
         match st.router.put_auto_with_ttl(chunk, expiration_ms).await {
             Ok((key, _report)) => {
+                if let (Some(w), Some(sid)) = (wal.as_ref(), tracked) {
+                    w.record_chunk(
+                        sid,
+                        &hex::encode(key.as_bytes()),
+                        crate::upload_wal::now_ms(),
+                    )
+                    .await;
+                }
                 chunks.push(DescriptorChunk {
                     id: key,
                     size,
@@ -628,7 +761,7 @@ async fn stream_upload(
                 });
                 acked.push(key);
             }
-            Err(e) => return Err(chunked_fail(st, &acked, Error::Router(e)).await),
+            Err(e) => return Err(chunked_fail(st, &wal, tracked, &acked, Error::Router(e)).await),
         }
     }
     // 描述符与片同 TTL:整个逻辑对象一起过期(与单 blob 的 TTL 读行为对称)。
@@ -638,12 +771,23 @@ async fn stream_upload(
         .put_auto_composed_with_ttl(Bytes::from(descriptor), expiration_ms)
         .await
     {
-        Ok((key, _report)) => Ok(Uploaded {
-            key,
-            len: written,
-            auto_chunks: Some(u32::try_from(chunks.len()).expect("chunks ≤ MAX_CHUNKS")),
-        }),
-        Err(e) => Err(chunked_fail(st, &acked, Error::Router(e)).await),
+        Ok((key, _report)) => {
+            // commit 行先于 201 回报落账:此后清扫器永不作废这些片。
+            if let (Some(w), Some(sid)) = (wal.as_ref(), tracked) {
+                w.record_commit(
+                    sid,
+                    &hex::encode(key.as_bytes()),
+                    crate::upload_wal::now_ms(),
+                )
+                .await;
+            }
+            Ok(Uploaded {
+                key,
+                len: written,
+                auto_chunks: Some(u32::try_from(chunks.len()).expect("chunks ≤ MAX_CHUNKS")),
+            })
+        }
+        Err(e) => Err(chunked_fail(st, &wal, tracked, &acked, Error::Router(e)).await),
     }
 }
 
@@ -1366,20 +1510,17 @@ mod tests {
         );
     }
 
-    /// 自动分片的数学口径:片数向上取整;总量上限 = 片数上限 × 单片;两者都无溢出。
+    /// 自动分片的数学口径:片数向上取整;单文件容量 = 片数上限 × 单片(公共上限须 ≤ 它)。
     #[test]
     fn auto_chunk_math() {
         let chunk = 4 * 1024 * 1024;
         assert_eq!(1u64.div_ceil(chunk), 1);
         assert_eq!(chunk.div_ceil(chunk), 1);
         assert_eq!((chunk + 1).div_ceil(chunk), 2, "恰整除不加片,过了界加一片");
-        assert_eq!(
-            auto_chunk_total_limit(chunk),
-            MAX_CHUNKS as u64 * chunk,
-            "默认片大小下总量上限 = 16 GiB(4096 × 4 MiB)"
-        );
+        // 默认片大小下描述符容量 = 16 GiB(4096 × 4 MiB),恰等于公共上限默认(跨界校验基线)。
+        assert_eq!(MAX_CHUNKS as u64 * chunk, 16 * 1024 * 1024 * 1024);
         // 配置上限内的单片,乘积必须在 u64 内(校验层防溢出的回归护栏)。
-        assert!(auto_chunk_total_limit(crate::config::AUTO_CHUNK_MAX_ALLOWED_BYTES) < u64::MAX);
+        assert!(MAX_CHUNKS as u64 * crate::config::AUTO_CHUNK_MAX_ALLOWED_BYTES < u64::MAX);
     }
 
     /// 分片路径的 session 头:缺省/正常通过;非文本、超 65535 都必须 400(且不往集群写任何片)。

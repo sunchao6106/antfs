@@ -447,7 +447,14 @@ async fn start_frontend(args: &DevClusterConfig, grpc_addr: &str) -> Option<Stri
         ..Default::default()
     };
     let registry = antfs_metric::Registry::new();
-    let state = match antfs_frontend::server::AppState::from_config(&cfg, &registry).await {
+    // 公共单文件上限走默认 16 GiB(REST/S3 同值的 [upload] 表;devcluster 不单设)。
+    let state = match antfs_frontend::server::AppState::from_config(
+        &cfg,
+        &antfs_config::UploadConfig::default(),
+        &registry,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "frontend start failed");
@@ -538,6 +545,8 @@ async fn start_s3(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
         config: Arc::new(cfg),
         // devcluster 内嵌网关默认不部署 SSE(生产走 antfs-s3 独立二进制的主钥文件)。
         sse: None,
+        // 公共单文件上限([upload] 表):devcluster 不单设,与 frontend 同走默认 16 GiB。
+        max_object_bytes: antfs_config::UploadConfig::default().max_object_bytes,
     };
     // 后台 GC(软删行保留期清理 + 孤儿 multipart TTL;默认 config 即启用)。
     antfs_s3::gc::spawn(state.clone(), antfs_s3::config::GcConfig::default());

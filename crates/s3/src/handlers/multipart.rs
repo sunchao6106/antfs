@@ -144,6 +144,20 @@ pub async fn complete_multipart_upload(
 
     let parts = crate::xml::parse_complete_multipart(xml_str)?;
 
+    // 公共单文件上限([upload] 表,与 PutObject 闸同一值):按 manifest 所列各片的
+    // 实际尺寸合计,超限 413;session 与 parts 行不动(客户端可 abort 或缩减后重发)。
+    {
+        let known = st.metastore.session_parts(upload_id).await?;
+        let total: u64 = parts
+            .iter()
+            .filter_map(|cp| known.iter().find(|p| p.part_number == cp.part_number))
+            .map(|pm| pm.size)
+            .sum();
+        if total > st.max_object_bytes {
+            return Err(S3Error::EntityTooLarge);
+        }
+    }
+
     // complete 级校验声明裁决(FULL_OBJECT 路径在此流式全验;composite 终判在会话锁内)。
     let checksum_param = complete_checksum_ruling(&st, upload_id, &headers, &parts).await?;
 

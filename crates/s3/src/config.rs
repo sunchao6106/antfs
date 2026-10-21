@@ -174,4 +174,15 @@ impl Validate for MetaStoreConfig {
 #[serde(default)]
 pub struct S3GatewayToml {
     pub s3: S3GatewayConfig,
+    /// 公共 `[upload]` 表(与 REST 网关共用一个值:单文件上传上限,来自 `common.toml`
+    /// 或自家文件,一处改两边生效 —— 2026-10-21 所有者裁决)。默认 16 GiB。
+    pub upload: antfs_config::UploadConfig,
+}
+
+impl S3GatewayToml {
+    /// 整份校验:自家 `[s3]` 表 + 公共上限表。S3 侧与片宽无跨界(无片宽概念),仅各自自洽。
+    pub fn validate_all(&self) -> antfs_config::Result<()> {
+        self.s3.validate()?;
+        self.upload.validate()
+    }
 }

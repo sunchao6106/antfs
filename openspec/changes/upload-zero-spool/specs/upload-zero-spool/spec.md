@@ -19,6 +19,17 @@ router SDK 的 `put_file` 系上传承诺用户侧零中转落盘且压缩覆盖
 - **WHEN** 同一文件两轮完整传输(含 507 换分区重试)
 - **THEN** 两轮实际传输的帧字节完全一致,声明的 Content-Length 恰等于实际字节数;构造偏差时服务端 400 拒收且库中无半记录
 
+### Requirement: S3 网关单文件上限双闸(⑥,2026-10-21)
+S3 网关 SHALL 对 `PutObject` 与 multipart upload 执行与 REST 网关**同一值**的公共单文件上限(`[upload] max_object_bytes`,顶层公共表):PutObject 声明的对象大小(aws-chunked 以 `x-amz-decoded-content-length` 为准)超限 SHALL 在读 body 之前回 413 `EntityTooLarge`;S3 multipart upload 的 CompleteMultipartUpload SHALL 按 manifest 所列各片实际尺寸合计对账,超限 SHALL 回 413 且 session 与 parts 行保持不动(客户端可 abort 或缩减后重发);片单件 ≤ `max_body_bytes` 不受影响;S3 网关的 PutObject/UploadPart 仍 SHALL 零本地临时文件。
+
+#### Scenario: 单传超限
+- **WHEN** PutObject 声明(CL 或解码长度)超过 `[upload] max_object_bytes`
+- **THEN** 413 EntityTooLarge,body 不读
+
+#### Scenario: multipart 合计超限
+- **WHEN** 两片各 640 KiB(单片 ≤ max_body_bytes=4 MiB)合计 1.25 MiB > 上限 1 MiB,发 CompleteMultipartUpload
+- **THEN** 413 EntityTooLarge;session 保留(ListParts 200),Abort 204,对象不存在(GET 404)
+
 ### Requirement: 服务端大对象 PUT 零暂存(A 段)
 store 数据面带 Content-Length 且超过内存直进阈值的 PUT SHALL 经 log 预留区直写落盘而不产生任何暂存文件;大对象专区(lane 段)的 commit SHALL 维持段内 `data_end` 前缀推进语义,小对象直行道的时延形态 SHALL 不受同时在途大对象传输影响;上传中途失败(字节数不符、空闲超时、客户端断开)SHALL 使预留回收(无空洞、`data_end` 不动)且该次写对读者与恢复完全不可见;持久化边界与恢复判定 SHALL 保持"flush 是唯一持久化边界、恢复只认上次 flush 的 data_end";磁盘格式 SHALL 零变更。
 
@@ -34,8 +45,8 @@ store 数据面带 Content-Length 且超过内存直进阈值的 PUT SHALL 经 l
 - **WHEN** 大对象慢速传输中并发小对象 PUT
 - **THEN** 小对象 201 的 ack 延迟与无大对象在途的对照组一致(确定性对照,禁 sleep)
 
-### Requirement: 网关上传零暂存(墙③,④=边收边分片)
-frontend 网关的 `POST /blobs` 上传 SHALL NOT 在本地(含 TMPDIR)写入任何文件:有声明的 body ≤ `max_body_bytes` 时 SHALL 全程有界内存缓冲且仅在字节数与声明核验一致后才写入;超过 `max_body_bytes` 时 SHALL 边接收边按 `auto_chunk_bytes` 分片逐片入库,传输未达 EOF、字节数与声明不符、片数超限或任一片失败时 SHALL 以墓碑清理由此已入库的全部片并回 400;成功 SHALL 以拼装描述符原子发布且对象对外语义(大小/GET/HEAD/拼装)与既有形态一致;配置面 SHALL 零新增(复用 max_body_bytes/auto_chunk_bytes/auto_chunk_enabled);`GET /blobs` 大对象的既有中转属下载面,不在本契约(维持现状另裁)。
+### Requirement: 网关上传恒切零暂存与公共上限(墙③,④+⑤+⑥+⑦ 裁决)
+frontend 网关的 `POST /blobs` 上传 SHALL NOT 在本地(含 TMPDIR)写入任何文件且 SHALL 恒切(auto_chunk_enabled 废弃,2026-10-21):有声明的 body ≤ `max_body_bytes` 时 SHALL 全程有界内存缓冲且仅在字节数与声明核验一致后才写入;超过 `max_body_bytes` 或无声明长度时 SHALL 边接收边按 `auto_chunk_bytes` 分片逐片入库,传输未达 EOF、字节数与声明不符、片数超限或任一片失败时 SHALL 以墓碑清理由此已入库的全部片并回 400;**公共单文件上限 `[upload] max_object_bytes`(REST 与 S3 网关共用的顶层公共表)超过 SHALL 413**(有声明读 body 前拒,无声明边收边超已入库片墓碑回收后 413);成功 SHALL 以拼装描述符原子发布且对象对外语义(大小/GET/HEAD/拼装)与既有形态一致;**启用 `frontend.upload_session_wal_dir` 后 SHALL 全程记账**(start/逐片 chunk/commit/abort)且超时孤儿会话(最后记账 6 小时无终态)SHALL 由清扫任务逐片墓碑并核销;`GET /blobs` 大对象的既有中转属下载面,不在本契约(维持现状另裁)。
 
 #### Scenario: 大对象上传全程零文件
 - **WHEN** 100 MiB 带声明的 POST /blobs 完成并 GET 读回

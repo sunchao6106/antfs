@@ -293,6 +293,61 @@ start);大对象 30s 慢速传输期间并发 1 KiB PUT ack 延迟对照组(I5 �
 关压缩仍有 A1+A3(两份)。经 S3 的 ≤ 4 MiB 对象只有 A3 一份;> 4 MiB 走 multipart,每片
 ≤ 4 MiB,内存分片 + 每片过 A3。**"零临时盘"在同一对象上的真实含义 = 把所在路径上的 A* 全消。**
 
+## 11. 收账簿已实施(2026-10-21 裁决⑦):参数与残余
+
+**承载**:`crates/frontend/src/upload_wal.rs` = Ambry「MySQL 会话表 + 定期清扫」的本地等价物。
+- **形态**:网关本地 JSONL 账簿,单写者线程独占文件,逐行 fsync(不在请求路径——通道容量 64 背压);
+- **行四类**:`start`(会话开启)、`chunk`(\d 片入库,id=16hex)、`commit`(描述符落库=正名;此后清
+  扫器**永不作废**)、`abort`(终结核销);
+- **扫描**:进程启动即一拍 + 此后每 `SWEEP_INTERVAL_SECS`=600 一拍;判老 = 最后记账
+  `STALE_AFTER_MS`=6h 无终态;清扫器逐片 `router.delete`(墓碑);部分失败留下一拍;
+  删成功 → `record_abort` 核销 → `compact_maybe`(已终结核 > 2048 行时原子重写为仅 active 会话);
+- **崩溃回放**:截断的尾行(无换行)被忽略;带换行的烂行 warn 跳过(该会话失账,退化为无人清扫,
+  **不会误删活数据**)。sid 开机接续回放最大值(不与历史撞号);
+- **残余**(明码,结构与 Ambry 25h TTL 兜底同窗不同解题):描述符已落库但 `commit` 行还在 fsync
+  途中断电 ⇒ 该会话被误判孤儿 ⇒ 清扫器作废**活着的片**(窗口 = 毫秒级,Ambry 同位置靠 TTL 自愈,
+  我们对象不可移植故以收账先行补位);账簿卷随 Pod 蒸发 ⇒ 该节点历史会话失账(退化为无人清扫,
+  不会误删)。
+- **观测**:`frontend_upload_sweeper_runs_total`(拍数)+ `frontend_upload_sweeper_tombstones_total`
+  (成功墓碑数);配套既有 `frontend_upload_chunk_cleanups_total`(断流清理事件)+
+  `frontend_upload_auto_chunk_orphan_deletes_total`(逐片删除尝试)。
+- **测试**:upload_wal 模块内 4 单测(四类会话判定/崩溃回放 sid 接续/截断尾容忍/瘦身);
+  e2e rest.rs `wal_records_committed_session`(网关路径确实全程记账:start+4 片 chunk+commit 行)。
+
+## 12. router 层恒切下沉(⑧ 开工单,下批实施)
+
+> 裁决"将来要全员受益就把切片下沉到 router 层,现在就做(固化)"。网关段已落地 = "由网关切"
+> 在 REST 面恒成立;**下批**把同一逻辑移到 router SDK 内部,让直连 SDK 用户(Bench、裸 Bytes put
+> 大对象者)同样享受分片 + 均衡(Ambry 模型:片散到不同分区,热点分摊)。
+
+**机制(与网关段共引一套底层)**:
+- `RouterConfig` + `put_bytes_chunk_bytes`(默认 4 MiB,范围 64 KiB ..= 1 GiB,0 = 不切——
+  兼容裸 Bytes put;校验时与上界同配防溢出);
+- `put_with_ttl(BlobBytes > 片宽)`:内部 = 切片(ceil(n/片宽),每片一个 StoreKey 发号)+
+  逐片 `put_keyed`(内已自带 507 换分区重试)+ **写描述符** → 返回描述符 blobId + 聚合报告;
+  单片(≤片宽)不切,直接现路径(零退化);
+- `get(blobId) / get_file`:描述符已可读拆(既有拼装路径),无需改;stat 无需改;
+- 所有"网关恒切成片"均走 `put_auto` 手工分段 → 片宽与 router 新切不冲突(各自独立;
+  网关段每片 ≤ 片宽 → 走 router 单片,不二次切);
+- **片带压缩(B 段桥)**:router 切片每片独立 `compress_for_put`(片内 ≤ 片宽,
+  ≤ 内存帧上界)→ 帧文件不出现;B 段(型二两遍流式)的 UploadSource 与本层正交
+  (B 段解决 file 超 8 MiB 的两遍;本层解决 SDK 直连大 Bytes 的切+散)。
+
+**共存矩阵**(零重叠):
+| 调用方 | 片宽 ≤ router 片宽 | 片宽 > router 片宽 |
+|---|---|---|
+| 网关 stream_upload | 片=普通 blob put(单片) | **router 再切**(每网关片变多个子片)+'假设不会
+  发生"(网关默认 4MiB=router 默认 4MiB;不等只发生在两侧独立调参;文档标注"须保持
+  router 片宽 ≤ 网关片宽"否则一网关片变多 router 片,描述符仍调对 → 结果正确、片数变多 |
+
+**任务切分(下批)**:
+1. `RouterConfig::put_bytes_chunk_bytes` + 校验;
+2. `put_with_ttl / put_auto_with(BlobBytes)` 内部切片 + 描述符 + 聚合报告;
+3. 失败 = 逐片墓碑(可能刚写入的片)+ 回落(同网关段 chunked_fail 模式);
+4. 测试:大 Bytes put → 201+读回逐字节+多分片散均衡;失败回收;指标;
+5. 文档 router.md 语言全更新(含双"切人"与共存矩阵);风控:router.rs 挂钩复杂性(A 段仍有
+   pending)→ 分不同文件模块。
+
 ## 10. 附录:孤儿处理的行业取证(2026-10-21,五仓本地源码,行号级)
 
 > 问题:上传分片已入存储、最终"发布物"没落地(断流/崩溃/被弃),谁回收?对

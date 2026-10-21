@@ -10,13 +10,17 @@ async fn main() {
 
     // 配置文件/环境变量都带 `s3` 表名(`antfs-s3.toml` 的 `[s3]` 表、`AMBRY_S3__LISTEN_ADDR`),
     // 与 frontend 二进制同型:顶层收进 `S3GatewayToml` 再取表。
+    // 加载链先读可选共享文件 `common.toml`(公共 `[upload]` 表 = 与 REST 网关共用的
+    // 单文件上限,一处改两边生效),自家 `antfs-s3.toml` 的同键后读覆盖。
     let toml: S3GatewayToml = antfs_config::Loader::new()
+        .with_file("common.toml", false)
         .with_file("antfs-s3.toml", false)
         .with_env_prefix("AMBRY")
         .load()
         .expect("load config");
+    toml.validate_all().expect("validate config");
+    let max_object_bytes = toml.upload.max_object_bytes;
     let cfg = toml.s3;
-    antfs_config::Validate::validate(&cfg).expect("validate config");
 
     let registry = antfs_metric::Registry::new();
     let metrics = Arc::new(antfs_s3::metrics::S3Metrics::new(&registry).expect("register metrics"));
@@ -56,6 +60,7 @@ async fn main() {
         registry: registry.clone(),
         config: Arc::new(cfg.clone()),
         sse,
+        max_object_bytes,
     };
     // `--rotate-sse-key <file>`:SSE 主钥轮换离线模式(不监听、不起 GC,跑完即退;
     // 网关须停机——语义见 sse_rotation 模块头)。

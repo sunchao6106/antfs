@@ -24,7 +24,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 
 | 方法 | 路径 | 请求 | 成功 | 失败 |
 |---|---|---|---|---|
-| `POST` | `/blobs` | body = blob 裸字节;可选 `x-antfs-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405)。body ≤ `max_body_bytes` 走单 blob;**超过且开启 `auto_chunk_enabled`(默认)时服务端自动分片**(见 §5,201 的 `x-antfs-blob-size` = 逻辑总量) | **201** + `Location: /blobs/{blobId}` + `x-antfs-blob-id: {16 hex}` + `x-antfs-blob-size: {n}` | 400(非法 session 头——分片路径校验;单 blob 直写路径无 id/会话参数)/ 413(超该路径上限:关自动分片 = `max_body_bytes`,开 = 片数 4096 × `auto_chunk_bytes`)/ 409(keyed 写全副本冲突,`router-conflict-surfacing` 2026-10-20 透传;现 REST 路径未部署 keyed 写,契约预留)/ 507(分区写满)/ 503(未达多数派) |
+| `POST` | `/blobs` | body = blob 裸字节;可选 `x-antfs-ttl-ms: <i64>`。**上传用 POST**(`curl -T` 发的是 PUT,会 405)。body ≤ `max_body_bytes` 走单 blob;**超过由网关恒切**(2026-10-21 裁决,无开关),边收边分片(见 §5,201 的 `x-antfs-blob-size` = 逻辑总量) | **201** + `Location: /blobs/{blobId}` + `x-antfs-blob-id: {16 hex}` + `x-antfs-blob-size: {n}` | 400(非法 session 头——分片路径校验;单 blob 直写路径无 id/会话参数)/ 413(超**公共单文件上限 `[upload] max_object_bytes`**,REST 与 S3 同一处:有声明读 body 前拒;无声明边收边超,已入库片逐片墓碑回收)/ 409(keyed 写全副本冲突,`router-conflict-surfacing` 2026-10-20 透传;现 REST 路径未部署 keyed 写,契约预留)/ 507(分区写满)/ 503(未达多数派) |
 | `GET` | `/blobs/{blobId}` | — | **200** + 原始字节 | 404(所有副本都没有)/ 400(非法 id)/ 502(分片描述符损坏或片缺失)/ 503(副本不可达) |
 | `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-antfs-blob-size`/`-deleted`/`-expired`/`-expiration-ms`。**拼装对象额外带 `x-antfs-blob-stitched: true` + `x-antfs-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
 | `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑;**删除不可逆**;重复删**幂等**,仍 204) | 404 / 503 / 400 |
@@ -107,22 +107,22 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 - 上传**分档**(④ 边收边分片,upload-zero-spool 2026-10-21;阈值 `INLINE_BODY_MAX` = 1 MiB,常量):≤ 1 MiB 走
   **内存路径**(`Router::put_auto_with_ttl(Bytes, ...)`,内部发号 + 507 换分区重试,内存上界 = 在途请求数 × 1 MiB);
   1 MiB < 声明 ≤ `max_body_bytes` 走**有界内存整收**(声明核验一致才写,内存上界 = 在途数 × `max_body_bytes`,与
-  S3 网关同口径);超过(自动分片开)或无声明长度走 [`stream_upload`] 的**决定窗 + 流式分片**(内存 = 窗口 +
+  S3 网关同口径);超过或无声明长度走 [`stream_upload`] 的**决定窗 + 流式分片(恒切,2026-10-21 裁决废除开关)**(内存 = 窗口 +
   单片,不随对象大小涨)。三条路径的 507 重试行为**完全对称**(最多 2 次换分区)。
   分档原因:每次落系统临时目录文件多出 `create/write/close/unlink` 的元数据开销,实测把 PUT p50 从 ~1ms 拖到
   ~9ms(release,4 KiB × 并发 32)—— **上传已全档零本地临时文件**(旧"上传落暂存文件"机制退役;下载大对象的
   中转保留,见"读方向"条)。
-- `frontend.max_body_bytes`:**单 blob 路径的上限 + 无声明接收的决定窗**。有 `Content-Length` 时先校验
-  (声明超上限 → 413 不读体);chunked(无 `Content-Length`)时边收边计数:关自动分片,超过它 → 413
-  且**零片入库**(硬上限原样);开自动分片,越窗部分转入边收边分片,413 的判据移到**总量上限**
-  (片数 4096 × 单片)——此时若干片可能已入库,413 后逐片墓碑尽力回收(孤儿残余 = ④ 裁决接受)。**部署对齐要求**:单 blob 与片走同一条数据面 PUT,故
+- `frontend.max_body_bytes`:**内部分档界 + 无声明接收的决定窗**(恒切后不再是 413 契约线)。**契约分界
+  只有一条**:公共单文件上限 `[upload] max_object_bytes`(与 S3 网关同一处)—— 声明超限读 body 前 413;
+  chunked(无 `Content-Length`)边收边计数,越线即停 → 413 且已入库片逐片墓碑回收(孤儿残余语义同断流,
+  收账簿兜底见下条)。**部署对齐要求**:单 blob 与片走同一条数据面 PUT,故
   `store_server.max_body_bytes` 必须 ≥ `frontend.max_body_bytes`(单 blob 不被数据面 413)且
   ≥ `frontend.auto_chunk_bytes`(片同理;devcluster 两侧同为 16 MiB)。
-- **服务端自动分片**(2026-10 起,默认开,`frontend.auto_chunk_enabled` / `auto_chunk_bytes`;④ 改为**边收边分片**):
+- **服务端自动分片(恒切)**(2026-10-21 裁决:`auto_chunk_enabled` 整字段删除,无兼容包袱;`frontend.auto_chunk_bytes` 定片宽,公共 `[upload] max_object_bytes` 定单文件上限):
   `POST /blobs` 的 body(声明或实收)超过 `max_body_bytes` 时:
   1. **决定窗** = `max_body_bytes`:无声明路径 EOF 在窗内 ⇒ 单 blob(核验后写);越窗即转分片模式
      (buf 自头切片,片边界语义同前)。有声明的大档直接进分片模式且 session 头**先校验**(400 早于
-     任何片入库);声明 > 片数 4096 × 单片(总量上限)在预检处 413,不读 body;
+     任何片入库);声明超公共单文件上限在预检处 413,不读 body(配置校验保证上限 ≤ 4096 × 片宽 = 描述符容量);
   2. 攒满 `auto_chunk_bytes` 即 `put_auto_with_ttl` **一片**(顺序写:并发扇出会把"单片内存"乘以片数
      在途,先不做);片与描述符**同 TTL**,整个逻辑对象一体过期(HEAD 可见 `expired` / `expiration-ms`);
   3. **EOF 对账**(实收 == 声明)后编**同 `/stitch` 的描述符**(session = 请求带的 `x-antfs-session`,缺省空)
@@ -134,15 +134,19 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
   **重试安全**:重试拿到一套全新 blobId,与失败轮互不相扰。
   **内存**:决定窗 + 单片(= `auto_chunk_bytes`,校验限 1..=1 GiB),不随对象大小涨;**本地落盘**:零。
   **与旧"先暂存后切片"的净语义差(所有者裁决 ④ 已接受)**:客户端断流时可能已有若干片入库(旧路径整包
-  校验后才写,零孤儿);**网关崩溃窗孤儿片无清扫面**(frontend 无名世界、无对账源)。缓解路线留观 =
-  `openspec/changes/upload-zero-spool/` design §9.3(PENDING 会话小对象方案;行业取证 Ambry/SeaweedFS/
-  CubeFS 对照见其 §10)。观测:`frontend_upload_chunk_cleanups_total`(事件)+ 配套 orphan 计数。
-  **总量上限**(默认 4096 × 4 MiB = 16 GiB)不再是暂存空间的界(没有暂存了),只是分片数的界。
+  校验后才写,零孤儿)。**收账簿(已于同日裁决「已入库垃圾要删」后实施)**:配 `frontend.upload_session_wal_dir`
+  (空 = 不记账、维持 ④ 无兜底)后,start / 逐片 chunk / commit / abort 全程落账(JSONL,逐行 fsync,写线程
+  独占);超时孤儿会话(最后记账 6h 无终态)由清扫任务逐片墓碑并核销(启动即一拍 + 每 10 分钟;四类会话判定
+  与残余风险[断电线毫秒窗 / 账簿卷蒸发,对照 Ambry 25h TTL 取舍]见 `upload_wal.rs` 模块注释;行业取证见
+  upload-zero-spool design §10)。观测:`frontend_upload_chunk_cleanups_total`(断流清理)+
+  `frontend_upload_sweeper_runs/tombstones_total`(清扫)。
+  **单文件上限**(公共表默认 16 GiB)与描述符容量(4096 × 片宽)由 `FrontendToml::validate_all` 在配置层合闸。
 - **读方向**:大对象(> 1 MiB)先经 SDK 落到暂存文件再**流式**回给客户端,小对象才整体读回
   —— 故 **frontend 侧内存不随对象大小涨**。**但 store 侧的 `GET` 仍把数据体整个读进内存**(真流式 GET 是 store 的待办,
   见 §11),所以端到端内存上界仍由 store 决定(自动分片的 `GET` 同样受此限:逐片 `get`、内存 = 单片)。
-- 一次上传的落盘量:frontend 暂存 1 份 + store 侧暂存 1 份 + log 1 份 —— 这是"内存换磁盘"的代价,记在 D5
-  (自动分片是"× N 片 + 描述符 1 份",且暂存文件例外地先写满总量再切片)。
+- 一次上传的落盘账(2026-10-21 现状):frontend 上传方向**零本地文件**(④ 已撤;下载大对象仍有 1 份中转)
+  + store 侧暂存 1 份(A 段未做)+ log 1 份 —— A 段落地后收敛为"log 一份 = 数据真身"(写放大 2× → 1×)。
+  分片形态 = × N 片 + 描述符 1 份(每片普通 blob;A2 压缩帧临时文件已从网关路径消失)。
 
 ## 6. CORS
 
@@ -171,9 +175,10 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | key(TOML) | 类型 | 默认值 | 取值范围/校验 | 含义/影响 | 对齐的 Ambry 原配置 |
 |---|---|---|---|---|---|
 | `frontend.listen_addr` | String | `127.0.0.1:7400` | 非空 | HTTP 监听地址 | `frontend.http.port` 等 |
-| `frontend.max_body_bytes` | u64 | `4194304`(4 MiB) | ≥1 | 单请求 body 上限(body ≤ 此值的仍是**单 blob**;关闭自动分片时即 413 硬上限,开启后是"转分片"的门槛,见 §5)。部署须与 `store_server.max_body_bytes` 对齐 | `frontend.max.json.request.size.bytes` 等(语义不同) |
-| `frontend.auto_chunk_enabled` | bool | `true` | — | 服务端自动分片开关:开 = body 超过 `max_body_bytes` 时自动切片多次上传并返回描述符的 blobId;关 = 恢复旧行为(超 `max_body_bytes` 一律 413,客户端手动走 `/stitch`) | 无(router 侧 chunking 在 Ambry 是另一层的事) |
-| `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | 自动分片单片大小:切片逐片入库的粒度,也是写路径单片驻留内存的读写缓冲大小;总量上限 = 4096 片 × 此值(默认 16 GiB) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层) |
+| `frontend.max_body_bytes` | u64 | `4194304`(4 MiB) | ≥1 | **内部分档界**(恒切,2026-10-21:不再是 413 契约线):有声明且 ≤ 此值走"内存整收"单 blob;超过转边收边分片。部署须与 `store_server.max_body_bytes` 对齐 | `frontend.max.json.request.size.bytes` 等(语义不同) |
+| `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | **恒切的单片大小**(片 = 普通 blob 粒度,也是单片驻留内存的读写缓冲);**描述符容量 = 4096 片 × 此值**(公共单文件上限在配置层须 ≤ 它) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层;router 下沉开工单 = upload-zero-spool design §12) |
+| `[upload] max_object_bytes`(顶层公共表) | u64 | `17179869184`(16 GiB) | ≥ 1 且 ≤ 4096 × `frontend.auto_chunk_bytes` | **单文件上传上限**:REST 与 S3 网关共用的契约分界线(`common.toml` 或各网关 TOML 顶层,一处改两边生效);有声明超限读 body 前 413,无声明边收边超、已入库片墓碑回收后 413 | 无 |
+| `frontend.upload_session_wal_dir` | String(路径) | `""` | 空 = 不记账;非空 = 目录可建可写(启动校验,失败拒启) | 边收边分片的**孤儿收账簿目录**(Ambry 会话表 + 定期清扫的本地等价物):begin / 逐片 chunk / commit / abort 全程落 JSONL(逐行 fsync,写线程独占);超时孤儿会话(最后记账 6h 无终态)由清扫任务逐片墓碑 + 核销 | 无 |
 | `frontend.cors_allowed_origins` | Vec\<String\> | `[]` | 各项为非空且非 `*` 的合法 header 值(校验期就拒) | CORS 来源白名单(**空 = 不挂 CORS 层**;不接受 `*`) | `frontend.options.allow.methods` 等 |
 | `frontend.router.master_addr` | String | `127.0.0.1:7101` | 非空 | 内嵌 SDK 的 master 地址(见 [`router.md` §5](./router.md)) | 无 |
 | `frontend.router.cluster_secret` | String | `""` | — | 集群准入密钥 | 无 |
@@ -203,7 +208,9 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend_upload_auto_chunk_total` | counter | `outcome` | 次 | 走服务端自动分片路径的上传请求数(成功在 handler 记、失败在 upload 的分片出口记),`upload_total` 的子集 | 无(语义上 Ambry 把 chunk 计数放在 router 层) |
 | `frontend_upload_auto_chunk_chunks_total` | counter | — | 片 | **成功**的自动分片上传写入的数据片数(不含描述符) | 无 |
 | `frontend_upload_auto_chunk_orphan_deletes_total` | counter | — | 次 | 自动分片中途失败后发起的孤儿片回收删除**尝试**数(best-effort,可能未删成) | 无 |
-| `frontend_upload_chunk_cleanups_total` | counter | — | 次 | 边收边分片(④)上传失败后**触发**孤儿片回收的事件数(逐片删除尝试数看上行;观测断流后的孤儿压力面) | 无 |
+| `frontend_upload_chunk_cleanups_total` | counter | — | 次 | 边收边分片上传失败后**触发**孤儿片回收的事件数(逐片删除尝试数看上行;观测断流后的孤儿压力面) | 无 |
+| `frontend_upload_sweeper_runs_total` | counter | — | 次 | 收账清扫拍数(启用 `upload_session_wal_dir` 后:启动即一拍 + 每 10 分钟;常零命中) | 无 |
+| `frontend_upload_sweeper_tombstones_total` | counter | — | 次 | 清扫器成功发出的孤儿片**墓碑数**(删除失败留待下一拍重试) | 无 |
 | `frontend_download_total` | counter | `outcome` | 次 | 下载请求数 | `FrontendMetrics.getBlobRequestMetrics` |
 | `frontend_download_bytes_total` | counter | — | 字节 | 下载字节数(成功;拼装对象按描述符里各片长度求和) | 无 |
 | `frontend_delete_total` | counter | `outcome` | 次 | 删除请求数 | `FrontendMetrics.deleteBlobRequestMetrics` |

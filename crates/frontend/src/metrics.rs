@@ -43,6 +43,10 @@ pub struct FrontendMetrics {
     /// `upload_auto_chunk_orphan_deletes_total`)。与"先暂存后切片"时代的净差:断流/崩溃窗
     /// 可能已有片入库,此数 + 孤儿删除数是孤儿压力面的观测位。
     pub upload_chunk_cleanups_total: IntCounter,
+    /// 收账清扫的**拍数**(启用 upload WAL 后,启动即一拍、此后每 10 分钟;常为零命中)。
+    pub upload_sweeper_runs_total: IntCounter,
+    /// 清扫器实际发出的孤儿片**墓碑数**(仅成功的删除计入;失败留下一拍,见 server.rs 清扫)。
+    pub upload_sweeper_tombstones_total: IntCounter,
     /// 下载请求数(`GET /blobs/{blobId}`),label `outcome`。
     pub download_total: IntCounterVec,
     /// 下载返回的字节数(counter,只计成功;拼装对象按描述符里各片长度求和)。
@@ -93,6 +97,16 @@ impl FrontendMetrics {
                 registry,
                 "frontend_upload_chunk_cleanups_total",
                 "stream-chunked uploads that triggered orphan-chunk cleanup on failure",
+            )?,
+            upload_sweeper_runs_total: counter(
+                registry,
+                "frontend_upload_sweeper_runs_total",
+                "upload session sweeper ticks (startup + periodic, usually zero hits)",
+            )?,
+            upload_sweeper_tombstones_total: counter(
+                registry,
+                "frontend_upload_sweeper_tombstones_total",
+                "orphan chunk tombstones successfully written by the upload sweeper",
             )?,
             download_total: counter_vec(
                 registry,
