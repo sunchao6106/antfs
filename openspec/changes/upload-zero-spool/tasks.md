@@ -11,6 +11,8 @@
       监控 `two_pass` 标签
 - [ ] 3. B:测试(见 design §5 B 面:两遍确定性对拍/CL 恰等兜底/超界可压与熵大文件成对
       断言/上界边界/TMPDIR 零触/指标实例)+ router.md 双表
+- [ ] 3b. (待裁决④)网关墙③:frontend 上传 TMPDIR 中转去除 —— 整包内存上限(推荐)或
+      边收边分片;GET 大对象同源中转是否一并纳入零临时盘目标随 ④ 裁
 - [ ] 4. A:`blob` Log lane 机制(`reserve_large`/commit/abort 回卷/seal 阈值)+ write_lock 拆短临界区
 - [ ] 5. A:store handler 三段化(前查/reserve/转发环/commit)+ 空闲超时 + 内闸(`put_stream_direct` 默认 true,旧暂存路径保留灰度)
 - [ ] 6. A:旋钮 ×2 + 监控 ×4 + `staging_dir` 退役文档 + store.md/router.md

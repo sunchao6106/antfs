@@ -19,6 +19,11 @@
   由 flush 写)。**单写者不变量**:`write_lock` 全程持有,段内 `debug_assert`("committed
   before any other append")——并发预留今日结构性不存在。弃单语义:未 commit 区间对读者与
   恢复扫描不可见,后续追加自然覆盖(`Log::reserve` 文档明文)。
+- **网关面(2026-10-21 勘误补入)**:`frontend/server.rs` `POST /blobs` body > 1MiB(或无
+  CL)→ 自制 `TempFile`(TMPDIR,RAII)全量中转 → `router.put_file(path)` / 分片复读切片;
+  GET 大对象同名中转(`get_file`)。根因同源:SDK 无"流式 body"写口。S3 网关零盘(全
+  `Bytes`,`read_bounded_body` 上限 `max_body_bytes` = 4 MiB/对象;另发现死旋钮
+  `s3.inline_body_max` 有声明无使用点)。**全场景临时文件清单见附录 §8。**
 - **削峰设计为什么存在**(暂存的辩护词,必须尊重):写锁串行整个引擎写;若引擎直读网络流,
   网络时长进锁 ⇒ 同分区所有写 p99 挂起。实测记录(小对象走暂存的那条注释):每 PUT 多 5 次
   fs 元数据操作,p50 ~1ms → ~9ms —— 这就是小对象走内存、大对象走暂存+每盘池的由来。
@@ -83,6 +88,9 @@
   网络发送流水线重叠,通常仍被网络时间掩盖。小文件主场景(≤上界)零增量。
 - 多副本不共享编码产物(今日共享帧文件的带宽收益让位于零盘;确定性保证各副本字节一致)。
 - 型一超上界的半途编码字节被丢弃(最坏多 ~0.5 遍计数 CPU;"无缝续数"优化可消,留实施)。
+- **B 段不覆盖网关墙③**(frontend 自制 `TempFile` 上传中转):其根因(SDK 无流式 body 写口)
+  与 B 段在 router 内消除压缩帧是两件事;frontend 去法两案(frontend 整包内存上限 / 边收边
+  分片)见 proposal 裁决点 4,获批后另补细案。
 
 ## 3. A 段设计(store 服务端:log 预留区直写 + 大小分道)
 
@@ -204,3 +212,30 @@ start);大对象 30s 慢速传输期间并发 1 KiB PUT ack 延迟对照组(I5 �
 - B 段残余 = cap 以上可压文件密度回归(裁决点 ① 已列回退选项)。
 - `write_all_at` 转发环在 reactor-adjacent blocking 散集:每 chunk 无序完成不伤正确性
   (定位写),但极端块乱序落盘不构成任何可见性问题(commit 前不可见)。
+
+## 8. 附录:全场景临时文件清单(2026-10-21 全量清点,行号级)
+
+> 取证方法:大小写不敏感全库扫描(`tempfile|temp_dir|tempdir|NamedTempFile` + `.tmp|/"tmp"|
+> staging|unique_suffix|自制 RAII 结构`),逐处人工分类运行时 vs 测试内联;教训 = 自制
+> `TempFile`(非 tempfile crate)曾致漏检。测试/基准夹具的 `tempdir()` 不入列(非运行时)。
+
+| # | 场景 | 触发条件 | 落盘位置 | 生命周期 | 与压缩关系 |
+|---|---|---|---|---|---|
+| **A 上传路径(墙)—— 本 change 的作战面** ||||||
+| A1 | frontend `POST /blobs` 上传中转(`server.rs:426` `TempFile`) | body > 1 MiB 或无 CL | **TMPDIR**(`antfs-frontend-{pid}-{ns}.tmp`) | Drop 同步删(async 线程直删) | 无关 |
+| A2 | router `put_file` 压缩帧(`compression.rs` `NamedTempFile`) | 压缩开 + 过前置闸 | **TMPDIR** | RAII 守护跨全副本/重试 | **独有**(此墙之本源) |
+| A3 | store 数据面 PUT 暂存(`server.rs` `StagedFile`) | CL > 1 MiB | **数据盘** `(盘)/tmp/` 或 `staging_dir` | 正常池删 + Drop 兜底 + 启动清扫 | 无关(数据不透明) |
+| **B 下载路径(呈报,不在当前订单)** ||||||
+| B1 | frontend `GET /blobs` 大对象中转(`server.rs:626` `get_file`) | 返回体为非拼装大对象 | **TMPDIR** | 随响应流 drop(发完/断连即删) | 无关 |
+| **C 引擎/集群机制性 tmp(数据盘上;原子发布/探测,非中转语义)** ||||||
+| C1 | 拉复制 bootstrap 物理拷段(`replica.rs:336`) | 空副本从对端拉段 | 副本 `log/{段名}.tmp` → fsync → rename | 失败清整个半成品目录 | 无关 |
+| C2 | 索引 / Binary Fuse filter 构建(`index/segment.rs:225`) | 段封存构建期 | 数据目录 `.tmp` → rename | 原子发布 | 无关 |
+| C3 | COMPACT 状态原子写(`compact_state.rs:39`) | 压实政策状态更新 | `{STATE_FILE}.tmp` → rename | 原子发布 | 无关 |
+| C4 | 磁盘健康探测短线文件(`health.rs`,§12.12 记档) | 探测开启时周期 | 数据盘 `tmp/`(即建即删) | 单次探测内 | 无关 |
+| **D 语义 = 数据/零盘佐证** ||||||
+| D1 | devcluster 测试内 tempdir(非运行时数据位置;生产 devcluster 数据走显式目录) | 仅测试 | — | — | — |
+| D2 | **S3 网关全链零临时文件**:PutObject/UploadPart/Copy/读回/拼装全部 `Bytes` 内存(`read_bounded_body` 上限 `max_body_bytes` = 4 MiB/对象,过限拒收;更大对象走 multipart 语义)。附发现:死旋钮 `s3.inline_body_max`(声明 + 校验,无任何使用点)—— 留观,不擅动 | ||||
+
+**上行叠加账(如实)**:经 frontend 的开压缩 10 MiB 上传最多踩 A1+A2+A3(三份临时拷贝);
+关压缩仍有 A1+A3(两份)。经 S3 的 ≤ 4 MiB 对象只有 A3 一份;> 4 MiB 走 multipart,每片
+≤ 4 MiB,内存分片 + 每片过 A3。**"零临时盘"在同一对象上的真实含义 = 把所在路径上的 A* 全消。**

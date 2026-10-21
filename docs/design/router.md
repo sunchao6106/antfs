@@ -230,7 +230,9 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 - [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
 - [ ] **上传路径零本地临时盘(全链路,所有者指示事后做)**:① 客户端 `put_file` 压缩的帧文件
       (`tempfile::NamedTempFile`,落 TMPDIR,详见 §7 SDK 透明压缩);② 服务端 > 1 MiB 带 CL 的
-      PUT 暂存 `<data_dir>/tmp/`(见 `store.md` 数据面端点·"流式 PUT"条目)。前置条件:store 补
+      PUT 暂存 `<data_dir>/tmp/`(见 `store.md` 数据面端点·"流式 PUT"条目);③ 网关面 frontend
+      上传 > 1 MiB 的 TMPDIR 全量中转(自制 `TempFile`,**2026-10-21 全量清点补入**,去法 =
+      提案裁决点 4;GET 大对象同源中转一并呈报)。前置条件:store 补
       chunked(无 CL)流式落盘路径;压缩比率闸语义重裁决(采样启发[SeaweedFS 派,判错认栽] /
       两遍确定性[CPU 1+N] / 放弃诚实比率);多副本并传的编码流形态(CPU×N vs 共享帧)。
       方案已设计归档:[`openspec/changes/upload-zero-spool/`](../../openspec/changes/upload-zero-spool/)

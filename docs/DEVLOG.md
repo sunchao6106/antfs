@@ -2341,3 +2341,27 @@ CL,服务端零改;真实否决理由仅剩"全量两遍在小文件主流下 CP
 ## Testing Done(docs-only 修订)
 
 - 零 `.rs` diff;`openspec validate upload-zero-spool` 过;CI/Docker 全量绿。
+
+### 步 92(upload-zero-spool):全量清点所有临时文件场景 + 勘误 frontend 误报
+
+**触发**:所有者质询"不开压缩,frontend or s3 上传不走本地临时文件?你确定吗?" —— 复核
+结论:**frontend 错、S3 对**。错因:此前清单 grep 大小写漏检(frontend 自制 `TempFile` 结构,
+非 tempfile crate),且网关面整体漏出清点范围;S3 全 handlers 走 `read_bounded_body`(整对象
+内存,上限 `max_body_bytes` = 4 MiB,过限拒收走 multipart)确为零盘。
+
+**全量清单**(design.md 新附录 §8,行号级、逐处分类运行时 vs 测试):
+- 上传墙:A1 frontend `POST /blobs` > 1 MiB TMPDIR 中转 / A2 router 压缩帧(压缩可关)/
+  A3 store > 1 MiB staged(数据盘);
+- 下载墙:B1 frontend `GET` 大对象 TMPDIR 中转(`get_file` 同源);
+- 引擎机制族(数据盘,原子发布/探测,非中转):C1 bootstrap 物理拷段 `.tmp`→fsync→rename /
+  C2 索引-Fuse 构建 tmp→rename / C3 COMPACT 状态 tmp→rename / C4 健康探测短线文件;
+- 佐证:S3 网关零盘;死旋钮 `s3.inline_body_max`(声明+校验、无使用点)留观不擅动。
+- 叠加账:开压缩的 10 MiB frontend 上行最多踩 A1+A2+A3 三份临时拷贝;关压缩仍 A1+A3 两份。
+
+**档案同步**:proposal 墙表 2→3(墙③ 网关面)+ 裁决点 4(frontend 去法两案:整包内存上限
+[推荐] vs 边收边分片)+ impact 勘误(原"frontend/s3 本就零盘"半错半对);design §0 补网关
+事实 + 附录 §8;tasks 增 3b(待裁决④);router.md §7 墙清单补 ③。
+
+## Testing Done(docs-only)
+
+- 零 `.rs` diff;`openspec validate upload-zero-spool` 过;CI/Docker 全量绿。

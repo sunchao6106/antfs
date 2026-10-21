@@ -14,6 +14,7 @@
 |---|---|---|---|
 | ① 客户端 | router `put_file` 压缩帧:`compress_stream_to_temp` → `tempfile::NamedTempFile`(落 **TMPDIR**,非数据盘) | 诚实比率闸需压缩后尺寸;一个帧供 N 副本并 PUT + 507 重试重读;RAII 清删 | 每次 put_file 额外写一遍压缩流;SDK 对 TMPDIR 依赖(无盘/只读 tmp 容器不可用);明文帧散落客户机盘上的窗口 |
 | ② 服务端 | store `put_blob`:CL > 1 MiB → `StagedFile`(`(staging_dir 或各盘)tmp/put_*.tmp`)后进引擎 | 引擎 `put_from_reader` 单写者(写锁全程)+ 忠实长度;暂存认网络时长与写锁解耦(文档化、实测过的 p50 1ms→9ms 教训) | 大对象双写(写两遍盘 = 写放大 2×);暂存文件生命周期(cancellation Drop 兜底 + 启动清扫) |
+| ③ 网关面 | frontend `POST /blobs`:body > 1 MiB(或无 CL)→ `TempFile` 全量中转 | 自制 RAII 结构(server.rs `TempFile::create`,TMPDIR `antfs-frontend-*.tmp`)→ `router.put_file(path)` / 分片复读;根因 = SDK 只有 `Bytes`(整进内存)与 `put_file`(文件路径)两个写口 | 与墙②同源的额外落盘 + TMPDIR 依赖;**压缩无关**。〔全量清点 2026-10-21 补入:此前 grep 大小写漏检自制 `TempFile`,误报网关零盘〕 |
 
 ## What Changes(两段,独立可裁决)
 
@@ -25,6 +26,11 @@
   **逐副本边压边传**(流式编码直接接 HTTP body,`Content-Length` = 第一遍数出的精确值;
   编码确定性 ⇒ 每字节一致,store"恰等 CL"校验是硬兜底)。507 重试 = 重跑该副本传输遍。
 - TMPDIR 依赖清零;任意体量、任意闸分支,客户端全程零文件。
+
+- > 勘误(2026-10-21 全量清点):**frontend 网关上传另有独立的 TMPDIR 暂存(墙③),B/A 段
+  都不覆盖** —— 需要网关侧方案(整包内存上限 / 边收边分片,两向初呈见裁决点 4)。S3 网关
+  确为零盘(纯内存,`read_bounded_body` 上限 `max_body_bytes` = 4 MiB/对象,过限拒收,
+  更大对象客户端走 multipart)。原 impact 行"frontend/s3 本就零盘"半错半对,已更正。
 
 **A 段(store,服务端墙,引擎攻坚)**:> 1 MiB CL PUT 去 `StagedFile`,改为
 **log 预留区直写 + 大小分道**:`Log` 增设大对象专用活跃段(lane;默认 2 条,每 lane
@@ -43,8 +49,9 @@
 - A:`blob`(Log/lane 机制 + abort 回卷)、`store`(handler 三段化)、文档(store.md/router.md);
   `store_server.staging_dir` 落地后退役( knob 保留解析,文档明示);监控 +4 项。
   engine 写路径 = 持久性红线 → 全套崩溃一致性/并发/abort 测试随批。
-- 不碰:s3/frontend 内存分块路径(本就零盘)、磁盘格式、chunked(无 CL)端口语义(维持
-  缓冲回落——router 全链路 PUT 恒带 CL)。
+- 不碰:磁盘格式、chunked(无 CL)端口语义(维持缓冲回落——router 全链路 PUT 恒带 CL)。
+  **s3 网关本就零盘**(纯内存界 4 MiB/对象);**frontend 网关的 TMPDIR 上传暂存是墙③,
+  须网关侧方案,不在 B/A 两段内**(见裁决点 4)。
 
 ## Out of Scope
 
@@ -60,3 +67,11 @@
 2. **A 段道型**(待决):推荐 **A-ii 大小分道**(本提案);保守护栏 = **A-iii 维持暂存 +
    `staging_dir` 指外置 scratch 盘**(零代码,"服务端盘"可控但非零)。
 3. **实施顺序**(待决):推荐 B 先(低风险速赢)→ A 后(引擎攻坚);亦可只批 B 段。
+4. **网关墙③(frontend 上传暂存)去法**(待决,全量清点后新增):
+   - i) **整包内存上限**(推荐):对齐 S3 网关形态 —— body ≤ `max_body_bytes` 全程内存
+     (`to_bytes` 有界),过限 413 / 引导客户端走分片;简单、同构、改动面小;代价 = 内存界
+     × 并发上传数。
+   - ii) **边收边分片**:网关直接 stream 进 `auto_chunk` 块逐片入集群,零整包内存零盘;
+     语义变化 = 中途断流窗口内已入库的孤儿片依赖 `cleanup_acked_chunks` 同款清理(残留
+     片可有 GC/墓碑兜底);config 校验与长度前置闸改走声明值。
+   - 下载面(GET 大对象同走 TMPDIR 中转)是否纳入"零临时盘"目标,一并裁定。
