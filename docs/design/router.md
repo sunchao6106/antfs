@@ -70,21 +70,28 @@ put(key, bytes): 解析 key 的高 32 位得 partitionId
 - **失败即报错,不偷偷换 partition 重写**:换分区重写会掩盖问题且可能与已部分写入的副本产生分叉;重试由调用方决定。
 - 变更类(`delete`)同样走多数派扇出。**TTL 只能在写入时给**:`put_with_ttl(key, data, expiration_ms)` / `put_file_with_ttl(path, expiration_ms)` 把绝对过期时刻(`expiration_ms`)随写一并扇出(单次多数派写);`put` / `put_file` 是 `NO_EXPIRATION`(常量由 `antfs_router` 再导出)的包装,等价于"永不过期"。写入之后**没有任何改 TTL 的接口**。
 - **`put_auto` / `put_auto_with_ttl`(内部发号 + 507 换分区重试)**:适用于上层**不关心落在哪个分区**的场景(frontend 小 body 上传、S3 网关)。内部 `allocate_one` → 多数派写 → 全副本 507 时摘掉该分区、重新发号到另一个分区重试(最多 `MAX_STORE_FULL_RETRIES=2` 次,共 3 次尝试),语义与 `put_file_with_ttl` 的重试逻辑完全一致,返回 `(StoreKey, PutReport)`。`put_with_ttl(key, data)` 的 key 由调用方预分配,因此无法换分区——只摘掉号段并返回 `StoreFull`。
-- **`put_file` 与压缩三闸同路**(`router-putfile-compression`,2026-10-20):压缩开启且过体量闸时,
-  先在客户端本地临时文件**流式预压**一个帧(17B 头 + 编码流,内存恒 O(拷贝缓冲),不随文件大小涨),
-  全部副本并行 PUT 与 507 换分区重试**共用同一帧文件**,结束后 RAII 自动清删;比率闸不过或流压
-  IO 失败则回落**原文件直传**(「每副本各自从文件流式读」语义不变)。监控标签与 Bytes 口共用一套
-  (含新增 `io` 回落)。
+恒切管线(2026-10-21 下沉,`upload-zero-spool` design §12):`put_with_ttl` /
+`put_auto_with_ttl` 收到超过 `put_bytes_chunk_bytes` 的 body 时内部切片 —— 每片 =
+一次**普通 blob 多数派写**(经 `put_auto_keyed` 内环:发号 + 507 换分区重试;SWRR 自然
+把片散向不同可写分区),尾笔把拼装描述符以 composed 位落库(既定 key 形落在调用方
+key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容量(`MAX_CHUNKS × 片宽`)
+前置 `too_large` 拒绝(一字节未写)。网关侧恒切(auto 段)与本管线共用同一底层。
 
-## 3. 读路径(R = 1)
+## 3. 读路径(R = 1;读口四形态,2026-10-21 读侧下沉)
 
-```
-get(key): 解析 partitionId → 副本位置(**`up` 的排在前面**)
-        → 逐个副本 HTTP GET,**第一个 200 即返回**
-        → 全部 404 → NotFound;还有副本不可达 → 报最后一个真实故障(不能把"读不到"当"不存在")
-```
+| 读口 | 语义 | 典型调用方 |
+|---|---|---|
+| `get(key)` | **逻辑对象整读**(Bytes):拼装对象自动逐片拼回真数据;普通对象原字节。实现 = `stat ‖ 裸读` 并发(`composed` 位是唯一类型判定)再分岔 | SDK 直连 / 压测(bench) |
+| `get_object_stream(key)` | **逻辑对象流式读**:`(逻辑长度, 流)`,内存 = 传输块级,不落盘不整体进内存 | 网关下载(REST `/blobs` GET) |
+| `get_object_range_stream(key, start, len)` | **逻辑对象窗口流式读**(blob-range-read):普通对象走数据面 `?offset=&length=`;拼装对象映射到**覆盖片**(边界片裁边,只取窗口相关片) | 网关部分读(REST/S3 Range) |
+| `get_blob(key)` | **裸 blob 读**(受控口):字节原样、单请求无前置 stat;拼装对象返回描述符字节。只服务“已知普通 blob”热路径(S3 单体读) | S3 网关 |
+| `stat_object(key)` | 逻辑对象**元数据**:`size` = 逻辑大小(拼装 = 各片之和)、`chunks` = 片数、deleted/expired | 网关 HEAD |
 
-blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多数副本有,连试几个必命中。
+- R=1 逐副本(**`up` 的排在前面**),**第一个 200 即返回**;全部 404 → `NotFound`;还有副本不可达 → 报最后一个真实故障(不能把"读不到"当"不存在")。
+- 窗口读的**覆盖片映射**对齐 Ambry `GetBlobOperation.getStoreKeysInByteRange`:片完整性核对入流内(尺寸不符 = 响亮错,不静默截短)。
+- 已删/已过期对象:与数据面 GET 拒读语义对齐(逻辑口回 `NotFound`)。
+- **不做落盘式读**(裁决⑭):`get_file` 已随读侧下沉移除,文件级消费由调用方对流自管。
+- blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多数副本有,连试几个必命中。
 
 ## 4. 失败语义(稳定契约)
 
@@ -106,7 +113,9 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `not_found` | 所有副本都 404「对象不存在」 | 真不存在(或已删/过期) |
 | `config` / `metric` | `RouterConfig` 加载/校验失败、指标注册失败 | 启动即败类,不是运行期路由问题 |
 | `http_client` | 构建数据面 HTTP 客户端失败 | 初始化问题(如 TLS/超时配置非法) |
-| `io` | `put_file` 暂存文件 IO 失败 | 本地盘问题;请求报错,重试另选暂存 |
+| `io` | `put_file` 本地文件 IO 失败 | 本地盘问题;请求报错,重试另选文件 |
+| `too_large` | 恒切管线容量拒绝(body > `put_bytes_chunk_bytes × MAX_CHUNKS`,一字节未写) | 调用方缩小重试或走流式口(2026-10-21 恒切下沉) |
+| `bad_composed` | 拼装对象读回时描述符/片不一致(上游损坏类) | 响亮上抛不静默(CLAUDE.md §3.3);网关映射 502 类口径 |
 | `quorum` | 未收满 W 个 ack | detail 里给出逐类失败计数 |
 | `partition_mismatch` | blobId 自带 partition 与目标不一致 | 拼错了 |
 
@@ -123,11 +132,7 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router.id_segment_size` | u32 | `1024` | ≥1 | **均分时**每个可写分区一次向 master 申请的 blobId 个数(号段 N)。总预留 = 分区数 × 该值(SWRR 分配的**总**号码池;**实际按写权重配比**切成各分区份额)。越大越省 RPC、router 崩溃留下的空洞越大(空洞无害,D3) | 无(Ambry 的 id 是本地随机生成,无发号) |
 | `router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新**可写分区列表**的周期(秒):已不可写分区的号段被丢掉、新出现的可写分区补一段 | 无 |
 | `router.latency_aware_routing` | bool | `true` | — | **读路由按观测延迟排序副本**(慢盘处置的客户端侧那一半):读恒为 R=1(第一个成功即返回),故"先试哪个副本"直接决定读延迟。开着时记录每副本请求耗时的 EWMA,读时 **`up` 优先 → 延迟升序 → master 原序**;未测副本按"已测均值"当先验;无数据时是**恒等变换**。**只改顺序、不改候选集** ⇒ 不改变 W/R 与冲突解决语义。关掉用于定位/对照压测。详见 [`cluster.md` §9.3](./cluster.md) | 无 |
-| `router.compression_enabled` | bool | `false` | — | **SDK 透明压缩总闸**(`router-blob-compression`,2026-10-20):开 = Bytes 形态写入(`put`/`put_auto`/`put_composed` 族)过三闸后以自描述帧落盘(读侧自动解压),store 集群全程不感知;关(默认)= 逐字节零变化。开启是运维决策(读 CPU 换盘/网带宽) | `router.compression.enabled` |
-| `router.compression_algorithm` | String | `gzip` | `zstd` \| `gzip` \| `lz4` \| `snappy` | 压缩算法(算法号进帧头,集群可混存不同时期写入的对象;改配置只影响**新写入**) | `router.compression.*` 的算法族在其 Compression 接口注册表 |
-| `router.compression_min_size_bytes` | usize | `4096` | ≥0(0 视为 1) | 最小试压体量:小于它的对象不压(海量小文件为主体的仓,压无益且帧头 17B 即亏) | `router.compression.minimal.content.size` |
-| `router.compression_min_ratio` | f64 | `1.05` | [1.0, 100.0] | 最小压缩比率(orig/stored):试压不足即回落原文 —— 熵数据自动出局(无类型闸的语义替代) | `router.compression.minimal.ratio` |
-| `router.compression_level` | i32 | `1` | zstd 1..=19 / gzip 0..=9 / lz4、snappy 忽略 | 级别权衡:默认 1 = 速度面(网关 CPU 是共享资源) | Ambry 经 `CompressionLevel` 接口 |
+| `router.put_bytes_chunk_bytes` | u64 | `4194304`(4 MiB) | `0`(关)或 64 KiB ..= 1 GiB | **SDK 直连大 Bytes 写的恒切片宽**(2026-10-21 下沉,`upload-zero-spool` design §12):body 超过它时 `put`/`put_auto` 族内部切片(片 = 普通多数派 blob,发号 SWRR 散向可写分区)+ 尾笔拼装描述符,返回描述符 blobId;读回走 `get`/`get_object_stream` 透明拼装。**网关内嵌 `[router]` 表须交叉校验"网关自身片/单体宽 ≤ 本值"**(frontend/s3 的 `validate_all` 已带,防止 gateway 片被二次切)。对齐 Ambry `router.max.put.chunk.size.bytes`(恒切无开关,此间以 0 表达"不切") | `router.max.put.chunk.size.bytes`(Ambry 4 MiB) |
 
 > **请求哪个 partition**:补段时先 `ListPartitions(state=RW)` 拿可写分区列表,再对**每个**分区显式点名
 > `partition_id` 申请一小批(master 复核该分区 RW 且**至少有一个副本**,否则 `ok=false` 只跳过该分区)。
@@ -162,8 +167,10 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 | `router_mutation_total` | counter | `op`, `outcome` | 次 | `delete`/`stat` 操作数 | `RouterMetrics.*OperationRate` |
 | `router_partition_refresh_total` | counter | `outcome` | 次 | 后台刷新可写分区列表的次数(失败为 `error`) | 无 |
 | `router_writable_partitions` | gauge | — | 个 | 本地**持有号段的分区数**(后台刷新后刷新;0 = 当前无可写分区) | 无 |
-| `router_compression_attempts_total` | counter | `outcome` | 次 | SDK 压缩三闸判定数(取值 `kept` / `too_small` / `low_ratio` / `disabled` / `io`,稳定契约;`io` = `put_file` 流压 IO 失败回落原文,`router-putfile-compression` 2026-10-20) | `CompressionMetrics.*`(速率/比率族) |
-| `router_compression_saved_bytes_total` | counter | — | 字节 | 压缩节省字节数(`orig − stored`,只计 kept) | `CompressionMetrics.compressRate` 族近义 |
+| `router_put_chunked_total` | counter | `outcome`(ok / fail / reject) | 次 | 经恒切管线的**逻辑对象**写入数(对象粒度;reject = 超容量前置拒绝,一字节未写) | 无(Ambry 无此分立观测) |
+| `router_put_chunked_chunks_total` | counter | — | 次 | 恒切管线成功写入的片数(片级多数派写本身另计 `router_put_total`) | 无 |
+| `router_put_chunked_orphan_deletes_total` | counter | — | 次 | 恒切失败回收发出的片**墓碑尝试**数(尽力口径,删成败不在此区分) | 无 |
+| `router_get_chunked_total` | counter | — | 次 | 逻辑读(`get`/`get_object_stream`/`get_object_range_stream`)自动拼装返回的逻辑对象数;每次片的实际传输已由 `router_get_total`/`router_get_bytes` 覆盖 | 无 |
 | `router_topology_refreshes_total` | counter | `reason` | 次 | 读拓扑重拉次数(`ttl` = TTL 到期 / `evict` = 全副本不可达驱逐;`router-read-topology-refresh` 2026-10-20) | 无 |
 | `router_id_prefetch_errors_total` | counter | — | 次 | 号段后台预取失败数(成功不打 —— 成功即用耗尽次数的下降体现;`router-id-prefetch` 2026-10-20) | 无 |
 
@@ -175,19 +182,22 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
 
 ## 7. 与 Ambry 的差异 / 已知取舍 / 待办
 
-**SDK 透明压缩**(`router-blob-compression`,2026-10-20;详见 `openspec/changes/router-blob-compression/`):
-- **帧形态**:payload = `8B 魔数 \x89ANTFSZ1 | algo u8 | orig_len u64 | 编码流`(17B 头);
-  store 集群(记录/索引/CRC/复制/compaction)全程视帧为不透明字节 ⇒ **磁盘格式零改**;
-- **三闸**:`enabled → min_size(4096) → ratio(1.05)`,`put_keyed` / `put_auto_keyed` /
-  `put_file` 三口对称接入(一次判定供全部副本);`put_file` 为**流式临时帧文件**形态
-  (`router-putfile-compression`,2026-10-20:客户端先行把 17B 头 + 编码流压进本地临时
-  文件,内存恒 O(拷贝缓冲)、**全副本并行 PUT 与 507 换分区重试共用同一帧**,RAII 自动
-  清删;流压 IO 失败一律回落原文直传,`io` 标签计入监控行)—— 原「v1 不压」取舍就此收官;
-- **算法族可配**(`gzip` 默认 / zstd / lz4 / snappy),算法号进帧头 —— 集群混存演进,
-  老帧永远读得动;`get` bulk 解压 / `get_file` 流式(channel + blocking 解码线程,
-  产出校验 = `orig_len`,不产截短文件);帧坏按副本损坏处理走 R=1 换重试;
-- **已知取舍**:REST HEAD 的 `x-antfs-blob-size` 对压缩对象呈 stored size(S3 层 HEAD
-  走 metastore 的 logical size 无感);`RouterConfig` 因 f64 字段退 `PartialEq`。
+**恒切下沉 + 逻辑读口**(2026-10-21,`upload-zero-spool` design §12;读侧裁决⑨/⑩/⑭):
+- 写:`put`/`put_auto` 族遇超片宽 body 内部切片(片 = 普通多数派 blob,SWRR 散分区)+ 拼装描述符;
+  失败 = 已入库片尽力墓碑 + 原错误透传;超容量 = `too_large` 前置拒绝。网关内嵌本表须交叉校验
+  "网关片/单体宽 ≤ `put_bytes_chunk_bytes`"(防二次切;frontend/s3 `validate_all`)。
+- 读:`get/get_object_stream/get_object_range_stream/stat_object` 以**逻辑对象**为口径(拼装自动拼回、
+  窗口只取覆盖片);裸字节只剩 `get_blob` 受控口。`get_file`(落盘式读)已删(⑭)。
+- 与 Ambry `NonBlockingRouter` 同型(恒切 + composite 重组),差异 = 描述符为普通 blob 落库
+  (composed 位类型判定)而非 Ambry 的元数据侧复合。
+
+**SDK 透明压缩已整体移除**(2026-10-21 所有者裁决⑬;曾以 `router-blob-compression` /
+`router-putfile-compression` 落地):五旋钮(`compression_enabled`/`algorithm`/
+`min_size_bytes`/`min_ratio`/`level`)、帧形态(17B 头自描述)、三闸、流式临时帧文件、
+读侧 bulk/流式解压、相关指标与 e2e 全数退场。**记档约束**:存量的压缩帧 blob 将按**原字节**读回
+(不再透明解压);**重开时的 TODO**(所有者明示):等读接口定型后,基于流式读口
+(`get_object_stream`/窗口流)重设计 —— 帧头兼容存量对象是硬前提;`get_object_range_stream`
+的窗口必须落在解压后坐标(或显式拒绝帧对象,勿切坏帧)。在此之前任何仓勿开启旧帧写入路径(已无)。
 
 **相对 Ambry 的差异(有意为之)**:
 1. **blobId 由 master 发号**(号段批处理 + Raft 水位),不是 router 本地随机铸 —— 见 `blobid-master-assign` D1–D4。
@@ -228,17 +238,13 @@ blob 不可变 → 不需要 `R + W > N`,R=1 足够;W=2(及更多)保证 ≥ 多
       驱逐。观测 `router_topology_refreshes_total{reason=ttl|evict}`)。
 - [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,frontend 的 `x-antfs-ttl-ms` 已是单次原子写)。
 - [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
-- [ ] **上传路径零本地临时盘(全链路,所有者指示事后做)**:① 客户端 `put_file` 压缩的帧文件
-      (`tempfile::NamedTempFile`,落 TMPDIR,详见 §7 SDK 透明压缩);② 服务端 > 1 MiB 带 CL 的
-      PUT 暂存 `<data_dir>/tmp/`(见 `store.md` 数据面端点·"流式 PUT"条目);③ 网关面 frontend
-      上传 > 1 MiB 的 TMPDIR 全量中转(自制 `TempFile`,**2026-10-21 全量清点补入**,去法 =
-      提案裁决点 4;GET 大对象同源中转一并呈报)。前置条件:store 补
-      chunked(无 CL)流式落盘路径;压缩比率闸语义重裁决(采样启发[SeaweedFS 派,判错认栽] /
-      两遍确定性[CPU 1+N] / 放弃诚实比率);多副本并传的编码流形态(CPU×N vs 共享帧)。
-      方案已设计归档:[`openspec/changes/upload-zero-spool/`](../../openspec/changes/upload-zero-spool/)
-      —— B 段(① 已裁定:≤上界内存帧 + **超上界两遍流式,压缩永不放弃**)、A 段(store log
-      预留区直写 + 大小分道)与**网关段(④ 已裁定:边收边分片,design §9)**;
-      ②A 道型 ③实施顺序仍待裁决。否决路线与并发预留/HOL 论证见该 design.md §4。
+- [x] ~~上传/下载路径零本地临时盘(读写两侧)~~ —— **读侧已全清**(2026-10-21:网关下载走
+      router 逻辑流(`get_object_stream`,裁决⑫);SDK 落盘式读口 `get_file` 已删(裁决⑭);
+      `put_file` 的压缩帧临时文件随压缩整体移除(裁决⑬)一并消失,`put_file` 直接流式发
+      副本文件)。**写侧网关面已零盘**(`upload-zero-spool` ④ 恒切+收账,前期落地);剩余 =
+      B 段(router 压缩重开后的超上界两遍流式 —— **待压缩接口定型**,见 §7 移除记档)与
+      A 段(store 暂存 `<data_dir>/tmp/` 的引擎侧去留,原方案归档
+      [`openspec/changes/upload-zero-spool/`](../../openspec/changes/upload-zero-spool/) design §4)。
 - [ ] **admin 手动权重入口 → master**:现在写权重只有"由容量现算"一个来源(`capacity_weight_permille`)。要做人工
   压权重,路径是 admin → master 写进同一处 → 同一个 `write_weight` 字段下发,**客户端零改动**(router 只当相对权重用)。
 - [ ] **SWRR 的 O(n) → O(log n)**:分区数上千时每次发号遍历在册分区不划算,需要换堆 / 树的加权调度结构。当前

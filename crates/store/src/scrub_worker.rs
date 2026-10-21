@@ -302,8 +302,9 @@ mod tests {
         (tmp, rm, pool, crate::disk_health::new_map(), metrics)
     }
 
-    /// 3 条 128B 记录(每条磁盘占 152B = 24 头开销 + 128 数据);单条预算 = 152。
-    const REC: u64 = 24 + 128;
+    /// 3 条 128B 记录(每条磁盘占 150B = 22 头开销 + 128 数据 —— 5ded718 记录 v4 去 2B
+    /// frame magic 后的实占);单条预算 = 150。
+    const REC: u64 = 22 + 128;
 
     fn populated_replica(rm: &ReplicaManager) -> ReplicaHandle {
         let h = rm.ensure_replica(1).unwrap();
@@ -314,7 +315,7 @@ mod tests {
         h
     }
 
-    /// 预算恰一条:三轮接力恰好覆盖全库一次(字节数 = 3×152 且不重扫),第四轮从头部开新周期
+    /// 预算恰一条:三轮接力恰好覆盖全库一次(字节数 = 3×150 且不重扫),第四轮从头部开新周期
     /// (`end_cursor = None` 之后游标归零)。每轮只完成 1 个 batch —— 蜗牛爬步长受预算钳制。
     #[tokio::test]
     async fn round_crawls_stepwise_and_repeats_cycles() {
@@ -338,7 +339,7 @@ mod tests {
         assert_eq!(
             metrics.scrub_background_bytes.get(),
             4 * REC,
-            "3×152 覆盖一次 + 新周期第一批:不重不漏"
+            "3×150 覆盖一次 + 新周期第一批:不重不漏"
         );
         let _ = tmp; // 持有寿命
     }

@@ -1,7 +1,7 @@
 //! client(router SDK)端到端集成测试:**真 master + 真 store(真 gRPC + 真 HTTP 端口)**。
 //!
 //! 覆盖判据(对齐 `docs/design/client.md` 与 `cluster.md §10`):
-//!   1. 发号 → 写 → 读往返一致(`put`/`get`/`put_file`/`get_file`);
+//!   1. 发号 → 写 → 读往返一致(`put`/`get`/`put_file`/`get_object_stream`);
 //!   2. **W = 实际副本数 / 2 + 1**:RF=3 掉一个副本仍能写成功(acks=2);RF=1 只要求 1 个 ack
 //!      (证明门槛是"实算多数派",不是写死 2);
 //!   3. **R = 1**:第一个副本不可达时自动换副本读成功;
@@ -223,18 +223,22 @@ async fn put_get_roundtrip_and_w_is_actual_majority() {
 
     // 文件往返(流式):写本地文件 → 传 → 下载到另一个文件 → 比对。
     let src = tmp.path().join("src.bin");
-    let dst = tmp.path().join("dst.bin");
     let bytes = payload(300 * 1024, 7);
     tokio::fs::write(&src, &bytes).await.unwrap();
     let (key, report) = client.put_file(&src).await.expect("put_file");
     assert_eq!(report.required, 2);
-    let n = client.get_file(&key, &dst).await.expect("get_file");
-    assert_eq!(n as usize, bytes.len());
-    assert_eq!(
-        tokio::fs::read(&dst).await.unwrap(),
-        bytes,
-        "文件往返必须一致"
-    );
+    // 读回(⑭ 读口只留 stream 式):流式收尽 = 原 file 长字节恒等。
+    let (_len, stream) = client
+        .get_object_stream(&key)
+        .await
+        .expect("get_object_stream");
+    let mut back = Vec::new();
+    let mut stream = std::pin::pin!(stream);
+    use futures::StreamExt as _;
+    while let Some(chunk) = stream.next().await {
+        back.extend_from_slice(&chunk.expect("stream chunk"));
+    }
+    assert_eq!(back, bytes, "put_file → 逻辑流式读回恒等");
 
     // 元数据 / 删除(删除不可逆:删了就取不回来了)。
     let stat = client.stat(&key).await.expect("stat");
@@ -912,230 +916,6 @@ async fn put_auto_retries_on_store_full_partition() {
     );
 }
 
-/// router-blob-compression:三态语义(默认关逐字节零变化 / 开后表现为帧且读回恒等) +
-/// get_file 流式解压 + 复制(RF=2)下帧字节透传保持一致。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compression_roundtrip_disabled_default_and_enabled() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
-    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
-    register_node(&node, 101, &addr_a).await;
-    let pid = create_partition(&node, vec![placement(101)]).await;
-    ensure_replica(&addr_a, pid).await;
-
-    let compressible = || {
-        // 高重复可压体(min_size 之上的确切可压模式)。
-        let pat = b"compressible-pattern-0123456789-";
-        bytes::Bytes::from(
-            (0..64 * 1024)
-                .map(|i| pat[i % pat.len()])
-                .collect::<Vec<_>>(),
-        )
-    };
-
-    // ── 态一:默认关 = 逐字节零变化(帧态 = 不存在)──
-    let registry = antfs_metric::Registry::new();
-    let off = Router::connect(client_cfg(&grpc), &registry).await.unwrap();
-    let k1 = off.allocate_one().await.unwrap();
-    let d1 = compressible();
-    off.put(k1, d1.clone()).await.expect("关态首写");
-    // 尺寸不缩(读回=写入;stored = 原文,admin 通道不做断言 —— get 恒等即可)。
-    assert_eq!(off.get(&k1).await.unwrap(), d1);
-    assert_eq!(
-        off.metrics()
-            .compression_attempts
-            .with_label_values(&["disabled"])
-            .get(),
-        1,
-        "关态应计 disabled 且不产生帧"
-    );
-
-    // ── 态二:开后 = 帧落盘 + bulk 读回恒等 ──
-    // 开态用默认算法(gzip,2026-10-20 所有者终裁)。
-    let mut cfg_on = client_cfg(&grpc);
-    cfg_on.compression_enabled = true;
-    assert_eq!(cfg_on.compression_algorithm, "gzip", "默认算法须为 gzip");
-    let registry_on = antfs_metric::Registry::new();
-    let on = Router::connect(cfg_on, &registry_on).await.unwrap();
-    let k2 = on.allocate_one().await.unwrap();
-    let d2 = compressible();
-    let report = on.put(k2, d2.clone()).await.expect("开态首写");
-    assert_eq!(report.acks, 1);
-    assert_eq!(on.get(&k2).await.unwrap(), d2, "bulk 口透明解压恒等");
-    let kept = on
-        .metrics()
-        .compression_attempts
-        .with_label_values(&["kept"])
-        .get();
-    let saved = on.metrics().compression_saved_bytes.get();
-    assert_eq!(kept, 1, "可压体过闸 kept");
-    assert!(saved > 65536 / 2, "节省过半(高度重复文本),got {saved}");
-
-    // ── 态三:get_file(流式口)对帧对象满地落盘恒等 ──
-    let dst = tmp.path().join("out.bin");
-    let n = on.get_file(&k2, &dst).await.expect("get_file");
-    assert_eq!(n, d2.len() as u64, "流式口产出 = 逻辑长度(orig_len)");
-    let read_back = std::fs::read(&dst).unwrap();
-    assert_eq!(read_back, d2);
-
-    // 同键零长前端(交叉):第二个小对象(低于 min_size)不压、原样 roundtrip。
-    let k3 = on.allocate_one().await.unwrap();
-    let tiny = bytes::Bytes::from_static(b"tiny-not-compressed");
-    on.put(k3, tiny.clone()).await.unwrap();
-    assert_eq!(on.get(&k3).await.unwrap(), tiny);
-    assert_eq!(
-        on.metrics()
-            .compression_attempts
-            .with_label_values(&["too_small"])
-            .get(),
-        1
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compression_survives_replication_frame_passthrough() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
-    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
-    let (_sb, addr_b) = start_store(&tmp.path().join("store-b"), 102).await;
-    register_node(&node, 101, &addr_a).await;
-    register_node(&node, 102, &addr_b).await;
-    // RF=2 ⇒ W=2:两副本都写;复制拉取(?replication=1)透传帧字节,两副本读回一致。
-    let pid = create_partition(&node, vec![placement(101), placement(102)]).await;
-    ensure_replica(&addr_a, pid).await;
-    ensure_replica(&addr_b, pid).await;
-
-    let mut cfg = client_cfg(&grpc);
-    cfg.compression_enabled = true;
-    let registry = antfs_metric::Registry::new();
-    let client = Router::connect(cfg, &registry).await.unwrap();
-    let pat = b"replicated-compressible-content-";
-    let data = {
-        let mut v = Vec::with_capacity(128 * 1024);
-        for i in 0..128 * 1024 {
-            v.push(pat[i % pat.len()]);
-        }
-        bytes::Bytes::from(v)
-    };
-    let key = client.allocate_one().await.unwrap();
-    client
-        .put(key, data.clone())
-        .await
-        .expect("W=2 双副本帧写入");
-    assert_eq!(client.get(&key).await.unwrap(), data, "读回恒等");
-}
-
-/// master-leader-address:client 故意指向 follower → 发号收 not-leader →
-/// 单飞切换 master 通道并重试成功;后续发号直达 leader 不再走自愈路径。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn router_self_heals_when_master_addr_points_at_follower() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (nodes, grpc_addrs) = start_three_node_master(tmp.path()).await;
-    let follower_entry = grpc_addrs
-        .iter()
-        .find(|(id, _)| *id != leader_id_of(&nodes))
-        .expect("follower exists")
-        .clone();
-
-    // (可选)注册一个数据节点 + 分区,让发号有 RW 分区可用(直接 Raft 写,不经 gRPC)。
-    let leader = nodes
-        .iter()
-        .find(|n| n.config.node_id == leader_id_of(&nodes))
-        .unwrap();
-    register_node(leader, 101, "127.0.0.1:101").await;
-    let pid = create_partition(leader, vec![placement(101)]).await;
-
-    // 前置:等 follower 的 leader 提示可得(自报注册经 Raft 异步收敛;轮询带 deadline,禁 sleep)。
-    {
-        use antfs_master::pb::GetBlobIdsRequest;
-        let mut probe = MasterClient::connect(format!("http://{}", follower_entry.1))
-            .await
-            .expect("probe connect");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let r = probe
-                .get_blob_ids(GetBlobIdsRequest {
-                    version: 1,
-                    cluster_secret: SECRET.to_string(),
-                    count: 4,
-                    partition_id: Some(pid),
-                })
-                .await
-                .expect("probe rpc")
-                .into_inner();
-            if !r.leader_addr.is_empty() || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    // router 连 follower(master 配置指错):首号触发 not-leader 自愈。
-    let mut cfg = client_cfg(&follower_entry.1);
-    cfg.id_segment_size = 4;
-    let registry = antfs_metric::Registry::new();
-    let client = Router::connect(cfg, &registry).await.unwrap();
-    let key = client.allocate_one().await.expect("自愈后发号必须成功");
-    assert_eq!(key.partition_id(), pid, "号段来自已建分区");
-    // 后续发号直达 leader(通道已切,不再 not-leader)。
-    let k2 = client.allocate_one().await.expect("切换后发号稳定");
-    assert_ne!(key, k2, "号不重复");
-}
-
-/// 三节点 master 集群(0 端口 + bound 取回;成员地址用 raft bound),等选出 leader。
-/// 返回 (节点, (node_id, grpc_addr) 列表)。
-async fn start_three_node_master(tmp: &std::path::Path) -> (Vec<MasterNode>, Vec<(u64, String)>) {
-    use openraft::BasicNode;
-    let mut nodes = Vec::new();
-    let mut members = std::collections::BTreeMap::new();
-    let mut grpc_addrs = Vec::new();
-    for id in 1u64..=3 {
-        let dir = tmp.join(format!("master-{id}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = antfs_master::config::MasterConfig {
-            node_id: id,
-            raft_addr: "127.0.0.1:0".to_string(),
-            grpc_addr: "127.0.0.1:0".to_string(),
-            data_dir: dir.to_string_lossy().into_owned(),
-            initial_members: vec![1, 2, 3],
-            cluster_secret: SECRET.to_string(),
-            partition_capacity_bytes: 64 << 20,
-            segment_capacity_bytes: 8 << 20,
-            id_alloc_segment_size: 4,
-            id_alloc_raft_batch_multiple: 2,
-            reconcile_startup_grace_secs: 0,
-            ..Default::default()
-        };
-        let registry = antfs_metric::Registry::new();
-        let node = MasterNode::start(cfg, &registry)
-            .await
-            .expect("start master");
-        node.serve().expect("serve master");
-        let raft_addr = node.bound_raft_addr().expect("bound raft");
-        members.insert(id, BasicNode::new(raft_addr));
-        grpc_addrs.push((id, node.bound_grpc_addr().expect("bound grpc")));
-        nodes.push(node);
-    }
-    nodes[0].initialize(members).await.expect("initialize");
-    for n in &nodes {
-        n.raft
-            .wait(Some(Duration::from_secs(15)))
-            .metrics(|m| m.current_leader.is_some(), "leader elected")
-            .await
-            .expect("leader elected within timeout");
-    }
-    (nodes, grpc_addrs)
-}
-
-fn leader_id_of(nodes: &[MasterNode]) -> u64 {
-    nodes[0]
-        .raft
-        .metrics()
-        .borrow()
-        .current_leader
-        .expect("has leader")
-}
-
 /// router-read-topology-refresh:两 reason 的 metric 证据 ——
 /// ttl(TTL 短旋钮轮询到重刷发生)/ evict(全员不可达分区触发驱逐)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1250,11 +1030,134 @@ async fn id_prefetch_keeps_allocation_fluent_on_tiny_segments() {
         "真 master 下的预取须零错误"
     );
 }
+// ── router 层恒切下沉(upload-zero-spool §12 + 读侧裁决⑨/⑩/⑭ + blob-range-read)──────
 
-/// router-putfile-compression:put_file 三闸与 Bytes 口同语义 —— 高重复内容走流式帧
-/// 文件上传(读口解压恒等)、过小落体量闸原文直传、强熵落比率闸原文直传;监控三笔各记。
+/// 恒切全链:大 Bytes `put_auto`(17 MiB > 片宽 4 MiB)→ 5 片 + 描述符;
+/// ① `get` 自动拼回原字节(⑨);② `stat_object` 逻辑尺寸/片数;③ `get_blob` 返回
+/// 裸描述符(格式层 parse 可验,⑩ 的受控口);④ 片散向两个可写分区(SWRR);
+/// ⑤ `get_object_stream` 流式整读恒等;⑥ 窗口读(5..7 MiB)只取覆盖片且字节恒等。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn put_file_compression_roundtrip_all_gates() {
+async fn put_auto_chunks_large_bytes_reads_back_and_spreads() {
+    use futures::StreamExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
+    let (_sb, addr_b) = start_store(&tmp.path().join("store-b"), 102).await;
+    register_node(&node, 101, &addr_a).await;
+    register_node(&node, 102, &addr_b).await;
+    // 两个可写分区(RF=1 各占一节点):发号轮转必产生分片散布。
+    let p0 = create_partition(&node, vec![placement(101)]).await;
+    let p1 = create_partition(&node, vec![placement(102)]).await;
+    ensure_replica(&addr_a, p0).await;
+    ensure_replica(&addr_b, p1).await;
+
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(client_cfg(&grpc), &registry).await.unwrap();
+    assert_eq!(
+        client.config().put_bytes_chunk_bytes,
+        4 * 1024 * 1024,
+        "默认片宽 4 MiB"
+    );
+
+    let data = bytes::Bytes::from(payload(17 * 1024 * 1024, 7));
+    let (key, _report) = client.put_auto(data.clone()).await.expect("put_auto 恒切");
+
+    // ① 逻辑整读自动拼装(⑨)。
+    assert_eq!(client.get(&key).await.expect("get = 逻辑拼装"), data);
+
+    // ② 逻辑元数据。
+    let meta = client.stat_object(&key).await.expect("stat_object");
+    assert_eq!(meta.size, data.len() as u64);
+    assert_eq!(meta.chunks, Some(5), "17 MiB / 4 MiB → 5 片");
+
+    // ③ 裸口 = 描述符本体(§格式层 parse 验证)。
+    let raw = client.get_blob(&key).await.expect("get_blob");
+    let refs = antfs_descriptor::parse(&raw).expect("描述符可解析");
+    assert_eq!(refs.len(), 5);
+    assert_eq!(refs[0].size, 4 * 1024 * 1024);
+    assert_eq!(refs[4].size, 1024 * 1024, "末片欠整 = 1 MiB");
+
+    // ④ 两分区(发号 SWRR 轮转)至少都被片覆盖。
+    let pids: std::collections::HashSet<u32> = refs
+        .iter()
+        .filter_map(|r| antfs_blob::StoreKey::from_slice(&r.id).map(|k| k.partition_id()))
+        .collect();
+    assert!(
+        pids.contains(&p0) && pids.contains(&p1),
+        "片须散向两分区: {pids:?}"
+    );
+
+    // ⑤ 流式整读恒等。
+    let (len, mut streamed) = client
+        .get_object_stream(&key)
+        .await
+        .expect("get_object_stream");
+    assert_eq!(len, data.len() as u64);
+    let mut got = Vec::with_capacity(data.len());
+    while let Some(chunk) = streamed.next().await {
+        got.extend_from_slice(&chunk.expect("流片"));
+    }
+    assert_eq!(got, data, "流式整读 = 原字节");
+
+    // ⑥ 窗口读(5..7 MiB:覆盖片 2 与 3,其中片 3 全采、片 2 裁头)。
+    let start = 5 * 1024 * 1024u64;
+    let want = &data[start as usize..(start as usize + 2 * 1024 * 1024)];
+    let mut ranged = client
+        .get_object_range_stream(&key, start, 2 * 1024 * 1024)
+        .await
+        .expect("range stream");
+    let mut rgot = Vec::new();
+    while let Some(chunk) = ranged.next().await {
+        rgot.extend_from_slice(&chunk.expect("range 流片"));
+    }
+    assert_eq!(rgot.as_slice(), want, "窗口读 = 原字节切片");
+    assert!(
+        client.metrics().get_chunked_total.get() >= 3,
+        "拼装读(整/流/窗)都计入 get_chunked_total"
+    );
+}
+
+/// key 形恒切的失败回收:既有 key 冲突(描述符 409)→ 已入库片**尽力墓碑** +
+/// `put_chunked_orphan_deletes_total` 计数;原 key 上的旧对象不受扰动。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyed_chunked_collision_tombstones_written_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
+    register_node(&node, 101, &addr_a).await;
+    let pid = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, pid).await;
+
+    let registry = antfs_metric::Registry::new();
+    let mut cfg = client_cfg(&grpc);
+    cfg.put_bytes_chunk_bytes = 64 * 1024; // 129 KiB → 3 片,测试快
+    let client = Router::connect(cfg, &registry).await.unwrap();
+
+    let key = client.allocate_one().await.unwrap();
+    let first = bytes::Bytes::from_static(b"first-write");
+    client.put(key, first.clone()).await.expect("占位写");
+
+    let big = bytes::Bytes::from(payload(129 * 1024, 3));
+    let err = client
+        .put_with_ttl(key, big, NO_EXPIRATION)
+        .await
+        .expect_err("同 key 冲突必须失败");
+    assert!(
+        matches!(err, antfs_router::Error::AlreadyExists { .. }),
+        "描述符落 key 409,得 {err:?}"
+    );
+    assert_eq!(
+        client.metrics().put_chunked_orphan_deletes_total.get(),
+        3,
+        "3 片逐片墓碑"
+    );
+    // 旧对象原样幸存。
+    assert_eq!(client.get_blob(&key).await.unwrap(), first);
+}
+
+/// 片宽 0(关):大 Bytes 单笔直写 —— `stat.composed = false`,`get`/`get_blob` 同字节。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunking_off_means_single_plain_blob() {
     let tmp = tempfile::tempdir().unwrap();
     let (node, grpc) = solo_master(&tmp.path().join("master")).await;
     let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
@@ -1263,58 +1166,25 @@ async fn put_file_compression_roundtrip_all_gates() {
     ensure_replica(&addr_a, pid).await;
 
     let mut cfg = client_cfg(&grpc);
-    cfg.compression_enabled = true; // 算法取默认 gzip
+    cfg.put_bytes_chunk_bytes = 0;
     let registry = antfs_metric::Registry::new();
     let client = Router::connect(cfg, &registry).await.unwrap();
 
-    // ① kept:高重复 128 KiB → 临时帧文件上传,读口解压恒等。
-    let pattern: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
-    let src = tmp.path().join("kept.bin");
-    std::fs::write(&src, &pattern).unwrap();
-    let (key, _) = client.put_file(&src).await.expect("put_file kept");
-    let out = tmp.path().join("kept-out.bin");
-    let n = client.get_file(&key, &out).await.expect("get_file kept");
-    assert_eq!(n as usize, pattern.len(), "逻辑大小 = 原文件大小");
-    assert_eq!(std::fs::read(&out).unwrap(), pattern);
-
-    // ② too_small:100 B 落体量闸,原文直传。
-    let small = b"tiny-antfs-putfile-payload".to_vec();
-    let src2 = tmp.path().join("small.bin");
-    std::fs::write(&src2, &small).unwrap();
-    let (key2, _) = client.put_file(&src2).await.expect("put_file small");
-    let out2 = tmp.path().join("small-out.bin");
-    client.get_file(&key2, &out2).await.expect("get_file small");
-    assert_eq!(std::fs::read(&out2).unwrap(), small);
-
-    // ③ low_ratio:强熵 128 KiB 落比率闸,原文直传。
-    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-    let ent: Vec<u8> = (0..128 * 1024)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x >> 33) as u8
-        })
-        .collect();
-    let src3 = tmp.path().join("ent.bin");
-    std::fs::write(&src3, &ent).unwrap();
-    let (key3, _) = client.put_file(&src3).await.expect("put_file entropy");
-    let out3 = tmp.path().join("ent-out.bin");
-    client
-        .get_file(&key3, &out3)
+    let data = bytes::Bytes::from(payload(5 * 1024 * 1024 + 11, 5));
+    let (key, _) = client.put_auto(data.clone()).await.expect("单笔直写");
+    let stat = client.stat(&key).await.expect("stat");
+    assert!(!stat.composed, "不切 = 普通 blob");
+    assert_eq!(client.get(&key).await.unwrap(), data);
+    assert_eq!(client.get_blob(&key).await.unwrap(), data);
+    // 普通对象的窗口读 = 数据面 offset/length 直切。
+    let mut ranged = client
+        .get_object_range_stream(&key, 100, 2 * 1024 * 1024)
         .await
-        .expect("get_file entropy");
-    assert_eq!(std::fs::read(&out3).unwrap(), ent);
-
-    // 三闸监控标签各记一笔(Bytes 口同款契约:kept / too_small / low_ratio)。
-    let attempts = |o: &str| {
-        client
-            .metrics()
-            .compression_attempts
-            .with_label_values(&[o])
-            .get()
-    };
-    assert!(attempts("kept") >= 1, "kept 至少一笔");
-    assert!(attempts("too_small") >= 1, "too_small 至少一笔");
-    assert!(attempts("low_ratio") >= 1, "low_ratio 至少一笔");
+        .expect("plain range");
+    use futures::StreamExt as _;
+    let mut got = Vec::new();
+    while let Some(c) = ranged.next().await {
+        got.extend_from_slice(&c.expect("plain range 片"));
+    }
+    assert_eq!(got.as_slice(), &data[100..(100 + 2 * 1024 * 1024)]);
 }

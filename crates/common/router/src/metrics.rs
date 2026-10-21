@@ -24,10 +24,6 @@ pub struct RouterMetrics {
     pub put_replica_errors: IntCounterVec,
     /// 因分区写满(全副本 507)而换分区重试的次数(counter)。
     pub router_put_store_full_retries: IntCounter,
-    /// 压缩三闸判定计数,label `outcome`(kept / too_small / low_ratio / disabled)。
-    pub compression_attempts: IntCounterVec,
-    /// 压缩节省的字节数(orig − stored;只计 kept)。
-    pub compression_saved_bytes: IntCounter,
     /// 读拓扑重拉次数,label `reason`(ttl = 周期过期 / evict = 全副本不可达驱逐)。
     pub topology_refreshes: IntCounterVec,
     /// 号段后台预取失败次数(成功不打:成功的预取自然体现在耗尽次数下降)。
@@ -42,6 +38,15 @@ pub struct RouterMetrics {
     pub partition_refresh_total: IntCounterVec,
     /// 本地持有号段的**分区数**(= 当前可写分区数;gauge)。
     pub writable_partitions: IntGauge,
+    /// 经恒切管线的**逻辑对象**数,label `outcome`(ok / fail / reject)。
+    pub put_chunked_total: IntCounterVec,
+    /// 恒切管线写入成功的片数(counter)。
+    pub put_chunked_chunks_total: IntCounter,
+    /// 恒切失败回收发出的片墓碑数(counter,尽力口径,删成败不在此区分)。
+    pub put_chunked_orphan_deletes_total: IntCounter,
+    /// 读侧自动拼装返回的逻辑对象数(恒切管线的成对读口;分数次计入,
+    /// 每次一片的实际数据传输已由 `get_total`/`get_bytes` 覆盖)。
+    pub get_chunked_total: IntCounter,
 }
 
 impl RouterMetrics {
@@ -86,16 +91,10 @@ impl RouterMetrics {
                 "router_put_store_full_retries_total",
                 "put retries after all replicas reported partition full (507)",
             )?,
-            compression_attempts: counter_vec(
+            get_chunked_total: counter(
                 registry,
-                "router_compression_attempts_total",
-                "SDK compression gate decisions per put",
-                &["outcome"],
-            )?,
-            compression_saved_bytes: counter(
-                registry,
-                "router_compression_saved_bytes_total",
-                "bytes saved by SDK compression (orig minus stored, kept only)",
+                "router_get_chunked_total",
+                "logical objects re-assembled from stitch chunks on read",
             )?,
             topology_refreshes: counter_vec(
                 registry,
@@ -135,6 +134,22 @@ impl RouterMetrics {
                 registry,
                 "router_writable_partitions",
                 "partitions currently holding a cached id segment",
+            )?,
+            put_chunked_total: counter_vec(
+                registry,
+                "router_put_chunked_total",
+                "logical objects written via the chunked pipeline by outcome",
+                &["outcome"],
+            )?,
+            put_chunked_chunks_total: counter(
+                registry,
+                "router_put_chunked_chunks_total",
+                "chunks successfully written by the chunked pipeline",
+            )?,
+            put_chunked_orphan_deletes_total: counter(
+                registry,
+                "router_put_chunked_orphan_deletes_total",
+                "tombstones issued to reclaim chunks of failed chunked puts (best-effort)",
             )?,
         })
     }

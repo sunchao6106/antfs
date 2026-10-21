@@ -59,8 +59,9 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 | 端点 | 内部动作 |
 |---|---|
 | `POST /blobs` | 小 body(≤ 1 MiB):`put_auto_with_ttl(bytes, expiration_ms)`(**内部发号 + 分区满 507 自动换分区重试**,最多 2 次);中 body(声明 ≤ `max_body_bytes`):有界内存整收 + `put_auto_with_ttl`(核验一致才写);**超过(自动分片开)或无声明长度**:`stream_upload` 决定窗 + 边收边分片(§5,④,零本地文件)。三条路径写行为对称(**W = 副本数/2+1**,收满即返回,其余靠拉复制补) |
-| `GET /blobs/{id}` | `get(&key)`(**R=1**,副本按 `up` 排序,首个 200 即返回) |
-| `HEAD /blobs/{id}` | `stat(&key)`(元数据不读数据体) |
+| `GET /blobs/{id}` | router **逻辑流式读** `get_object_stream(&key)`(R=1;拼装自动拼回真数据,内存 = 传输块级,**全程零本地文件**;回 `Accept-Ranges: bytes`) |
+| `GET /blobs/{id}` + `Range` | `stat_object`(逻辑大小)→ `get_object_range_stream(&key, start, len)`:单区间 → **206** + `Content-Range`(拼装对象只取**覆盖片**,边界片裁边);越界/空对象/`bytes=-0` → **416** + `Content-Range: bytes */size`;无头/语法坏/多区间 → 200 全对象(对齐 s3 语义矩阵;blob-range-read 2026-10-21) |
+| `HEAD /blobs/{id}` | `stat_object(&key)`(逻辑元数据:拼装对象 size = 各片之和、`x-antfs-blob-stitch-chunks`);带 Range 也回 **206** 无 body(Ambry 口径) |
 | `DELETE` | `delete`(多数派写墓碑,**不可逆**) |
 
 - `x-antfs-ttl-ms` 的落地方式:**同一次写** —— frontend 把该头解析成绝对 `expiration_ms` 交给 SDK(`Router::put_with_ttl` /
@@ -110,8 +111,10 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
   S3 网关同口径);超过或无声明长度走 [`stream_upload`] 的**决定窗 + 流式分片(恒切,2026-10-21 裁决废除开关)**(内存 = 窗口 +
   单片,不随对象大小涨)。三条路径的 507 重试行为**完全对称**(最多 2 次换分区)。
   分档原因:每次落系统临时目录文件多出 `create/write/close/unlink` 的元数据开销,实测把 PUT p50 从 ~1ms 拖到
-  ~9ms(release,4 KiB × 并发 32)—— **上传已全档零本地临时文件**(旧"上传落暂存文件"机制退役;下载大对象的
-  中转保留,见"读方向"条)。
+  ~9ms(release,4 KiB × 并发 32)—— **上传已全档零本地临时文件**(旧"上传落暂存文件"机制退役);
+  **下载方向同样零盘(2026-10-21 读侧下沉,裁决⑫)**:大对象 GET 不再落系统临时目录中转,
+  router `get_object_stream` 直通(窗口读 `get_object_range_stream` 同口径,§3 表);旧
+  `TempFile` 中转机制删除。
 - `frontend.max_body_bytes`:**内部分档界 + 无声明接收的决定窗**(恒切后不再是 413 契约线)。**契约分界
   只有一条**:公共单文件上限 `[upload] max_object_bytes`(与 S3 网关同一处)—— 声明超限读 body 前 413;
   chunked(无 `Content-Length`)边收边计数,越线即停 → 413 且已入库片逐片墓碑回收(孤儿残余语义同断流,
@@ -141,11 +144,13 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
   upload-zero-spool design §10)。观测:`frontend_upload_chunk_cleanups_total`(断流清理)+
   `frontend_upload_sweeper_runs/tombstones_total`(清扫)。
   **单文件上限**(公共表默认 16 GiB)与描述符容量(4096 × 片宽)由 `FrontendToml::validate_all` 在配置层合闸。
-- **读方向**:大对象(> 1 MiB)先经 SDK 落到暂存文件再**流式**回给客户端,小对象才整体读回
+- **读方向**(2026-10-21 更新):router 逻辑流直通(`get_object_stream`),内存 = 传输块级,
+  **零临时文件**;小对象与拼装对象走同一条逻辑流(router 决定分岔)
   —— 故 **frontend 侧内存不随对象大小涨**。**但 store 侧的 `GET` 仍把数据体整个读进内存**(真流式 GET 是 store 的待办,
   见 §11),所以端到端内存上界仍由 store 决定(自动分片的 `GET` 同样受此限:逐片 `get`、内存 = 单片)。
-- 一次上传的落盘账(2026-10-21 现状):frontend 上传方向**零本地文件**(④ 已撤;下载大对象仍有 1 份中转)
-  + store 侧暂存 1 份(A 段未做)+ log 1 份 —— A 段落地后收敛为"log 一份 = 数据真身"(写放大 2× → 1×)。
+- 一次上传的落盘账(2026-10-21 读侧下沉后):frontend **读/写双向零本地文件**(上传 ④ 恒切+收账;
+  下载 router 逻辑流直通)+ store 侧暂存 1 份(A 段未做)+ log 1 份 —— A 段落地后收敛为
+  "log 一份 = 数据真身"(写放大 2× → 1×)。
   分片形态 = × N 片 + 描述符 1 份(每片普通 blob;A2 压缩帧临时文件已从网关路径消失)。
 
 ## 6. CORS
@@ -186,6 +191,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend.router.id_segment_size` | u32 | `1024` | ≥1 | **均分时**每个可写分区一次申请的 blobId 个数(总预留 = 分区数 × 该值,**实际按写权重配比**;见 [`router.md` §2/§5](./router.md)) | 无 |
 | `frontend.router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新可写分区列表的周期(秒;见 [`router.md` §2](./router.md)) | 无 |
 | `frontend.router.latency_aware_routing` | bool | `true` | — | 读路径副本排序开关(`up` → 观测延迟 EWMA 升序 → master 原序;只改尝试序不改候选集;见 [`router.md` §5](./router.md)) | 无 |
+| `frontend.router.put_bytes_chunk_bytes` | u64 | `4194304`(4 MiB) | `0`(关)或 64 KiB ..= 1 GiB,且**交叉校验:0 或 ≥ `frontend.auto_chunk_bytes`**(违反拒启) | 内嵌 router 的 SDK 恒切片宽(直连语义,见 [`router.md` §5](./router.md))。**交叉校验的存在理由**:网关切片宽 ≤ router 片宽才能保证"网关片在 router 里恒为单笔普通 blob",一旦小于,每片网关片会被 router 二次切成"子片 + 子描述符"而网关读不回原文 —— 配置期结构性禁止(design §12 共存矩阵) | 无 |
 
 > **`[frontend.router]` 是内嵌 router 的配置子表**:W/R、号段大小等只有**一处真源**,frontend 不重复定义
 > (W 甚至不可配,见 `router.md §2`)。

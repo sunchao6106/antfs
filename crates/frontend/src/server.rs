@@ -17,7 +17,6 @@
 //! 描述符并返回其 blobId —— `GET`/`HEAD` 走既有的描述符透明拼装路径,客户端无感知(见
 //! [`upload`] / [`stream_upload`])。
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -27,13 +26,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
-use futures::stream::{self, Stream, StreamExt};
+use futures::StreamExt;
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use antfs_metric::IntCounterVec;
-use antfs_router::{BlobStat, Error as RouterError, Router as BlobRouter, StoreKey, NO_EXPIRATION};
+use antfs_router::{
+    Error as RouterError, ObjectStat, Router as BlobRouter, StoreKey, NO_EXPIRATION,
+};
 
 use crate::config::FrontendConfig;
 use crate::metrics::{
@@ -86,19 +86,11 @@ const CORS_EXPOSED_HEADERS: [HeaderName; 8] = [
 /// blobId 的文本形式必须是 8 字节 hex —— 唯一的报错文案(blobId 是自定位的 64bit 号,D3)。
 const BLOB_ID_INVALID: &str = "blob id must be 8 bytes (16 hex)";
 
-// ── 拼装描述符格式(无状态拼装的落盘契约;格式演进见 CLAUDE.md §3.4)────────────────────────────
+// ── 拼装描述符格式(写入侧;读侧拼装已下沉 router,⑩)────────────────────────────────
 // 格式单点在 `antfs-descriptor`;此处按本层错误口径做薄壳映射。
 
 /// 单个拼装对象的片数上限。
 const MAX_CHUNKS: usize = antfs_descriptor::MAX_CHUNKS;
-/// 描述符字节上限(1 MiB):`GET` 据此决定"整体读出判定"还是"直接流式"(CLAUDE.md §5.3);
-/// 片数与会话长度各自设限后,正常永远到不了这个上界(4096 片最多约 160 KiB)。
-const DESCRIPTOR_MAX_BYTES: u64 = antfs_descriptor::MAX_BYTES;
-
-// ── 流式读写参数 ────────────────────────────────────────────────────────────────────────────
-
-/// 暂存文件/响应体的单块缓冲(内存 = 一块,不随对象大小涨)。
-const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 /// frontend 的错误出口:边界校验类自身错误 + SDK 错误的归一。
 ///
@@ -174,6 +166,10 @@ fn router_status(e: &RouterError) -> StatusCode {
     match e {
         // 所有副本都没有该对象。
         RouterError::NotFound { .. } => StatusCode::NOT_FOUND,
+        // 恒切管线容量拒绝(片数超描述符上限):超大对象,413(与公共上限同一 4xx 家族)。
+        RouterError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        // 拼装对象上游损坏(描述符/片不一致):响亮 502(与既有 corrupt-descriptor 口径一致)。
+        RouterError::BadComposed(_) => StatusCode::BAD_GATEWAY,
         // 分区写满:507 让调用方/压测一眼看出"该加分区了"(与 store 数据面同一约定),不混进 500。
         RouterError::StoreFull { .. } => StatusCode::INSUFFICIENT_STORAGE,
         // key 冲突(副本 409 透传,keyed 写全失败且皆为冲突):与 store 数据面同码,
@@ -808,9 +804,14 @@ async fn cleanup_acked_chunks(st: &AppState, acked: &[StoreKey]) {
 }
 
 /// `GET /blobs/{blobId}`:200 + 原始字节(R=1 首个成功)。全副本 404 → 404;不可达/未达多数派类 → 503。
-async fn get_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<String>) -> Response {
+async fn get_blob(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(blob_id): AxumPath<String>,
+) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_DOWNLOAD);
-    match download(&st, &blob_id).await {
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    match download(&st, &blob_id, range).await {
         Ok((resp, len)) => {
             st.metrics
                 .download_total
@@ -828,72 +829,94 @@ async fn get_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<String
 
 /// 读一个对象,返回 `(响应, 响应体字节数)`。
 ///
-/// - **类型只看 `composed` 位**(descriptor-drop-magic 后唯一判定):置位 = 拼装描述符
-///   → 整体读回解析拼装(超限/坏描述符响亮 502,信任位不降级);无位 = 普通对象原字节;
-/// - **小对象**整体读回;**大对象不整体进内存**(CLAUDE.md §5.3):`get_file` 落暂存文件后
-///   流式回给调用方。SDK 只有 `get`(整体进内存)与 `get_file`(落文件)两个读口,
-///   后者才不把对象整个缓进内存。
-async fn download(st: &AppState, blob_id: &str) -> Result<(Response, u64), Error> {
+/// - 类型与拼装全在 router 层裁决(⑩:网关不识描述符):`stat_object` 给**逻辑大小**,
+///   `get_object_*stream` 给流式逻辑字节(内存 = 传输块级,全程零本地文件 —— ⑫);
+/// - `Range` 头(blob-range-read):忽略族 → 200 全对象;单区间 → 206 + `Content-Range`,
+///   越界/空对象/`bytes=-0` → 416;拼装对象窗口 = router 只取覆盖片(10⁴ 倍浪费消解)。
+async fn download(
+    st: &AppState,
+    blob_id: &str,
+    range: Option<&str>,
+) -> Result<(Response, u64), Error> {
     let key = parse_blob_id(blob_id)?;
-    // 先取元数据:① 拿 size 决定读路径;② 顺便让"对象不存在"给出干净的 404(而非读一半才发现)。
-    let meta = st.router.stat(&key).await?;
-    if meta.composed {
-        if meta.size > DESCRIPTOR_MAX_BYTES {
-            return Err(Error::Upstream(
-                "composed blob exceeds the descriptor size bound".into(),
-            ));
+    // 元数据先行:① 逻辑大小(Range 解析基准);② 让"对象不存在"给出干净的 404(而非读一半才发现)。
+    let meta = st.router.stat_object(&key).await?;
+    let total = meta.size;
+    match crate::range::parse_range(range, total) {
+        crate::range::RangeOutcome::Full => {
+            let (len, stream) = st.router.get_object_stream(&key).await?;
+            let mut resp = (StatusCode::OK, Body::from_stream(stream)).into_response();
+            put_header(&mut resp, header::ACCEPT_RANGES, "bytes");
+            put_header(&mut resp, header::CONTENT_LENGTH, &len.to_string());
+            Ok((resp, len))
         }
-        let body = st.router.get(&key).await?;
-        return stitched_body(st, &body).await;
+        crate::range::RangeOutcome::Partial(w) => {
+            let stream = st
+                .router
+                .get_object_range_stream(&key, w.start, w.len)
+                .await?;
+            let mut resp = (StatusCode::PARTIAL_CONTENT, Body::from_stream(stream)).into_response();
+            put_header(&mut resp, header::ACCEPT_RANGES, "bytes");
+            put_header(&mut resp, header::CONTENT_RANGE, &w.content_range(total));
+            put_header(&mut resp, header::CONTENT_LENGTH, &w.len.to_string());
+            Ok((resp, w.len))
+        }
+        crate::range::RangeOutcome::Unsatisfiable { spec } => {
+            // 416 + `Content-Range: bytes */total`(RFC 7233 §4.2 推荐形态,客户端可据此纠偏)。
+            tracing::debug!(range = %spec, total, "unsatisfiable range");
+            let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            put_header(
+                &mut resp,
+                header::CONTENT_RANGE,
+                &format!("bytes */{total}"),
+            );
+            Ok((resp, 0))
+        }
     }
-    if meta.size <= DESCRIPTOR_MAX_BYTES {
-        let body = st.router.get(&key).await?;
-        let len = body.len() as u64;
-        return Ok(((StatusCode::OK, body).into_response(), len));
-    }
-    let staging = TempFile::create();
-    let len = st.router.get_file(&key, staging.path()).await?;
-    let file = tokio::fs::File::open(staging.path()).await?;
-    // 暂存文件随响应体流一起 drop → 发完/连接断开即删。
-    let stream = file_stream(file, staging, STREAM_CHUNK_BYTES);
-    Ok((Body::from_stream(stream).into_response(), len))
 }
 
 /// `HEAD /blobs/{blobId}`:200 + 无 body,状态经 `x-antfs-blob-*` 响应头透出(不读数据体)。
-async fn head_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<String>) -> Response {
+async fn head_blob(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(blob_id): AxumPath<String>,
+) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_HEAD);
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let result = async {
         let key = parse_blob_id(&blob_id)?;
-        let mut meta = st.router.stat(&key).await?;
-        // 拼装对象:`stat` 只看到**描述符**那个 blob(几百字节),直接报出去会与 `GET`(拼装后的逻辑字节流)对不上。
-        // 故对**置位行**做小对象读回,把 size 换成各片之和,并回 `x-antfs-blob-stitched` 头
-        // (无位行不读数据体:位是唯一类型判定,普通对象没有"逻辑大小"一说)。
-        // 代价可控:描述符按构造 ≤ DESCRIPTOR_MAX_BYTES,置位行才需要多读一次数据体(≤1 MiB)。
-        // 已删/已过期的拼装对象读不出逻辑大小(数据面拒读已过期体,`get` 的失败被静默忽略)
-        // —— 退回描述符自身的 stat 是已知取舍;过期的对象本就不再是"取内容"的语义。
-        let mut stitched_chunks = None;
-        if meta.composed && !meta.deleted && !meta.expired && meta.size <= DESCRIPTOR_MAX_BYTES {
-            if let Ok(body) = st.router.get(&key).await {
-                if let Ok(chunks) = decode_descriptor(&body) {
-                    meta.size = chunks.iter().map(|c| c.size).sum();
-                    stitched_chunks = Some(chunks.len());
-                }
-            }
-        }
-        Ok((meta, stitched_chunks))
+        // 逻辑元数据(拼装对象的 size = 各片之和、片数;router 层语义,⑩)。
+        let meta = st.router.stat_object(&key).await?;
+        Ok(meta)
     }
     .await;
     match result {
-        Ok((meta, stitched_chunks)) => {
+        Ok(meta) => {
             st.metrics
                 .mutation_total
                 .with_label_values(&[OP_HEAD, OUTCOME_OK])
                 .inc();
-            let mut resp = StatusCode::OK.into_response();
+            let total = meta.size;
+            let mut resp = match crate::range::parse_range(range, total) {
+                // Ambry 口径(blob-range-read D3):HEAD 带 Range 也回 206(无 body)。
+                crate::range::RangeOutcome::Partial(w) => {
+                    let mut r = StatusCode::PARTIAL_CONTENT.into_response();
+                    put_header(&mut r, header::ACCEPT_RANGES, "bytes");
+                    put_header(&mut r, header::CONTENT_RANGE, &w.content_range(total));
+                    r
+                }
+                crate::range::RangeOutcome::Unsatisfiable { .. } => {
+                    let mut r = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                    put_header(&mut r, header::CONTENT_RANGE, &format!("bytes */{total}"));
+                    r
+                }
+                crate::range::RangeOutcome::Full => StatusCode::OK.into_response(),
+            };
             for (name, value) in stat_headers(&meta) {
                 put_header(&mut resp, name, &value);
             }
-            if let Some(n) = stitched_chunks {
+            // 拼装对象:stitched 两头(逻辑片数)。
+            if let Some(n) = meta.chunks {
                 put_header(&mut resp, HEADER_BLOB_STITCHED, "true");
                 put_header(&mut resp, HEADER_BLOB_STITCH_CHUNKS, &n.to_string());
             }
@@ -1071,97 +1094,6 @@ fn encode_descriptor(session: &[u8], chunks: &[DescriptorChunk]) -> Result<Vec<u
     antfs_descriptor::encode(session, &refs).map_err(|e| Error::Invalid(e.to_string()))
 }
 
-/// 解码拼装描述符。任何结构性错误 → [`Error::Upstream`](502):
-/// 描述符字节由组合写口落位(parse 只吃位字节),解析不了即上游损坏。
-fn decode_descriptor(buf: &[u8]) -> Result<Vec<DescriptorChunk>, Error> {
-    let refs = antfs_descriptor::parse(buf).map_err(|e| Error::Upstream(e.to_string()))?;
-    let mut chunks = Vec::with_capacity(refs.len());
-    for r in refs {
-        let id = StoreKey::from_slice(&r.id)
-            .ok_or_else(|| Error::Upstream("corrupt stitch descriptor: bad chunk id".into()))?;
-        chunks.push(DescriptorChunk {
-            id,
-            size: r.size,
-            expiration_ms: r.expiration_ms,
-        });
-    }
-    Ok(chunks)
-}
-
-// ── 读取与拼装 ──────────────────────────────────────────────────────────────────────────────
-
-/// 把描述符描述的片**流式**拼进响应体(R=1 逐片取;内存 = 单片,不随对象大小涨)。
-async fn stitched_body(st: &AppState, descriptor: &[u8]) -> Result<(Response, u64), Error> {
-    let chunks = decode_descriptor(descriptor)?;
-    let total: u64 = chunks.iter().map(|c| c.size).sum();
-    // 首片先做一次元数据预检:整对象已不可读时给调用方一个明确的 502,而不是"发到一半才断"的 200。
-    // 其余片在流里惰性取(描述符写入时已校验全部片可读;读时缺片即上游数据被删/损坏)。
-    let first = chunks
-        .first()
-        .ok_or_else(|| Error::Upstream("descriptor has no chunk".into()))?;
-    st.router.stat(&first.id).await.map_err(|e| {
-        Error::Upstream(format!(
-            "chunk {} is unreadable: {e}",
-            hex::encode(first.id.as_bytes())
-        ))
-    })?;
-
-    let client = st.router.clone();
-    let body = stream::iter(chunks).then(move |chunk| {
-        let client = client.clone();
-        async move { fetch_chunk(&client, &chunk).await }
-    });
-    Ok((Body::from_stream(body).into_response(), total))
-}
-
-/// 取一个片,并核对长度与描述符记录一致(不一致 = 上游数据损坏:记录并中断响应体,CLAUDE.md §3.3)。
-async fn fetch_chunk(client: &BlobRouter, chunk: &DescriptorChunk) -> std::io::Result<Bytes> {
-    let id = hex::encode(chunk.id.as_bytes());
-    let data = client
-        .get(&chunk.id)
-        .await
-        .map_err(|e| std::io::Error::other(format!("chunk {id} unavailable: {e}")))?;
-    if data.len() as u64 != chunk.size {
-        tracing::warn!(
-            chunk_id = %id,
-            expected = chunk.size,
-            actual = data.len(),
-            "stitched chunk size mismatch"
-        );
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("chunk {id} size mismatch"),
-        ));
-    }
-    Ok(data)
-}
-
-/// 把一个本地文件读成流(每次一块,内存 = 单块)。`guard` 随流一起 drop → 响应体发完/连接断开时
-/// 删掉暂存文件。
-fn file_stream(
-    file: tokio::fs::File,
-    guard: TempFile,
-    buf_bytes: usize,
-) -> impl Stream<Item = std::io::Result<Bytes>> {
-    struct State {
-        file: tokio::fs::File,
-        _guard: TempFile,
-        buf: Vec<u8>,
-    }
-    let init = State {
-        file,
-        _guard: guard,
-        buf: vec![0u8; buf_bytes],
-    };
-    stream::try_unfold(init, |mut st| async move {
-        let n = st.file.read(&mut st.buf).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        Ok(Some((Bytes::copy_from_slice(&st.buf[..n]), st)))
-    })
-}
-
 // ── 请求/响应辅助 ────────────────────────────────────────────────────────────────────────────
 
 /// 请求观测 guard:入口 inc `in_flight`,drop 时 dec 并记录耗时(错误路径与边界校验早退也计)。
@@ -1220,7 +1152,7 @@ fn created_response(key: StoreKey, len: u64) -> Response {
 }
 
 /// `HEAD` 的状态头(布尔值用 `"true"`/`"false"`)。
-fn stat_headers(meta: &BlobStat) -> [(HeaderName, String); 4] {
+fn stat_headers(meta: &ObjectStat) -> [(HeaderName, String); 4] {
     [
         (HEADER_BLOB_SIZE, meta.size.to_string()),
         (HEADER_BLOB_DELETED, meta.deleted.to_string()),
@@ -1268,55 +1200,6 @@ fn body_limit(max_body_bytes: u64) -> usize {
     usize::try_from(max_body_bytes).unwrap_or(usize::MAX)
 }
 
-/// 进程内唯一的暂存文件名后缀(纳秒 + 自增序号;不为它引 `rand`)。
-fn unique_suffix() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos}-{seq}")
-}
-
-/// 暂存文件(系统临时目录):**无论成功失败**都在 drop 时删掉。
-///
-/// **下载大对象的中转**(`GET` 的 `get_file` 流式落盘);上传路径不经此(④ 边收边分片,零本地文件)。
-struct TempFile {
-    path: PathBuf,
-}
-
-impl TempFile {
-    fn create() -> Self {
-        TempFile {
-            path: std::env::temp_dir().join(format!(
-                "antfs-frontend-{}-{}.tmp",
-                std::process::id(),
-                unique_suffix()
-            )),
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                path = %self.path.display(),
-                error = %e,
-                "failed to remove staging file"
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,10 +1218,10 @@ mod tests {
         let chunks = vec![chunk(7, 1, 100), chunk(7, 2, 4096), chunk(9, 3, 0)];
         let buf = encode_descriptor(b"session-abc", &chunks).expect("encode");
         assert_eq!(buf[0], antfs_descriptor::VERSION, "版本位在首字节");
-        let back = decode_descriptor(&buf).expect("decode");
+        let back = antfs_descriptor::parse(&buf).expect("parse");
         assert_eq!(back.len(), 3);
         for (got, want) in back.iter().zip(chunks.iter()) {
-            assert_eq!(got.id, want.id, "片序必须原样保留");
+            assert_eq!(got.id, *want.id.as_bytes(), "片序必须原样保留");
             assert_eq!(got.size, want.size);
             assert_eq!(got.expiration_ms, want.expiration_ms);
         }
@@ -1369,20 +1252,26 @@ mod tests {
 
         let buf = encode_descriptor(b"s", &[chunk(1, 1, 5)]).expect("encode");
         assert!(
-            decode_descriptor(&buf[..buf.len() - 1]).is_err(),
+            antfs_descriptor::parse(&buf[..buf.len() - 1]).is_err(),
             "截断必须拒"
         );
         let mut trailing = buf.clone();
         trailing.push(0);
-        assert!(decode_descriptor(&trailing).is_err(), "多余字节必须拒");
+        assert!(
+            antfs_descriptor::parse(&trailing).is_err(),
+            "多余字节必须拒"
+        );
         let mut bad_version = buf.clone();
         bad_version[0] = antfs_descriptor::VERSION + 1;
-        assert!(decode_descriptor(&bad_version).is_err(), "未知版本必须拒");
         assert!(
-            decode_descriptor(b"nope-nope-nope").is_err(),
+            antfs_descriptor::parse(&bad_version).is_err(),
+            "未知版本必须拒"
+        );
+        assert!(
+            antfs_descriptor::parse(b"nope-nope-nope").is_err(),
             "坏版本必须拒"
         );
-        assert!(decode_descriptor(&[]).is_err(), "空 body 必须拒");
+        assert!(antfs_descriptor::parse(&[]).is_err(), "空 body 必须拒");
     }
 
     /// blobId 文本形式:非 hex / 长度不是 8 字节都归 400,且文案固定。

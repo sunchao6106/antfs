@@ -1,4 +1,4 @@
-//! 主动磁盘健康探测(照搬 Ambry `DiskManager$DiskHealthCheck`):周期 write→read→verify→delete,
+//! 主动磁盘健康探测(参考 Ambry `DiskManager$DiskHealthCheck`):周期 write→read→verify→delete,
 //! 带超时抓盘 hang。**仅上报观测**(S2 不据此自动下线;放置避让留后续)。默认关(对齐 Ambry)。
 //!
 //! **每盘至多一个在飞探测**(盘 hang 隔离):`tokio::time::timeout` 只能放弃**等待**,卡在盘里的

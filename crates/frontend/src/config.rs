@@ -75,8 +75,10 @@ pub struct FrontendToml {
 }
 
 impl FrontendToml {
-    /// 整份装配校验:自家字段 + 公共上限 + **跨界检查**(公共上限 ≤ 4096 × 片宽,
-    /// 物理天花板来自拼装描述符的片数容量;要更大单文件须先调大片宽)。
+    /// 整份装配校验:自家字段 + 公共上限 + **跨界检查**:
+    /// ① 公共上限 ≤ 4096 × 片宽(物理天花板来自拼装描述符的片数容量;要更大单文件须先调大片宽);
+    /// ② router 恒切片宽 ≤ 0(关)或 ≥ 网关切片宽 `auto_chunk_bytes` —— 否则网关片会在
+    /// router 内被**二次切**成"子片 + 子描述符",而本校验保证它结构性不发生(design §12 共存矩阵)。
     pub fn validate_all(&self) -> Result<()> {
         self.frontend.validate()?;
         self.upload.validate()?;
@@ -87,6 +89,16 @@ impl FrontendToml {
                 format!(
                     "exceeds descriptor capacity: {} chunks x frontend.auto_chunk_bytes = {cap}; increase auto_chunk_bytes first",
                     antfs_descriptor::MAX_CHUNKS
+                ),
+            ));
+        }
+        let width = self.frontend.router.put_bytes_chunk_bytes;
+        if width != 0 && width < self.frontend.auto_chunk_bytes {
+            return Err(antfs_config::ConfigError::invalid(
+                "frontend.router.put_bytes_chunk_bytes",
+                format!(
+                    "must be 0 (off) or >= frontend.auto_chunk_bytes ({}), otherwise every gateway chunk is re-chunked into sub-chunks + a sub-descriptor",
+                    self.frontend.auto_chunk_bytes
                 ),
             ));
         }
@@ -218,6 +230,25 @@ mod tests {
         // 上限为 0 由公共层自校验拒绝。
         toml.upload.max_object_bytes = 0;
         assert!(toml.validate_all().is_err(), "0 上限必须拒");
+    }
+
+    /// router 恒切片宽与网关切片宽的跨界检查(design §12 共存矩阵,结构性禁止"网关片被二次切")。
+    #[test]
+    fn router_chunk_width_cross_checks_with_gateway_chunk_bytes() {
+        let mut toml = FrontendToml::default();
+        toml.frontend.router.put_bytes_chunk_bytes = 0;
+        toml.validate_all()
+            .expect("router 恒切关闭(0)与网关任何片宽共存");
+        toml.frontend.router.put_bytes_chunk_bytes = 4 * 1024 * 1024;
+        toml.validate_all()
+            .expect("与默认网关片宽(4 MiB)相等合法(片不二次切)");
+        toml.frontend.router.put_bytes_chunk_bytes = 8 * 1024 * 1024;
+        toml.validate_all().expect("大于网关片宽合法(片走单片路径)");
+        toml.frontend.router.put_bytes_chunk_bytes = 64 * 1024;
+        assert!(
+            toml.validate_all().is_err(),
+            "router 片宽 < 网关片宽必须拒(每网关片将被二次切成子片 + 子描述符)"
+        );
     }
 
     #[test]

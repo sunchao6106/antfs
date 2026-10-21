@@ -31,12 +31,14 @@
 //!
 //! blobId = 8 字节 `partitionId << 32 | objectId`([`antfs_blob::StoreKey`],大端),URL 里编成 16 位 hex。
 
-pub mod compression;
 pub mod config;
 pub mod error;
 pub mod metrics;
 
+mod chunked;
+
 pub use antfs_blob::{StoreKey, NO_EXPIRATION};
+pub use chunked::ObjectStat;
 pub use config::RouterConfig;
 pub use error::{Error, Result};
 pub use metrics::RouterMetrics;
@@ -291,12 +293,18 @@ enum ReadOutcome {
     Failed(Error),
 }
 
+/// 客户端句柄:`Clone` = 又一个指向同一批共享结构(号段池/拓扑/指标/master 通道)的句柄,
+/// 不复制任何业务状态;逻辑流式读(`get_object_stream`)的流出参靠它取得 `+ 'static` 所有权。
+#[derive(Clone)]
 pub struct Router {
-    cfg: RouterConfig,
+    // pub(crate):恒切下沉在兄弟模块 chunked.rs 实现(§12 风控:router 主文件不再胀),
+    // 复用本两字段;不外露出 crate。
+    pub(crate) cfg: RouterConfig,
     /// master 控制面客户端(tonic 方法需 `&mut self`,故加锁;调用频率 = 每号段一次,不构成瓶颈)。
     master: Arc<Mutex<MasterClient<Channel>>>,
     /// 上次自愈切换 master 通道的时刻(ms):1s 防抖,抗选主中期 hint 抖动。
-    last_retarget_ms: std::sync::atomic::AtomicU64,
+    /// `Arc`(可 `Clone` 前提):各句柄共享同一防抖相位,与单实例行为一致。
+    last_retarget_ms: Arc<std::sync::atomic::AtomicU64>,
     http: reqwest::Client,
     /// 号段池。**锁跨取段的 `await` 持有**:号段边界单飞,避免并发调用各取一段。
     ///
@@ -308,7 +316,8 @@ pub struct Router {
     /// [`Router::ordered_for_read`])—— 否则测量值变了、缓存里的顺序却一直是旧的。
     topology: Arc<Topology>,
     latency: Arc<LatencyTable>,
-    metrics: Arc<RouterMetrics>,
+    // pub(crate) 理由同 cfg:chunked.rs 复用。
+    pub(crate) metrics: Arc<RouterMetrics>,
     /// 号段后台预取在飞分区(`router-id-prefetch`):同区一拍一次,单飞任务独占写回。
     prefetching: Arc<std::sync::Mutex<std::collections::HashSet<PartitionId>>>,
 }
@@ -370,7 +379,7 @@ impl Router {
         Ok(Router {
             cfg,
             prefetching: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            last_retarget_ms: std::sync::atomic::AtomicU64::new(0),
+            last_retarget_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             master: Arc::new(Mutex::new(MasterClient::new(channel))),
             http,
             ids,
@@ -634,104 +643,19 @@ impl Router {
     /// 写一个 blob 并在**写入时定下过期时刻**(`expiration_ms`,`NO_EXPIRATION` = 不过期)。
     ///
     /// 对象不可变,TTL 只有这一次机会确定 —— 没有事后"改期"的路径(要不同 TTL 就换一个 blobId)。
+    ///
+    /// body 超过 `put_bytes_chunk_bytes`(片宽 > 0)时走**恒切管线**:片 = 普通多数派 blob、
+    /// 描述符落在本 key(组合位);返回报告 = 描述符那笔写。读回用 [`Router::get_object`]。
     pub async fn put_with_ttl(
         &self,
         key: StoreKey,
         data: Bytes,
         expiration_ms: i64,
     ) -> Result<PutReport> {
-        self.put_keyed(key, data, expiration_ms, false).await
-    }
-
-    /// SDK 压缩压缩口:三闸 + 帧封 + 指标(监控 outcome 标签即设计契约,见 router.md)。
-    fn compress_for_put(&self, data: Bytes) -> Bytes {
-        let cfg = &self.cfg;
-        // `connect()` 已过 Validate(算法名白名单):此处不变量成立,expect 属确证不变量例。
-        let algo = compression::algo_id_by_name(&cfg.compression_algorithm)
-            .expect("compression_algorithm validated in connect");
-        match compression::maybe_compress(
-            cfg.compression_enabled,
-            algo,
-            cfg.compression_level,
-            cfg.compression_min_size_bytes,
-            cfg.compression_min_ratio,
-            &data,
-        ) {
-            compression::Gate::Kept(frame, saved) => {
-                self.metrics
-                    .compression_attempts
-                    .with_label_values(&["kept"])
-                    .inc();
-                self.metrics.compression_saved_bytes.inc_by(saved);
-                frame
-            }
-            compression::Gate::Skipped(outcome) => {
-                self.metrics
-                    .compression_attempts
-                    .with_label_values(&[outcome])
-                    .inc();
-                data
-            }
-        }
-    }
-
-    /// `put_file` 的压缩预备:三闸与 Bytes 口([`compress_for_put`](Self::compress_for_put))
-    /// 同语义、同一套监控标签;全过 ⇒ 原文件**流式**预压进临时帧文件(内存恒 O(拷贝缓冲),
-    /// 不随文件大小涨),一次压制、多副本并 PUT 与 507 重试**共用**;任一闸未过或流压
-    /// io 失败 ⇒ 原文件直传。返回(实际上传路径, 帧文件 RAII 守护)。
-    async fn prepare_file_upload(
-        &self,
-        path: &Path,
-        len: u64,
-    ) -> (std::path::PathBuf, Option<tempfile::NamedTempFile>) {
-        let cfg = &self.cfg;
-        if !cfg.compression_enabled {
-            self.metrics
-                .compression_attempts
-                .with_label_values(&["disabled"])
-                .inc();
-            return (path.to_path_buf(), None);
-        }
-        if (len as usize) < cfg.compression_min_size_bytes.max(1) {
-            self.metrics
-                .compression_attempts
-                .with_label_values(&["too_small"])
-                .inc();
-            return (path.to_path_buf(), None);
-        }
-        // `connect()` 已过 Validate(算法名白名单):不变量成立,expect 属确证不变量例。
-        let algo = compression::algo_id_by_name(&cfg.compression_algorithm)
-            .expect("compression_algorithm validated in connect");
-        let orig = path.to_path_buf();
-        let level = cfg.compression_level;
-        let min_ratio = cfg.compression_min_ratio;
-        let out = match tokio::task::spawn_blocking(move || {
-            compression::compress_stream_to_temp(&orig, len, algo, level, min_ratio)
-        })
-        .await
-        {
-            Ok(v) => v,
-            // 单飞 join 失败(任务 panic 等,极罕见):回落原文 —— 压缩永不让写入失败。
-            Err(_) => compression::StreamedPut::Original { why: "io" },
-        };
-        match out {
-            compression::StreamedPut::Frame { temp, stored } => {
-                self.metrics
-                    .compression_attempts
-                    .with_label_values(&["kept"])
-                    .inc();
-                let saved = len.saturating_sub(stored);
-                self.metrics.compression_saved_bytes.inc_by(saved);
-                let p = temp.path().to_path_buf();
-                (p, Some(temp))
-            }
-            compression::StreamedPut::Original { why } => {
-                self.metrics
-                    .compression_attempts
-                    .with_label_values(&[why])
-                    .inc();
-                (path.to_path_buf(), None)
-            }
+        if self.chunked_gate(data.len())? {
+            self.put_with_ttl_chunked(key, data, expiration_ms).await
+        } else {
+            self.put_keyed(key, data, expiration_ms, false).await
         }
     }
 
@@ -759,8 +683,6 @@ impl Router {
         expiration_ms: i64,
         composed: bool,
     ) -> Result<PutReport> {
-        // SDK 压缩put 三闸,一次判定供全部副本:扇出前的单点 = 复制带宽共收益。
-        let data = self.compress_for_put(data);
         let pid = key.partition_id();
         let replicas = self.replicas_for(pid).await?;
         let total = replicas.len();
@@ -825,12 +747,19 @@ impl Router {
     }
 
     /// [`put_auto`](Self::put_auto) + 写入时定 TTL,语义同 [`put_with_ttl`](Self::put_with_ttl)。
+    ///
+    /// body 超过 `put_bytes_chunk_bytes`(片宽 > 0)时走**恒切管线**:返回**描述符** blobId
+    /// (片散向不同可写分区);读回用 [`Router::get_object`] 透明拼装。
     pub async fn put_auto_with_ttl(
         &self,
         data: Bytes,
         expiration_ms: i64,
     ) -> Result<(StoreKey, PutReport)> {
-        self.put_auto_keyed(data, expiration_ms, false).await
+        if self.chunked_gate(data.len())? {
+            self.put_auto_with_ttl_chunked(data, expiration_ms).await
+        } else {
+            self.put_auto_keyed(data, expiration_ms, false).await
+        }
     }
 
     /// [`put_auto_with_ttl`](Self::put_auto_with_ttl) 的组合写形态(自动发号 + 类型位;
@@ -850,8 +779,6 @@ impl Router {
         expiration_ms: i64,
         composed: bool,
     ) -> Result<(StoreKey, PutReport)> {
-        // SDK 压缩·put 三闸:auto 发号是网关写的主路径(与 put_keyed 对称,一次判定供全部副本)。
-        let data = self.compress_for_put(data);
         let mut key = self.allocate_one().await?;
         let mut first_err: Option<Error> = None;
         for attempt in 0..=MAX_STORE_FULL_RETRIES {
@@ -934,9 +861,7 @@ impl Router {
     ) -> Result<(StoreKey, PutReport)> {
         let path = path.as_ref().to_path_buf();
         let len = tokio::fs::metadata(&path).await?.len();
-        // 压缩三闸一次判定(与 Bytes 口同语义/同监控):全过 ⇒ 流式预压临时帧文件,
-        // 全部副本与 507 换分区重试共用同一帧;`_frame` 守护持有到函数返回,自动清删。
-        let (upload, _frame) = self.prepare_file_upload(&path, len).await;
+        let upload = path.clone();
         let mut key = self.allocate_one().await?;
         let mut first_err: Option<Error> = None;
         for attempt in 0..=MAX_STORE_FULL_RETRIES {
@@ -1060,7 +985,20 @@ impl Router {
     ///
     /// 全部副本都报"不存在"才判 [`Error::NotFound`];若还有副本不可达,则报最后一个真实故障
     /// (不能把"读不到"当成"不存在")。
+    /// **逻辑对象读**(SDK 直连用户与网关的标准读口;2026-10-21 读侧下沉):`composed` 位
+    /// 置位的拼装对象自动逐片拼回**真数据**;普通对象返回原字节。
+    ///
+    /// 裸字节口径(不解析描述符)只保留一个受控出口 [`Router::get_blob`],供"已知普通
+    /// blob"的单请求读(如 S3 网关);要把逻辑对象流式取回(内存不过整对象)用
+    /// [`Router::get_object_stream`],元数据用 [`Router::stat_object`]。
     pub async fn get(&self, key: &StoreKey) -> Result<Bytes> {
+        self.get_object(key).await
+    }
+
+    /// **裸 blob 读**(原 `get` 语义,字节原样;R=1 逐副本、陈旧拓扑驱逐重拉一次):
+    /// 拼装对象返回的是**描述符字节本身** —— 除非明确在做装配,读拼装对象请用
+    /// [`Router::get`]。单请求、无前置 stat,适合"已知不是拼装对象"的批量热路径。
+    pub async fn get_blob(&self, key: &StoreKey) -> Result<Bytes> {
         let pid = key.partition_id();
         let replicas = self.ordered_for_read(&self.replicas_for(pid).await?);
         match self.read_from_all(pid, key, &replicas).await {
@@ -1136,16 +1074,27 @@ impl Router {
         ReadOutcome::Failed(last.unwrap_or(Error::NotFound { pid }))
     }
 
-    /// 下载到本地文件(流式,内存 = 单块)。
-    pub async fn get_file(&self, key: &StoreKey, path: impl AsRef<Path>) -> Result<u64> {
+    /// R=1 开流(逐副本,`up`/延迟序),返回首个成功副本的流式响应与其地址;
+    /// `window = Some((start, len))` 走数据面窗口读(blob-range-read),`None` 整读。
+    /// 全副本 NotFound → NotFound;穷尽(含非纯 NotFound)→ 最后错误并计指标。
+    /// 读态拓扑**不**做驱逐重拉(只有 `get_blob` 的 R=1 循环带重拉)。
+    async fn open_replica_stream(
+        &self,
+        key: &StoreKey,
+        window: Option<(u64, u64)>,
+    ) -> Result<(reqwest::Response, String)> {
         let pid = key.partition_id();
         let replicas = self.ordered_for_read(&self.replicas_for(pid).await?);
         let mut last: Option<Error> = None;
         let mut missing = 0usize;
         for r in &replicas {
             let addr = r.addr.clone();
-            match self.get_stream(pid, key, &addr).await {
-                Ok(resp) => return drain_to_file(resp, &addr, path.as_ref(), &self.metrics).await,
+            let res = match window {
+                Some((start, len)) => self.get_stream_windowed(pid, key, &addr, start, len).await,
+                None => self.get_stream(pid, key, &addr).await,
+            };
+            match res {
+                Ok(resp) => return Ok((resp, addr)),
                 Err(e @ Error::NotFound { .. }) => {
                     missing += 1;
                     last = Some(e);
@@ -1163,6 +1112,40 @@ impl Router {
             .with_label_values(&[err.kind()])
             .inc();
         Err(err)
+    }
+
+    /// 窗口版流式开路(与 [`get_stream`](Self::get_stream) 同语义,唯 URL 带窗口 query)。
+    async fn get_stream_windowed(
+        &self,
+        pid: PartitionId,
+        key: &StoreKey,
+        addr: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<reqwest::Response> {
+        let t0 = Instant::now();
+        let resp = self
+            .http
+            .get(blob_url_windowed(addr, pid, key, start, len))
+            .send()
+            .await
+            .map_err(|source| {
+                self.note_latency(addr, t0.elapsed());
+                Error::Http {
+                    addr: addr.to_string(),
+                    source,
+                }
+            })?;
+        self.note_latency(addr, t0.elapsed());
+        match resp.status().as_u16() {
+            200 => Ok(resp),
+            416 => Err(Error::ReplicaStatus {
+                addr: addr.to_string(),
+                status: 416,
+                detail: "range not satisfiable".to_string(),
+            }),
+            _ => Err(classify_err_status(addr, pid, resp).await),
+        }
     }
 
     async fn get_stream(
@@ -1193,16 +1176,9 @@ impl Router {
 
     async fn get_from(&self, pid: PartitionId, key: &StoreKey, addr: &str) -> Result<Bytes> {
         let resp = self.get_stream(pid, key, addr).await?;
-        let raw = resp.bytes().await.map_err(|source| Error::Http {
+        resp.bytes().await.map_err(|source| Error::Http {
             addr: addr.to_string(),
             source,
-        })?;
-        // 压缩帧透明解压(bulk 口):非帧原样透传;帧坏(伪 magic/未知算法/orig_len 不符)→
-        // 该副本按损坏处理,上层 get 的 R=1 循环会换下一副本重试。
-        compression::decode_frame(&raw).map_err(|detail| Error::ReplicaStatus {
-            addr: addr.to_string(),
-            status: 500,
-            detail,
         })
     }
 
@@ -1696,6 +1672,15 @@ fn blob_url(addr: &str, pid: PartitionId, key: &StoreKey) -> String {
     format!("http://{addr}/partitions/{pid}/blobs/{}", hex_key(key))
 }
 
+/// blob 读的**窗口 URL**(`GET ?offset=&length=`,blob-range-read D2):length 恒显式
+/// (开区间由调用方对逻辑长收口后传入)。
+fn blob_url_windowed(addr: &str, pid: PartitionId, key: &StoreKey, start: u64, len: u64) -> String {
+    format!(
+        "http://{addr}/partitions/{pid}/blobs/{}?offset={start}&length={len}",
+        hex_key(key)
+    )
+}
+
 /// PUT 的 URL:`expiration_ms` 非 [`NO_EXPIRATION`] 时带上写入时定下的 TTL;组合写
 /// 追加 `composed=true`(数据面 `PUT ?expiration_ms=…&composed=true`)。
 fn put_url(
@@ -1768,183 +1753,6 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
         .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
-/// 把响应体流式写进本地文件(内存 = 单块)。
-async fn drain_to_file(
-    resp: reqwest::Response,
-    addr: &str,
-    path: &Path,
-    metrics: &RouterMetrics,
-) -> Result<u64> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut stream = resp.bytes_stream();
-    use bytes::BytesMut;
-    // 窥满 17B(不足帧头长的短 body 也按非帧处理);peek 期间多收的部分存 `carry`,
-    // 判定**之后**才决定去向 —— 不得在判帧前就把流引去解码管道。
-    let mut head = BytesMut::with_capacity(compression::FRAME_HEADER);
-    let mut carry: Vec<Bytes> = Vec::new();
-    while head.len() < compression::FRAME_HEADER {
-        match stream.next().await {
-            Some(chunk) => {
-                let chunk = chunk.map_err(|source| Error::Http {
-                    addr: addr.to_string(),
-                    source,
-                })?;
-                let want = compression::FRAME_HEADER - head.len();
-                if chunk.len() > want {
-                    head.extend_from_slice(&chunk[..want]);
-                    carry.push(chunk.slice(want..));
-                } else {
-                    head.extend_from_slice(&chunk);
-                }
-            }
-            None => break,
-        }
-    }
-    if compression::is_frame(&head) {
-        // 帧:多收部分依序首喂解码源(pipe 前置一段 spill ula)。
-        return drain_compressed(
-            &mut stream,
-            carry.first().cloned().unwrap_or_default(),
-            head.freeze(),
-            addr,
-            path,
-            metrics,
-        )
-        .await;
-    }
-    // 溢收的独立块(理论上单 chunk 溢出即走 carry[0] 单块)—— 防御:全部走非帧写出。
-    let spilled: Vec<Bytes> = carry;
-    // 非帧:普通直落盘(peek 出的 head 与溢收块补写)。
-    let mut file = tokio::fs::File::create(path).await?;
-    let mut n = 0u64;
-    if !head.is_empty() {
-        n += head.len() as u64;
-        file.write_all(&head).await?;
-    }
-    for b in &spilled {
-        n += b.len() as u64;
-        file.write_all(b).await?;
-    }
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| Error::Http {
-            addr: addr.to_string(),
-            source,
-        })?;
-        n += chunk.len() as u64;
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    file.sync_all().await?;
-    metrics.get_total.with_label_values(&["ok"]).inc();
-    metrics.get_bytes.inc_by(n);
-    Ok(n)
-}
-
-/// 压缩帧 → 文件:解码线程(spawn_blocking)经**一条**有界通道接网络,内存 = 块级。
-/// `head`:已窥出的 17B 帧头;`first`:peek 期溢收的首块(无则空)。
-async fn drain_compressed(
-    stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
-    first: bytes::Bytes,
-    head: bytes::Bytes,
-    addr: &str,
-    path: &Path,
-    _metrics: &RouterMetrics,
-) -> Result<u64> {
-    // 网络块 → 有界通道(容量 4);解码线程(下)阻塞拉取喂同步 Decoder,天然背压。
-    let (net_tx, net_rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
-    let dec_path = path.to_path_buf();
-    let decode = tokio::task::spawn_blocking(move || -> std::result::Result<u64, String> {
-        /// 网络通道 → `std::io::Read` 桥(帧头已被消费,源从 peek 余部续起)。
-        struct NetSource {
-            rx: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
-            front: std::io::Cursor<bytes::Bytes>,
-        }
-        impl std::io::Read for NetSource {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                loop {
-                    if self.front.position() < self.front.get_ref().len() as u64 {
-                        return std::io::Read::read(&mut self.front, buf);
-                    }
-                    match self.rx.blocking_recv() {
-                        Some(Ok(b)) => self.front = std::io::Cursor::new(b),
-                        Some(Err(e)) => return Err(e),
-                        None => return Ok(0),
-                    }
-                }
-            }
-        }
-        let (mut decoder, orig_len, algo) = compression::streaming_decoder(
-            &head,
-            Box::new(NetSource {
-                rx: net_rx,
-                front: std::io::Cursor::new(first),
-            }),
-        )
-        .ok_or_else(|| "not a frame".to_string())?;
-        let mut file = std::fs::File::create(&dec_path).map_err(|e| format!("create: {e}"))?;
-        let mut produced = 0u64;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            use std::io::Read as _;
-            let n = decoder
-                .read(&mut buf)
-                .map_err(|e| format!("{algo} decode: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            produced += n as u64;
-            if produced > orig_len {
-                return Err(format!(
-                    "{algo} decode produced {produced} > declared orig_len {orig_len}"
-                ));
-            }
-            std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
-        }
-        if produced != orig_len {
-            return Err(format!(
-                "{algo} decode produced {produced} < declared orig_len {orig_len}"
-            ));
-        }
-        file.sync_all().map_err(|e| format!("fsync: {e}"))?;
-        Ok(produced)
-    });
-
-    // async 侧:喂通道 + 收集解码结果(stream 错误优先上报)。
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| Error::Http {
-            addr: addr.to_string(),
-            source,
-        })?;
-        net_tx
-            .send(Ok(chunk))
-            .await
-            .map_err(|_| Error::ReplicaStatus {
-                addr: addr.to_string(),
-                status: 500,
-                detail: "decode worker exited early".to_string(),
-            })?;
-    }
-    drop(net_tx);
-    let produced = decode
-        .await
-        .map_err(|e| Error::ReplicaStatus {
-            addr: addr.to_string(),
-            status: 500,
-            detail: format!("decode join: {e}"),
-        })?
-        .map_err(|detail| Error::ReplicaStatus {
-            addr: addr.to_string(),
-            status: 500,
-            detail,
-        })?;
-    Ok(produced)
-}
-
-/// master 的业务性拒绝(`ok=false`)→ 归一错误。
-///
-/// `not leader` 单独归一为 [`Error::NotLeader`](发号路径据此自愈重定向;`leader_addr` 由调用点
-/// 传入 —— follower 回填的 gRPC 地址,注册窗口期为空)。
 fn map_master_error(error: &str, pid: PartitionId, leader_addr: &str) -> Error {
     if error.contains("not leader") {
         Error::NotLeader {

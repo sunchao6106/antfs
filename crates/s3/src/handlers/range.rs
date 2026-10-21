@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
 use antfs_blob::StoreKey;
 
@@ -236,24 +236,37 @@ impl Stream for PartStream {
                 self.pending = None;
                 let wp = self.parts[self.idx];
                 self.idx += 1;
-                let start = wp.skip as usize;
-                let end = start + wp.take as usize;
-                if data.len() < end {
+                // 取件即窗口(片窗只传窗口字节,blob-range-read P4.2):短读 = 片与 manifest
+                // 不一致,响亮 500(同一口径,不静默截短)。
+                if data.len() != wp.take as usize {
                     return Poll::Ready(Some(Err(S3Error::InternalError(format!(
-                        "part blob shorter than manifest entry: got {} bytes, need {}..{}",
+                        "part blob window {}+{} yielded {} bytes (expected {})",
+                        wp.skip,
+                        wp.take,
                         data.len(),
-                        start,
-                        end
+                        wp.take
                     )))));
                 }
-                return Poll::Ready(Some(Ok(data.slice(start..end))));
+                return Poll::Ready(Some(Ok(data)));
             }
             let Some(wp) = self.parts.get(self.idx).copied() else {
                 return Poll::Ready(None);
             };
             let st = self.st.clone();
             self.pending = Some(Box::pin(async move {
-                st.router.get(&wp.key).await.map_err(S3Error::from)
+                // 片窗取件:router 窗口流只传窗口字节(边界片免整片白读),
+                // 逐块收拢为 Bytes(≤ 片宽,内存界同既存)。
+                let mut stream = st
+                    .router
+                    .get_object_range_stream(&wp.key, wp.skip, wp.take)
+                    .await?;
+                let mut buf = Vec::with_capacity(wp.take as usize);
+                while let Some(chunk) = stream.next().await {
+                    buf.extend_from_slice(
+                        &chunk.map_err(|e| S3Error::InternalError(format!("part read: {e}")))?,
+                    );
+                }
+                Ok(Bytes::from(buf))
             }));
         }
     }

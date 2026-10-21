@@ -1713,3 +1713,87 @@ async fn wal_records_committed_session() {
         "恰一次 commit(清扫器此后永不作废这批片):\n{text}"
     );
 }
+
+// ── 22:Range 部分读(blob-range-read;拼装对象窗口 = router 只取覆盖片)──────────────────
+#[tokio::test]
+async fn range_reads_serve_206_and_slice_composed_objects() {
+    let cfg = FrontendConfig {
+        max_body_bytes: 256 * 1024,
+        auto_chunk_bytes: 96 * 1024,
+        ..Default::default()
+    };
+    let fx =
+        Fixture::start_with_frontend(cfg, antfs_config::UploadConfig::default(), &[101, 102]).await;
+
+    // 300 KiB / 96 KiB 片 = 4 片拼装对象。
+    let data = pseudo_random(300 * 1024);
+    let blob_id = fx.upload(&data).await;
+
+    // 单区间:206 + Content-Range + 字节恒等(跨片界窗口)。
+    let resp = fx
+        .http
+        .get(fx.url(&format!("/blobs/{blob_id}")))
+        .header("Range", "bytes=100000-120000")
+        .send()
+        .await
+        .expect("range get");
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        header(&resp, "content-range"),
+        format!("bytes 100000-120000/{}", data.len())
+    );
+    let body = resp.bytes().await.expect("body");
+    assert_eq!(&body[..], &data[100000..=120000]);
+
+    // 开区间尾窗(bytes=s-):截到对象尾。
+    let resp = fx
+        .http
+        .get(fx.url(&format!("/blobs/{blob_id}")))
+        .header("Range", "bytes=-1000")
+        .send()
+        .await
+        .expect("tail range");
+    assert_eq!(resp.status().as_u16(), 206);
+    let body = resp.bytes().await.expect("tail body");
+    assert_eq!(&body[..], &data[data.len() - 1000..]);
+
+    // 越界 → 416 + Content-Range: bytes */total。
+    let resp = fx
+        .http
+        .get(fx.url(&format!("/blobs/{blob_id}")))
+        .header("Range", "bytes=999999-")
+        .send()
+        .await
+        .expect("unsat");
+    assert_eq!(resp.status().as_u16(), 416);
+    assert_eq!(
+        header(&resp, "content-range"),
+        format!("bytes */{}", data.len())
+    );
+
+    // HEAD 带 Range 也回 206(Ambry 口径,D3),无 body、Content-Range 对齐。
+    let resp = fx
+        .http
+        .head(fx.url(&format!("/blobs/{blob_id}")))
+        .header("Range", "bytes=0-99")
+        .send()
+        .await
+        .expect("head range");
+    assert_eq!(resp.status().as_u16(), 206);
+    assert_eq!(
+        header(&resp, "content-range"),
+        format!("bytes 0-99/{}", data.len())
+    );
+
+    // 多区间/语法坏 → 忽略回 200 全对象(语义矩阵与 s3 一致)。
+    let resp = fx
+        .http
+        .get(fx.url(&format!("/blobs/{blob_id}")))
+        .header("Range", "bytes=0-1,3-4")
+        .send()
+        .await
+        .expect("multi range ignored");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.bytes().await.expect("full body");
+    assert_eq!(&body[..], &data[..]);
+}

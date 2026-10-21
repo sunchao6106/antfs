@@ -81,5 +81,19 @@
 7. ~~收账~~ **已实施(2026-10-21,"已入库垃圾要删")**:`upload_session_wal_dir`(Ambry 式
    账簿+定期清扫的本地等价物;单写线程逐行 fsync;6h 过期 + 10min 一拍;残余风险 =
    断电线毫秒窗 / 账簿卷蒸发,见 upload_wal.rs 模块注释)。
-8. **router 下沉(裁决:开工单固化,下批实施)**:gateway 段已落;router SDK 内部恒切
-   (Bre./才直 Bun put > 片宽即切)让全员受益 = **下批方向**;开工单见 design §12。
+8. ~~router 下沉~~ **已实施(2026-10-21,design §12 + 落地记录)**:router 层恒切
+   (`put_bytes_chunk_bytes` 默认 4 MiB,0=关;片 = 普通多数派 blob 散分区 + 描述符;
+   失败墓碑;超容量 `too_large`)。
+9. **读侧下沉(同日连环裁决)**:⑨ router 读分块对象**自动拼装返真数据**(get 逻辑读);
+   ⑩ **拼装清单屏蔽在 router 层**,上层不见描述符(frontend 手搓拼装代码删除);
+   ⑪ 流式直通读(`get_object_stream`)并入本期;⑫ **读写路径全部去临时本地文件**
+   (下载抄盘消灭;put_file 预压框架随⑬消失);⑭ **读接口只留 stream 式**
+   (`get_file` 落盘式读整族删除,读口 = get / get_blob / get_object_stream /
+   get_object_range_stream / stat_object)。
+10. **压缩功能整体移除(⑬,用户明示)**:五旋钮/三闸/帧形态/流压/解压/指标/测试全退场;
+    **重开为记录在案的 TODO**(等读接口定型,基于流式读口重设计,帧头兼容存量是硬前提,
+    见 router.md §7 移除记档)。存量压缩帧将按原字节读回。
+11. **部分读同日并入(blob-range-read)**:数据面 `?offset=&length=` 窗口流(超越 Ambry,
+    其 store 协议无 offset/length)+ router `get_object_range_stream`(拼装对象只取
+    覆盖片)+ REST `Range`(206/416,Ambry 口径 HEAD 也 206)+ S3 网关读原语切到
+    router 窗口流(P4.1/P4.2 收口)。

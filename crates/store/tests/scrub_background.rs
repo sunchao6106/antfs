@@ -18,7 +18,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 /// 单条记录的磁盘占位:24B 记录开销 + 128B 数据。
-const REC: u64 = 24 + 128;
+// 5ded718 记录 v4 去 2B 帧 magic(24→22B 头)后,单条 128B 记录磁盘实占 = 150。
+const REC: u64 = 22 + 128;
 
 fn store_config() -> antfs_blob::StoreConfig {
     antfs_blob::StoreConfig {
@@ -120,7 +121,7 @@ async fn background_loop_finds_corrupted_bytes() {
     let srv = spawn_scrub_node(tmp.path()).await;
     put_records(&srv, 3).await;
 
-    // 翻坏第 2 条(offset 152)的 magic:物理 = 段头 64 + 152。
+    // 翻坏第 2 条(offset = REC)的帧标识:物理 = 段头 64 + REC。
     let seg = std::fs::read_dir(tmp.path().join("partition_0").join("log"))
         .unwrap()
         .filter_map(|e| e.ok())

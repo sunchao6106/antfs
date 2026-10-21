@@ -9,6 +9,14 @@
 use antfs_config::{at_least, Result, Validate};
 use serde::Deserialize;
 
+/// `put_bytes_chunk_bytes` 默认值:4 MiB —— 与网关恒切片宽同档,Ambry
+/// `router.max.put.chunk.size.bytes` 同型默认(RouterConfig.java,恒切、无开关)。
+pub const DEFAULT_PUT_BYTES_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+/// `put_bytes_chunk_bytes` 下限(非 0 时):切无收益、描述符开销反超的界。
+pub const PUT_BYTES_CHUNK_MIN_BYTES: u64 = 64 * 1024;
+/// `put_bytes_chunk_bytes` 上限:片是"中等单元",过 1 GiB 失切义(与内存帧上界同档)。
+pub const PUT_BYTES_CHUNK_MAX_BYTES: u64 = 1 << 30;
+
 /// router(客户端 SDK)配置。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
@@ -43,21 +51,15 @@ pub struct RouterConfig {
     /// 已不可写的分区,其本地号段被丢掉;新出现的可写分区,补一段加进缓存。
     /// **0 = 关闭**刷新(退回"只在号段耗尽时拉一次列表")。
     pub partition_refresh_secs: u64,
-    /// SDK 层透明数据压缩(`router-blob-compression`,对齐 Ambry `router.compression.enabled`):
-    /// 开启后 Bytes 形态写入过三闸(enabled / min_size / ratio)以**自描述帧**落盘 —— 帧头带
-    /// 算法号,集群可混存不同时期不同算法写的对象,读侧按帧自动解压。**默认 false = 行为
-    /// 与无该特性完全一致**;开启是运维决策(读 CPU 换盘/网带宽)。
-    pub compression_enabled: bool,
-    /// 压缩算法:`gzip`(默认)| `zstd` | `lz4` | `snappy`。改配置只影响**新写入**;
-    /// 旧对象按帧头算法号照常读回(算法演进不破坏可读性)。
-    pub compression_algorithm: String,
-    /// 压缩最小体量(字节):小于它的对象不试压(海量小文件为主体的仓,压无益)。
-    pub compression_min_size_bytes: usize,
-    /// 最小压缩比率(orig/compressed):试压不足此值即回落原文(熵数据自动出局)。
-    pub compression_min_ratio: f64,
-    /// 压缩级别:zstd 1..=19 / gzip 0..=9 / lz4、snappy 定档(忽略级别)。默认 1 = 速度面
-    /// (网关 CPU 是共享资源)。
-    pub compression_level: i32,
+    // 压缩五旋钮 2026-10-21 整体移除(所有者裁决13:读接口定型后基于流式读口重开;
+    // 存量压缩帧将按原字节读回,重开须带帧头兼容,见 router.md 待办)。
+    /// SDK 直连大 Bytes 写(`put` / `put_auto` 族)的**恒切片宽**(router 下沉,2026-10-21):
+    /// `> 0` 且 body 超过它时,router 内部切成多片**普通 blob** + 尾笔写**拼装描述符**,
+    /// 片经发号轮转散向不同可写分区(热点分摊);对齐 Ambry `router.max.put.chunk.size.bytes`
+    /// (恒切、无开关)。**0 = 不切**(裸 Bytes 直写惯例兼容)。读侧成对口 = `get_object`
+    /// (透明拼装);`get` / `get_file` 保持裸字节语义。**内嵌本表做网关的仓**须交叉校验
+    /// "网关自身片宽 ≤ 本值"(frontend / s3 的 `validate` 已带),否则网关片会被二次切。
+    pub put_bytes_chunk_bytes: u64,
 }
 
 impl Default for RouterConfig {
@@ -69,11 +71,7 @@ impl Default for RouterConfig {
             id_segment_size: 1024,
             latency_aware_routing: true,
             partition_refresh_secs: 30,
-            compression_enabled: false,
-            compression_algorithm: "gzip".to_string(),
-            compression_min_size_bytes: 4096,
-            compression_min_ratio: 1.05,
-            compression_level: 1,
+            put_bytes_chunk_bytes: DEFAULT_PUT_BYTES_CHUNK_BYTES,
         }
     }
 }
@@ -88,36 +86,37 @@ impl Validate for RouterConfig {
         }
         at_least("router.request_timeout_secs", self.request_timeout_secs, 1)?;
         at_least("router.id_segment_size", self.id_segment_size, 1)?;
-        if !crate::compression::SUPPORTED_ALGOS.contains(&self.compression_algorithm.as_str()) {
-            return Err(antfs_config::ConfigError::invalid(
-                "router.compression_algorithm",
-                "must be one of: zstd, gzip, lz4, snappy",
-            ));
-        }
-        match self.compression_algorithm.as_str() {
-            "zstd" if !(1..=19).contains(&self.compression_level) => {
-                return Err(antfs_config::ConfigError::invalid(
-                    "router.compression_level",
-                    "zstd level must be in [1, 19]",
-                ));
-            }
-            "gzip" if !(0..=9).contains(&self.compression_level) => {
-                return Err(antfs_config::ConfigError::invalid(
-                    "router.compression_level",
-                    "gzip level must be in [0, 9]",
-                ));
-            }
-            _ => {}
-        }
-        if !(self.compression_min_ratio.is_finite()
-            && (1.0..=100.0).contains(&self.compression_min_ratio))
+        // min_size 不设下限(0 = 全试压是合法运维选择);零长 body 恒走 too_small 闸。
+        if self.put_bytes_chunk_bytes != 0
+            && !(PUT_BYTES_CHUNK_MIN_BYTES..=PUT_BYTES_CHUNK_MAX_BYTES)
+                .contains(&self.put_bytes_chunk_bytes)
         {
             return Err(antfs_config::ConfigError::invalid(
-                "router.compression_min_ratio",
-                "must be in [1.0, 100.0]",
+                "router.put_bytes_chunk_bytes",
+                "must be 0 (off) or in [64 KiB, 1 GiB]",
             ));
         }
-        // min_size 不设下限(0 = 全试压是合法运维选择);零长 body 恒走 too_small 闸。
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_bytes_chunk_bytes_bounds() {
+        let mut cfg = RouterConfig::default();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.put_bytes_chunk_bytes, DEFAULT_PUT_BYTES_CHUNK_BYTES);
+
+        for bad in [1u64, 63 * 1024, (1 << 30) + 1] {
+            cfg.put_bytes_chunk_bytes = bad;
+            assert!(cfg.validate().is_err(), "rejected width {bad}");
+        }
+        for ok in [0u64, 64 * 1024, 1 << 30] {
+            cfg.put_bytes_chunk_bytes = ok;
+            assert!(cfg.validate().is_ok(), "accepted width {ok}");
+        }
     }
 }

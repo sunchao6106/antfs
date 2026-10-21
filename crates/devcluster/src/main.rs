@@ -439,9 +439,6 @@ async fn start_frontend(args: &DevClusterConfig, grpc_addr: &str) -> Option<Stri
         router: antfs_router::RouterConfig {
             master_addr: grpc_addr.to_string(),
             cluster_secret: SECRET.to_string(),
-            // devcluster 顶层的压缩开关对 frontend/S3 两个网关同时生效(同一份观察面)。
-            compression_enabled: args.frontend_compression_enabled,
-            compression_algorithm: args.frontend_compression_algorithm.clone(),
             ..Default::default()
         },
         ..Default::default()
@@ -501,9 +498,6 @@ async fn start_s3(args: &DevClusterConfig, grpc_addr: &str) -> Option<String> {
         router: antfs_router::RouterConfig {
             master_addr: grpc_addr.to_string(),
             cluster_secret: SECRET.to_string(),
-            // devcluster 顶层的压缩开关对 frontend/S3 两个网关同时生效(同一份观察面)。
-            compression_enabled: args.frontend_compression_enabled,
-            compression_algorithm: args.frontend_compression_algorithm.clone(),
             ..Default::default()
         },
         ..Default::default()

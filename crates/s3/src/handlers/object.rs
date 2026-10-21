@@ -444,12 +444,35 @@ async fn get_plain_object(
     window: Option<ByteWindow>,
     echo_checksum: Option<&StoredChecksum>,
 ) -> Result<Response, S3Error> {
-    let data = st.router.get(&meta.blob_id).await?;
-    let body = apply_window(data, meta, window)?;
-    let len = body.len() as u64;
-    object_read_builder(meta, false, len, window, echo_checksum)
-        .body(Body::from(body))
-        .map_err(response_build_error)
+    match window {
+        // 整对象:单次 R=1 整读(≤ max_body 有界),行级尺寸对账维持既有口径。
+        None => {
+            let data = st.router.get_blob(&meta.blob_id).await?;
+            if data.len() as u64 != meta.size {
+                return Err(S3Error::InternalError(format!(
+                    "blob size {} != row size {} (bucket {}, key {})",
+                    data.len(),
+                    meta.size,
+                    meta.bucket,
+                    meta.key
+                )));
+            }
+            object_read_builder(meta, false, meta.size, window, echo_checksum)
+                .body(Body::from(data))
+                .map_err(response_build_error)
+        }
+        // 窗口:router 窗口读(blob-range-read P4.1)—— 只传窗口字节,流式回体;
+        // 行/blob 漂移由数据面窗口钳制(短读 → 体错误响亮),不再前置整读对账。
+        Some(w) => {
+            let stream = st
+                .router
+                .get_object_range_stream(&meta.blob_id, w.start, w.len)
+                .await?;
+            object_read_builder(meta, false, w.len, window, echo_checksum)
+                .body(Body::from_stream(stream))
+                .map_err(response_build_error)
+        }
+    }
 }
 
 async fn get_multipart_object(
@@ -492,7 +515,7 @@ async fn get_encrypted_object(
             descriptor.alg
         )));
     }
-    let frame = st.router.get(&meta.blob_id).await?;
+    let frame = st.router.get_blob(&meta.blob_id).await?;
     let plain = crate::sse::read_object_frame(master, frame.as_ref(), &descriptor.key_id)?;
     let body = apply_window(Bytes::from(plain), meta, window)?;
     let len = body.len() as u64;
@@ -816,7 +839,7 @@ async fn copy_single_part(
     user_meta: &UserMeta,
     sse: &Option<std::sync::Arc<crate::sse::MasterKey>>,
 ) -> Result<String, S3Error> {
-    let raw = st.router.get(&src_meta.blob_id).await?;
+    let raw = st.router.get_blob(&src_meta.blob_id).await?;
     // 加密源:engine 读回的是帧 → 解出明文再走重钥逻辑(拷贝按明文重算 ETag/重定加密态)。
     let data = Bytes::from(decrypt_source_bytes(&st, src_meta, raw.as_ref())?);
     let etag = md5_hex(&data);
@@ -889,7 +912,7 @@ async fn copy_via_multipart(
             .map_err(|e| S3Error::InternalError(format!("part index overflow: {e}")))?;
         let blob_id = antfs_blob::StoreKey::from_slice(&part.blob_id)
             .ok_or_else(|| S3Error::InternalError("bad blob_id in manifest".into()))?;
-        let data = Bytes::from(st.router.get(&blob_id).await?.to_vec());
+        let data = Bytes::from(st.router.get_blob(&blob_id).await?.to_vec());
         let size = data.len() as u64;
         let etag = md5_hex(&data);
         let (new_blob, _) = st

@@ -180,9 +180,48 @@ pub struct S3GatewayToml {
 }
 
 impl S3GatewayToml {
-    /// 整份校验:自家 `[s3]` 表 + 公共上限表。S3 侧与片宽无跨界(无片宽概念),仅各自自洽。
+    /// 整份校验:自家 `[s3]` 表 + 公共上限表 + **跨界检查** —— router 恒切片宽
+    /// (2026-10-21 下沉,`router.put_bytes_chunk_bytes`)须为 0(关)或 ≥ `s3.max_body_bytes`:
+    /// S3 网关对单体 blob **直读裸字节**(不解析描述符;大对象走自家 multipart),
+    /// 交叉校验结构性保证网关写的单体永不超片宽、恒为普通 blob,不会被 router 内部
+    /// 二次切成"子片 + 子描述符"而读回原字节。
     pub fn validate_all(&self) -> antfs_config::Result<()> {
         self.s3.validate()?;
-        self.upload.validate()
+        self.upload.validate()?;
+        let width = self.s3.router.put_bytes_chunk_bytes;
+        if width != 0 && width < self.s3.max_body_bytes {
+            return Err(antfs_config::ConfigError::invalid(
+                "s3.router.put_bytes_chunk_bytes",
+                format!(
+                    "must be 0 (off) or >= s3.max_body_bytes ({}): the S3 gateway reads single blobs raw and never reassembles descriptors",
+                    self.s3.max_body_bytes
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// router 恒切片宽与 max_body 的跨界检查(读侧裸口径不变式)。
+    #[test]
+    fn router_chunk_width_cross_checks_with_max_body() {
+        let mut toml = S3GatewayToml::default();
+        toml.s3.router.put_bytes_chunk_bytes = 0;
+        toml.validate_all()
+            .expect("router 恒切关闭(0)与任何 max_body 共存");
+        toml.s3.router.put_bytes_chunk_bytes = 4 * 1024 * 1024;
+        toml.validate_all().expect("与默认 max_body(4 MiB)相等合法");
+        toml.s3.router.put_bytes_chunk_bytes = 8 * 1024 * 1024;
+        toml.validate_all()
+            .expect("大于 max_body 合法(网关写的单体恒为普通 blob)");
+        toml.s3.router.put_bytes_chunk_bytes = 64 * 1024;
+        assert!(
+            toml.validate_all().is_err(),
+            "router 片宽 < max_body:单体将被 router 二次切而 S3 裸读回描述符字节,必须拒"
+        );
     }
 }

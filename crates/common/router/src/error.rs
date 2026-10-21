@@ -109,6 +109,15 @@ pub enum Error {
     /// 本地文件 IO(读写上传/下载的文件)。
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// 恒切管线容量拒绝:body 超过 `put_bytes_chunk_bytes × MAX_CHUNKS`
+    /// (描述符片数上限);一字节未写,调用方可缩小重试或走流式口。
+    #[error("blob of {len} bytes exceeds the chunked-put capacity of {max} bytes")]
+    TooLarge { len: u64, max: u64 },
+
+    /// 拼装对象读回时描述符/片不一致(上游损坏类,不静默忽略 —— CLAUDE.md §3.3)。
+    #[error("bad composed blob: {0}")]
+    BadComposed(&'static str),
 }
 
 impl Error {
@@ -134,6 +143,8 @@ impl Error {
             Error::Quorum { .. } => "quorum",
             Error::PartitionMismatch { .. } => "partition_mismatch",
             Error::Io(_) => "io",
+            Error::TooLarge { .. } => "too_large",
+            Error::BadComposed(_) => "bad_composed",
         }
     }
 

@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod metrics;
+pub mod range;
 pub mod server;
 pub mod upload_wal;
 

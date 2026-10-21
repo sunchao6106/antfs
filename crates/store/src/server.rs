@@ -876,11 +876,17 @@ fn joined_put(
     }
 }
 
-/// blob 读的查询参数:`replication=1` 时对已删除/过期对象也返回数据体(供复制忠实 apply)。
+/// blob 读的查询参数:`replication=1` 时对已删除/过期对象也返回数据体(供复制忠实 apply);
+/// `offset`/`length` = 部分读窗口(blob-range-read D2:内部 RPC 直接语义,offset 缺省 0、
+/// length 缺省读到尾;窗口在复制读分支不消费 —— 整读契约零触碰)。
 #[derive(serde::Deserialize, Default)]
 struct GetParams {
     #[serde(default)]
     replication: Option<u8>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    length: Option<u64>,
 }
 
 /// 复制元数据请求参数:`seg`/`off` 为游标(均缺 = 从头);`max_bytes` 批上限。
@@ -1373,13 +1379,23 @@ async fn get_blob(
     {
         Ok(Ok(meta)) if !meta.deleted && !meta.expired => {
             let len = meta.data_len;
+            // 窗口读(blob-range-read):start 越界 → 416;length 截到对象尾(与网关层
+            // `bytes=s-` 的截尾语义一致);零长窗口 = 合法的空 200。
+            let start = params.offset.unwrap_or(0);
+            if start > len {
+                return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            }
+            let window_len = params
+                .length
+                .map(|l| l.min(len - start))
+                .unwrap_or(len - start);
             // 盘维度字节带宽(timer Drop 时 inc):现在设定,随流持有;流发完/丢弃(oneshot 断连)均落账。
-            t.set_bytes(len);
+            t.set_bytes(window_len);
             let sr = StreamingRead {
                 store,
                 key,
-                offset: 0,
-                remain: len,
+                offset: start,
+                remain: window_len,
                 pool: st.pool.clone(),
                 disk: disk.clone(),
                 timer: t,
@@ -1435,14 +1451,14 @@ async fn get_blob(
                     }
                 }
             };
-            // 计数语义:请求级(每 GET 一次 get_total;字节 = 总长;duration 在流尾 Drop 计入)。
+            // 计数语义:请求级(每 GET 一次 get_total;字节 = 窗口长;duration 在流尾 Drop 计入)。
             st.metrics.get_total.inc();
-            st.metrics.get_bytes.inc_by(len);
+            st.metrics.get_bytes.inc_by(window_len);
             // duration 口径(与 design 记档一致):直方图在流首按总长分桶 observe —— stat 完成
             // 即知成败与长度标签,放流首以免"断连后连直方图都没有"的双重失真。
             st.metrics
                 .blob_request_duration
-                .with_label_values(&["get", size_bucket(len)])
+                .with_label_values(&["get", size_bucket(window_len)])
                 .observe(started.elapsed().as_secs_f64());
             let _ = metrics_arc;
             axum::body::Body::from_stream(stream).into_response()

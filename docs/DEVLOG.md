@@ -2472,3 +2472,43 @@ TTL 的会话对象、内容=片位表;描述符落正名才发布;清扫器只�
 - antfs-config 新增 2 单测(UploadConfig 默认/解析);
 - 文档双表一致性 = frontend.md §8 配置 5 行新增/删减 + §9 监控 2 行新增;
   common.md §1.2/§1.3; s3.md 配置/不变量行 —— 含 `[upload]` 公共表行(CLAUDE.md §7 双表纪律)。
+
+### 步 97(upload-zero-spool + blob-range-read):router 读写下沉全链(⑧-⑭ 七连环裁决)
+
+**触发(所有者连环裁定,同日)**:⑧ router 下沉"现在就做" → ⑨ "router 内部读分块对象自动处理,
+返回真正的文件数据" → ⑩ "分片拼装清单屏蔽在 router 层,不要保留给上层" → ⑪ 读流式直通并入本期 →
+⑫ "读写路径上去掉临时本地文件" → ⑬ "压缩功能先全部删掉,等接口确定了再新开(**记 TODO**)" →
+⑭ "读接口只允许有 stream 式,不允许出现 file 式";另:blob-range-read(既有调研提案)并入本批、
+S3 Range 接口适配 router 窗口读、一切调整落最新设计文档。
+
+**落地(自内向外四层)**:
+- **router(核心,新 chunked.rs)**:恒切管线(`put`/`put_auto` 族 > 片宽切普通 blob + SWRR 散分区 +
+  composed 描述符;失败逐片墓碑;超容量 `too_large` 前置拒绝);读口**五形态** —— `get`(逻辑整读,
+  `stat‖裸读`并发)/`get_object_stream`(逻辑流式)/`get_object_range_stream`(窗口流:plain 走数据面
+  `?offset=&length=`,composed 只取覆盖片+边界裁边)/`get_blob`(裸字节受控口)/`stat_object`(逻辑
+  元数据);`put_file` 落盘式读、`get_file` 整族删除(⑭);`Router: Clone`(Arc 化防抖字)。
+  **压缩全删(⑬)**:config 五旋钮/三闸/帧/流压临时文件/bulk+流式解压/指标×2/e2e×3 退场,
+  重开 = 记录在案 TODO(router.md §7)。
+- **store**:数据面 GET 增 `?offset=&length=` 窗口流(§12.15 同一管线参数化;start 越界 416;
+  length 截尾;复制读分支零触碰;指标改按窗口长计)。
+- **frontend**:download 全走 router 逻辑流(小对象/拼装/大对象/Range 统一)
+  —— **读路径零本地文件(⑫ 收官,TempFile 机制删除)**;HEAD 改 `stat_object`(逻辑大小+片数头,
+  Range → 206 对齐 Ambry D3);`Range` 解析模块(frontend/src/range.rs,同语义移植 + 单测矩阵;
+  跨 crate 复用方向不正,实施偏差记档);删 stitched_body/fetch_chunk/file_stream/decode_descriptor
+  (网关不再识描述符,⑩);错误映射增 `too_large`→413 / `bad_composed`→502。
+- **S3**:窗口读直接适配 router(单对象 Range → `get_object_range_stream` 流式 206;
+  PartStream 每片窗口取件 `skip/take`,短读响亮 500;整读路径/SSE 整帧解密保持原样);
+  交叉校验 `s3.router.put_bytes_chunk_bytes`(0 或 ≥ max_body)。
+- **交叉校验(frontend/s3 validate_all)**:router 片宽 < 网关片宽/单体宽 → 拒启(设计 §12 共存
+  矩阵的坏格结构性封死)。
+- **既有修复(非本批引入)**:所有者 5ded718 记录 24→22B 后 scrub_worker 测试期望未同步(REC
+  152→150),随批补齐;本地另有所有者 3 个未推送 docs/格式提交随批一起走 CI。
+- **文档全量**、openspec 双 change 落档、裁决⑨-⑪、D1-D5 定稿、spec delta 三 requirement)。
+
+## Testing Done
+
+- workspace 全量:**78 套 819+**(router 22 lib + 18 e2e:恒切 17MiB 往返/散布两分区/窗口 5-7MiB
+  室内恒等/关键 409 冲突三片墓碑计数/宽 0 关态/put_file 流读恒等;frontend 19 lib + 25 rest:
+  REST Range 矩阵(206 尾窗/416/HEAD 206/多区间忽略)+ 既有 413/WAL/断流全绿;
+  S3 107/0(42 ignored 仍需库例);store 147/0(scrub 修复后);
+- `openspec validate` 双 change 过;fmt 净;clippy 0。

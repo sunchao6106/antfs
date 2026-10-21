@@ -59,3 +59,18 @@ frontend 网关的 `POST /blobs` 上传 SHALL NOT 在本地(含 TMPDIR)写入任
 #### Scenario: 中小对象语义不变
 - **WHEN** 有声明的 body ≤ `max_body_bytes` 的上传
 - **THEN** 单 blob 落库(非拼装)、内存有界、等长核验失败时 400 且零片写入
+
+### Requirement: router 层恒切与透明逻辑读(⑧/⑨/⑩/⑭,2026-10-21)
+router SDK SHALL 对超过 `router.put_bytes_chunk_bytes`(默认 4 MiB,0=关,64 KiB..=1 GiB)的 Bytes 写(`put`/`put_auto` 族)内部切片 —— 片 SHALL 为普通多数派 blob 且经发号轮转散向可写分区,尾笔 SHALL 以 composed 位写拼装描述符并返回其 blobId;任一失败 SHALL 尽力墓碑已入库片并透传原错误,超容量(`MAX_CHUNKS × 片宽`)SHALL 前置拒绝且一字节不写;读侧 SHALL 透明拼装:`get` 返回逻辑对象字节、`get_object_stream`/`get_object_range_stream` 流式且内存有界不落盘、`stat_object` 报逻辑大小与片数,裸字节 SHALL 仅存于受控口 `get_blob`,落盘式读接口 SHALL 不存在(§⑭);内嵌 router 配置的网关 SHALL 在装配期交叉校验"网关片/单体宽 ≤ router 片宽或恒切关闭",违者 SHALL 拒绝启动。
+
+#### Scenario: SDK 大对象直写与读回
+- **WHEN** 直连 SDK 用户 `put_auto(17 MiB)`(片宽 4 MiB)
+- **THEN** 5 片落库且分属两个可写分区;`get` 逐字节等于原文;`stat_object` 报 17 MiB / 5 片;`get_blob` 返回描述符字节
+
+#### Scenario: 失败回收
+- **WHEN** `put_with_ttl` 撞既有 key(描述符落 key 409)
+- **THEN** 返回 AlreadyExists;已写片逐片墓碑(`router_put_chunked_orphan_deletes_total`)且原 key 旧对象不受扰
+
+#### Scenario: 网关误配结构性拒绝
+- **WHEN** frontend TOML 设 `router.put_bytes_chunk_bytes=64 KiB` 而 `auto_chunk_bytes=4 MiB`
+- **THEN** 启动校验拒绝(网关片将被二次切)

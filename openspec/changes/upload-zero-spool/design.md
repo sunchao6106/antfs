@@ -340,6 +340,15 @@ start);大对象 30s 慢速传输期间并发 1 KiB PUT ack 延迟对照组(I5 �
   发生"(网关默认 4MiB=router 默认 4MiB;不等只发生在两侧独立调参;文档标注"须保持
   router 片宽 ≤ 网关片宽"否则一网关片变多 router 片,描述符仍调对 → 结果正确、片数变多 |
 
+**落地记录(2026-10-21 当日实施)**:写侧 = `crates/common/router/src/chunked.rs`
+(恒切管线 + 逻辑读口 `get`/`get_object_stream`/`get_object_range_stream`/`stat_object` +
+裸口 `get_blob`;失败墓碑;`too_large`/`bad_composed` 错误族;指标 4 项)。读侧裁决⑨-⑭
+(见 proposal 裁决 9-11):frontend 手搓拼装删除、下载零盘;**压缩功能整体移除(⑬,
+含 put_file 预压临时文件)——重开压缩 = 记录在案的 TODO,接口定型后基于流式读口重设计**;
+共存矩阵的"router 片宽 4 MiB < 网关片宽"坏格改由**配置交叉校验**结构性封死
+(frontend/s3 `validate_all`:router 片宽 0 或 ≥ 网关片宽/单体宽)。D1(压缩帧×窗口读)
+随压缩移除**消解**;blob-range-read change 同日并入实施。
+
 **任务切分(下批)**:
 1. `RouterConfig::put_bytes_chunk_bytes` + 校验;
 2. `put_with_ttl / put_auto_with(BlobBytes)` 内部切片 + 描述符 + 聚合报告;

@@ -47,11 +47,6 @@ pub struct DevClusterConfig {
     pub partition_capacity_bytes: u64,
     /// frontend REST 端口。
     pub frontend_port: u16,
-    /// frontend 内嵌 router 的 **SDK 透明压缩**开关(`router-blob-compression`,默认关)。
-    /// 开 = 经 frontend 的写入过三闸出帧(读回自动解压)。
-    pub frontend_compression_enabled: bool,
-    /// 压缩算法名(直通 `RouterConfig::compression_algorithm`;`gzip` 默认 / zstd / lz4 / snappy)。
-    pub frontend_compression_algorithm: String,
     /// S3 gateway 端口 (default 7500)。仅当 [`s3_metastore_url`](Self::s3_metastore_url) 设置时使用。
     pub s3_port: u16,
     /// MetaStore 连接 URL。设置后启动 S3 gateway。
@@ -89,8 +84,6 @@ impl Default for DevClusterConfig {
             disk_health: false,
             partition_capacity_bytes: 64 << 20,
             frontend_port: 7400,
-            frontend_compression_enabled: false,
-            frontend_compression_algorithm: "gzip".to_string(),
             s3_port: 7500,
             s3_metastore_url: None,
             host: "127.0.0.1".to_string(),

@@ -638,7 +638,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 
 | 指标名 | 类型 | 标签 | 单位 | 含义 | 对齐 Ambry |
 |---|---|---|---|---|---|
-| `store_server_blob_request_duration_seconds` | histogram | `op`(put/get),`size`(small/medium/large) | 秒 | **成功** blob 请求延迟,按对象大小分桶(边界 50 KiB / 1 MiB);错误/早退不计数 | `ServerMetrics` 的 small/medium/large blob 分桶计时器 |
+| `store_server_blob_request_duration_seconds` | histogram | `op`(put/get),`size`(small/medium/large) | 秒 | **成功** blob 请求延迟,按对象大小分桶(边界 50 KiB / 1 MiB;GET 的窗口读按**窗口长**分桶);错误/早退不计数 | `ServerMetrics` 的 small/medium/large blob 分桶计时器 |
 | `store_server_rejected_requests_total` | counter | `op`,`reason`(目前仅 `disabled`) | 次 | 被 RequestControl 静默拒掉的请求数(在进引擎之前) | Ambry `RequestControl` 的静默拒绝计数 |
 | `store_server_replicas_dropped_total` | counter | — | 次 | 收到 `DROPPED` 指令后**实际删除**本地副本数据的次数(见 §12.6);重复指令被幂等忽略,**不**计数 | — |
 | `store_server_replication_paused` | gauge | — | 0/1 | 运维是否暂停本节点主动拉复制(1 = 暂停);见 §12.7 | — |
@@ -1394,6 +1394,23 @@ bytes_stream()` 逐块落盘)与下游(frontend 暂存流式回)早已是流式�
 - 语义差异记档:不可读对象(不存在/已删/已过)404 时点从"整读后"提前到"流首";
   流中途对象被删/被 compaction 回收 → 连接中断(响应头已发;连接即一致性边界,
   客户端可换副本重试 —— R=1 语义)。
+
+### 12.15.1 数据面窗口读 `?offset=&length=`(blob-range-read,2026-10-21)
+
+**动机**:路由/网关有了部分读窗口(REST `Range`、S3 206)。若 store 只会整读,
+byte-range 只能"整取回再切片" —— 10 GiB 对象取 1 MiB 也是 10 GiB 过网。
+把既有的 `read_range` 分块流参数化个起点,窗口读就直达引擎(超越 Ambry:
+其 store 协议无 offset/length,切片全在 router 侧)。
+
+**实现**(挂在 §12.15 的同一条流式路径上):
+- query:`offset`(缺省 0)+ `length`(缺省 = 读到尾,自动截到对象尾;对齐网关
+  `bytes=s-` 的截尾语义);`start > 对象长` → **416**;零长窗口 = 合法空 200。
+- `?replication=1` **不消费窗口参数**(整读 + include_expired + 整条 CRC 的复制
+  契约零触碰;豁免清单同上,分类不受新 query 影响 —— `classify` 只认 `replication=`)。
+- 引擎校验口径 = §12.15 的 `read_range` 原样(记录头逐块重验;CRC 取舍不变);
+  窗口越界的引擎层 Corrupt 由流首 stat 的 416 前置挡住。
+- 指标口径(零新增):请求一次 `get_total`;**字节数/时长分桶改按窗口长计**
+  (服务了多少记多少);`disk_bytes_total` 同窗口实际传输。
 
 ### 12.16 数据面删除审计日志(2026-10-20)
 
