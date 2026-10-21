@@ -4,14 +4,14 @@
 //! 以及"写不下"到底报 400(记录超过任何段)还是 507(分区写满)——两者给运维的处置完全不同。
 //!
 //! 注意 `Log` 是**裸字节**日志(记录头/CRC 由 `BlobStore` 编码),故这里直接给 `Log::append` 的长度就是
-//! `payload().len()`;`BlobStore` 那一条才带 38B 记录开销。
+//! `payload().len()`;`BlobStore` 那一条才带 22B 记录开销。
 
 use std::path::Path;
 
 use antfs_blob::{BlobStore, Error, Log, LogSegmentName, StoreKey};
 
 const SEG_HDR: u64 = 64; // `LogSegment` 段头
-const REC_OVERHEAD: u64 = 38; // `BlobStore` 的 记录头 + 尾 CRC(KEY_SIZE = 8)
+const REC_OVERHEAD: u64 = 22; // `blob.rs::RECORD_OVERHEAD`(记录头 + 尾 CRC)
 const DATA: u64 = 500; // 负载长度
 const LOG_REC: u64 = DATA; // 直接给 Log::append 的裸记录长度
 

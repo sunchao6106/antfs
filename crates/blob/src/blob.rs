@@ -7,10 +7,15 @@
 //! 每次写入都在 Log 追加一条**自描述记录**(含 key 后缀/flags/crc),索引只保存
 //! `key → (LogOffset, 记录大小, flags, TTL)`。因此索引损坏时可由扫描 Log 重建。
 //!
-//! 记录布局(小端,crc 覆盖其前所有字节;总开销 24B):
+//! 记录布局(小端,crc 覆盖其前所有字节;固定开销 22B):
 //! ```text
-//! [ magic u16 | version u8 | flags u8 | key_suffix u32 | expiration i64 | data_len u32 | data | crc u32 ]
+//! [ version u8 | flags u8 | key_suffix(u32 大端) | expiration i64 | data_len u32 | data | crc u32 ]
 //! ```
+//!
+//! **无帧 magic**(2026-10-21 密度裁决:无历史数据,v4 原地改不另立版本):记录的**身份/位置**
+//! 校验由偏移 0 的 version 字节承担(`!= 4` 即 Corrupt,重同步落点同理),**完整性**仍由
+//! 尾部 crc(2⁻³²)把关 —— 数据正确性红线未变,省掉的是每条 2B 的哨兵。
+//!
 //! key 的**高 32bit(partitionId)不落在记录里** —— 一个 log 段属于唯一一个副本,该前缀是整段
 //! 常量,写在段头(`LogSegment::key_prefix`),记录只存低 32bit 的 `objectId`;读时由
 //! [`Log::key_prefix`] 补全。`put` 写 `flags=0`;`delete` 写 `flags=FLAG_DELETED`、`data_len=0` 的墓碑。
@@ -29,15 +34,15 @@ use crate::log_segment::LogSegment;
 use crate::metrics::{StoreMetricHandles, StoreMetrics};
 use crate::types::{LogOffset, LogSegmentName, StoreKey};
 
-const REC_MAGIC: u16 = 0x424D; // "MB"
 const REC_VERSION: u8 = 4;
 
 mod rec {
-    pub const MAGIC: usize = 0;
-    pub const VERSION: usize = 2;
-    pub const FLAGS: usize = 3;
+    /// 版本字节兼作帧判定(2026-10-21 起 magic 退役,它顶在偏移 0):`!= REC_VERSION` 即 Corrupt,
+    /// 重同步的落点确认也靠它。
+    pub const VERSION: usize = 0;
+    pub const FLAGS: usize = 1;
     /// key 的**低 32bit**(`objectId`);高 32bit 在段头(`LogSegment::key_prefix`)。
-    pub const KEY_SUFFIX: usize = 4; // u32
+    pub const KEY_SUFFIX: usize = 2; // u32
     pub const EXPIRATION: usize = KEY_SUFFIX + 4; // i64
     pub const DATA_LEN: usize = EXPIRATION + 8; // u32
     pub const DATA: usize = DATA_LEN + 4;
@@ -68,7 +73,7 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// 只写记录头(magic/version/flags/key 后缀/expiration/data_len)。
+/// 只写记录头(version/flags/key 后缀/expiration/data_len)。
 ///
 /// 流式写入需要**先落头再落数据体**(长度已知,先写在预留区首部),故与 [`encode_record`] 共用。
 /// `key_suffix` 按**大端**落盘,与 [`StoreKey`] 的字节序一致(便于十六进制对读)。
@@ -80,7 +85,6 @@ fn encode_header_into(
     data_len: u32,
 ) {
     debug_assert!(buf.len() >= RECORD_HEADER);
-    buf[rec::MAGIC..rec::MAGIC + 2].copy_from_slice(&REC_MAGIC.to_le_bytes());
     buf[rec::VERSION] = REC_VERSION;
     buf[rec::FLAGS] = flags;
     buf[rec::KEY_SUFFIX..rec::KEY_SUFFIX + 4].copy_from_slice(&key_suffix.to_be_bytes());
@@ -91,8 +95,8 @@ fn encode_header_into(
 /// 记录内 `data_len` 是 u32:数据体超过 `u32::MAX` 的记录**不可写** —— 否则长度字段回绕,落盘后任何读取
 /// 都会因 `decode_record` 的尺寸校验失败而报 `Corrupt`(持久性红线:宁拒绝,不写坏)。
 ///
-/// 段大小上限 4 GiB(`StoreConfig::validate` 强制)时本检查**必然通过**(单条记录 ≤ 段 − 102
-/// < `u32::MAX`),保留它是第二道保险。
+/// 段大小上限 4 GiB(`StoreConfig::validate` 强制)时本检查**必然通过**(单条记录 ≤ 段 − 86
+/// = 64 段头 + 22 记录固定开销 < `u32::MAX`),保留它是第二道保险。
 fn record_data_len(len: u64) -> Result<u32> {
     u32::try_from(len).map_err(|_| {
         Error::BadArgument(format!(
@@ -139,10 +143,6 @@ struct DecodedRecord {
 fn decode_record(buf: &[u8], key_prefix: u32) -> Result<DecodedRecord> {
     if buf.len() < RECORD_OVERHEAD {
         return Err(Error::Corrupt(format!("record too short: {}", buf.len())));
-    }
-    let magic = u16::from_le_bytes(buf[rec::MAGIC..rec::MAGIC + 2].try_into().unwrap());
-    if magic != REC_MAGIC {
-        return Err(Error::Corrupt(format!("bad record magic {magic:#x}")));
     }
     if buf[rec::VERSION] != REC_VERSION {
         return Err(Error::Corrupt(format!(
@@ -2293,8 +2293,8 @@ fn for_each_record(
 /// 读取 `at` 处一条完整记录(先读头拿 data_len,再读整条并校验 crc)。
 ///
 /// key 的前缀来自段头(`log.key_prefix()`),记录体里只有低 32bit 后缀。
-/// 只读记录头(24B)做与 [`decode_record`] 同源的轻校验,返回数据体长度。
-/// 供 [`BlobStore::read_range`] 的切片路径复用:magic/version/key 全等、活索引指向墓碑即 Corrupt。
+/// 只读记录头(18B)做与 [`decode_record`] 同源的轻校验,返回数据体长度。
+/// 供 [`BlobStore::read_range`] 的切片路径复用:version/key 全等、活索引指向墓碑即 Corrupt。
 fn read_record_header(log: &Log, at: LogOffset, key: &StoreKey) -> Result<u64> {
     let head = log.read(at, RECORD_HEADER)?;
     if head.len() < RECORD_HEADER {
@@ -2302,10 +2302,6 @@ fn read_record_header(log: &Log, at: LogOffset, key: &StoreKey) -> Result<u64> {
             "record header too short: {}",
             head.len()
         )));
-    }
-    let magic = u16::from_le_bytes(head[rec::MAGIC..rec::MAGIC + 2].try_into().unwrap());
-    if magic != REC_MAGIC {
-        return Err(Error::Corrupt(format!("bad record magic {magic:#x}")));
     }
     if head[rec::VERSION] != REC_VERSION {
         return Err(Error::Corrupt(format!(
@@ -3000,15 +2996,14 @@ mod tests {
             assert_eq!(got, &data[skip..]);
         }
 
-        // 坏头(magic)读取 → Corrupt(stream 首头校验真实生效的直接证据)。
-        // 构造:写第二条记录, frost 到其记录头 magic 字节。
+        // 头首字节读取 → 偏移 0 即 version(stream 首头校验与 decode 同源的直接证据)。
         let k2 = key(3);
         store.put(k2, b"victim").unwrap();
         let iv = store.inner().index.find(&k2).unwrap();
         let file_head = store.inner().log.read(iv.offset, RECORD_HEADER).unwrap();
-        assert_eq!(file_head[0..2], REC_MAGIC.to_le_bytes());
+        assert_eq!(file_head[0], REC_VERSION);
         // 用底层写接口改不了(不可变);改为验证"活索引指向墓碑"路径:删除后 index 判 Deleted 已覆盖。
-        // magic 校验的生效性由 format 层既有 record_roundtrip_layout_and_crc_guard 族守;
+        // 头校验(版本/键不合即 Corrupt)的生效性由 format 层既有 record_roundtrip_layout_and_crc_guard 族守;
         // 本矩阵不再构造盘面位翻转(引擎不可变写纪律下做不到不破坏其他不变量)。
         store.close().unwrap();
     }
@@ -3215,10 +3210,10 @@ mod tests {
 
     #[test]
     fn record_roundtrip_layout_and_crc_guard() {
-        // 记录头 24B = magic2 + version1 + flags1 + key_suffix4 + expiration8 + data_len4 + crc4。
-        assert_eq!(RECORD_OVERHEAD, 24);
-        assert_eq!(rec::KEY_SUFFIX, 4, "key 只存低 32bit 后缀");
-        assert_eq!(rec::DATA, 20);
+        // 记录固定开销 22B = version1 + flags1 + key_suffix4 + expiration8 + data_len4 + crc4。
+        assert_eq!(RECORD_OVERHEAD, 22);
+        assert_eq!(rec::KEY_SUFFIX, 2, "key 只存低 32bit 后缀");
+        assert_eq!(rec::DATA, 18);
 
         let k = StoreKey::from_parts(7, 42);
         let data = b"payload".to_vec();

@@ -36,7 +36,7 @@ fn non_multiple_partition_and_segment_sizes_are_legal() {
 #[test]
 fn default_segment_size_keeps_single_record_under_u32() {
     const SEG_HEADER: u64 = 64; // `log_segment.rs::HEADER_SIZE`
-    const RECORD_OVERHEAD: u64 = 38; // `blob.rs::RECORD_OVERHEAD`(KEY_SIZE = 8)
+    const RECORD_OVERHEAD: u64 = 22; // `blob.rs::RECORD_OVERHEAD`
     let seg = StoreConfig::default().segment_size_bytes;
     assert_eq!(
         seg,
@@ -55,7 +55,7 @@ fn default_segment_size_keeps_single_record_under_u32() {
 #[test]
 fn default_max_body_bytes_fits_in_one_segment() {
     const SEG_HEADER: u64 = 64;
-    const RECORD_OVERHEAD: u64 = 38;
+    const RECORD_OVERHEAD: u64 = 22;
     let max_body = StoreServerConfig::default().max_body_bytes;
     let seg = StoreConfig::default().segment_size_bytes;
     assert!(

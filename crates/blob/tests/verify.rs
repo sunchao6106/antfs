@@ -55,7 +55,7 @@ fn clean_store_verifies_and_summarises() {
 
 #[test]
 fn verify_locates_corrupted_record() {
-    // 在线损坏场景(副本已在跑):写完后直接翻转段文件里第一条记录的 magic,再 verify。
+    // 在线损坏场景(副本已在跑):写完后直接翻转段文件里第一条记录的头首字节(version),再 verify。
     //
     // 注:这里**不重开** store —— 见文件末尾"已知缺口"一节:open() 的索引重建遇到坏记录会整体失败,
     // 那种"副本起不来"的形态无法经本 API 检查(属后续增强)。
@@ -78,8 +78,8 @@ fn verify_locates_corrupted_record() {
         .expect("至少一个段文件");
     let mut bytes = std::fs::read(&seg).unwrap();
     assert!(bytes.len() > 200, "段应有内容");
-    // 段头固定 64 字节(物理),数据 offset 0 映射到物理 64 → 翻转第 64 字节 = 破坏第一条记录的 magic。
-    // 只坏 magic、不动 data_len,故"重同步到下一条"这条路径也被覆盖。
+    // 段头固定 64 字节(物理),数据 offset 0 映射到物理 64 → 翻转第 64 字节 = 破坏第一条记录的 version。
+    // 只坏头首字节、不动 data_len,故"重同步到下一条"这条路径也被覆盖。
     bytes[64] ^= 0xff;
     std::fs::write(&seg, &bytes).unwrap();
 
@@ -113,8 +113,8 @@ fn verify_respects_max_bytes_and_reports_truncated() {
     assert!(partial.records < full.records, "部分扫描的记录数应更少");
 }
 
-/// 152 = 24B 记录开销 + 128B 数据:恰好一条的预算。
-const ONE_128B_RECORD: u64 = 24 + 128;
+/// 150 = 22B 记录开销 + 128B 数据:恰好一条的预算。
+const ONE_128B_RECORD: u64 = 22 + 128;
 
 /// 预算到点时的游标必须指向**下一条未扫字节**,从它续扫恰好补齐剩余、不重不漏。
 #[test]
@@ -191,7 +191,7 @@ fn verify_from_resyncs_and_resumes_past_corruption() {
     }
     store.flush().unwrap();
 
-    // 翻坏第 2 条(offset 152)的 magic:物理 = 段头 64 + 152。
+    // 翻坏第 2 条(offset 150)的头首字节:物理 = 段头 64 + 150。
     let seg = first_segment(dir.path());
     let mut raw = std::fs::read(&seg).unwrap();
     raw[64 + ONE_128B_RECORD as usize] ^= 0xff;
@@ -299,7 +299,7 @@ fn open_tolerates_damaged_record_and_reports_damage() {
         store.flush().unwrap();
     }
 
-    // 破坏第一条记录的 magic(物理 64 = 数据 offset 0),data_len 保持完好 → 可重同步。
+    // 破坏第一条记录的 version(物理 64 = 数据 offset 0),data_len 保持完好 → 可重同步。
     let seg = first_segment(dir.path());
     let mut bytes = std::fs::read(&seg).unwrap();
     bytes[64] ^= 0xff;
@@ -364,14 +364,13 @@ fn open_abandons_unresyncable_segment_but_recovers_later_segments() {
     let segs = segment_files(dir.path());
     assert!(segs.len() >= 2, "应滚出至少两个段: {segs:?}");
 
-    // 破坏**第一段**的记录头(magic + data_len 一起改)→ 无法重同步。
+    // 破坏**第一段**的记录头(version + data_len 一起改)→ 无法重同步。
     let first = &segs[0];
     let mut bytes = std::fs::read(first).unwrap();
-    bytes[64] = 0x00; // magic 低位
-    bytes[65] = 0x00; // magic 高位
-                      // data_len 在记录内偏移 16(u32;magic@0、version@2、flags@3、key_suffix@4、exp@8、data_len@16):
+    bytes[64] = 0x00; // version 置 0 → decode 即拒
+                      // data_len 在记录内偏移 14(u32;version@0、flags@1、key_suffix@2、exp@6、data_len@14):
                       // 写成极大值使"按头重同步"越界 → 判为不可重同步。
-    for b in bytes[64 + 16..64 + 20].iter_mut() {
+    for b in bytes[64 + 14..64 + 18].iter_mut() {
         *b = 0xff;
     }
     std::fs::write(first, &bytes).unwrap();

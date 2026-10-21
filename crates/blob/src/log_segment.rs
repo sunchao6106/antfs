@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
-const HEADER_MAGIC: u32 = 0x414D_4253; // "AMBS"
+/// 段头 3B 帧 magic:ASCII `ant`(2026-10-21 起替代 4B "AMBS";无历史兼容包袱,布局原地改,
+/// 段头 version 值仍为 3)。段文件的身份锚 —— `open` / `peek_generation`(物理拷贝校验)的第一道闸。
+const HEADER_MAGIC: [u8; 3] = *b"ant";
 const HEADER_VERSION: u16 = 3;
 const HEADER_SIZE: usize = 64;
 
@@ -28,9 +30,9 @@ pub const MAX_CAPACITY: u64 = 4 * 1024 * 1024 * 1024;
 
 /// header 内各字段偏移(小端)。
 mod hdr {
-    pub const MAGIC: usize = 0; // u32
-    pub const VERSION: usize = 4; // u16
-                                  // 6..8 reserved
+    pub const MAGIC: usize = 0; // 3B "ant"
+    pub const VERSION: usize = 3; // u16
+                                  // 5..8 reserved
     pub const CAPACITY: usize = 8; // u64
     pub const DATA_END: usize = 16; // u64
     pub const CREATED_NS: usize = 24; // u64
@@ -53,8 +55,7 @@ pub fn peek_generation(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < hdr::HEADER_LEN {
         return None;
     }
-    let magic = u32::from_le_bytes(bytes[hdr::MAGIC..hdr::MAGIC + 4].try_into().ok()?);
-    if magic != HEADER_MAGIC {
+    if bytes[hdr::MAGIC..hdr::MAGIC + 3] != HEADER_MAGIC {
         return None;
     }
     let stored_crc = u32::from_le_bytes(bytes[hdr::CRC..hdr::CRC + 4].try_into().ok()?);
@@ -185,9 +186,12 @@ impl LogSegment {
         file.read_exact_at(&mut hb, 0)?;
         let s = &hb;
 
-        let magic = u32::from_le_bytes(s[hdr::MAGIC..hdr::MAGIC + 4].try_into().unwrap());
-        if magic != HEADER_MAGIC {
-            return Err(Error::Corrupt(format!("bad magic {magic:#x}")));
+        if s[hdr::MAGIC..hdr::MAGIC + 3] != HEADER_MAGIC {
+            return Err(Error::Corrupt(format!(
+                "bad segment magic {:?} (expected {:?})",
+                &s[hdr::MAGIC..hdr::MAGIC + 3],
+                HEADER_MAGIC
+            )));
         }
         let version = u16::from_le_bytes(s[hdr::VERSION..hdr::VERSION + 2].try_into().unwrap());
         if version != HEADER_VERSION {
@@ -365,7 +369,7 @@ impl LogSegment {
 
     fn write_header(&self) -> Result<()> {
         let mut s = [0u8; hdr::HEADER_LEN];
-        s[hdr::MAGIC..hdr::MAGIC + 4].copy_from_slice(&HEADER_MAGIC.to_le_bytes());
+        s[hdr::MAGIC..hdr::MAGIC + 3].copy_from_slice(&HEADER_MAGIC);
         s[hdr::VERSION..hdr::VERSION + 2].copy_from_slice(&HEADER_VERSION.to_le_bytes());
         s[hdr::CAPACITY..hdr::CAPACITY + 8].copy_from_slice(&self.capacity.to_le_bytes());
         s[hdr::DATA_END..hdr::DATA_END + 8]
@@ -507,7 +511,7 @@ mod tests {
         // 手写一个 capacity 超过上界的段头(CRC 自洽,只违反容量不变量)→ open 必须报 Corrupt。
         let (_dir, path) = temp_path("ceiling_open");
         let mut hb = [0u8; HEADER_SIZE];
-        hb[hdr::MAGIC..hdr::MAGIC + 4].copy_from_slice(&HEADER_MAGIC.to_le_bytes());
+        hb[hdr::MAGIC..hdr::MAGIC + 3].copy_from_slice(&HEADER_MAGIC);
         hb[hdr::VERSION..hdr::VERSION + 2].copy_from_slice(&HEADER_VERSION.to_le_bytes());
         hb[hdr::CAPACITY..hdr::CAPACITY + 8].copy_from_slice(&(MAX_CAPACITY + 1).to_le_bytes());
         let crc = crc32fast::hash(&hb[0..hdr::COVERED]);

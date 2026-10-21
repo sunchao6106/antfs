@@ -33,9 +33,9 @@
 
 | 偏移 | 字段 | 长度 | 说明 |
 |---|---|---|---|
-| 0..4 | `magic("AMBS")` | u32 | |
-| 4..6 | `version` | u16 | `= 3` |
-| 6..8 | `reserved` | 2 | |
+| 0..3 | `magic("ant")` | 3B | ASCII `a`,`n`,`t`;段文件身份锚(2026-10-21 起替代 4B `"AMBS"`;无历史兼容包袱,布局原地改、段头 version 值仍 `= 3`) |
+| 3..5 | `version` | u16 | `= 3` |
+| 5..8 | `reserved` | 3B | |
 | 8..16 | `capacity` | u64 | 段容量 |
 | 16..24 | `data_end` | u64 | 持久化水位 |
 | 24..32 | `created_ns` | u64 | |
@@ -79,18 +79,21 @@
   master 不可达 / 拒绝发号时同样保留这个本地兜底值,副本照常建、照常服务(下次从零建这份副本时再申领)。
 - 崩溃一致性:先建首段、再落身份;崩在中间只会留下"没有身份文件"的目录,由 `BlobStore::open` 自愈。
 
-**记录(v4)** —— `magic(2) | version(1) | flags(1) | key_suffix(4) | expiration_ms(8) | data_len(4) | data | crc(4)`,固定开销 **24 B**(一条记录的物理总长 = `24 + data_len`):
+**记录(v4)** —— `version(1) | flags(1) | key_suffix(4) | expiration_ms(8) | data_len(4) | data | crc(4)`,固定开销 **22 B**(一条记录的物理总长 = `22 + data_len`):
 
 | 偏移 | 字段 | 长度 | 说明 |
 |---|---|---|---|
-| 0..2 | `magic` | u16 | `"MB"` |
-| 2 | `version` | u8 | `= 4` |
-| 3 | `flags` | u8 | 0 = PUT,`FLAG_DELETED` = 墓碑,`FLAG_COMPOSED`(bit 4)= 拼装描述符类型位(`blob-composed-flag`,布局不变);位 1-3 预留 |
-| 4..8 | `key_suffix` | u32 | 大端 = blobId **低 32bit**(objectId) |
-| 8..16 | `expiration_ms` | i64 | `-1` = 不过期 |
-| 16..20 | `data_len` | u32 | 数据体长度 |
-| 20.. | `data` | | 数据体 |
+| 0 | `version` | u8 | `= 4` |
+| 1 | `flags` | u8 | 0 = PUT,`FLAG_DELETED` = 墓碑,`FLAG_COMPOSED`(bit 4)= 拼装描述符类型位(`blob-composed-flag`,布局不变);位 1-3 预留 |
+| 2..6 | `key_suffix` | u32 | 大端 = blobId **低 32bit**(objectId) |
+| 6..14 | `expiration_ms` | i64 | `-1` = 不过期 |
+| 14..18 | `data_len` | u32 | 数据体长度 |
+| 18.. | `data` | | 数据体 |
 | 末尾 4 B | `crc` | u32 | 覆盖其前所有字节 |
+
+- **无帧 magic**(2026-10-21 密度优化:无历史兼容包袱,v4 布局原地改、版本值不动):记录的**身份/位置**校验由
+  偏移 0 的 `version` 字节承担(`!= 4` 即 `Corrupt`,坏记录重同步的落点确认同理),**完整性**仍由尾部
+  `crc`(2⁻³²)把关 —— 磁盘上的数据正确性红线不变,削掉的是每条 2B 的身份哨兵(旧 `"MB"`)。
 
 - **key 高 32bit 不在记录里,只在段头存一次**:同一副本(同一分区)内所有 key 的高 4B 恒等 = 段头的 `key_prefix`,故记录只存 4B 后缀;读取方用 `key_prefix ‖ key_suffix` 拼回完整 8B blobId。**写路径校验 key 的 partition 与该副本前缀一致,不一致 → `BadArgument`**(绝不静默拼出一个错 key)。
 - `expiration_ms` **只在写入时给定**(`-1` = 不过期),写完即定、之后无处可改。
@@ -273,7 +276,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 - [x] 内存参考模型全量对拍
 - [x] **复制增量拉取(A):`Journal`(内存 offset→key 有序游标,超限逐出)+ `find_entries_since(token, max_size)`(journal 快路径 + 扫 log 慢路径,批内按 key 去最新态,`max_size` 限量)+ `find_missing_keys`;对齐 Ambry `Journal`/`findEntriesSince`。** 游标重定位已补齐(见 §9.2):`FindToken` 带**段身份**(位置 + 代次),引擎做段身份校验、服务层做**副本 incarnation** 校验(两层),认不出即重置为从头重扫;sessionId 仍未落(重启后游标本就只在内存里,清零即从头)
 - [x] **并发模型 D4(store 层完成 P1–P3)**(见 §8;Option B:`Log` 段表 `RwLock`、`BlobStore` 方法 `&self`、`inner: RwLock<Arc<Inner>>` 仅 compaction 换入、无重试循环、不引 `arc-swap`;并发测试守护)
-- [x] **存储模型简化:对象不可变 + 删除不可逆**(去掉复活/改 TTL/硬删;**段头 v2→v3**(每段 4B `key_prefix`;v3 起再带 4B 段代次 `generation`,见 §3)、**记录 v4**(24B 开销)、**索引 v2**(29B 条目)、复制合并改为**墓碑恒胜**;TTL 只在写入时定)—— 见 `openspec/changes/simplify-delete-model/`
+- [x] **存储模型简化:对象不可变 + 删除不可逆**(去掉复活/改 TTL/硬删;**段头 v2→v3**(每段 4B `key_prefix`;v3 起再带 4B 段代次 `generation`,见 §3)、**记录 v4**(22B 开销;2026-10-21 去帧 magic)、**索引 v2**(29B 条目)、复制合并改为**墓碑恒胜**;TTL 只在写入时定)—— 见 `openspec/changes/simplify-delete-model/`
 - [x] ~~后台调度器(周期 compaction + 定时 persist)~~ —— **已落地为本地维护 worker**(`worker.rs`:flush 固定周期 + compaction「首跑钟点 + 周期」调度,`local_worker_enabled` 默认开;原「移出 store 层、归属抽象 blob-server 角色」的设想随 store server 落地作废,调度进 store server、判定进引擎层,见 §9.1)
 - [x] compaction 策略:CompactAll + 按段增量 + **cost-benefit 选段**(对齐 `StatsBasedCompactionPolicy`)
 - [x] **compaction 回收口径 + 候选集策略**(见 §9.1;`CompactPolicy{dead_ratio, now_ms, tombstone_retention_ms, tombstones_allowed}`:回收被取代的旧记录 + TTL 过期对象 + 过保留期墓碑(**还要过墓碑回收闸门**);墓碑删除时刻复用索引 `expiration_ms` 槽位,布局不变)—— 见 `openspec/changes/store-compaction-policy/`
@@ -1376,8 +1379,8 @@ bytes/bad_records_total` + `scrub_background_paused` gauge)。
 bytes_stream()` 逐块落盘)与下游(frontend 暂存流式回)早已是流式。
 
 **实现**:
-- 引擎新增公开原语 `BlobStore::read_range(key, offset, len)`:24B 记录头同口径校验
-  (magic/version/key/墓碑位),数据体仅搬 `[offset, offset+len)` 切片;**不重验整条
+- 引擎新增公开原语 `BlobStore::read_range(key, offset, len)`:18B 记录头同口径校验
+  (version/key/墓碑位),数据体仅搬 `[offset, offset+len)` 切片;**不重验整条
   CRC**(切片不构成 CRC 覆盖单元 —— bit-rot 防线由复制整读 CRC + 后台 scrub 承担,
   记录头每块重验);`offset+len` 越界 → Corrupt。
 - 数据面:首 stat(经每盘池)定 404/总长 → `Body::from_stream` 逐块(512 KiB

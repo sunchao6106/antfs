@@ -100,7 +100,7 @@ fn two_stores_share_registry_distinguished_by_label() {
     assert!(text.contains("store_request_duration_seconds_count{op=\"put\",store=\"p2\"} 1"));
 }
 
-/// 默认段大小的**结构性不变量**:段 ≤ 4 GiB 时,单条记录 ≤ `段 − 64(段头) − 24(记录头尾) < u32::MAX`,
+/// 默认段大小的**结构性不变量**:段 ≤ 4 GiB 时,单条记录 ≤ `段 − 64(段头) − 22(记录头尾) < u32::MAX`,
 /// 故"`data_len` 只有 u32 → 长度回绕写出坏记录"在默认配置下**不可能发生**
 /// (`record_data_len` 的显式校验是第二道保险,供把段配大时兜底)。
 ///
@@ -109,7 +109,7 @@ fn two_stores_share_registry_distinguished_by_label() {
 #[test]
 fn default_segment_size_keeps_single_record_under_u32() {
     const SEG_HEADER: u64 = 64; // `log_segment.rs::HEADER_SIZE`
-    const RECORD_OVERHEAD: u64 = 24; // `blob.rs::RECORD_OVERHEAD`
+    const RECORD_OVERHEAD: u64 = 22; // `blob.rs::RECORD_OVERHEAD`
                                      // 硬编码 4 GiB,而不用 `StoreConfig::default()` —— 这样"默认被改"必然让本测试变红。
     let seg = 4 * 1024 * 1024 * 1024u64;
     assert_eq!(
