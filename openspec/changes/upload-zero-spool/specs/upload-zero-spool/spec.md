@@ -33,3 +33,18 @@ store 数据面带 Content-Length 且超过内存直进阈值的 PUT SHALL 经 l
 #### Scenario: 大对象在途不拖小对象
 - **WHEN** 大对象慢速传输中并发小对象 PUT
 - **THEN** 小对象 201 的 ack 延迟与无大对象在途的对照组一致(确定性对照,禁 sleep)
+
+### Requirement: 网关上传零暂存(墙③,④=边收边分片)
+frontend 网关的 `POST /blobs` 上传 SHALL NOT 在本地(含 TMPDIR)写入任何文件:有声明的 body ≤ `max_body_bytes` 时 SHALL 全程有界内存缓冲且仅在字节数与声明核验一致后才写入;超过 `max_body_bytes` 时 SHALL 边接收边按 `auto_chunk_bytes` 分片逐片入库,传输未达 EOF、字节数与声明不符、片数超限或任一片失败时 SHALL 以墓碑清理由此已入库的全部片并回 400;成功 SHALL 以拼装描述符原子发布且对象对外语义(大小/GET/HEAD/拼装)与既有形态一致;配置面 SHALL 零新增(复用 max_body_bytes/auto_chunk_bytes/auto_chunk_enabled);`GET /blobs` 大对象的既有中转属下载面,不在本契约(维持现状另裁)。
+
+#### Scenario: 大对象上传全程零文件
+- **WHEN** 100 MiB 带声明的 POST /blobs 完成并 GET 读回
+- **THEN** 201 + 描述符发布、读回逐字节一致、TMPDIR 文件数增量为零
+
+#### Scenario: 断流清理
+- **WHEN** 大对象传输中途断开或实发与声明不符
+- **THEN** 已入库各片被逐一墓碑删除、回 400、`frontend_upload_chunk_cleanups_total` 递增
+
+#### Scenario: 中小对象语义不变
+- **WHEN** 有声明的 body ≤ `max_body_bytes` 的上传
+- **THEN** 单 blob 落库(非拼装)、内存有界、等长核验失败时 400 且零片写入

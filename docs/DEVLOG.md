@@ -2365,3 +2365,20 @@ CL,服务端零改;真实否决理由仅剩"全量两遍在小文件主流下 CP
 ## Testing Done(docs-only)
 
 - 零 `.rs` diff;`openspec validate upload-zero-spool` 过;CI/Docker 全量绿。
+
+### 步 93(upload-zero-spool):裁决 ④ 落档 —— 网关边收边分片
+
+**触发**:所有者裁定网关墙③去法 = **边收边分片**(ii;整包内存方案落选)。
+
+**方案**(design.md §9 新节):网关上传分档 —— 小(≤1 MiB)现状整进内存;中(≤
+`max_body_bytes` 4 MiB)有界内存**核验后**才写(该档零孤儿);大与无 CL **流式分片**(攒满
+`auto_chunk_bytes` 即入库,EOF 对账 Σ==声明/片数 ≤4096,描述符原子发布)。断流/不符/超发
+→ 既有 `cleanup_acked_chunks` 逐片墓碑 → 400;新增 counter `frontend_upload_chunk_cleanups_total`;
+配置零新增;对象形态(普通 blob / 拼装界限)零变化。红利:网关不再调 `put_file` ⇒ **A2
+(router 压缩帧临时文件)从网关路径整体消失**。净变化(已拍板接受):崩溃窗孤儿片无回收面
+(frontend 无 metastore/无 GC;缓解路径留观:描述符先行/WAL/孤儿清扫)。B1 下载面留待另裁。
+spec 增「网关上传零暂存」契约(三场景);tasks 0b 勾、3b 具体化。
+
+## Testing Done(docs-only)
+
+- 零 `.rs` diff;`openspec validate upload-zero-spool` 过;CI/Docker 全量绿。

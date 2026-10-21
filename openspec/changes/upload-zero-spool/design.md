@@ -213,6 +213,52 @@ start);大对象 30s 慢速传输期间并发 1 KiB PUT ack 延迟对照组(I5 �
 - `write_all_at` 转发环在 reactor-adjacent blocking 散集:每 chunk 无序完成不伤正确性
   (定位写),但极端块乱序落盘不构成任何可见性问题(commit 前不可见)。
 
+## 9. 网关墙③方案(④ 已裁定 2026-10-21:边收边分片)
+
+> 所有者裁决:网关上传不再"先整包中转再切片",改为**边接收边分片直接写进集群**;
+> 断流孤儿由既有清理机制兜底(残余风险见 9.3,已明码接受)。
+
+### 9.1 分档(配置零新增;对象语义对既有契约零变化)
+
+| 档 | 判据(有 CL) | 行为 | 内存 |
+|---|---|---|---|
+| 小 | ≤ 1 MiB(INLINE) | `to_bytes` → 单 blob `put_auto_with_ttl`(现状不动) | 1 MiB × 在途 |
+| 中 | 1 MiB < CL ≤ `max_body_bytes`(默认 4 MiB) | `to_bytes(max)` → 等长核验 → 单 blob(**核验通过才写 ⇒ 该档零孤儿**) | 4 MiB × 在途(与 S3 网关同界) |
+| 大 | CL > `max_body_bytes`(auto_chunk 开,默认开) | **流式分片**:攒满 `auto_chunk_bytes`(默认 4 MiB)即 `put` 一片;EOF 对账(Σ==CL,片数 ≤ 4096)→ 描述符 | 单片缓冲 × 在途 |
+| 无 CL | 自适应 | 攒到 `max_body_bytes`:EOF 在内 = 单 blob;溢出 = 已攒部分作首片、转入流式分片 | 同上按档 |
+
+- `auto_chunk` 关:大档一律 413(旧契约不动);无 CL 超 cap 同 413(转档前零写 ⇒ 零孤儿)。
+- 对象形态不变:**≤ max_body = 普通 blob;> max_body = 拼装(描述符 + 片,同 TTL)** —— GET/HEAD/拼装/配置零改。
+- 每片仍走 `put_auto_with_ttl(Bytes)` + `compress_for_put`(同今日分片路径)⇒ **网关从此不调
+  `put_file` —— A2(router 压缩帧临时文件)从网关路径彻底消失**,只余 SDK 直用户。
+
+### 9.2 失败与清理
+
+断流/字节不符/片数/超发/任一片失败耗尽内部重试 → `cleanup_acked_chunks`(既有函数,逐片
+`delete` 墓碑,幂等)→ 400 + 清理指标;单片清理失败记 warn 留孤儿(无对账面,趟 9.3)。
+201 的对外语义 = 描述符落库(片先于描述符;描述符是可见性原子门,既有语义原样)。
+
+### 9.3 孤儿风险(净变化,已拍板接受)
+
+- 今日"先整包中转"= 任意失败**零孤儿**;④ 后:**断流且进程活着** ⇒ 墓碑清理兜(个别墓碑
+  失败留孤儿);**进程崩溃窗** ⇒ 已入库片无人认领(frontend 无 metastore/无 GC)。
+  窗口 = 在途上传 × 已写片量;频率 = 网关崩溃于上传中(低)。
+- 留观缓解(不在本批,档此):描述符先行 / 断流 WAL(类比 s3-reclaim-wal)/ 低频孤儿清扫。
+
+### 9.4 监控
+
+新增 counter `frontend_upload_chunk_cleanups_total`(断流清理触发次数;成功/失败语义靠
+该读数 + 既有 `upload_total{outcome}`/`upload_auto_chunk_chunks_total` 合成)。frontend.md
+双表随批更新(CLauDE.md §7)。
+
+### 9.5 测试面
+
+大档 e2e(100 MiB:TMPDIR 差集零文件 + 读回逐字节 + CL 对账);中小档边界恰等/恰超(4 MiB);
+无 CL 自适应三分支(EOF 内单 blob / 溢出转分片 / 超 4096 片 413+全清);断流注入(片界
+前/后 + 客户端 abort)→ 400 + 逐片墓碑断言 + 指标递增;超发(声明 5 MiB 实发 6 MiB)→
+已写片全清;auto_chunk 关(413 且零写);cleanup 幂等(重复清理属性断言);崩溃窗孤儿
+仅记档不做恢复断言(无 GC 面,诚实标界)。
+
 ## 8. 附录:全场景临时文件清单(2026-10-21 全量清点,行号级)
 
 > 取证方法:大小写不敏感全库扫描(`tempfile|temp_dir|tempdir|NamedTempFile` + `.tmp|/"tmp"|
