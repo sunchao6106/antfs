@@ -1850,7 +1850,7 @@ mod tests {
             .is_err());
 
         let _ = store
-            .resolve_pending_reclaims(&[StoreKey::from_parts(4, 1), StoreKey::from_parts(4, 2)])
+            .resolve_pending_reclaims(&[StoreKey::from_parts(4, 3)])
             .await;
     }
 

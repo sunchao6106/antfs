@@ -2605,6 +2605,14 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
 
 ## Testing Done
 
+- **CI 复盘补记**:步 100 首推 CI 红 —— `complete_multipart_discards_unlisted_parts`
+  的按家清理我清成"列入清单的片",(4,3) 才是 WAL 里那行(**被丢弃者才入账**),下游
+  `reclaim_wal_steady_state_runs_dry`(稳态必须跑干)当班抓包;pg/mysql 双修。
+  教训两条:①清理清单以"产生 WAL 行的动作"为账本(遮蔽/丢弃/abort),不以"上传过
+  的 id"为准;②活库改动后本地门禁必须**复刻 CI 跑法**(`cargo test -p antfs-s3 --
+  --ignored --test-threads=1`,PG+MySQL 双 DSN 两步)—— 单跑 lib 并行口径验不到
+  集成尾部。修复后本地复刻 CI 两步双绿(MySQL 方言全量 e2e 同过;mysql 侧 21 项
+  真活跑非早退)。
 - antfs-s3(pg 活库,--ignored 并行)×3 全绿;antfs-router 22 lib + 17 e2e 全绿含新
   413 e2e;devcluster 编译绿断言生效;workspace 全套见 CI;clippy 0;fmt 净;
   openspec validate 过。
