@@ -113,3 +113,20 @@
     (router 聚合 detail/指标可辨;frontend 413、S3 EntityTooLarge 直译),devcluster 一体
     装配加启动期断言;对齐红线以配置行注固化于 store.md/frontend.md。同批修复 pg/mysql
     活库单测的并行隔离缺陷(`wal_wipe` 全表清 → 按自家行 `resolve`;3× 全绿复验)。
+16. **A 段冻结 + B 段作废(2026-10-22,记档于 tasks)**:A 道型(store 暂存区/lane 机制,
+    原任务 4-7)冻结不做(理由与重启条件见 tasks.md 冻结条目);替选最小项(内联门槛
+    `INLINE_BODY_MAX` 抬至片宽档、可配 + 在写并发闸,连带 staged 路径 / `staging_dir`
+    退役评估)另行呈批。B 段压缩三件套(原任务 1-3)随 ⑬ 压缩整体移除作废删除;重开口径
+    维持 router.md §7 的 TODO(读接口定型后由所有者裁决)。
+17. **store 裸默认自洽化(2026-10-22,所有者显式指示)**:`store_server.max_body_bytes`
+    默认 2→5 MiB。5 MiB > router 默认恒切片宽 4 MiB,分体部署照抄默认不再对每个整片 413;
+    原默认理由(对齐 axum `DefaultBodyLimit` 的 2 MiB)作废。运行期 `body_too_large` 显形、
+    分体红线行注("必须 ≥ 片宽")与 devcluster 断言维持不变;要收超片量级的单笔仍须显式调大。
+18. **暂存中转整体退役(2026-10-22,所有者定案)**:store PUT 收敛两岔 —— 带 CL > 上限 413;
+    ≤ 上限一律**内存整收**一次写(恒切后单笔=片宽级,5 MiB 默认上限盖得住,暂存只剩每片一圈白费
+    I/O)。`StagedFile` / `stage_body` / `INLINE_BODY_MAX` / `staging_dir` 配置与目录基建全部移除;
+    `to_bytes` 以声明值为限 + 长度恰等核验;无 CL 回落路径不变;mount 期 `clean_tmp_dir` 保留为
+    升级清残。内存契约:**每请求上界 = max_body_bytes,聚合 = 在途数 × 上限**(在途不受限与旧小对象
+    路径同口径;曾提议的"在写并发闸/内联门槛旋钮"被所有者否决,采极简形态,重启评估依 A 段冻结条件)。
+    测试面:流式路径改名岗哨(片宽级 CL 内存直写 + tmp 目录永不出现)、断连无可见对象无文件、
+    超限 413、声明不符 400。

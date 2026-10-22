@@ -625,7 +625,8 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 
 | key(TOML 路径) | 类型 | 默认 | 范围/校验 | 含义/影响 | 对齐 Ambry |
 |---|---|---|---|---|---|
-| `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限,**两条路径都按它校验**:① 非流式抽取器(以及 PUT 的 chunked 回落路径)经 `DefaultBodyLimit`/`to_bytes` 上限;**② 流式 PUT(带 `Content-Length`)在收 body 前先比 `Content-Length`,超限直接 413(不读 body)**。**默认与 axum `DefaultBodyLimit` 默认值一致**(§5.1 不擅自改默认),要收真正的大 blob 必须显式调大 | — — **对齐红线(2026-10-22)**:必须 ≥ 网关恒切片宽与 router 恒切片宽,否则每片 413;分体 TOML 无静态交叉校验,错配在运行期由 router `body_too_large` 错误家族显式报(见 router.md 错误表),devcluster 一体配置另有启动期断言 |
+| `store_server.max_body_bytes` | u64 | 5242880(5 MiB) | ≥1 | 数据面单请求 body 上限,PUT 的主闸:**带 CL 在收 body 前先比声明值,超限直接 413(不读 body);≤ 上限一律内存整收**(裁决 #18:暂存中转已退役);无 CL 的 chunked 回落走缓冲,同受此限(超限 413)。**每请求内存上界 = 该上限,聚合 = 在途请求数 × 上限 —— 调大即同步放大内存峰值**。**默认 5 MiB > router 默认恒切片宽 4 MiB**(2026-10-22 所有者显式指示,分体裸默认自洽;
+  原"2 MiB 对齐 axum `DefaultBodyLimit` 默认值"的理由作废),要收真正的大 blob 仍须显式调大 | — — **对齐红线(2026-10-22)**:必须 ≥ 网关恒切片宽与 router 恒切片宽,否则每片 413;分体 TOML 无静态交叉校验,错配在运行期由 router `body_too_large` 错误家族显式报(见 router.md 错误表),devcluster 一体配置另有启动期断言 |
 | `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0(0 = 不设默认时长) | `/admin/request-control` 未指定 `ttl_secs` 时的默认禁用时长(秒);**0 = 永久禁用**(须显式开回) | 偏离 Ambry(其 RequestControl 无 TTL),见 12.3 |
 | `store_server.scrub_max_batch_bytes` | u64 | 67108864(64 MiB) | ≥1 | `verify`(手动端点与后台巡检共用)单次扫描的**读取字节上限**;到点返回部分结果 + `truncated` + `end_cursor` | — |
 | `store_server.scrub_background_enabled` | bool | **false** | — | 后台一致性巡检(bit-rot 蜗牛爬)总开关;关 = 与本批之前**逐字节等价**(零后台 IO)。开启后每 tick 对一个候选副本做容错深扫,只报警不修复(§12.13) | — |
@@ -916,7 +917,7 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 | 本地 worker:flush(逐 replica 并发提交)、compaction(顺序提交) | ✅ 该副本所在盘的池 |
 | 拉复制每轮(本地盘读写) | ✅ 该 pid 所在盘的池 |
 | **健康探测**(write/read/unlink)、**盘容量 `statvfs`** | ❌ 仍走进程级池,但**每盘至多一发在飞**(见「二」)—— 让探测去抢请求的池,等于坏盘把探测器一起拖进去 |
-| **建副本前的目录创建**(`ensure_replica`)、**流式 put 的暂存文件 `unlink`** | ❌ 仍走进程级池(前者在建之前还不知道盘 id,后者见「五」)。**残留风险**,见下 |
+| **建副本前的目录创建**(`ensure_replica`) | ❌ 仍走进程级池(建之前还不知道盘 id)。**残留风险**,见下 |
 | tonic / axum / 各客户端内部 | 与存储无关 |
 
 **测试证据**(`cargo test -p antfs-store`;每条都带失败时限 —— 坏了当场红,不挂死):
@@ -955,9 +956,9 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 
 **残留风险(如实标注,上线前逐条确认)**
 
-1. **建副本前的目录创建**与**流式 put 的暂存文件 `unlink`** 仍走进程级阻塞池:坏盘上的这两类操作
-   (尤其 `unlink`)理论上仍是共享池的入口。当前靠"每盘至多一发探测"与"暂存目录可配"缓解;彻底归口留给
-   `store-disk-isolation` 的后续阶段。
+1. **建副本前的目录创建**(`ensure_replica`)仍走进程级阻塞池:坏盘上的目录操作理论上仍是共享池的
+   入口;彻底归口留给 `store-disk-isolation` 的后续阶段。(原第二条"流式 put 暂存 `unlink`"的暴露面
+   已随暂存路径整体退役消除 —— 裁决 #18,2026-10-22:不再有暂存文件产生,自然无 unlink 可挂。)
 2. **一次已准入的操作没有超时**:盘挂死时该盘最多 `pool_size` 个请求会一直挂着,直到客户端放弃或盘恢复。
    **健康闸门(D2)与 IO 看门狗(D3)已在 §12.12 落地** —— 新请求会对被隔离的盘**快速 503**;
    但"已经进到 syscall 里的那一发"**仍然无法取消**(Rust 既不能取消 blocking 任务,也不能 kill 线程),
@@ -1010,27 +1011,19 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 |---|---|
 | `health.rs` 探测的 `exists` / `write` / `read` / `unlink` | 合并进**一个**阻塞任务(超时由异步侧加,见上) |
 | `heartbeat.rs` 盘容量 `statvfs`(原 `dm.refresh()` 全盘同步调用) | 逐盘单飞刷新(`spawn_refresh` / `collect_refresh` + `DiskManager::apply_statfs`);未归的盘沿用上一拍容量值,而**心跳照发**(否则"盘抽风"会被 master 读成"节点死") |
-| `server.rs` 流式 put 的暂存文件 `unlink`(`StagedFile`) | **正常出口**显式等一次删除(跑在阻塞池里,契约不变:响应发出 ⇒ 暂存文件已清);**取消出口**(handler future 被 drop)靠 `Drop` 丢一个分离删除任务兜底,运行时已关则直删;遗留 `*.tmp` 由启动时 `clean_tmp_dir` 收尾 |
+| ~~`server.rs` 流式 put 暂存 `unlink`(`StagedFile`)~~ | **已随暂存路径退役(2026-10-22,裁决 #18)**:PUT 带 CL ≤ 上限一律内存整收,无暂存文件即无此清理契约;启动 `clean_tmp_dir` 只扫各盘 `tmp/` 的历史残渣 |
 
-**五、暂存目录可配(`store_server.staging_dir`)**
+**五、暂存目录可配(`store_server.staging_dir`)—— 已退役(2026-10-22,裁决 #18)**
 
-流式 put 的中转文件默认落在**各数据盘自己的 `tmp/` 子目录**(逐盘隔离:哪个盘上的分区,就暂存在哪个盘上)。
-配了 `store_server.staging_dir` 则本节点**所有盘**的暂存文件都落那一个目录 —— 用途是把"大对象中转"的写入
-从数据盘上挪开(单独的本地 SSD / scratch 盘)。两条代价必须知道:
-
-- **它成了单点**:该目录所在的盘坏掉,本节点所有分区的**大对象上传**一起失败(≤1 MiB 的小对象走内存路径,
-  不经暂存,不受影响);
-- **空间口径变了**:需要 ≈ 在途大对象数 × 单对象大小,而且这部分**不进任何容量上报**(暂存文件不是数据),
-  撑爆时表现为上传失败(400 `staging body failed`),而不是"盘将满"告警 —— 运维得自己盯这个目录。
-
-**别指到 tmpfs / 内存盘**:大文件暂存会直接吃内存(默认放数据盘就是这个原因)。
-
-其它口径:目录不存在时由启动挂载创建(嵌套路径也建)、启动时清掉遗留 `*.tmp`;各盘 `tmp/` 仍照旧清理
-(升级前留下的残渣不会复活、也不会被当成数据)。**留空 = 默认,既有落点不变**(CLAUDE.md §5.1 不擅改默认)。
-
-> **后续方向**:「暂存文件」本身已被 `upload-zero-spool` 方案(见 `openspec/changes/upload-zero-spool/`)
-> 列为待消除项 —— A 段落地后本机制退役(`staging_dir` knob 保留解析、文档标 deprecated,初版经
-> `put_stream_direct` 灰度闸共存)。**裁决前的当下,本节口径继续有效**。
+暂存中转路径(带 CL 且 >1 MiB 的单笔先落盘暂存、引擎回读、写后删除)连同 `staging_dir` 配置项整体移除。
+理由:恒切(⑧)后 router 送来的单笔 = 片宽级(默认 4 MiB),`max_body_bytes`(默认 5 MiB)盖得住 ——
+暂存只剩"每片在盘上多转一圈"的纯开销(实测小对象 p50 ~1ms → ~9ms)。现在 PUT 带 CL ≤ 上限**一律
+内存整收**:每请求内存上界 = `max_body_bytes`;聚合上界 = 在途请求数 × `max_body_bytes`(与旧小对象
+路径同口径,调大上限即同步放大内存峰值);无 CL 的 chunked 回落路径不变(缓冲,同受上限,413 口径同)。
+不再产生任何中转文件 ⇒ 无 unlink 挂死暴露面、无"暂存目录单点/空间不进容量上报"两条历史代价。
+启动时 `clean_tmp_dir` 仍扫一遍各盘 `tmp/` —— 仅为旧版本升上来的部署清一次历史 `*.tmp` 残渣。
+`BlobStore::put_from_reader` / `put_composed_from_reader` 仍是引擎公开流式写原语(自有测试套
+`crates/blob/tests/stream_put.rs`),server 侧唯一调用点已随本机制移除。
 
 口径边界(如实记录):
 
@@ -1055,7 +1048,6 @@ exclusive 的),"之后什么都没有"即一致。**不校验段身份**:peer �
 | (每盘)`pool_size` | u32 | (可选) | ≥1 | 该盘自己的池大小,覆盖 `pool_default_size`。例:`[[store_server.data_dirs]]` 下 `dir = "/data/nvme0"` + `pool_size = 64` | — |
 | `store_server.pool_queue_size` | u32 | 32 | ≥0(`0` = 不排队,满即拒) | 每盘池的排队容量(worker 全忙时允许等待的请求数)。**有界**是刻意的:无限排队会推高延迟、占死连接,还掩盖"这块盘已经不行了" | — |
 | `store_server.pool_acquire_timeout_ms` | u64 | 200 | ≥0(`0` = 不等) | 池满时的**准入等待上限**(等的是"有空位",不是"这次 IO 做完")。超时 ⇒ **503 + `Retry-After`**;短暂排队能吸收瞬时突发,又不至于把请求拖成"看起来挂了" | — |
-| `store_server.staging_dir` | String | `""` | 空 = 默认;非空不得带前后空格 | 流式 put 的暂存目录(见上「五」) | — |
 
 > 探测开关/周期/超时沿用既有三项(`disk_health_enabled` / `disk_health_interval_secs` /
 > `disk_health_timeout_secs`,见 §12.4 与 cluster.md §9);慢请求阈值复用其中最后一项,**不新增配置**。

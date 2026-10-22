@@ -150,76 +150,6 @@ async fn per_disk_metrics_close_the_loop_after_put_and_get() {
     }
 }
 
-/// 目录里剩下的文件名(不存在 → 空)。给"某个具体目录有没有残渣"用(与 `staging_leftovers` 的
-/// "数据盘 tmp/" 口径互补)。
-fn leftovers_in(dir: &std::path::Path) -> Vec<String> {
-    std::fs::read_dir(dir)
-        .map(|it| {
-            it.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 配了 `store_server.staging_dir` ⇒ 流式 put 的中转文件全落那**一个**目录(含嵌套路径也会被建出来),
-/// 各数据盘的 `tmp/` 一个都不建;成功与被拒的上传都不留残渣。
-#[tokio::test]
-async fn staging_dir_override_takes_all_streamed_puts() {
-    let tmp = tempfile::tempdir().unwrap();
-    let data = tmp.path().join("data");
-    // 故意用嵌套路径:必须由 mount 自己建出来(而不是要求运维先建好)。
-    let scratch = tmp.path().join("scratch").join("staging");
-    let cfg = StoreServerConfig {
-        node_id: 1,
-        data_dirs: vec![data.to_string_lossy().into_owned().into()],
-        http_addr: "127.0.0.1:0".into(),
-        partition_capacity_bytes: 64 << 20,
-        max_body_bytes: 8 << 20,
-        staging_dir: scratch.to_string_lossy().into_owned(),
-        ..Default::default()
-    };
-    let registry = antfs_metric::Registry::new();
-    let srv = StoreServer::start_with(cfg, store_config(4 << 20), &registry).expect("start");
-    let router = srv.router();
-    assert!(scratch.is_dir(), "配了暂存目录 ⇒ 启动时就该建出来");
-    create_replica(&router).await;
-
-    // 2 MiB > 1 MiB 内存上界 ⇒ 走流式暂存路径;段 4 MiB 装得下 ⇒ 成功。
-    let body = vec![9u8; 2 << 20];
-    let key = data_key(0x31);
-    let put = Request::put(format!("/partitions/0/blobs/{key}"))
-        .header("content-length", body.len().to_string())
-        .body(Body::from(body))
-        .unwrap();
-    assert_eq!(status_of(&router, put).await, StatusCode::CREATED);
-    assert!(
-        leftovers_in(&scratch).is_empty(),
-        "成功路径不得留残渣:{:?}",
-        leftovers_in(&scratch)
-    );
-
-    // 5 MiB 记录装不进 4 MiB 段 ⇒ 400;这一次 body 已落到暂存文件之后才被拒,同样不得留残渣。
-    let too_big = vec![7u8; 5 << 20];
-    let key2 = data_key(0x32);
-    let rejected = Request::put(format!("/partitions/0/blobs/{key2}"))
-        .header("content-length", too_big.len().to_string())
-        .body(Body::from(too_big))
-        .unwrap();
-    assert_eq!(status_of(&router, rejected).await, StatusCode::BAD_REQUEST);
-    assert!(
-        leftovers_in(&scratch).is_empty(),
-        "被拒的上传不得留残渣:{:?}",
-        leftovers_in(&scratch)
-    );
-
-    // 关键判据:配了共用暂存目录 ⇒ 各数据盘的 `tmp/` **从不被创建**(一旦落回旧路径,这里会存在)。
-    assert!(
-        !data.join("tmp").exists(),
-        "共用暂存目录生效时不该再给数据盘建 tmp/"
-    );
-}
-
 /// 配置 → 每盘池 → 指标这条链在**真装配**里闭环:某盘显式指定的 worker 数生效、没给的盘走每盘默认,
 /// 且池确实在服务数据面(put/get 走的就是各自盘的池)。
 #[tokio::test]
@@ -954,17 +884,6 @@ async fn max_body_bytes_rejects_oversized_bodies() {
     );
 }
 
-/// 暂存目录(流式 put 的中转文件落点)里的残留文件名。
-fn staging_leftovers(disk_dir: &std::path::Path) -> Vec<String> {
-    std::fs::read_dir(disk_dir.join("tmp"))
-        .map(|it| {
-            it.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 async fn get_body(router: &axum::Router, path: &str) -> (StatusCode, Vec<u8>) {
     let resp = router
         .clone()
@@ -982,12 +901,12 @@ async fn get_body(router: &axum::Router, path: &str) -> (StatusCode, Vec<u8>) {
     (status, body)
 }
 
-/// 带 `Content-Length` 的 PUT:走**流式**路径(暂存到盘 + 引擎按长度顺序写),
-/// 大 body 不再整个缓进内存;且成功/失败都不留暂存文件。
+/// 带 `Content-Length` 的 PUT(裁决 #18 后):**内存整收**一次写 —— 片宽级 body(3 MiB)照样
+/// 单笔成功、逐字节等价读回;且**任何时点都不创建中转文件**(`tmp/` 目录从不存在,防暂存路径回归)。
 #[tokio::test]
-async fn put_with_content_length_streams_body_and_leaves_no_staging_file() {
+async fn put_with_content_length_goes_memory_and_creates_no_files() {
     let tmp = tempfile::tempdir().unwrap();
-    // 段容量/盘容量/body 上限都放大到 3 MiB body 收得下(本测试只验流式路径本身)。
+    // 段容量/盘容量/body 上限都放大到 3 MiB body 收得下。
     let srv = server_with(tmp.path(), store_config(8 << 20), 64 << 20, 8 << 20);
     let router = srv.router();
     create_replica(&router).await;
@@ -1004,20 +923,19 @@ async fn put_with_content_length_streams_body_and_leaves_no_staging_file() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED, "流式 put 必须成功");
+    assert_eq!(resp.status(), StatusCode::CREATED, "片宽级单笔必须成功");
 
     let (status, got) = get_body(&router, &format!("/partitions/0/blobs/{key}")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(got, data, "流式写的对象必须与整块写等价(逐字节一致)");
+    assert_eq!(got, data, "内存一把写的对象必须与任何写法等价(逐字节一致)");
 
     assert!(
-        staging_leftovers(tmp.path()).is_empty(),
-        "成功路径必须清掉暂存文件,实际残留 {:?}",
-        staging_leftovers(tmp.path())
+        !tmp.path().join("tmp").exists(),
+        "暂存路径已退役:任何 PUT 都不得再创建 tmp/ 中转目录"
     );
 }
 
-/// 流式路径同样受 `store_server.max_body_bytes` 约束:声明长度超限 → 413。
+/// 声明长度超 `store_server.max_body_bytes` → 413(内存/缓冲路径同受此约束)。
 #[tokio::test]
 async fn put_with_content_length_over_limit_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1038,8 +956,8 @@ async fn put_with_content_length_over_limit_is_rejected() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert!(
-        staging_leftovers(tmp.path()).is_empty(),
-        "被拒的请求不该留下暂存文件"
+        !tmp.path().join("tmp").exists(),
+        "被拒的请求不得创建任何中转文件"
     );
 }
 
@@ -1071,9 +989,8 @@ async fn put_with_mismatched_content_length_creates_nothing() {
     let (status, _) = get_body(&router, &format!("/partitions/0/blobs/{key}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "失败的上传不得留下可见对象");
     assert!(
-        staging_leftovers(tmp.path()).is_empty(),
-        "失败路径也要清掉暂存文件,实际残留 {:?}",
-        staging_leftovers(tmp.path())
+        !tmp.path().join("tmp").exists(),
+        "失败路径不留任何中转文件(内存路径天然无文件可漏)"
     );
 }
 
@@ -1196,12 +1113,12 @@ async fn store_full_maps_to_507() {
     );
 }
 
-/// 上传被**中途放弃**时不得把暂存文件漏在盘上(真 socket:裸 TCP 发满 headers 与部分 body 后直接断开)。
-///
-/// 这是实测抓到的 bug:store 侧原本在 `.await` 之后手写 `remove_file`,而连接断开时 hyper 会 drop 掉
-/// 在飞的 handler future → 清理代码永不执行(一次 2 MiB × 3000 次压测漏出 1600+ 个文件)。现在靠 RAII 兜住。
+/// 客户端中途断开(声明了 CL 只发一半就弃连):**不得产生任何可见对象**,盘上**不得留任何中转文件**。
+/// 暂存路径退役(裁决 #18)后后者天然成立 —— 本测试是防回归岗哨:老实现曾在断连时漏出一地
+/// `put_*.tmp`(store 侧 `.await` 后手写 remove,hyper 弃连即永达;当年靠 RAII 才兜住)。
+/// 若未来重盘中转路径,这条必须先红。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cancelled_upload_leaves_no_staging_file() {
+async fn cancelled_upload_leaves_no_visible_object_and_no_files() {
     use tokio::io::AsyncWriteExt;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1212,7 +1129,6 @@ async fn cancelled_upload_leaves_no_staging_file() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    // 建 replica(真 HTTP,走 admin 端点)。
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/admin/partitions/0"))
         .send()
@@ -1220,7 +1136,7 @@ async fn cancelled_upload_leaves_no_staging_file() {
         .expect("admin create replica");
     assert_eq!(resp.status().as_u16(), 201);
 
-    // 声明 4 MiB(> INLINE_BODY_MAX ⇒ 走暂存路径),只发 64 KiB 就断开。
+    // 声明 4 MiB(片宽级,内存路径),只发 64 KiB 就断开。
     let key = data_key(0xee);
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     let head = format!(
@@ -1230,37 +1146,28 @@ async fn cancelled_upload_leaves_no_staging_file() {
     sock.write_all(head.as_bytes()).await.unwrap();
     sock.write_all(&vec![7u8; 64 * 1024]).await.unwrap();
     sock.flush().await.unwrap();
-    // 给 handler 一点时间进入 staging,然后**直接断开**(不写完 body)。
-    let staging = tmp.path().join("tmp");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if std::fs::read_dir(&staging)
-            .map(|it| it.count())
-            .unwrap_or(0)
-            > 0
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
     drop(sock);
 
-    // 有界轮询:暂存目录最终必须为空。
+    // 有界轮询:处置竞态收尾后对象不可见;`tmp/` 全程不得存在(防暂存路径回归)。
+    let base = format!("http://{addr}/partitions/0/blobs/{key}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let left: Vec<String> = std::fs::read_dir(&staging)
-            .map(|it| {
-                it.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if left.is_empty() {
+        let status = reqwest::Client::new()
+            .get(&base)
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0);
+        assert!(
+            !tmp.path().join("tmp").exists(),
+            "暂存的 tmp/ 目录不该被创建(暂存已退役)"
+        );
+        if status == 404 {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "上传被放弃后暂存文件必须清掉,实际残留 {left:?}"
+            "断开的半截上传不得让对象可见(当前 GET 状态 {status})"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -1293,8 +1200,8 @@ async fn record_too_big_for_segment_is_400_not_500() {
         "记录超段容量是客户端问题 → 400"
     );
     assert!(
-        staging_leftovers(tmp.path()).is_empty(),
-        "被拒的上传同样不得留下暂存文件"
+        !tmp.path().join("tmp").exists(),
+        "被拒的上传同样不得创建任何中转文件"
     );
 }
 

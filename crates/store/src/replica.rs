@@ -496,21 +496,6 @@ impl ReplicaManager {
             .collect()
     }
 
-    /// 某分区副本的**暂存目录**(流式 put 的中转文件落点;按需创建)。
-    ///
-    /// 默认落在该副本的数据盘上而不是系统临时目录:大文件暂存不该吃 tmpfs(RAM);崩溃遗留由
-    /// [`crate::disk::DiskManager::mount`] 的 `clean_tmp_dir` 清理。配了 `store_server.staging_dir`
-    /// 则所有分区都用那一个目录(此时它已在 mount 期建好,这里的 `create_dir_all` 只是幂等兜底)。
-    pub fn tmp_dir_for(&self, pid: PartitionId) -> Result<std::path::PathBuf> {
-        let disk_id = self.get(pid).map(|h| h.disk_id).ok_or(Error::NoReplica)?;
-        let dir = self
-            .disks
-            .tmp_dir_for_disk(&disk_id)
-            .ok_or(Error::NoReplica)?;
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
-    }
-
     /// 某分区副本的**盘上目录**(`<disk.dir>/partition_<pid>`)。
     ///
     /// 本地维护写 `COMPACT_POLICY_STATE` 等每副本状态文件需要它,而 `BlobStore` 的 `dir` 字段

@@ -836,8 +836,6 @@ store server(一个进程 / 一台数据节点)
 - [ ] `store_server.data_dirs` 逐机核对:每块盘一条;异构盘写 `pool_size`,其余盘按"留给未指定盘的预算"
       均分(口径见 [`store.md` §12.11](./store.md))。
 - [ ] 线程预算:`store_server.pool_default_size`(默认 16)× 盘数 = 每节点线程数,按机型核。
-- [ ] `store_server.staging_dir` 决策(流式 put 暂存):不指定 = 各盘 `tmp/`;指定 = **单点**且**不进容量上报**,
-      **别指 tmpfs**(大文件暂存会吃内存)。
 - [ ] 观测通道可达:`/metrics` 与所有 `/admin/**` **不在健康闸门的拒绝名单里** —— 确认 LB / 防火墙也不挡,
       这是坏盘期间唯一的远程手段。
 

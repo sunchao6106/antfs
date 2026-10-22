@@ -2616,3 +2616,42 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
 - antfs-s3(pg 活库,--ignored 并行)×3 全绿;antfs-router 22 lib + 17 e2e 全绿含新
   413 e2e;devcluster 编译绿断言生效;workspace 全套见 CI;clippy 0;fmt 净;
   openspec validate 过。
+
+### 步 101:store 裸默认自洽化(裁决 #17)—— max_body 2→5 MiB
+
+**背景**:#16 冻结核对时发现分体部署裸默认不自洽 —— store 默认 2 MiB 装不下 router 默认
+4 MiB 整片,照抄默认的分体部署会对每个整片响 413 `body_too_large`(#15 显形)。所有者
+明示抬到 5 MiB(盖过片宽,留 1 MiB 松量);原"2 MiB = axum `DefaultBodyLimit` 默认"的
+登记理由作废(§5.1 之明示流程)。
+
+同批记档:upload-zero-spool B 段压缩三件套删除(随 ⑬ 作废)、A 段(原任务 4-7)冻结
+(裁决 #16,重启条件三则);staged 路径 / `staging_dir` 去留仍与"内联门槛小补丁"一项
+耦合待所有者裁决。
+
+## Testing Done
+
+- antfs-store 全部测试绿(141/0 lib + 13 测试二进制,含改名岗哨 3 处与断连重写 1 处);
+  workspace **79 套 811/0**;clippy 0;fmt 净;`openspec validate` 过。
+- 活库复刻 CI 两步双绿:PG+MySQL 串行 `-- --ignored --test-threads=1` 两轮各 **15 套 156/0**
+  (MySQL 方言全量 e2e 同过—— 暂存退役未波及任何网关链路)。
+- 测试面变化如实记录:随机制退役删 4 测试字段级断言(staging_dir 覆盖/嵌套创建/默认落点/
+  StagedFile Drop),对应能力已不存在;新增/改写 4 处岗哨(片宽级 CL 内存直写+tmp 永不创建、
+  断连无可见对象无文件、超限 413 无文件、声明不符 400 无文件)。
+
+### 步 102:暂存中转整体退役(裁决 #18)+ 落地口径
+
+**机制**:store PUT 收敛两岔 —— 带 CL > `max_body_bytes` 413(body 不读);≤ 上限一律**内存整收**
+(以声明值为 `to_bytes` 上限 + 收完核验恰等)一次写。恒切(⑧)后 router 单笔=片宽级(默认 4 MiB),
+5 MiB 上限盖得住 ⇒ 暂存"先落盘再回读"只剩每片一圈白费 I/O + create/unlink 元数据动作。
+
+**移除面**:`StagedFile`(RAII 守卫及双出口删除)、`stage_body`、`STAGE_BUF_BYTES`、
+`INLINE_BODY_MAX`、`store_server.staging_dir`(字段/默认/校验/两测试)、`DiskManager::mount_with`
+/`tmp_dir_for_disk`/`staging_dir()/Disk::tmp_dir`、`ReplicaManager::tmp_dir_for`;mount 期
+`clean_tmp_dir` **保留**为升级部署的 `tmp/*.tmp` 历史残渣一次性收尾。引擎
+`put_from_reader`/`put_composed_from_reader` 保留(公开流式写原语,自有测试套)。
+
+**内存契约显性化**:每请求上界 = `max_body_bytes`(**裁决 #17 已抬至 5 MiB**);聚合 = 在途数 ×
+上限 —— 在途不受限与旧小对象路径同口径。曾提议的"内联门槛旋钮/在写并发闸"被所有者否决(极简
+形态);若未来上限调大或出现直连大单笔形态,重启评估(与 A 段冻结重启条件同轨)。
+配齐裁决 #16(B/A 封账)、#17(裸默认自洽)同一批记档。
+

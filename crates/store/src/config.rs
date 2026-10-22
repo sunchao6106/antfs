@@ -159,8 +159,10 @@ pub struct StoreServerConfig {
     /// `store.min.log.segment.count.to.reclaim.to.trigger.compaction`)。
     pub compaction_min_log_segment_count_to_reclaim: usize,
     /// 数据面单请求 body 上限(字节),经 axum `DefaultBodyLimit` 生效。
-    /// **默认 2 MiB = axum `DefaultBodyLimit` 的默认值**(CLAUDE.md §5.1 不擅自改默认):要观测/接收
-    /// 真正的大 blob 需显式调大;调小则超限请求在 extractor 前即被 413 拒掉。
+    /// **默认 5 MiB > router 默认恒切片宽 4 MiB**(2026-10-22 所有者显式指示,走 CLAUDE.md §5.1
+    /// 明示流程):分体部署的裸默认自此自洽 —— 裸默认 store 不再对 router 的 4 MiB 整片逐一 413;
+    /// 历史上"2 MiB 对齐 axum `DefaultBodyLimit` 默认值"的理由随之作废。要收真正的大 blob(超
+    /// 单笔片量级)仍需显式调大;调小则超限请求在 extractor 前即被 413 拒掉。
     pub max_body_bytes: u64,
     /// 请求静默(`/admin/request-control`)未指定 `ttl_secs` 时的默认禁用时长(秒)。
     /// **0 = 不设默认时长**(即未指定 `ttl_secs` 时永久禁用,须显式开回)。
@@ -179,17 +181,6 @@ pub struct StoreServerConfig {
     /// `balance_max_in_flight`:宁可慢,不打满)。管的是**跨盘**并发;**同盘**内由该盘的有界池
     ///(D1)自行串行,池饱和 = 本轮跳过退避,绝不重试轰炸。
     pub scrub_background_max_in_flight: u32,
-    /// **流式 put 的暂存目录**(可选)。留空 = 默认落在各数据盘自己的 `tmp/` 子目录下(逐盘隔离,
-    /// 见 [`crate::disk::Disk::tmp_dir`]);非空 = 本节点所有盘的暂存文件都落这一个目录。
-    ///
-    /// 想配它通常是为了把"大对象中转"的写入从数据盘上挪开(例如单独一块本地 SSD),或让系统盘/专用
-    /// scratch 盘承载它。**两条代价必须知道**(docs/design/store.md §12.11 详述):
-    /// ① 该目录成了**单点**:它所在的盘坏掉,本节点所有分区的大对象上传一起失败(小对象走内存路径不受影响);
-    /// ② 需要的空间 ≈ 在途大对象数 × 单对象大小(不再受"目标盘有没有地方"约束),且这部分空间不进任何
-    /// 容量上报(暂存文件不是数据)。
-    ///
-    /// **别指到 tmpfs/内存盘**:大文件暂存会直接吃内存(默认放数据盘就是这个原因)。
-    pub staging_dir: String,
     /// **每盘默认池大小**(worker 线程数):`data_dirs` 里没给自己 `pool_size` 的盘都用它。
     ///
     /// 引擎 IO 走**每盘自己的** worker 线程(见 [`crate::disk_pool`]),不再共用进程级阻塞池 ——
@@ -300,15 +291,13 @@ impl Default for StoreServerConfig {
             compaction_policy: CompactionPolicyKind::Hybrid,
             compaction_policy_switch_days: 6,
             compaction_min_log_segment_count_to_reclaim: 1,
-            // axum `DefaultBodyLimit` 的默认值(2 MiB);不擅自改默认,调大才收得下真正的大 blob。
-            max_body_bytes: 2 * 1024 * 1024,
+            // 2026-10-22 所有者明示:5 MiB 盖过 router 默认片宽 4 MiB(裁决 #17),分体裸默认自洽。
+            max_body_bytes: 5 * 1024 * 1024,
             request_control_default_ttl_secs: 1800,
             scrub_max_batch_bytes: 64 << 20,
             scrub_background_enabled: false,
             scrub_background_interval_secs: 60,
             scrub_background_max_in_flight: 1,
-            // 空 = 默认(各数据盘的 `tmp/` 子目录);不擅自改默认(CLAUDE.md §5.1)。
-            staging_dir: String::new(),
             // 经验初值(线上按 `disk_pool_queued` / `disk_pool_rejected` 标定;见字段注释)。
             pool_default_size: 16,
             pool_queue_size: 32,
@@ -443,14 +432,6 @@ impl Validate for StoreServerConfig {
             u64::from(self.scrub_background_max_in_flight),
             1,
         )?;
-        // 暂存目录:空 = 默认(各数据盘的 `tmp/` 子目录)。非空则必须是不带前后空格的路径 —— 带空格
-        // 多半是配置笔误,与其在盘上造一个名叫 " /data/scratch" 的目录,不如当场起不来。
-        if self.staging_dir != self.staging_dir.trim() {
-            return Err(antfs_config::ConfigError::invalid(
-                "store_server.staging_dir",
-                "must not have leading or trailing whitespace (empty = per-disk default)",
-            ));
-        }
         // 每盘池:默认大小 ≥1(0 会让每盘都退化成 1 线程,几乎肯定是笔误;真要 1 就写 1);
         // 队列与准入超时可 0(0 = 不排队 / 不等)。
         at_least("store_server.pool_default_size", self.pool_default_size, 1)?;
@@ -614,30 +595,6 @@ mod tests {
         ] {
             assert!(parse_hhmm(bad).is_err(), "{bad:?} 应被拒");
         }
-    }
-
-    /// 暂存目录默认**空** = 各数据盘的 `tmp/` 子目录:新增配置项不得改动既有默认落点(CLAUDE.md §5.1)。
-    #[test]
-    fn staging_dir_defaults_to_empty() {
-        assert_eq!(StoreServerConfig::default().staging_dir, "");
-    }
-
-    /// 带前后空格的暂存目录路径是笔误,当场拒掉(否则会在盘上造一个怪名目录);
-    /// 正常路径照常通过(注意 `data_dirs` 必填,故用例里要给一个)。
-    #[test]
-    fn staging_dir_rejects_surrounding_whitespace() {
-        let bad = StoreServerConfig {
-            data_dirs: vec!["/tmp/antfs-a".to_string().into()],
-            staging_dir: " /data/scratch ".to_string(),
-            ..Default::default()
-        };
-        assert!(bad.validate().is_err(), "前后空格必须被拒");
-        let ok = StoreServerConfig {
-            data_dirs: vec!["/tmp/antfs-a".to_string().into()],
-            staging_dir: "/data/scratch".to_string(),
-            ..Default::default()
-        };
-        assert!(ok.validate().is_ok());
     }
 
     /// 每盘池的默认值:每盘默认 16 个 worker、排队 32、准入等待 200ms。

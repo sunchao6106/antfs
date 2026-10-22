@@ -16,7 +16,6 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use tokio_stream::StreamExt;
 
 use crate::compaction_jobs::{CompactionJob, CompactionJobs, CompactionResult};
 use crate::config::StoreServerConfig;
@@ -116,7 +115,7 @@ impl StoreServer {
                  See docs/design/cluster.md §9.2 and §9.5"
             );
         }
-        let disks = DiskManager::mount_with(&config.data_dirs, staging_dir(&config))?;
+        let disks = DiskManager::mount(&config.data_dirs)?;
         let store_metrics = antfs_blob::StoreMetrics::new(registry)?;
         let metrics = Arc::new(StoreServerMetrics::new(registry)?);
         let replicas = Arc::new(ReplicaManager::new(
@@ -394,11 +393,6 @@ impl StoreServer {
     pub fn request_control(&self) -> Arc<RequestControl> {
         self.state.request_control.clone()
     }
-}
-
-/// 配置里的暂存目录 → `Option<PathBuf>`:空串 = 用各盘默认的 `tmp/` 子目录。
-fn staging_dir(config: &StoreServerConfig) -> Option<std::path::PathBuf> {
-    (!config.staging_dir.is_empty()).then(|| std::path::PathBuf::from(&config.staging_dir))
 }
 
 /// 配置的 body 上限 → `usize`;超出 `usize`(仅 32 位平台)`usize::MAX` 等价于不限制。
@@ -682,16 +676,6 @@ struct PutParams {
     composed: Option<bool>,
 }
 
-/// 流式 put 的单块缓冲(引擎 `put_from_reader` 内部也是同量级的分块)。
-const STAGE_BUF_BYTES: usize = 64 * 1024;
-
-/// **直接进内存**的 body 上界:≤ 该值走内存路径(`Bytes` → `put_ttl`),> 该值才落盘暂存 + 流式写。
-///
-/// 为什么小对象不走暂存:暂存要 `create/write/close/unlink` 一个文件,每个 PUT 多 ~5 次文件系统元数据操作;
-/// 小对象是绝对主流,大并发下这套开销把 PUT p50 从 ~1ms 拖到 ~9ms(devcluster + bench 实测,release)。
-/// 内存上界 = 在途请求数 × 该值(默认 1 MiB),仍远小于"整个 blob 缓进内存"(CLAUDE.md §5.3)的旧形态。
-const INLINE_BODY_MAX: u64 = 1024 * 1024;
-
 /// 请求声明的 body 长度(`Content-Length`);缺省 = 分块编码或未声明 → 走缓冲回落路径。
 fn content_length(req: &axum::extract::Request) -> Option<u64> {
     req.headers()
@@ -700,116 +684,7 @@ fn content_length(req: &axum::extract::Request) -> Option<u64> {
         .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
-/// 暂存文件的 **RAII 守卫**,两条删除路径(正常出口 [`remove`](Self::remove) / 取消出口 `Drop`)。
-///
-/// 为什么不能只在"`.await` 之后手写 `remove_file`":客户端断开或上游取消会让本 handler 的 future 被
-/// **drop**,`.await` 之后的清理代码**永远不执行** → 暂存文件漏在盘上。实测(2 MiB 对象 × 3000 次、
-/// router 收满 W 后取消在飞请求)漏出 1600+ 个文件。故正常出口**显式等**一次删除(契约:响应发出 ⇒
-/// 暂存文件已清,集成测试就断言这一点),取消出口靠 `Drop` 兜底。
-///
-/// 语义上安全:被取消时 blocking 任务可能仍在读这个文件,Unix 下 unlink 已打开的文件不影响其 fd(磁盘空间
-/// 在关闭时释放),引擎该次写可能照样成功 —— 那对副本一致性无害(第 3 份本就靠拉复制补齐)。
-///
-/// **两条路径都把删除放进阻塞池**:暂存目录在**数据盘**上,坏盘上 `unlink` 同样会挂,而在 reactor 线程上
-/// 直调同步 `remove_file` 就是把 HTTP 工作线程押在一块坏盘上。`Drop` 里没有运行时(进程收尾)时直删兜底,
-/// 反正启动时 `clean_tmp_dir` 还会清一遍遗留 `*.tmp`。
-struct StagedFile {
-    path: std::path::PathBuf,
-}
-
-impl StagedFile {
-    fn new(dir: &std::path::Path, pid: PartitionId) -> Self {
-        Self {
-            path: dir.join(format!("put_{pid}_{}.tmp", unique_suffix())),
-        }
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    /// 正常出口:删掉暂存文件并**等它完成**(删除跑在阻塞池里,不占 reactor)。
-    ///
-    /// 先 `take` 路径、再派任务、最后才 `await`:这样即使在 `await` 中途被取消,删除任务也已经在跑
-    /// (`JoinHandle` 被丢弃 = 任务分离,不会取消),而 `self` 落下时路径已空、不会重复删。
-    async fn remove(mut self) {
-        let path = std::mem::take(&mut self.path);
-        let handle = tokio::task::spawn_blocking(move || std::fs::remove_file(&path));
-        drop(self);
-        let _ = handle.await;
-    }
-}
-
-impl Drop for StagedFile {
-    fn drop(&mut self) {
-        // `take` 掉路径:即使下面的删除失败,本结构再被 drop 也不会重复删。
-        let path = std::mem::take(&mut self.path);
-        match tokio::runtime::Handle::try_current() {
-            Ok(h) => {
-                // 取消路径不能 await,只丢一个分离任务(删除本身仍跑在阻塞池上)。
-                h.spawn(async move {
-                    let _ = tokio::fs::remove_file(&path).await;
-                });
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-}
-
-/// 进程内唯一的暂存文件名后缀(时间纳秒 + 自增序号;不为它引 `rand` 依赖)。
-fn unique_suffix() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{ns}_{n}")
-}
-
-/// 把请求体**流式**落到暂存文件,并校验实际字节数恰等于 `Content-Length`。
-///
-/// 内存占用 = 单块(不随 body 大小涨)。字节数不符(客户端中途断开/超发)一律报错 —— 该次 put
-/// 不产生任何可见记录,调用方负责删掉暂存文件。
-async fn stage_body(
-    body: axum::body::Body,
-    path: &std::path::Path,
-    declared: u64,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(path).await?;
-    let mut stream = body.into_data_stream();
-    let mut written = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("body stream: {e}"))
-        })?;
-        written += chunk.len() as u64;
-        if written > declared {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "body longer than Content-Length",
-            ));
-        }
-        file.write_all(&chunk).await?;
-    }
-    // 只 flush 到 OS,**不 fsync**:暂存文件是传输中转而非持久化边界 —— 记录真正被 ack 是在引擎把
-    // 它写进 log 之后(引擎的持久化边界仍是周期 flush)。给中转文件 fsync 不改持久性语义,却把每次
-    // PUT 变成一次同步落盘(macOS 上实测 p50 从 ~1ms 恶化到 ~250ms,见 devcluster + bench 记录)。
-    file.flush().await?;
-    if written != declared {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("body shorter than Content-Length ({written} < {declared})"),
-        ));
-    }
-    Ok(())
-}
-
-/// put 结果 → 响应(指标 + 状态码),三条写入路径(流式/缓冲/带 TTL)共用,避免状态码分叉。
+/// put 结果 → 响应(指标 + 状态码),两条写入路径(带/无 `Content-Length`)共用,避免状态码分叉。
 fn finish_put(
     metrics: &StoreServerMetrics,
     t: &OpTimer,
@@ -1182,14 +1057,18 @@ fn op_names() -> String {
     DataOp::ALL.map(DataOp::as_str).join(", ")
 }
 
-/// `PUT` 的三种形态(按请求头分流,统一走 [`finish_put`] 收敛状态码/指标):
+/// `PUT /partitions/{pid}/blobs/{key}`:单笔 body 收下后作为一条记录交引擎一次写。
 ///
-/// - **有 `Content-Length` 且在 `max_body_bytes` 内**:流式 —— body 边收边落到该分区所在盘的暂存文件
-///   (内存 O(64KiB),**不随文件大小涨**),再交引擎按已知长度顺序写
-///   ([`antfs_blob::BlobStore::put_from_reader`])。暂存后再进引擎写锁,避免把网络传输时间串进该盘所有写;
-/// - **无 `Content-Length`**(`Transfer-Encoding: chunked`):回落**缓冲**路径(整块进内存),
-///   仍受 `max_body_bytes` 限制 —— 保持对既有调用方的向后兼容;
-/// - 超限:413,body 不读(有 `Content-Length` 时)。
+/// 两条岔路(裁决 #18,2026-10-22 —— 暂存盘中转路径整体退役):
+///
+/// - **有 `Content-Length` 且 ≤ `max_body_bytes`**:内存整收(`to_bytes` 上限=声明值,收完核长度恰等)。
+///   恒切(⑧)后 router 送来的单笔=片宽级(默认 4 MiB),5 MiB 上限盖得住 —— 中转过盘只剩一圈
+///   白费 I/O + create/unlink 元数据动作(实测小对象 p50 ~1ms → ~9ms)。每请求内存上界 =
+///   `max_body_bytes`;聚合上界 = 在途请求数 × `max_body_bytes`(在途不受限,与旧小对象路径同口径,
+///   调大上限即同步放大内存峰值,store.md 配置行已记);
+/// - **无 `Content-Length`**(`Transfer-Encoding: chunked`):回落**缓冲**路径(整块进内存,
+///   仍受 `max_body_bytes` 限制,超限 413)—— 保持对既有调用方的向后兼容;
+/// - 声明超限:413,body 不读。
 async fn put_blob(
     State(st): State<AppState>,
     Path((pid, key_hex)): Path<(PartitionId, String)>,
@@ -1208,115 +1087,63 @@ async fn put_blob(
     let store = handle.store.clone();
     let t = t.with_disk(&handle.disk_id);
 
-    match content_length(&req) {
-        Some(len) if len > st.max_body_bytes => (
+    let declared = content_length(&req);
+    if let Some(len) = declared.filter(|len| *len > st.max_body_bytes) {
+        return (
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
                 "body {len} exceeds store_server.max_body_bytes {}",
                 st.max_body_bytes
             ),
         )
-            .into_response(),
-        // 小对象走内存(有界):落盘暂存要 create/write/close/unlink 一个文件,小对象是绝对主流,
-        // 那套元数据开销在大并发下把 PUT 拖慢数倍(实测 macOS 上 p50 ~1ms → ~9ms)。内存上界 =
-        // 并发数 × INLINE_BODY_MAX。大对象才走下面的流式暂存(内存不随大小涨)。
-        Some(len) if len <= INLINE_BODY_MAX => {
-            let body = match axum::body::to_bytes(req.into_body(), INLINE_BODY_MAX as usize).await {
-                Ok(b) => b,
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        "body shorter than Content-Length (or exceeds the inline limit)",
-                    )
-                        .into_response()
-                }
-            };
-            let n = body.len() as u64;
-            // `to_bytes` 不看 `Content-Length` 头,必须自己核:客户端中途断开/少发时不能当成功写进去。
-            if n != len {
-                return (
+            .into_response();
+    }
+    // 内存上限:带声明 → 恰 = 声明值(超限已在上面拒掉);无声明 → 整收单上限兜底。
+    let limit = match declared {
+        Some(len) => usize::try_from(len).unwrap_or(usize::MAX),
+        None => body_limit(st.max_body_bytes),
+    };
+    let body = match axum::body::to_bytes(req.into_body(), limit).await {
+        Ok(b) => b,
+        Err(_) => {
+            // 带声明时上限=声明值:此处只剩"短于/长于声明"或流错误 → 400;无声明时上限=收单上限 → 413。
+            let (status, msg) = if declared.is_some() {
+                (
                     StatusCode::BAD_REQUEST,
-                    format!("body shorter than Content-Length ({n} < {len})"),
+                    "body shorter/longer than Content-Length (or stream error)",
                 )
-                    .into_response();
-            }
-            let disk = t.disk_id().to_string();
-            let joined = st
-                .pool
-                .run(&disk, "put", move || {
-                    if composed {
-                        store.put_composed_ttl(key, &body, expiration_ms)
-                    } else {
-                        store.put_ttl(key, &body, expiration_ms)
-                    }
-                })
-                .await;
-            joined_put(&st, &t, n, joined)
-        }
-        Some(len) => {
-            let tmp_dir = match st.replicas.tmp_dir_for(pid) {
-                Ok(d) => d,
-                Err(crate::error::Error::NoReplica) => {
-                    return (StatusCode::NOT_FOUND, "no replica for partition").into_response()
-                }
-                Err(e) => {
-                    record_err(&st.metrics, "io");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
-                }
+            } else {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "body exceeds store_server.max_body_bytes (or stream error)",
+                )
             };
-            let staged = StagedFile::new(&tmp_dir, pid);
-            if let Err(e) = stage_body(req.into_body(), staged.path(), len).await {
-                record_err(&st.metrics, "io");
-                return (StatusCode::BAD_REQUEST, format!("staging body failed: {e}"))
-                    .into_response();
-            }
-            let path = staged.path().to_path_buf();
-            let disk = t.disk_id().to_string();
-            let joined = st
-                .pool
-                .run(&disk, "put", move || -> antfs_blob::Result<()> {
-                    let f = std::fs::File::open(&path)?;
-                    let mut src = std::io::BufReader::with_capacity(STAGE_BUF_BYTES, f);
-                    if composed {
-                        store.put_composed_from_reader(key, len, &mut src, expiration_ms)
-                    } else {
-                        store.put_from_reader(key, len, &mut src, expiration_ms)
-                    }
-                })
-                .await;
-            // 正常出口:显式等一次删除(删除跑在阻塞池上,不占 reactor)→ "响应发出 ⇒ 暂存文件已清"
-            // 是硬契约;若本 handler 在等待期间被**取消**(客户端断开/上游 abort),则靠 `Drop` 兜住 ——
-            // 那正是之前漏文件的那条路径(见 `StagedFile` 的注释)。
-            staged.remove().await;
-            joined_put(&st, &t, len, joined)
+            return (status, msg).into_response();
         }
-        None => {
-            let body =
-                match axum::body::to_bytes(req.into_body(), body_limit(st.max_body_bytes)).await {
-                    Ok(b) => b,
-                    Err(_) => {
-                        return (
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "body exceeds store_server.max_body_bytes (or stream error)",
-                        )
-                            .into_response()
-                    }
-                };
-            let len = body.len() as u64;
-            let disk = t.disk_id().to_string();
-            let joined = st
-                .pool
-                .run(&disk, "put", move || {
-                    if composed {
-                        store.put_composed_ttl(key, &body, expiration_ms)
-                    } else {
-                        store.put_ttl(key, &body, expiration_ms)
-                    }
-                })
-                .await;
-            joined_put(&st, &t, len, joined)
+    };
+    let len = body.len() as u64;
+    // `to_bytes` 不看 `Content-Length` 头,必须自己核:客户端中途断开/少发时不能当成功写进去。
+    if let Some(want) = declared {
+        if len != want {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("body shorter than Content-Length ({len} < {want})"),
+            )
+                .into_response();
         }
     }
+    let disk = t.disk_id().to_string();
+    let joined = st
+        .pool
+        .run(&disk, "put", move || {
+            if composed {
+                store.put_composed_ttl(key, &body, expiration_ms)
+            } else {
+                store.put_ttl(key, &body, expiration_ms)
+            }
+        })
+        .await;
+    joined_put(&st, &t, len, joined)
 }
 
 async fn get_blob(
@@ -1945,28 +1772,6 @@ mod tests {
             !text.contains(r#"disk_id="d0",op="put""#),
             "早退请求不该落盘维度:\n{text}"
         );
-    }
-
-    /// 暂存文件的 `Drop` 必须真的把文件删掉 —— 删除已丢进阻塞池(分离任务),故这里做**有界轮询**
-    /// (不用 `sleep`:让出调度 + 文件删除本身是瞬时的)。
-    #[tokio::test]
-    async fn staged_file_drop_removes_the_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let staged = StagedFile::new(tmp.path(), 0);
-        let path = staged.path().to_path_buf();
-        std::fs::write(&path, b"staged").unwrap();
-        assert!(path.exists(), "守卫建好后文件应存在");
-        drop(staged);
-
-        let mut removed = false;
-        for _ in 0..10_000 {
-            if !path.exists() {
-                removed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(removed, "Drop 应把暂存文件删掉(经阻塞池)");
     }
 
     /// 没调 `set_bytes` 的请求(delete / metadata / segments)不该产生 0 字节的带宽样本:
