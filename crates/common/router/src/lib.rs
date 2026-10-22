@@ -644,7 +644,7 @@ impl Router {
     ///
     /// 对象不可变,TTL 只有这一次机会确定 —— 没有事后"改期"的路径(要不同 TTL 就换一个 blobId)。
     ///
-    /// body 超过 `put_bytes_chunk_bytes`(片宽 > 0)时走**恒切管线**:片 = 普通多数派 blob、
+    /// body 超过 `put_bytes_chunk_bytes` 时走**恒切管线**:片 = 普通多数派 blob、
     /// 描述符落在本 key(组合位);返回报告 = 描述符那笔写。读回用 [`Router::get_object`]。
     pub async fn put_with_ttl(
         &self,
@@ -748,7 +748,7 @@ impl Router {
 
     /// [`put_auto`](Self::put_auto) + 写入时定 TTL,语义同 [`put_with_ttl`](Self::put_with_ttl)。
     ///
-    /// body 超过 `put_bytes_chunk_bytes`(片宽 > 0)时走**恒切管线**:返回**描述符** blobId
+    /// body 超过 `put_bytes_chunk_bytes` 时走**恒切管线**:返回**描述符** blobId
     /// (片散向不同可写分区);读回用 [`Router::get_object`] 透明拼装。
     pub async fn put_auto_with_ttl(
         &self,

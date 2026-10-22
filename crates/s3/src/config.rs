@@ -189,11 +189,12 @@ impl S3GatewayToml {
         self.s3.validate()?;
         self.upload.validate()?;
         let width = self.s3.router.put_bytes_chunk_bytes;
-        if width != 0 && width < self.s3.max_body_bytes {
+        // 恒切禁 0(2026-10-22 裁决):0 天然小于任何正 max_body,本分支一并拒。
+        if width < self.s3.max_body_bytes {
             return Err(antfs_config::ConfigError::invalid(
                 "s3.router.put_bytes_chunk_bytes",
                 format!(
-                    "must be 0 (off) or >= s3.max_body_bytes ({}): the S3 gateway reads single blobs raw and never reassembles descriptors",
+                    "must be >= s3.max_body_bytes ({}) and nonzero — chunking cannot be disabled — the S3 gateway reads single blobs raw and never reassembles descriptors",
                     self.s3.max_body_bytes
                 ),
             ));
@@ -212,7 +213,7 @@ mod tests {
         let mut toml = S3GatewayToml::default();
         toml.s3.router.put_bytes_chunk_bytes = 0;
         toml.validate_all()
-            .expect("router 恒切关闭(0)与任何 max_body 共存");
+            .expect_err("恒切禁 0:片宽必须大于 0,0 必须被拒");
         toml.s3.router.put_bytes_chunk_bytes = 4 * 1024 * 1024;
         toml.validate_all().expect("与默认 max_body(4 MiB)相等合法");
         toml.s3.router.put_bytes_chunk_bytes = 8 * 1024 * 1024;

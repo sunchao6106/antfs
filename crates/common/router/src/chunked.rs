@@ -3,7 +3,7 @@
 //!
 //! - **写**:`put` / `put_auto` 族收到**超过片宽的裸 Bytes** 时内部切片 —— 片 = 普通多数派
 //!   blob(发号轮转散向不同可写分区,热点分摊),尾笔写**拼装描述符**(组合位落库)。
-//!   对齐 Ambry `NonBlockingRouter`:恒切、片宽可 0 = 关。
+//!   对齐 Ambry `NonBlockingRouter`:恒切、片宽禁 0(2026-10-22 裁决:不可关)。
 //! - **读**:拼装对象自动拼回**真数据**([`Router::get`] 整读 / [`Router::get_object_stream`]
 //!   流式 / [`Router::stat_object`] 元数据);普通对象原字节。
 //!   [`Router::get_blob`] 是唯一的裸字节口(供 S3 等"已知普通 blob"的单请求热路径)。

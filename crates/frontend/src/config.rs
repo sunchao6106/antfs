@@ -93,11 +93,12 @@ impl FrontendToml {
             ));
         }
         let width = self.frontend.router.put_bytes_chunk_bytes;
-        if width != 0 && width < self.frontend.auto_chunk_bytes {
+        // 恒切禁 0(2026-10-22 裁决)+ 共存矩阵:width < 片宽即拒(0 天然小于任何正片宽)。
+        if width < self.frontend.auto_chunk_bytes {
             return Err(antfs_config::ConfigError::invalid(
                 "frontend.router.put_bytes_chunk_bytes",
                 format!(
-                    "must be 0 (off) or >= frontend.auto_chunk_bytes ({}), otherwise every gateway chunk is re-chunked into sub-chunks + a sub-descriptor",
+                    "must be >= frontend.auto_chunk_bytes ({}) and nonzero — chunking cannot be disabled — otherwise every gateway chunk is re-chunked into sub-chunks + a sub-descriptor",
                     self.frontend.auto_chunk_bytes
                 ),
             ));
@@ -237,8 +238,10 @@ mod tests {
     fn router_chunk_width_cross_checks_with_gateway_chunk_bytes() {
         let mut toml = FrontendToml::default();
         toml.frontend.router.put_bytes_chunk_bytes = 0;
-        toml.validate_all()
-            .expect("router 恒切关闭(0)与网关任何片宽共存");
+        assert!(
+            toml.validate_all().is_err(),
+            "恒切禁 0:片宽必须大于 0,0 必须被拒"
+        );
         toml.frontend.router.put_bytes_chunk_bytes = 4 * 1024 * 1024;
         toml.validate_all()
             .expect("与默认网关片宽(4 MiB)相等合法(片不二次切)");

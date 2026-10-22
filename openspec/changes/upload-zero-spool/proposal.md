@@ -97,3 +97,7 @@
     其 store 协议无 offset/length)+ router `get_object_range_stream`(拼装对象只取
     覆盖片)+ REST `Range`(206/416,Ambry 口径 HEAD 也 206)+ S3 网关读原语切到
     router 窗口流(P4.1/P4.2 收口)。
+12. **恒切禁 0(2026-10-22,用户明示"必须开")**:`router.put_bytes_chunk_bytes` 必须 > 0
+    (router `validate` 拒 0;frontend/s3 交叉校验同步收严,"0=关"分支删除)。理由:直连 GB 级
+    单笔 Bytes 写失去兜底防线;`put_file` 与拉复制整段仍是单笔大 body 的合法来源,Bytes 路径
+    不设关闭态。

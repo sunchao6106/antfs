@@ -132,7 +132,7 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
 | `router.id_segment_size` | u32 | `1024` | ≥1 | **均分时**每个可写分区一次向 master 申请的 blobId 个数(号段 N)。总预留 = 分区数 × 该值(SWRR 分配的**总**号码池;**实际按写权重配比**切成各分区份额)。越大越省 RPC、router 崩溃留下的空洞越大(空洞无害,D3) | 无(Ambry 的 id 是本地随机生成,无发号) |
 | `router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新**可写分区列表**的周期(秒):已不可写分区的号段被丢掉、新出现的可写分区补一段 | 无 |
 | `router.latency_aware_routing` | bool | `true` | — | **读路由按观测延迟排序副本**(慢盘处置的客户端侧那一半):读恒为 R=1(第一个成功即返回),故"先试哪个副本"直接决定读延迟。开着时记录每副本请求耗时的 EWMA,读时 **`up` 优先 → 延迟升序 → master 原序**;未测副本按"已测均值"当先验;无数据时是**恒等变换**。**只改顺序、不改候选集** ⇒ 不改变 W/R 与冲突解决语义。关掉用于定位/对照压测。详见 [`cluster.md` §9.3](./cluster.md) | 无 |
-| `router.put_bytes_chunk_bytes` | u64 | `4194304`(4 MiB) | `0`(关)或 64 KiB ..= 1 GiB | **SDK 直连大 Bytes 写的恒切片宽**(2026-10-21 下沉,`upload-zero-spool` design §12):body 超过它时 `put`/`put_auto` 族内部切片(片 = 普通多数派 blob,发号 SWRR 散向可写分区)+ 尾笔拼装描述符,返回描述符 blobId;读回走 `get`/`get_object_stream` 透明拼装。**网关内嵌 `[router]` 表须交叉校验"网关自身片/单体宽 ≤ 本值"**(frontend/s3 的 `validate_all` 已带,防止 gateway 片被二次切)。对齐 Ambry `router.max.put.chunk.size.bytes`(恒切无开关,此间以 0 表达"不切") | `router.max.put.chunk.size.bytes`(Ambry 4 MiB) |
+| `router.put_bytes_chunk_bytes` | u64 | `4194304`(4 MiB) | 64 KiB ..= 1 GiB,**禁 0**(**2026-10-22 裁决:恒切不可关**,validate 拒 0) | **SDK 直连大 Bytes 写的恒切片宽**(2026-10-21 下沉,`upload-zero-spool` design §12):body 超过它时 `put`/`put_auto` 族内部切片(片 = 普通多数派 blob,发号 SWRR 散向可写分区)+ 尾笔拼装描述符,返回描述符 blobId;读回走 `get`/`get_object_stream` 透明拼装。**网关内嵌 `[router]` 表须交叉校验"网关自身片/单体宽 ≤ 本值"**(frontend/s3 的 `validate_all` 已带,防止 gateway 片被二次切)。对齐 Ambry `router.max.put.chunk.size.bytes`(恒切无开关;2026-10-22 起本表同样禁 0) | `router.max.put.chunk.size.bytes`(Ambry 4 MiB) |
 
 > **请求哪个 partition**:补段时先 `ListPartitions(state=RW)` 拿可写分区列表,再对**每个**分区显式点名
 > `partition_id` 申请一小批(master 复核该分区 RW 且**至少有一个副本**,否则 `ok=false` 只跳过该分区)。
@@ -186,6 +186,9 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
 - 写:`put`/`put_auto` 族遇超片宽 body 内部切片(片 = 普通多数派 blob,SWRR 散分区)+ 拼装描述符;
   失败 = 已入库片尽力墓碑 + 原错误透传;超容量 = `too_large` 前置拒绝。网关内嵌本表须交叉校验
   "网关片/单体宽 ≤ `put_bytes_chunk_bytes`"(防二次切;frontend/s3 `validate_all`)。
+  **恒切禁 0**(2026-10-22 裁决"恒切必须开"):router 自身 `validate` 拒 0,网关侧交叉校验
+  同步收严(0 天然小于任何正片宽,一并拒)——`put_file` 路径(未挂恒切)与拉复制整段仍是
+  单笔大 body 的合法来源,SDK Bytes 路径的兜底防线不设关闭态。
 - 读:`get/get_object_stream/get_object_range_stream/stat_object` 以**逻辑对象**为口径(拼装自动拼回、
   窗口只取覆盖片);裸字节只剩 `get_blob` 受控口。`get_file`(落盘式读)已删(⑭)。
 - 与 Ambry `NonBlockingRouter` 同型(恒切 + composite 重组),差异 = 描述符为普通 blob 落库

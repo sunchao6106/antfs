@@ -12,7 +12,7 @@ use serde::Deserialize;
 /// `put_bytes_chunk_bytes` 默认值:4 MiB —— 与网关恒切片宽同档,Ambry
 /// `router.max.put.chunk.size.bytes` 同型默认(RouterConfig.java,恒切、无开关)。
 pub const DEFAULT_PUT_BYTES_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
-/// `put_bytes_chunk_bytes` 下限(非 0 时):切无收益、描述符开销反超的界。
+/// `put_bytes_chunk_bytes` 下限:切无收益、描述符开销反超的界。
 pub const PUT_BYTES_CHUNK_MIN_BYTES: u64 = 64 * 1024;
 /// `put_bytes_chunk_bytes` 上限:片是"中等单元",过 1 GiB 失切义(与内存帧上界同档)。
 pub const PUT_BYTES_CHUNK_MAX_BYTES: u64 = 1 << 30;
@@ -54,9 +54,9 @@ pub struct RouterConfig {
     // 压缩五旋钮 2026-10-21 整体移除(所有者裁决13:读接口定型后基于流式读口重开;
     // 存量压缩帧将按原字节读回,重开须带帧头兼容,见 router.md 待办)。
     /// SDK 直连大 Bytes 写(`put` / `put_auto` 族)的**恒切片宽**(router 下沉,2026-10-21):
-    /// `> 0` 且 body 超过它时,router 内部切成多片**普通 blob** + 尾笔写**拼装描述符**,
+    /// body 超过它时,router 内部切成多片**普通 blob** + 尾笔写**拼装描述符**,
     /// 片经发号轮转散向不同可写分区(热点分摊);对齐 Ambry `router.max.put.chunk.size.bytes`
-    /// (恒切、无开关)。**0 = 不切**(裸 Bytes 直写惯例兼容)。读侧成对口 = `get_object`
+    /// (恒切、无开关)。**禁 0**(2026-10-22 裁决:恒切不可关,validate 拒 0)。读侧成对口 = `get_object`
     /// (透明拼装);`get` / `get_file` 保持裸字节语义。**内嵌本表做网关的仓**须交叉校验
     /// "网关自身片宽 ≤ 本值"(frontend / s3 的 `validate` 已带),否则网关片会被二次切。
     pub put_bytes_chunk_bytes: u64,
@@ -86,14 +86,14 @@ impl Validate for RouterConfig {
         }
         at_least("router.request_timeout_secs", self.request_timeout_secs, 1)?;
         at_least("router.id_segment_size", self.id_segment_size, 1)?;
-        // min_size 不设下限(0 = 全试压是合法运维选择);零长 body 恒走 too_small 闸。
-        if self.put_bytes_chunk_bytes != 0
-            && !(PUT_BYTES_CHUNK_MIN_BYTES..=PUT_BYTES_CHUNK_MAX_BYTES)
-                .contains(&self.put_bytes_chunk_bytes)
+        // 零长 body 恒走 too_small 闸。
+        // 2026-10-22 裁决:恒切不可关(0 必须拒绝)——直连 GB 级单笔失去兜底防线。
+        if !(PUT_BYTES_CHUNK_MIN_BYTES..=PUT_BYTES_CHUNK_MAX_BYTES)
+            .contains(&self.put_bytes_chunk_bytes)
         {
             return Err(antfs_config::ConfigError::invalid(
                 "router.put_bytes_chunk_bytes",
-                "must be 0 (off) or in [64 KiB, 1 GiB]",
+                "must be in [64 KiB, 1 GiB] and nonzero: chunking cannot be disabled",
             ));
         }
         Ok(())
@@ -110,11 +110,11 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.put_bytes_chunk_bytes, DEFAULT_PUT_BYTES_CHUNK_BYTES);
 
-        for bad in [1u64, 63 * 1024, (1 << 30) + 1] {
+        for bad in [0u64, 1, 63 * 1024, (1 << 30) + 1] {
             cfg.put_bytes_chunk_bytes = bad;
             assert!(cfg.validate().is_err(), "rejected width {bad}");
         }
-        for ok in [0u64, 64 * 1024, 1 << 30] {
+        for ok in [64 * 1024, 1 << 30] {
             cfg.put_bytes_chunk_bytes = ok;
             assert!(cfg.validate().is_ok(), "accepted width {ok}");
         }

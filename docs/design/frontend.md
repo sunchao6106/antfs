@@ -193,7 +193,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend.router.id_segment_size` | u32 | `1024` | ≥1 | **均分时**每个可写分区一次申请的 blobId 个数(总预留 = 分区数 × 该值,**实际按写权重配比**;见 [`router.md` §2/§5](./router.md)) | 无 |
 | `frontend.router.partition_refresh_secs` | u64 | `30` | ≥0(`0` = 关闭) | 后台刷新可写分区列表的周期(秒;见 [`router.md` §2](./router.md)) | 无 |
 | `frontend.router.latency_aware_routing` | bool | `true` | — | 读路径副本排序开关(`up` → 观测延迟 EWMA 升序 → master 原序;只改尝试序不改候选集;见 [`router.md` §5](./router.md)) | 无 |
-| `frontend.router.put_bytes_chunk_bytes` | u64 | `4194304`(4 MiB) | `0`(关)或 64 KiB ..= 1 GiB,且**交叉校验:0 或 ≥ `frontend.auto_chunk_bytes`**(违反拒启) | 内嵌 router 的 SDK 恒切片宽(直连语义,见 [`router.md` §5](./router.md))。**交叉校验的存在理由**:网关切片宽 ≤ router 片宽才能保证"网关片在 router 里恒为单笔普通 blob",一旦小于,每片网关片会被 router 二次切成"子片 + 子描述符"而网关读不回原文 —— 配置期结构性禁止(design §12 共存矩阵) | 无 |
+| `frontend.router.put_bytes_chunk_bytes` | u64 | `4194304`(4 MiB) | 64 KiB ..= 1 GiB 且**交叉校验:≥ `frontend.auto_chunk_bytes`**(违反拒启;**禁 0** —— 2026-10-22 裁决恒切不可关) | 内嵌 router 的 SDK 恒切片宽(直连语义,见 [`router.md` §5](./router.md))。**交叉校验的存在理由**:网关切片宽 ≤ router 片宽才能保证"网关片在 router 里恒为单笔普通 blob",一旦小于,每片网关片会被 router 二次切成"子片 + 子描述符"而网关读不回原文 —— 配置期结构性禁止(design §12 共存矩阵) | 无 |
 
 > **`[frontend.router]` 是内嵌 router 的配置子表**:W/R、号段大小等只有**一处真源**,frontend 不重复定义
 > (W 甚至不可配,见 `router.md §2`)。

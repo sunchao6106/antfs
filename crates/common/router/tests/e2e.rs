@@ -1157,7 +1157,7 @@ async fn keyed_chunked_collision_tombstones_written_chunks() {
 
 /// 片宽 0(关):大 Bytes 单笔直写 —— `stat.composed = false`,`get`/`get_blob` 同字节。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn chunking_off_means_single_plain_blob() {
+async fn zero_width_is_rejected_and_plain_windows_slice_raw() {
     let tmp = tempfile::tempdir().unwrap();
     let (node, grpc) = solo_master(&tmp.path().join("master")).await;
     let (_sa, addr_a) = start_store(&tmp.path().join("store-a"), 101).await;
@@ -1165,20 +1165,32 @@ async fn chunking_off_means_single_plain_blob() {
     let pid = create_partition(&node, vec![placement(101)]).await;
     ensure_replica(&addr_a, pid).await;
 
+    // 2026-10-22 裁决:恒切不可关 —— 片宽 0 必须在 Router 装配处即被拒。
     let mut cfg = client_cfg(&grpc);
     cfg.put_bytes_chunk_bytes = 0;
     let registry = antfs_metric::Registry::new();
+    assert!(
+        matches!(
+            Router::connect(cfg, &registry).await,
+            Err(e) if e.to_string().contains("put_bytes_chunk_bytes")
+        ),
+        "恒切禁 0:装配必须拒绝"
+    );
+
+    // 片宽以下 = 单笔普通 blob(不切),裸读与窗口直切语义不受影响。
+    let mut cfg = client_cfg(&grpc);
+    cfg.put_bytes_chunk_bytes = 4 * 1024 * 1024;
     let client = Router::connect(cfg, &registry).await.unwrap();
 
-    let data = bytes::Bytes::from(payload(5 * 1024 * 1024 + 11, 5));
+    let data = bytes::Bytes::from(payload(600 * 1024 + 7, 5));
     let (key, _) = client.put_auto(data.clone()).await.expect("单笔直写");
     let stat = client.stat(&key).await.expect("stat");
-    assert!(!stat.composed, "不切 = 普通 blob");
+    assert!(!stat.composed, "片宽以下 = 普通 blob");
     assert_eq!(client.get(&key).await.unwrap(), data);
     assert_eq!(client.get_blob(&key).await.unwrap(), data);
     // 普通对象的窗口读 = 数据面 offset/length 直切。
     let mut ranged = client
-        .get_object_range_stream(&key, 100, 2 * 1024 * 1024)
+        .get_object_range_stream(&key, 100, 400 * 1024)
         .await
         .expect("plain range");
     use futures::StreamExt as _;
@@ -1186,5 +1198,5 @@ async fn chunking_off_means_single_plain_blob() {
     while let Some(c) = ranged.next().await {
         got.extend_from_slice(&c.expect("plain range 片"));
     }
-    assert_eq!(got.as_slice(), &data[100..(100 + 2 * 1024 * 1024)]);
+    assert_eq!(got.as_slice(), &data[100..(100 + 400 * 1024)]);
 }

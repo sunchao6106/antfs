@@ -2515,3 +2515,29 @@ S3 Range 接口适配 router 窗口读、一切调整落最新设计文档。
 - **复盘补记(事后 review 抓到)**:①大对象 GET 首片预检的失败分类从旧 502(上游损坏)
   漂移为 503(传输类可重试)—— 503 语义更准(片不可读属暂时态),记档不改;
   ②frontend.md §4 两条读描述 bullet 未随批更新(脚本语法错整段未落盘),随即补正。
+
+### 步 98:恒切禁 0(裁决:必须开)+ 五连问答释疑
+
+**触发(所有者连问五题,其中第 4 题为指令)**:S3 上限三分(16 GiB 累积 / single 体
+max_body 4 MiB / 都走 router)、put_file 使用场景与恒切可行性、**片宽必须 > 0**、
+开源参照系 store 写路径调研。
+
+**改动(裁决"恒切必须开")**:
+- router `validate`:片宽 0 由合法(0=关)翻为**拒绝**(错误消息更新);字段/模块/
+  读口 doc 注释去"可关"措辞;边界测试翻转(0 入 bad 集)。
+- frontend/s3 `validate_all` 交叉校验收严:`width != 0 && width < X` → `width < X`
+  (0 天然小于任何正片宽,同支拒);两处测试"0 共存"期望翻为 must_reject;错误消息
+  去 "0 (off)" 口径。
+- e2e:`chunking_off_means_single_plain_blob`(前提已非法)重写为
+  `zero_width_is_rejected_and_plain_windows_slice_raw`:恒切 0 在 `Router::connect`
+  装配期即拒(错误文本断言);片宽以下单笔普通 blob 的裸读/窗口直切语义保留断言。
+- 文档:router.md §5 行(MUST>0)+ §3 尾注、frontend.md §8 行、s3.md §5 行+不变量段、
+  upload-zero-spool spec delta(恒切无关闭态)+ proposal 裁决 #12。
+
+**动机(白话)**:恒切是 SDK 直连大 Bytes 的最后一道防线;关掉它,单笔 GB 级 body 直怼
+store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该防线不设退出态。
+
+## Testing Done
+
+- antfs-router 22 lib + 18 e2e 全绿(重写测试过);frontend/s3 配置测试绿(见 workspace);
+- `openspec validate upload-zero-spool` 过;待:fmt/clippy/workspace 全套 + CI 双绿。
