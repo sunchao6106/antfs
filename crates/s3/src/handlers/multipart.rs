@@ -144,6 +144,37 @@ pub async fn complete_multipart_upload(
 
     let parts = crate::xml::parse_complete_multipart(xml_str)?;
 
+    let result = finish_multipart(&st, bucket, upload_id, &parts, &headers).await?;
+
+    let xml = crate::xml::serialize_complete_multipart(bucket, key, &result.etag);
+    let mut response = (StatusCode::OK, [("content-type", "application/xml")], xml).into_response();
+    if let Some(c) = &result.checksum {
+        response.headers_mut().insert(
+            c.algo.lower_name(),
+            c.value
+                .parse()
+                .map_err(|_| S3Error::InternalError("checksum header".into()))?,
+        );
+        response.headers_mut().insert(
+            "x-amz-checksum-type",
+            c.kind.as_str().parse().expect("static header value"),
+        );
+    }
+    Ok(response)
+}
+
+/// complete 终段(显式 XML 路径与 `streamed_put_object` 内部复用同一干道):
+/// 共享上限对账(members 实际尺寸合计)→ complete 级校验裁决(claims 从 `ruling_headers`
+/// 读:XML 路径 = 本请求头,流式路径 = 合并后的整对象 claim 合成头)→ 会话锁定落行 →
+/// 遮蔽丢弃账回收。配额拒绝的"session/parts 行不动可重发"语义对两条调用方同样成立
+/// (流式调用方拿到 Err 后走自己的 abort 清场)。
+async fn finish_multipart(
+    st: &AppState,
+    bucket: &str,
+    upload_id: &str,
+    parts: &[CompletePart],
+    ruling_headers: &axum::http::HeaderMap,
+) -> Result<CompleteMultipartResult, S3Error> {
     // 公共单文件上限([upload] 表,与 PutObject 闸同一值):按 manifest 所列各片的
     // 实际尺寸合计,超限 413;session 与 parts 行不动(客户端可 abort 或缩减后重发)。
     {
@@ -159,11 +190,11 @@ pub async fn complete_multipart_upload(
     }
 
     // complete 级校验声明裁决(FULL_OBJECT 路径在此流式全验;composite 终判在会话锁内)。
-    let checksum_param = complete_checksum_ruling(&st, upload_id, &headers, &parts).await?;
+    let checksum_param = complete_checksum_ruling(st, upload_id, ruling_headers, parts).await?;
 
     let result = match st
         .metastore
-        .complete_multipart(upload_id, &parts, checksum_param)
+        .complete_multipart(upload_id, parts, checksum_param)
         .await
     {
         Ok(result) => result,
@@ -185,26 +216,11 @@ pub async fn complete_multipart_upload(
         .iter()
         .chain(result.discarded_part_blobs.iter())
     {
-        if let Err(e) = crate::handlers::tombstone_and_resolve(&st, old).await {
+        if let Err(e) = crate::handlers::tombstone_and_resolve(st, old).await {
             tracing::warn!(error = %e, "s3 gc: blob reclaim failed after multipart complete (WAL row kept)");
         }
     }
-
-    let xml = crate::xml::serialize_complete_multipart(bucket, key, &result.etag);
-    let mut response = (StatusCode::OK, [("content-type", "application/xml")], xml).into_response();
-    if let Some(c) = &result.checksum {
-        response.headers_mut().insert(
-            c.algo.lower_name(),
-            c.value
-                .parse()
-                .map_err(|_| S3Error::InternalError("checksum header".into()))?,
-        );
-        response.headers_mut().insert(
-            "x-amz-checksum-type",
-            c.kind.as_str().parse().expect("static header value"),
-        );
-    }
-    Ok(response)
+    Ok(result)
 }
 
 pub async fn abort_multipart_upload(st: AppState, upload_id: &str) -> Result<Response, S3Error> {
@@ -360,4 +376,196 @@ async fn verify_full_object_claims(
     Ok(CompleteChecksum::FullObject(verified.expect(
         "claims were non-empty so at least one value is verified",
     )))
+}
+
+/// PutObject 大对象流式通路(2026-10-22,裁决 #13):申报尺寸 > `s3.max_body_bytes`
+/// 且 ≤ 共享单文件上限的直传,不再 413,改为网关固定片缓冲整流 —— 内存恒 = 1 片,
+/// 边收边写。全套闸与账与显式 multipart 共用:session 行落库即受既有 GC 会话过期
+/// 兜底;上限/声明中段对账;complete 级校验;配额;遮蔽回收。任何中途失败(网络断/
+/// 尺寸不符/校验失配/配额拒)显式 abort 墓碑已写片 —— 与小对象"先验后写"路径相比,
+/// 失败瞬时性留片(由 abort/GC 收账),换取大对象零整存。SSE 暂不支持(与显式
+/// multipart 同族限制)。ETag 为 multipart 式合成(`N=1` 时与单传 md5 同形)——与 AWS
+/// 单传 md5 惯例存在已知偏差,记档 s3.md。
+pub(crate) async fn streamed_put_object(
+    st: AppState,
+    bucket: &str,
+    key: &str,
+    req: Request,
+    declared_total: Option<u64>,
+) -> Result<Response, S3Error> {
+    if req.headers().get("x-amz-server-side-encryption").is_some() {
+        return Err(S3Error::NotImplemented(
+            "streamed PutObject does not support server-side encryption this round".into(),
+        ));
+    }
+    let header_claims = crate::checksum::collect_claim_headers(req.headers())?;
+    crate::checksum::ensure_full_object_type(req.headers())?;
+    let declared_trailer = req
+        .headers()
+        .get("x-amz-trailer")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // trailer 扩展必须在 into_body 消费 request 前拿走(其终值在 body EOF 后才齐)。
+    let trailer_sink = req
+        .extensions()
+        .get::<crate::auth::chunked::ChunkedTrailers>()
+        .cloned();
+    let (content_type, user_meta) = crate::handlers::object::capture_object_meta(req.headers())?;
+
+    let upload_id = st
+        .metastore
+        .create_multipart(bucket, key, Some(content_type.as_str()), &user_meta)
+        .await?;
+
+    let (parts, total) = match streamed_parts(
+        &st,
+        &upload_id,
+        req.into_body(),
+        st.config.max_body_bytes as usize,
+        st.max_object_bytes,
+        declared_total,
+    )
+    .await
+    {
+        Ok(parts) => parts,
+        Err(e) => {
+            abort_streamed_session(&st, &upload_id).await;
+            return Err(e);
+        }
+    };
+
+    if parts.is_empty() || declared_total.is_some_and(|d| d != total) {
+        abort_streamed_session(&st, &upload_id).await;
+        return Err(S3Error::IncompleteBody);
+    }
+
+    // 声明合并(头 + trailer,EOF 后终值;验证在 complete 级,这里只并集)。
+    let trailer_claims = trailer_sink
+        .map(|wrapper| wrapper.0.lock().expect("trailer sink lock").clone())
+        .unwrap_or_default();
+    let merged = match crate::checksum::merge_trailer_claims(
+        header_claims,
+        &trailer_claims,
+        declared_trailer.as_deref(),
+    ) {
+        Ok(merged) => merged,
+        Err(e) => {
+            abort_streamed_session(&st, &upload_id).await;
+            return Err(e);
+        }
+    };
+    let mut ruling_headers = axum::http::HeaderMap::new();
+    for claim in &merged {
+        let value = claim
+            .value
+            .parse()
+            .map_err(|_| S3Error::InternalError("checksum header".into()))?;
+        ruling_headers.insert(claim.algo.lower_name(), value);
+    }
+
+    let result = match finish_multipart(&st, bucket, &upload_id, &parts, &ruling_headers).await {
+        Ok(result) => result,
+        Err(e) => {
+            abort_streamed_session(&st, &upload_id).await;
+            return Err(e);
+        }
+    };
+    st.metrics.put_objects_streamed_total.inc();
+    st.metrics
+        .put_object_streamed_parts_total
+        .inc_by(parts.len() as u64);
+
+    let mut response = (
+        StatusCode::OK,
+        [(header::ETAG, format!("\"{}\"", result.etag))],
+        "",
+    )
+        .into_response();
+    if let Some(c) = &result.checksum {
+        response.headers_mut().insert(
+            c.algo.lower_name(),
+            c.value
+                .parse()
+                .map_err(|_| S3Error::InternalError("checksum header".into()))?,
+        );
+        response.headers_mut().insert(
+            "x-amz-checksum-type",
+            c.kind.as_str().parse().expect("static header value"),
+        );
+    }
+    Ok(response)
+}
+
+/// 边收边切边写:固定片宽缓冲,满一片写一片(router 单笔 + session 片行);
+/// 片 etag = 片 md5(与 UploadPart 同口径,complete 验配对账)。
+async fn streamed_parts(
+    st: &AppState,
+    upload_id: &str,
+    body: axum::body::Body,
+    chunk_cap: usize,
+    max_object: u64,
+    declared_total: Option<u64>,
+) -> Result<(Vec<CompletePart>, u64), S3Error> {
+    let mut stream = body.into_data_stream();
+    let mut buf = bytes::BytesMut::new();
+    let mut total: u64 = 0;
+    let mut parts: Vec<CompletePart> = Vec::new();
+    let mut next_part: i32 = 1;
+    while let Some(item) = stream.next().await {
+        let chunk = item.map_err(crate::handlers::map_body_error)?;
+        total += chunk.len() as u64;
+        if total > max_object || declared_total.is_some_and(|d| total > d) {
+            // 中段熔断:一字节不多写已落片的账,清场职责在调用方(abort)。
+            return Err(S3Error::IncompleteBody);
+        }
+        buf.extend_from_slice(&chunk);
+        while buf.len() >= chunk_cap {
+            let piece = buf.split_to(chunk_cap).freeze();
+            parts.push(write_streamed_part(st, upload_id, next_part, piece).await?);
+            next_part += 1;
+        }
+    }
+    if !buf.is_empty() {
+        parts.push(write_streamed_part(st, upload_id, next_part, buf.freeze()).await?);
+    }
+    Ok((parts, total))
+}
+
+async fn write_streamed_part(
+    st: &AppState,
+    upload_id: &str,
+    part_number: i32,
+    data: bytes::Bytes,
+) -> Result<CompletePart, S3Error> {
+    let etag = {
+        use md5::{Digest, Md5};
+        format!("{:x}", Md5::digest(&data))
+    };
+    let size = data.len() as u64;
+    let (blob_key, _) = st.router.put_auto_with_ttl(data, NO_EXPIRATION).await?;
+    st.metastore
+        .put_part(
+            upload_id,
+            PartMeta {
+                part_number,
+                blob_id: blob_key,
+                size,
+                etag: etag.clone(),
+                checksum: None,
+            },
+        )
+        .await?;
+    Ok(CompletePart { part_number, etag })
+}
+
+async fn abort_streamed_session(st: &AppState, upload_id: &str) {
+    match st.metastore.abort_multipart(upload_id).await {
+        Ok(blob_ids) => {
+            for bid in blob_ids {
+                let _ = crate::handlers::tombstone_and_resolve(st, &bid).await;
+            }
+        }
+        // abort 自身失败(元库抖动)不吞原错:会话行仍在,过期 GC 兜底收尾。
+        Err(e) => tracing::warn!(error = %e, upload_id, "s3 streamed put abort failed"),
+    }
 }

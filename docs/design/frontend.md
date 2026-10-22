@@ -65,7 +65,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 | `DELETE` | `delete`(多数派写墓碑,**不可逆**) |
 
 - `x-antfs-ttl-ms` 的落地方式:**同一次写** —— frontend 把该头解析成绝对 `expiration_ms` 交给 SDK(`Router::put_with_ttl` /
-  `put_file_with_ttl`),数据面 `PUT ...?expiration_ms=` 原子承接,故 TTL 是**单次多数派写**。
+  数据面 `PUT ...?expiration_ms=` 原子承接,故 TTL 是**单次多数派写**(`put_file` 家族 2026-10-22 移除)。
   **写入之后没有任何改 TTL 的接口**(不能续期、不能作废、不能永久化)。
 
 ## 4. 分片拼装(`POST /stitch`)——**无状态**设计
@@ -245,7 +245,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
       落位:`?composed=true` 组合写口 + `metadata` 回 `composed`;`descriptor-drop-magic` 2026-10-19
       收口:无位行恒按普通对象原字节返回,内容探测退役)。三选项推演与先例出处见
       `openspec/changes/blob-io-end-to-end/tasks.md` 待办首条。
-- [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**,`x-antfs-ttl-ms` 现为单次多数派写。
+- [x] ~~`Router::put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl`**,`x-antfs-ttl-ms` 现为单次多数派写。
 - [x] ~~读路径端到端流式~~ —— **已完结**(`store-read-streaming` 2026-10-20:引擎
       `read_range` 切片原语 + 数据面 GET 分块流(512 KiB 过每盘有界池,单请求内存 =
       单块,与对象大小无关);`?replication=1` 复制读保持整读原路含 CRC;细节见

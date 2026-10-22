@@ -75,3 +75,22 @@ router SDK SHALL 对超过 `router.put_bytes_chunk_bytes`(默认 4 MiB,64 KiB..=
 #### Scenario: 网关误配结构性拒绝
 - **WHEN** frontend TOML 设 `router.put_bytes_chunk_bytes=64 KiB` 而 `auto_chunk_bytes=4 MiB`
 - **THEN** 启动校验拒绝(网关片将被二次切)
+
+## ADDED Requirements(2026-10-22 追补)
+
+### Requirement: S3 单笔直传流式内部 multipart
+
+S3 网关 SHALL 接受申报尺寸 > `s3.max_body_bytes` 且 ≤ 共享单文件上限(`[upload] max_object_bytes`)
+的 PutObject:网关 SHALL 以固定片宽(= `max_body_bytes`)缓冲整流、逐片经约定的多数派写落地并
+登记内部 multipart session 片行,收完 SHALL 走与显式 multipart 同一 complete 干道(上限对账、
+complete 级 FULL_OBJECT 校验按 manifest 流式复验、配额、遮蔽丢弃回收);任何中途失败(断流/
+尺寸不符/校验失配/配额拒)SHALL 墓碑已写片并清 session 行;成功响应的 ETag SHALL 为 multipart
+式合成口径。SSE 申报 SHALL 拒 501(与显式 multipart 同族)。
+
+#### Scenario: 大对象直传零整存往返
+- **WHEN** 客户端单笔 PUT 申报 9 MiB(max_body 4 MiB,总上限 16 GiB)
+- **THEN** 200;内部片 = 3;GET 回读逐字节恒等;HEAD 逻辑尺寸;网关内存峰值 = 1 片
+
+#### Scenario: 坏校验声明清场
+- **WHEN** 整对象 checksum 声明值失配
+- **THEN** 400 BadDigest;GET 该对象 404;session 片行零残留(abort 已墓碑全部内部片)

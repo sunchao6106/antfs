@@ -101,3 +101,10 @@
     (router `validate` 拒 0;frontend/s3 交叉校验同步收严,"0=关"分支删除)。理由:直连 GB 级
     单笔 Bytes 写失去兜底防线;`put_file` 与拉复制整段仍是单笔大 body 的合法来源,Bytes 路径
     不设关闭态。
+13. **S3 单笔直传流式化(同日,"要做")**:`max_body_bytes` 的"单笔直传上限"身份退役——
+    申报 > max_body(≤ 共享总上限)的 PutObject 转网关固定片整流的**内部 multipart**
+    (复用 session/finish 干道全套闸与账;执行同日落地,见 spec 与 s3.md)。代价记档:
+    先写后验(abort 墓碑 + 过期会话 GC 兜底)、大对象 ETag 为 multipart 式合成。
+14. **`put_file` 家族移除(同日,"没实际调用就删掉")**:router SDK 文件直传口整体退役
+    (全仓零内部调用方;507 重试与流式语义由 `put`/`put_auto` 恒切族全覆盖)。
+    单笔任意大 body 的合法来源自此只剩拉复制整段(engine 内部,不经写接口)。

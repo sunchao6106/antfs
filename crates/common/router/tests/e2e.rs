@@ -1,7 +1,7 @@
 //! client(router SDK)端到端集成测试:**真 master + 真 store(真 gRPC + 真 HTTP 端口)**。
 //!
 //! 覆盖判据(对齐 `docs/design/client.md` 与 `cluster.md §10`):
-//!   1. 发号 → 写 → 读往返一致(`put`/`get`/`put_file`/`get_object_stream`);
+//!   1. 发号 → 写 → 读往返一致(`put`/`get`/`get_object_stream`;`put_file` 家族已移除);
 //!   2. **W = 实际副本数 / 2 + 1**:RF=3 掉一个副本仍能写成功(acks=2);RF=1 只要求 1 个 ack
 //!      (证明门槛是"实算多数派",不是写死 2);
 //!   3. **R = 1**:第一个副本不可达时自动换副本读成功;
@@ -183,80 +183,6 @@ fn payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn put_get_roundtrip_and_w_is_actual_majority() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
-    let dir_a = tmp.path().join("store-a");
-    let dir_b = tmp.path().join("store-b");
-    let (_sa, addr_a) = start_store(&dir_a, 101).await;
-    let (_sb, addr_b) = start_store(&dir_b, 102).await;
-    register_node(&node, 101, &addr_a).await;
-    register_node(&node, 102, &addr_b).await;
-
-    // RF=2:多数派 = 2/2+1 = 2 → 两个副本都必须 ack。
-    let pid = create_partition(&node, vec![placement(101), placement(102)]).await;
-    ensure_replica(&addr_a, pid).await;
-    ensure_replica(&addr_b, pid).await;
-
-    let registry = antfs_metric::Registry::new();
-    let client = Router::connect(client_cfg(&grpc), &registry)
-        .await
-        .expect("connect client");
-
-    for (i, len) in [1usize, 4096, 100 * 1024].into_iter().enumerate() {
-        let key = client.allocate_one().await.expect("allocate");
-        assert_eq!(key.partition_id(), pid, "master 必须发我可写分区的号");
-        let data = bytes::Bytes::from(payload(len, i as u8));
-        let report = client.put(key, data.clone()).await.expect("put");
-        assert_eq!(report.total, 2);
-        assert_eq!(report.required, 2, "RF=2 → 多数派 2");
-        assert_eq!(report.acks, 2, "两个真副本都应 ack");
-        assert_eq!(
-            client.get(&key).await.expect("get"),
-            data,
-            "往返必须逐字节一致"
-        );
-    }
-
-    // 文件往返(流式):写本地文件 → 传 → 下载到另一个文件 → 比对。
-    let src = tmp.path().join("src.bin");
-    let bytes = payload(300 * 1024, 7);
-    tokio::fs::write(&src, &bytes).await.unwrap();
-    let (key, report) = client.put_file(&src).await.expect("put_file");
-    assert_eq!(report.required, 2);
-    // 读回(⑭ 读口只留 stream 式):流式收尽 = 原 file 长字节恒等。
-    let (_len, stream) = client
-        .get_object_stream(&key)
-        .await
-        .expect("get_object_stream");
-    let mut back = Vec::new();
-    let mut stream = std::pin::pin!(stream);
-    use futures::StreamExt as _;
-    while let Some(chunk) = stream.next().await {
-        back.extend_from_slice(&chunk.expect("stream chunk"));
-    }
-    assert_eq!(back, bytes, "put_file → 逻辑流式读回恒等");
-
-    // 元数据 / 删除(删除不可逆:删了就取不回来了)。
-    let stat = client.stat(&key).await.expect("stat");
-    assert_eq!(stat.size, bytes.len() as u64);
-    assert!(!stat.deleted);
-    client.delete(&key).await.expect("delete");
-    assert!(matches!(
-        client.get(&key).await,
-        Err(Error::NotFound { .. })
-    ));
-    let after = client.stat(&key).await.expect("stat after delete");
-    assert!(after.deleted, "墓碑的元数据仍可读(deleted=true)");
-    assert!(!after.expired);
-
-    // 重复删幂等:墓碑 key 再删仍成功(204),且不改变状态。
-    client.delete(&key).await.expect("idempotent re-delete");
-    let still = client.stat(&key).await.expect("stat after re-delete");
-    assert!(still.deleted);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -745,55 +671,6 @@ async fn fill_partition_until_full(addr: &str, pid: u32) {
         );
     }
     assert!(saw_full, "partition {pid} must fill up and return 507");
-}
-
-/// **分区写满(全副本 507)自动换分区重试**:`put_file_with_ttl` 内部发号,命中已满分区时
-/// 摘掉该分区号段、重新发号到空分区,重试成功;`router_put_store_full_retries_total` 计数。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn put_file_retries_on_store_full_partition() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
-    // 节点 A:分区容量极小(64 KiB),写满即 507;节点 B:正常容量。
-    let (_sa, addr_a) =
-        start_store_with(&tmp.path().join("store-a"), 101, 64 << 10, 64 << 10).await;
-    let (_sb, addr_b) = start_store_with(&tmp.path().join("store-b"), 102, 64 << 20, 8 << 20).await;
-    register_node(&node, 101, &addr_a).await;
-    register_node(&node, 102, &addr_b).await;
-
-    let full_pid = create_partition(&node, vec![placement(101)]).await;
-    let empty_pid = create_partition(&node, vec![placement(102)]).await;
-    ensure_replica(&addr_a, full_pid).await;
-    ensure_replica(&addr_b, empty_pid).await;
-    fill_partition_until_full(&addr_a, full_pid).await;
-
-    // 关后台刷新:让"摘掉已满分区"在测试窗口内保持(否则刷新会把它重新补回来)。
-    let registry = antfs_metric::Registry::new();
-    let client = Router::connect(
-        RouterConfig {
-            id_segment_size: 64,
-            partition_refresh_secs: 0,
-            ..client_cfg(&grpc)
-        },
-        &registry,
-    )
-    .await
-    .expect("connect");
-
-    let src = tmp.path().join("upload.bin");
-    tokio::fs::write(&src, payload(4096, 1)).await.unwrap();
-    // 多次上传:首次命中已满分区 → 自动换分区重试;之后只从空分区取号。全部必须成功。
-    for _ in 0..20 {
-        let (key, report) = client
-            .put_file_with_ttl(&src, NO_EXPIRATION)
-            .await
-            .expect("put_file_with_ttl must succeed via retry");
-        assert_eq!(key.partition_id(), empty_pid, "成功写入的号必须落在空分区");
-        assert_eq!(report.acks, 1);
-    }
-    assert!(
-        client.metrics().router_put_store_full_retries.get() > 0,
-        "至少一次命中已满分区触发换分区重试"
-    );
 }
 
 /// **`put_with_ttl` 全副本 507 → 摘掉该分区号段 + 返回 StoreFull**(key 已绑定分区,不重试)。

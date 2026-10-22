@@ -68,8 +68,8 @@ put(key, bytes): 解析 key 的高 32 位得 partitionId
   副本数取**放置全量**(不是"活着的副本数"):RF=3 掉一个节点仍写得进,掉两个就写不进(正确 —— 少数派不接受写)。
 - **提前返回 = 取消剩余请求**:第 3 份靠异步拉复制收敛(`cluster.md §10`),这是 W 语义的应有之义,也是延迟的来源。
 - **失败即报错,不偷偷换 partition 重写**:换分区重写会掩盖问题且可能与已部分写入的副本产生分叉;重试由调用方决定。
-- 变更类(`delete`)同样走多数派扇出。**TTL 只能在写入时给**:`put_with_ttl(key, data, expiration_ms)` / `put_file_with_ttl(path, expiration_ms)` 把绝对过期时刻(`expiration_ms`)随写一并扇出(单次多数派写);`put` / `put_file` 是 `NO_EXPIRATION`(常量由 `antfs_router` 再导出)的包装,等价于"永不过期"。写入之后**没有任何改 TTL 的接口**。
-- **`put_auto` / `put_auto_with_ttl`(内部发号 + 507 换分区重试)**:适用于上层**不关心落在哪个分区**的场景(frontend 小 body 上传、S3 网关)。内部 `allocate_one` → 多数派写 → 全副本 507 时摘掉该分区、重新发号到另一个分区重试(最多 `MAX_STORE_FULL_RETRIES=2` 次,共 3 次尝试),语义与 `put_file_with_ttl` 的重试逻辑完全一致,返回 `(StoreKey, PutReport)`。`put_with_ttl(key, data)` 的 key 由调用方预分配,因此无法换分区——只摘掉号段并返回 `StoreFull`。
+- 变更类(`delete`)同样走多数派扇出。**TTL 只能在写入时给**:`put_with_ttl(key, data, expiration_ms)` 把绝对过期时刻(`expiration_ms`)随写一并扇出(单次多数派写);`put` 是 `NO_EXPIRATION`(常量由 `antfs_router` 再导出)的包装,等价于"永不过期"。写入之后**没有任何改 TTL 的接口**。
+- **`put_auto` / `put_auto_with_ttl`(内部发号 + 507 换分区重试)**:适用于上层**不关心落在哪个分区**的场景(frontend 小 body 上传、S3 网关)。内部 `allocate_one` → 多数派写 → 全副本 507 时摘掉该分区、重新发号到另一个分区重试(最多 `MAX_STORE_FULL_RETRIES=2` 次,共 3 次尝试),返回 `(StoreKey, PutReport)`。(`put_file` 家族 2026-10-22 整体移除:全仓零内部调用方,大文件直传统一收敛到 `put`/`put_auto` 的恒切管线上。)`put_with_ttl(key, data)` 的 key 由调用方预分配,因此无法换分区——只摘掉号段并返回 `StoreFull`。
 恒切管线(2026-10-21 下沉,`upload-zero-spool` design §12):`put_with_ttl` /
 `put_auto_with_ttl` 收到超过 `put_bytes_chunk_bytes` 的 body 时内部切片 —— 每片 =
 一次**普通 blob 多数派写**(经 `put_auto_keyed` 内环:发号 + 507 换分区重试;SWRR 自然
@@ -113,7 +113,7 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
 | `not_found` | 所有副本都 404「对象不存在」 | 真不存在(或已删/过期) |
 | `config` / `metric` | `RouterConfig` 加载/校验失败、指标注册失败 | 启动即败类,不是运行期路由问题 |
 | `http_client` | 构建数据面 HTTP 客户端失败 | 初始化问题(如 TLS/超时配置非法) |
-| `io` | `put_file` 本地文件 IO 失败 | 本地盘问题;请求报错,重试另选文件 |
+| `io` | reqwest 传输层 IO 错误 | 网络拓扑问题;错误带 addr,读侧自动换副本 |
 | `too_large` | 恒切管线容量拒绝(body > `put_bytes_chunk_bytes × MAX_CHUNKS`,一字节未写) | 调用方缩小重试或走流式口(2026-10-21 恒切下沉) |
 | `bad_composed` | 拼装对象读回时描述符/片不一致(上游损坏类) | 响亮上抛不静默(CLAUDE.md §3.3);网关映射 502 类口径 |
 | `quorum` | 未收满 W 个 ack | detail 里给出逐类失败计数 |
@@ -142,7 +142,7 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
 > (早期版本用"`0` 表示自动",导致第 0 号分区无法被点名,已改。)
 
 > **没有 W/R 配置项**(见 §2)、**没有重试次数配置项**(失败即返回,重试由调用方决定)。
- > 唯一例外:`put_file_with_ttl` 与 `put_auto_with_ttl` 在**全部副本都报 507(分区写满)**时内部换分区重试(写死最多 2 次,
+ > 唯一例外:`put_auto_with_ttl` 与恒切片(`put_auto_with_ttl` 内部)在**全部副本都报 507(分区写满)**时内部换分区重试(写死最多 2 次,
 > 见 §6 `router_put_store_full_retries_total`);`put_with_ttl` 的 key 已绑定分区,只摘掉该分区号段并返回
 > `StoreFull`,不重试。
 >
@@ -187,8 +187,8 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
   失败 = 已入库片尽力墓碑 + 原错误透传;超容量 = `too_large` 前置拒绝。网关内嵌本表须交叉校验
   "网关片/单体宽 ≤ `put_bytes_chunk_bytes`"(防二次切;frontend/s3 `validate_all`)。
   **恒切禁 0**(2026-10-22 裁决"恒切必须开"):router 自身 `validate` 拒 0,网关侧交叉校验
-  同步收严(0 天然小于任何正片宽,一并拒)——`put_file` 路径(未挂恒切)与拉复制整段仍是
-  单笔大 body 的合法来源,SDK Bytes 路径的兜底防线不设关闭态。
+  同步收严(0 天然小于任何正片宽,一并拒);同日 `put_file` 家族整体移除(零内部调用),
+  唯一"单笔任意大"的合法来源只剩拉复制整段,SDK Bytes 路径的兜底防线不设关闭态。
 - 读:`get/get_object_stream/get_object_range_stream/stat_object` 以**逻辑对象**为口径(拼装自动拼回、
   窗口只取覆盖片);裸字节只剩 `get_blob` 受控口。`get_file`(落盘式读)已删(⑭)。
 - 与 Ambry `NonBlockingRouter` 同型(恒切 + composite 重组),差异 = 描述符为普通 blob 落库
@@ -239,11 +239,11 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
       过期读前 Lookup 重拉(失败保旧表,读可用性优先);R=1 全副本失败且含不可达类 → 驱逐
       该分区条目 + 重拉一次,新列表不同则本次读重试一次(单请求有界);纯 NotFound miss 不
       驱逐。观测 `router_topology_refreshes_total{reason=ttl|evict}`)。
-- [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl` / `put_file_with_ttl`**(写入时定 TTL,frontend 的 `x-antfs-ttl-ms` 已是单次原子写)。
+- [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl`**(写入时定 TTL,frontend 的 `x-antfs-ttl-ms` 已是单次原子写)。
 - [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
 - [x] ~~上传/下载路径零本地临时盘(读写两侧)~~ —— **读侧已全清**(2026-10-21:网关下载走
       router 逻辑流(`get_object_stream`,裁决⑫);SDK 落盘式读口 `get_file` 已删(裁决⑭);
-      `put_file` 的压缩帧临时文件随压缩整体移除(裁决⑬)一并消失,`put_file` 直接流式发
+      `put_file` 家族已整体移除(2026-10-22 裁决,零内部调用方);其压缩帧临时文件更早随压缩移除(⑬)一并消失
       副本文件)。**写侧网关面已零盘**(`upload-zero-spool` ④ 恒切+收账,前期落地);剩余 =
       B 段(router 压缩重开后的超上界两遍流式 —— **待压缩接口定型**,见 §7 移除记档)与
       A 段(store 暂存 `<data_dir>/tmp/` 的引擎侧去留,原方案归档

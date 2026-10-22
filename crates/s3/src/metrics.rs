@@ -20,6 +20,9 @@ pub struct S3Metrics {
     pub chunked_requests_total: antfs_metric::IntCounter,
     pub chunked_rejected_total: IntCounterVec,
     pub meta_cache_lookups_total: IntCounterVec,
+    /// 大对象 PutObject 流式内部 multipart(2026-10-22):对象粒度与片粒度各一。
+    pub put_objects_streamed_total: antfs_metric::IntCounter,
+    pub put_object_streamed_parts_total: antfs_metric::IntCounter,
 }
 
 impl S3Metrics {
@@ -112,6 +115,16 @@ impl S3Metrics {
                 "s3_meta_cache_lookups_total",
                 "Per-request credential/bucket metastore lookups served by the s3-meta-cache layer",
                 &["kind", "result"],
+            )?,
+            put_objects_streamed_total: counter(
+                registry,
+                "s3_put_objects_streamed_total",
+                "PutObjects larger than max_body_bytes streamed through the internal multipart machinery",
+            )?,
+            put_object_streamed_parts_total: counter(
+                registry,
+                "s3_put_object_streamed_parts_total",
+                "Internal parts written for streamed PutObjects",
             )?,
         })
     }

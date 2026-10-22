@@ -488,6 +488,45 @@ impl S3Fixture {
         }
     }
 
+    /// 本 fixture 桶内 multipart 片行残留(session 行删除后片行应随 abort 清空)。
+    /// 方言中性,口径同 `shadowed_rows_in_bucket`(共享测试库,限本桶域)。
+    pub async fn parts_rows_in_bucket(&self, bucket: &str) -> i64 {
+        match self.driver.as_str() {
+            "mysql" => {
+                let pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&self.metastore_url)
+                    .await
+                    .expect("direct mysql connect");
+                let r: (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM multipart_parts p JOIN multipart_uploads s \
+                     ON p.upload_id = s.upload_id WHERE s.bucket = ?",
+                )
+                .bind(bucket)
+                .fetch_one(&pool)
+                .await
+                .expect("count query");
+                r.0
+            }
+            _ => {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&self.metastore_url)
+                    .await
+                    .expect("direct pg connect");
+                let r: (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM multipart_parts p JOIN multipart_uploads s \
+                     ON p.upload_id = s.upload_id WHERE s.bucket = $1",
+                )
+                .bind(bucket)
+                .fetch_one(&pool)
+                .await
+                .expect("count query");
+                r.0
+            }
+        }
+    }
+
     pub async fn start() -> S3Fixture {
         Self::start_with_sse(true).await
     }

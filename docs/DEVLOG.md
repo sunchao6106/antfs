@@ -2541,3 +2541,37 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
 
 - antfs-router 22 lib + 18 e2e 全绿(重写测试过);frontend/s3 配置测试绿(见 workspace);
 - `openspec validate upload-zero-spool` 过;待:fmt/clippy/workspace 全套 + CI 双绿。
+
+### 步 99:S3 单笔直传流式化(裁决 #13)+ put_file 家族移除(裁决 #14)
+
+**触发(所有者三连批)**:①" S3 直传即使几个 G 也该固定 buffer 边收边调 router"—— 要做;
+② `put_file` 全仓零内部调用 → 删;③ "暂存区是不是就不需要做了"(问答见报呈,引出 A 段重定位)。
+
+**改动 1:S3 PutObject 大对象流式内部 multipart**
+- 形态:申报 > `max_body_bytes`(≤ 总上限)不再 413。固定片宽(= max_body)整流,
+  每满一片 `put_auto_with_ttl` + session 片行;收完走 `finish_multipart` 干道——
+  显式 multipart 的 complete 逻辑后段整体抽出为共享函数(XML 路径与流式路径同源)。
+- 校验:头 + trailer 声明合并后以**合成头**交给 complete 级 FULL_OBJECT 裁决
+  (按 manifest 流式复验,内存 = 1 片);bad digest → abort 墓碑全部片 + 400。
+- 语义代价两笔回如实记档(s3.md/proposal):先写后验(小对象"先验后写"不变);
+  大对象 ETag = multipart 合成口径(与 AWS 单传 md5 惯例的已知偏差,N=1 时同形)。
+- 指标 +2:`s3_put_objects_streamed_total` / `s3_put_object_streamed_parts_total`。
+- 活库 e2e 新 binary `streamed_put`(4 测:9MiB 往返/ck 正确/ck 坏清场零残留/SSE 501)。
+
+**改动 2:router `put_file` 家族移除**
+- lib.rs 删 `put_file`/`put_file_with_ttl`/`put_file_to`(约 175 行)+ `Path` import;
+  归属 e2e 两测(往返/507 重试)随族移除(507 重试的 put_auto 版全存);
+  frontend 死注释改现口径;router.md/frontend.md/s3.md 涉及处全清。
+- 动机:零内部调用方;大文件直传统一收敛到恒切族,"单笔任意大"合法来源只剩
+  拉复制整段(engine 内部)。
+
+## Testing Done
+
+- 活库(本机 PG `antfs_s3`):streamed_put 4/4 绿(字节恒等/ETag 复合/ck 头回显/
+  **坏 ck 清场 session 片行零残留**/SSE 501 对象不存在);limits 2/2 复跑绿。
+- workspace(非 ignore 全套):router 22+16(put_file 两测随族移除)→ **79 套 817/0**;
+  clippy 0;fmt 净;openspec validate 过。
+- **既有缺陷记档(非本批引入)**:pg 活库单测在全 ignored **并行**模式 5/5 复现
+  `reclaim_wal_transactional_recording` 红(HEAD 对照同样红;串行 `--test-threads=1` 42/0 绿;
+  定位:并行同库 + 固定 StoreKey 跨测试相撞,`delete_objects_batch` /
+  `put_part_concurrent_retransmit_exactly_once` 旁删 WAL 行)。未擅修,留案。

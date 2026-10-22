@@ -95,6 +95,32 @@ pub async fn put_object(
             return Err(S3Error::EntityTooLarge);
         }
     }
+    // 大对象分流(2026-10-22,裁决 #13):申报尺寸超 `s3.max_body_bytes` 但在共享
+    // 单文件上限内的直传,不再 413,转网关固定片整流的内部 multipart 通路
+    // (内存 = 1 片);上限对账收口到 `max_object_bytes`;SSE 与显式 multipart 同拒。
+    {
+        let declared_total = req
+            .headers()
+            .get("x-amz-decoded-content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .or_else(|| {
+                req.headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            });
+        if declared_total.is_some_and(|d| d > st.config.max_body_bytes) {
+            return crate::handlers::multipart::streamed_put_object(
+                st,
+                bucket,
+                key,
+                req,
+                declared_total,
+            )
+            .await;
+        }
+    }
     let body_bytes = crate::handlers::read_bounded_body(&st, req).await?;
 
     // checksum 收集/验证:分帧 trailer 在 body EOF 后才齐;sink 为空(非分帧请求)

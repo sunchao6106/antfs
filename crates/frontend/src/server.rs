@@ -61,8 +61,9 @@ const HEADER_BLOB_STITCHED: HeaderName = HeaderName::from_static("x-antfs-blob-s
 /// `x-antfs-blob-stitch-chunks`:拼装的片数(`HEAD` 专用,仅拼装对象有)。
 const HEADER_BLOB_STITCH_CHUNKS: HeaderName = HeaderName::from_static("x-antfs-blob-stitch-chunks");
 
-/// **直接进内存**的 body 上界:≤ 该值走内存路径(`Bytes` → `Router::put`),> 该值(或未声明长度)
-/// 才落盘暂存 + [`Router::put_file`] 流式写。
+/// **直接进内存**的 body 上界:≤ 该值走内存路径(`Bytes` → `Router::put`);> 该值(或未声明长度)
+/// 走 [`stream_upload`] 恒切流式(内存决定窗 + 攒满即发片,零本地文件;`Router::put_file`
+/// 家族已移除,大 body 一律经恒切收敛为 ≤ 片宽的单笔 Bytes 写)。
 ///
 /// 为什么小对象不走暂存:暂存要 `create/write/close/unlink` 一个文件,每个上传多 ~5 次文件系统元数据操作;
 /// 小对象是绝对主流,大并发下这套开销把 PUT p50 从 ~1ms 拖到 ~9ms(devcluster + bench 实测,release)。

@@ -44,7 +44,6 @@ pub use error::{Error, Result};
 pub use metrics::RouterMetrics;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -62,7 +61,8 @@ use antfs_master::PartitionId;
 
 const PROTO_VERSION: u32 = 1;
 
-/// `put_file_with_ttl` 因分区写满(全副本 507)而**换分区重试**的最大次数。
+/// `put`/`put_auto` 写族因分区写满(全副本 507)而**换分区重试**的最大次数
+/// (`put_file` 家族已随 2026-10-22 裁决整体移除:零内部调用方,大文件直传统一走恒切)。
 ///
 /// 不做成配置项:重试是"分区满 → 换一个分区"的确定性补救,不是退避策略;次数写死 2 次
 /// (共 3 次尝试)足够覆盖"恰好撞上一个刚写满的分区",又不会在集群整体写满时反复空转。
@@ -847,89 +847,6 @@ impl Router {
         unreachable!("loop always returns")
     }
 
-    /// 上传本地文件:分配 blobId → 并行 PUT 全部副本,**每个副本各自从文件流式读**
-    /// (`reqwest::Body::from(File)` 自带 `Content-Length`),内存不随文件大小涨。
-    pub async fn put_file(&self, path: impl AsRef<Path>) -> Result<(StoreKey, PutReport)> {
-        self.put_file_with_ttl(path, NO_EXPIRATION).await
-    }
-
-    /// [`put_file`](Self::put_file) + 写入时定 TTL,语义同 [`put_with_ttl`](Self::put_with_ttl)。
-    pub async fn put_file_with_ttl(
-        &self,
-        path: impl AsRef<Path>,
-        expiration_ms: i64,
-    ) -> Result<(StoreKey, PutReport)> {
-        let path = path.as_ref().to_path_buf();
-        let len = tokio::fs::metadata(&path).await?.len();
-        let upload = path.clone();
-        let mut key = self.allocate_one().await?;
-        let mut first_err: Option<Error> = None;
-        for attempt in 0..=MAX_STORE_FULL_RETRIES {
-            let pid = key.partition_id();
-            let replicas = self.replicas_for(pid).await?;
-            let total = replicas.len();
-            let started = Instant::now();
-            let futs = FuturesUnordered::new();
-            for r in &replicas {
-                let addr = r.addr.clone();
-                let path = upload.clone();
-                futs.push(async move {
-                    let res = self
-                        .put_file_to(pid, &key, &path, expiration_ms, &addr)
-                        .await;
-                    (addr, res)
-                });
-            }
-            let f = collect_majority(futs, total).await;
-            let outcome = if f.reached() { "ok" } else { "quorum" };
-            self.metrics.put_total.with_label_values(&[outcome]).inc();
-            self.metrics
-                .put_seconds
-                .with_label_values(&[outcome])
-                .observe(started.elapsed().as_secs_f64());
-            for (_, e) in &f.failures {
-                self.metrics
-                    .put_replica_errors
-                    .with_label_values(&[e.kind()])
-                    .inc();
-            }
-            if f.reached() {
-                self.metrics.put_bytes.inc_by(len);
-                return Ok((
-                    key,
-                    PutReport {
-                        acks: f.ok.len(),
-                        total: f.total,
-                        required: f.required,
-                    },
-                ));
-            }
-            if first_err.is_none() {
-                first_err = Some(Error::Quorum {
-                    acks: f.ok.len(),
-                    required: f.required,
-                    total: f.total,
-                    detail: f.detail(),
-                });
-            }
-            // 全部(除 ok 外)副本都 409 = key 冲突:确定性失败直接透传,且**不换号重试** ——
-            // auto 发的新号撞旧号意味着号被复用(严重问题,见 `Error::AlreadyExists` 注释)。
-            if let Some(addr) = all_already_exists(&f) {
-                return Err(Error::AlreadyExists { addr });
-            }
-            // 全部副本都 507 = 分区写满:摘掉该分区、换一个分区重试(最多 MAX_STORE_FULL_RETRIES 次)。
-            if all_store_full(&f).is_some() && attempt < MAX_STORE_FULL_RETRIES {
-                self.metrics.router_put_store_full_retries.inc();
-                self.evict_partition(pid).await;
-                key = self.allocate_one().await?;
-                continue;
-            }
-            // 重试耗尽(或非全 507):返回第一次尝试的原始错误。
-            return Err(first_err.expect("first_err is set on the first failing attempt"));
-        }
-        unreachable!("loop always returns")
-    }
-
     async fn put_body(
         &self,
         pid: PartitionId,
@@ -954,28 +871,6 @@ impl Router {
                 }
             })?;
         self.note_latency(addr, t0.elapsed());
-        classify_put(addr, pid, resp).await
-    }
-
-    async fn put_file_to(
-        &self,
-        pid: PartitionId,
-        key: &StoreKey,
-        path: &Path,
-        expiration_ms: i64,
-        addr: &str,
-    ) -> Result<()> {
-        let file = tokio::fs::File::open(path).await?;
-        let resp = self
-            .http
-            .put(put_url(addr, pid, key, expiration_ms, false))
-            .body(reqwest::Body::from(file))
-            .send()
-            .await
-            .map_err(|source| Error::Http {
-                addr: addr.to_string(),
-                source,
-            })?;
         classify_put(addr, pid, resp).await
     }
 
