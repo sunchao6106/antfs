@@ -24,7 +24,7 @@
       s3 106/0(+limits.rs 双闸 2 用例)、openspec 24 维度;文档:前端/通用/S3 三 md 双表续。
 - [x] 3d. router 下沉(⑧)已实施(2026-10-21):恒切管线 + 逻辑读口(get /
       get_object_stream / get_object_range_stream / stat_object)+ 裸口 get_blob +
-      失败墓碑 + 交叉校验(frontend/s3validate_all 防二次切)+ compression 整体移除(⑬,
+      失败墓碑 + 交叉校验(frontend/s3 `validate_all` 防二次切)+ compression 整体移除(⑬,
       重开=TODO)+ 读侧零盘(⑫)+ 读口纯 stream(⑭);e2e:恒切往返/散布/窗口/409 回收/关 0;
       REST Range 206/416。见 design §12 落地记录与 proposal 裁决 8-11。
 - [ ] 4. A:`blob` Log lane 机制(`reserve_large`/commit/abort 回卷/seal 阈值)+ write_lock 拆短临界区

@@ -2512,3 +2512,6 @@ S3 Range 接口适配 router 窗口读、一切调整落最新设计文档。
   REST Range 矩阵(206 尾窗/416/HEAD 206/多区间忽略)+ 既有 413/WAL/断流全绿;
   S3 107/0(42 ignored 仍需库例);store 147/0(scrub 修复后);
 - `openspec validate` 双 change 过;fmt 净;clippy 0。
+- **复盘补记(事后 review 抓到)**:①大对象 GET 首片预检的失败分类从旧 502(上游损坏)
+  漂移为 503(传输类可重试)—— 503 语义更准(片不可读属暂时态),记档不改;
+  ②frontend.md §4 两条读描述 bullet 未随批更新(脚本语法错整段未落盘),随即补正。

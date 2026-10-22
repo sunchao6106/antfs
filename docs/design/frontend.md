@@ -87,14 +87,16 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
      描述符上限 1 MiB(超 → 400);片列表**当 blob 存**是刻意的:中心存一份"片→对象"映射就等于引入
      **每对象元数据**,与 D3 冲突。
    - 因此 `POST /stitch` 是**幂等性无关**的普通写:201 + `Location: /blobs/{stitchedId}`。
-3. **读 stitched blob**:先 `stat`;**位是唯一类型判定**(`composed` 置位 ⇔ 描述符):置位行整体读回
-   解析拼装(超上限/结构坏 = 上游损坏响亮 502,信任位不降级),逐片 `get` 并**流式拼接**进响应
-   (内存 O(单片));无位行 = 普通对象原字节返回,任何前缀都不触发内容探测
-   (避免把大对象整个缓进内存,CLAUDE.md §5.3);
-   片缺失/描述符损坏 → **502**(上游数据不一致,不是客户端的问题)。
-4. **`HEAD` 与 `GET` 对齐**:置位行做一次小对象读回换算**逻辑大小**(各片之和)+
-   `x-antfs-blob-stitched: true` / `x-antfs-blob-stitch-chunks: N`;无位行不读数据体,报自身
-   `stat` 大小、不带这两个头。代价可控:描述符按构造 ≤ 1 MiB(`DESCRIPTOR_MAX_BYTES`)。
+3. **读 stitched blob**(2026-10-21 读侧下沉后):**网关不再识描述符** —— 走 router 逻辑口
+   (`stat_object` 逻辑大小 / `get_object_stream` 流式拼装 / `get_object_range_stream` 窗口裁片)。
+   类型判定(`composed` 位)、描述符解析、覆盖片映射与片完整性核对全在 router(裁决⑩);
+   网关只把 router 的错误按 §错误映射表翻译(描述符/片损坏 = `bad_composed` → **502**;
+   预检遇到暂时性传输失败 = **503** 可重试 —— 与旧"一律 502"相比,此漂移记录在案:
+   片不可读属暂时态,503 语义更准)。
+4. **`HEAD` 与 `GET` 对齐(经 `stat_object`)**:置位行逻辑大小 = 各片之和、片数头两只
+   (`x-antfs-blob-stitched: true` / `x-antfs-blob-stitch-chunks: N`;router 内对描述符做
+   ≤1 MiB 有界读,尽力口径 —— 已删/过期退描述符自身 stat);无位行不读数据体、不带两头;
+   带 `Range` 时 HEAD 回 **206** 无 body(blob-range-read D3,Ambry 口径)。
 4. **`DELETE` 只删描述符本身,不递归删片**:一次删 N 个对象是危险动作(且片可能被多个 stitched blob 共享);
     孤儿片靠 `x-antfs-ttl-ms` + store 本地 worker 回收。自动分片(§5)产生的对象**删描述符后同样留下孤儿片**
     —— 服务端知悉但故意不递归(无法从描述符区分"片是否被共享"是原因之一;描述符现已带 composed 类型位(`blob-composed-flag`),
