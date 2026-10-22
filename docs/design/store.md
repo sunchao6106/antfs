@@ -625,7 +625,7 @@ struct Inner { log: Arc<Log>, index: Arc<PersistentIndex> }
 
 | key(TOML 路径) | 类型 | 默认 | 范围/校验 | 含义/影响 | 对齐 Ambry |
 |---|---|---|---|---|---|
-| `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限,**两条路径都按它校验**:① 非流式抽取器(以及 PUT 的 chunked 回落路径)经 `DefaultBodyLimit`/`to_bytes` 上限;**② 流式 PUT(带 `Content-Length`)在收 body 前先比 `Content-Length`,超限直接 413(不读 body)**。**默认与 axum `DefaultBodyLimit` 默认值一致**(§5.1 不擅自改默认),要收真正的大 blob 必须显式调大 | — |
+| `store_server.max_body_bytes` | u64 | 2097152(2 MiB) | ≥1 | 数据面单请求 body 上限,**两条路径都按它校验**:① 非流式抽取器(以及 PUT 的 chunked 回落路径)经 `DefaultBodyLimit`/`to_bytes` 上限;**② 流式 PUT(带 `Content-Length`)在收 body 前先比 `Content-Length`,超限直接 413(不读 body)**。**默认与 axum `DefaultBodyLimit` 默认值一致**(§5.1 不擅自改默认),要收真正的大 blob 必须显式调大 | — — **对齐红线(2026-10-22)**:必须 ≥ 网关恒切片宽与 router 恒切片宽,否则每片 413;分体 TOML 无静态交叉校验,错配在运行期由 router `body_too_large` 错误家族显式报(见 router.md 错误表),devcluster 一体配置另有启动期断言 |
 | `store_server.request_control_default_ttl_secs` | u64 | 1800 | ≥0(0 = 不设默认时长) | `/admin/request-control` 未指定 `ttl_secs` 时的默认禁用时长(秒);**0 = 永久禁用**(须显式开回) | 偏离 Ambry(其 RequestControl 无 TTL),见 12.3 |
 | `store_server.scrub_max_batch_bytes` | u64 | 67108864(64 MiB) | ≥1 | `verify`(手动端点与后台巡检共用)单次扫描的**读取字节上限**;到点返回部分结果 + `truncated` + `end_cursor` | — |
 | `store_server.scrub_background_enabled` | bool | **false** | — | 后台一致性巡检(bit-rot 蜗牛爬)总开关;关 = 与本批之前**逐字节等价**(零后台 IO)。开启后每 tick 对一个候选副本做容错深扫,只报警不修复(§12.13) | — |

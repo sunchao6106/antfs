@@ -216,6 +216,8 @@ impl From<antfs_router::Error> for S3Error {
             antfs_router::Error::StoreFull { .. } => {
                 Self::InternalError("storage capacity exhausted".into())
             }
+            // store 单笔上限拒收直译 413(上游片宽与 store 上限错配的显式信号)。
+            antfs_router::Error::BodyTooLarge { .. } => Self::EntityTooLarge,
             _ => Self::InternalError(e.to_string()),
         }
     }

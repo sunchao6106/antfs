@@ -108,3 +108,8 @@
 14. **`put_file` 家族移除(同日,"没实际调用就删掉")**:router SDK 文件直传口整体退役
     (全仓零内部调用方;507 重试与流式语义由 `put`/`put_auto` 恒切族全覆盖)。
     单笔任意大 body 的合法来源自此只剩拉复制整段(engine 内部,不经写接口)。
+15. **store 单笔上限错配显式化(同日)**:分体 TOML(store 的 `max_body_bytes` 与网关/router
+    片宽)之间无静态交叉校验 —— 运行期把 store 413 升为独立错误家族 `body_too_large`
+    (router 聚合 detail/指标可辨;frontend 413、S3 EntityTooLarge 直译),devcluster 一体
+    装配加启动期断言;对齐红线以配置行注固化于 store.md/frontend.md。同批修复 pg/mysql
+    活库单测的并行隔离缺陷(`wal_wipe` 全表清 → 按自家行 `resolve`;3× 全绿复验)。

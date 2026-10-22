@@ -1620,6 +1620,9 @@ async fn classify_err_status(addr: &str, pid: PartitionId, resp: reqwest::Respon
         507 => Error::StoreFull {
             addr: addr.to_string(),
         },
+        413 => Error::BodyTooLarge {
+            addr: addr.to_string(),
+        },
         503 => Error::Silenced {
             addr: addr.to_string(),
             retry_after_secs: retry,

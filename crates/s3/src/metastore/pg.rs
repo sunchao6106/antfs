@@ -1107,13 +1107,6 @@ mod tests {
         Some(pool)
     }
 
-    async fn wal_wipe(pool: &PgPool) {
-        sqlx::query("DELETE FROM pending_reclaims")
-            .execute(pool)
-            .await
-            .expect("wal wipe");
-    }
-
     #[tokio::test]
     #[ignore]
     async fn put_get_roundtrip() {
@@ -1206,7 +1199,10 @@ mod tests {
         assert_eq!(got.size, 2);
         assert_eq!(got.etag, "e2");
 
-        wal_wipe(&pool).await;
+        // 只清自家行:并行同库测试不得全表清 WAL(2026-10-22 隔离修复,DEVLOG 100)。
+        let _ = store
+            .resolve_pending_reclaims(&[StoreKey::from_parts(1, 1), StoreKey::from_parts(1, 2)])
+            .await;
     }
 
     #[tokio::test]
@@ -1237,7 +1233,9 @@ mod tests {
         let got = store.get_object(&bucket, &key).await.unwrap();
         assert!(got.is_none());
 
-        wal_wipe(&pool).await;
+        let _ = store
+            .resolve_pending_reclaims(&[StoreKey::from_parts(1, 10)])
+            .await;
     }
 
     #[tokio::test]
@@ -1289,7 +1287,13 @@ mod tests {
             assert!(got.is_none());
         }
 
-        wal_wipe(&pool).await;
+        let _ = store
+            .resolve_pending_reclaims(
+                &(0..3u32)
+                    .map(|i| StoreKey::from_parts(1, i))
+                    .collect::<Vec<_>>(),
+            )
+            .await;
     }
 
     #[tokio::test]
@@ -1742,7 +1746,13 @@ mod tests {
         expected.sort();
         assert_eq!(owned, expected, "每个 blob 的回收所有权必须恰一次");
 
-        wal_wipe(&pool).await;
+        let _ = store
+            .resolve_pending_reclaims(
+                &(1..=8u32)
+                    .map(|i| StoreKey::from_parts(9, i))
+                    .collect::<Vec<_>>(),
+            )
+            .await;
     }
 
     #[tokio::test]
@@ -1799,7 +1809,9 @@ mod tests {
             .await
             .is_err());
 
-        wal_wipe(&pool).await;
+        let _ = store
+            .resolve_pending_reclaims(&[StoreKey::from_parts(4, 1), StoreKey::from_parts(4, 2)])
+            .await;
     }
 
     #[tokio::test]
@@ -1853,7 +1865,9 @@ mod tests {
             .await
             .is_err());
 
-        wal_wipe(&pool).await;
+        let _ = store
+            .resolve_pending_reclaims(&[StoreKey::from_parts(5, 7)])
+            .await;
     }
 
     #[tokio::test]
@@ -1882,7 +1896,9 @@ mod tests {
         let list_res = store.list_parts(&upload_id, ListPartsOpts::default()).await;
         assert!(list_res.is_err());
 
-        wal_wipe(&pool).await;
+        let _ = store
+            .resolve_pending_reclaims(&[StoreKey::from_parts(1, 5)])
+            .await;
     }
 
     #[tokio::test]
@@ -1927,7 +1943,9 @@ mod tests {
             .unwrap();
         assert_eq!(res.blob_id, StoreKey::from_parts(1, 2));
 
-        wal_wipe(&pool).await;
+        let _ = store
+            .resolve_pending_reclaims(&[StoreKey::from_parts(1, 1), StoreKey::from_parts(1, 2)])
+            .await;
     }
 
     #[tokio::test]

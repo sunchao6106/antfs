@@ -94,3 +94,17 @@ complete 级 FULL_OBJECT 校验按 manifest 流式复验、配额、遮蔽丢弃
 #### Scenario: 坏校验声明清场
 - **WHEN** 整对象 checksum 声明值失配
 - **THEN** 400 BadDigest;GET 该对象 404;session 片行零残留(abort 已墓碑全部内部片)
+
+## ADDED Requirements(2026-10-22 追补 II)
+
+### Requirement: store 单笔上限错配的运行期显式化
+
+对分体部署 TOML 之间无法静态交叉校验的"网关/router 恒切片宽 ≤ store `max_body_bytes`"
+红线,router SHALL 在运行期把 store 413 拒收升为独立错误家族 `body_too_large`(区别于
+恒切容量 `too_large`),错误分类、多数派失败聚合 detail 与 `router_put_replica_errors_total`
+标签 SHALL 可辨;frontend SHALL 映射 413、S3 SHALL 映射 EntityTooLarge。devcluster 一体
+配置 SHALL 在装配期断言该红线。
+
+#### Scenario: 片宽错配以专属家族显形
+- **WHEN** store `max_body_bytes` 被配为低于片宽,router 发出单笔写
+- **THEN** 多数派失败聚合 detail 含 `body_too_large×N`;`router_put_replica_errors_total{kind="body_too_large"}` 计数;frontend 回 413、S3 回 EntityTooLarge

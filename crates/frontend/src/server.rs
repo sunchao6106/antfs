@@ -168,7 +168,9 @@ fn router_status(e: &RouterError) -> StatusCode {
         // 所有副本都没有该对象。
         RouterError::NotFound { .. } => StatusCode::NOT_FOUND,
         // 恒切管线容量拒绝(片数超描述符上限):超大对象,413(与公共上限同一 4xx 家族)。
-        RouterError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        RouterError::TooLarge { .. } | RouterError::BodyTooLarge { .. } => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
         // 拼装对象上游损坏(描述符/片不一致):响亮 502(与既有 corrupt-descriptor 口径一致)。
         RouterError::BadComposed(_) => StatusCode::BAD_GATEWAY,
         // 分区写满:507 让调用方/压测一眼看出"该加分区了"(与 store 数据面同一约定),不混进 500。

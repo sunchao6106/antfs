@@ -2575,3 +2575,36 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
   `reclaim_wal_transactional_recording` 红(HEAD 对照同样红;串行 `--test-threads=1` 42/0 绿;
   定位:并行同库 + 固定 StoreKey 跨测试相撞,`delete_objects_batch` /
   `put_part_concurrent_retransmit_exactly_once` 旁删 WAL 行)。未擅修,留案。
+
+### 步 100:store 单笔上限错配显式化(#15)+ 活库单测并行隔离修复
+
+**触发(所有者双批)**:①"做下"(交叉校验钉子);②"那个 test 问题也修复掉";全程指令
+"所有方案调整固化设计文档"。
+
+**改动 1:413 运行期语义 + 一体装配红线**
+- router 新错误变体 `BodyTooLarge{addr}`(独立 kind `body_too_large`,与恒切容量
+  `too_large` 分家 —— 运维 动作 vs 调用方缩小重试要一眼可分);`classify_err_status`
+  增 413 臂(原先落 ReplicaStatus 大杂烩)。
+- frontend 直译 413;S3 `From<router::Error>` 增臂直译 EntityTooLarge。
+- devcluster 一体装配启动期断言(store 16 MiB ≥ 网关片宽 & router 片宽)。
+- e2e 新增 `store_body_cap_rejection_maps_to_body_too_large`(16 KiB 上限的 store +
+  64 KiB 单笔 →聚合 detail `body_too_large×1` + 副本错误计数)。
+- 方案固化:router.md 错误表行 / store.md `max_body_bytes` 行注(对齐红线)/
+  frontend.md `auto_chunk_bytes` 行注(红线反向)/ s3.md 流式段补直译句;
+  openspec proposal 裁决 #15 + spec delta 新场景。
+
+**改动 2:pg/mysql 活库单测并行隔离缺陷修复(既有,步 99 记档的案)**
+- 真因:测试助手 `wal_wipe` 对共享库 `pending_reclaims` **全表无差别 DELETE** —— 任何
+  并行邻居过界即清掉别人在途断言的行(单跑恒绿、并行 5/5 红,src stash 复核确证非
+  本仓新引入)。
+- 修法:pg 8 处 + mysql 8 处的 wipe 全部改为**按自家 blob 行 `resolve_pending_reclaims`**
+  (清自家行,等价卫生、零误伤);`wal_wipe` 函数移除;首个替换处留注释指 DEVLOG。
+- 验证:全 ignored **并行 3× 42/0 全绿**(此前 5/5 必红);串行口径不变;mysql 侧
+  逻辑镜像(编辑级核对,无活库条件,报告如实口径)。测试隔离规矩:活库共享库
+  不得出现全表级清库(已随注释/DEVLOG 固化)。
+
+## Testing Done
+
+- antfs-s3(pg 活库,--ignored 并行)×3 全绿;antfs-router 22 lib + 17 e2e 全绿含新
+  413 e2e;devcluster 编译绿断言生效;workspace 全套见 CI;clippy 0;fmt 净;
+  openspec validate 过。

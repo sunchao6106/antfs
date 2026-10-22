@@ -70,6 +70,40 @@ async fn start_store(dir: &std::path::Path, node_id: u64) -> (StoreServer, Strin
     start_store_with(dir, node_id, 64 << 20, 8 << 20).await
 }
 
+/// 起真数据节点但**压缩单笔上限**(`store_server.max_body_bytes` 的 413 面;其余同
+/// [`start_store_with`])—— 错配探测测试专用。
+async fn start_store_with_body_cap(
+    dir: &std::path::Path,
+    node_id: u64,
+    max_body_bytes: u64,
+) -> (StoreServer, String) {
+    let cfg = StoreServerConfig {
+        node_id,
+        data_dirs: vec![dir.to_string_lossy().into_owned().into()],
+        http_addr: "127.0.0.1:0".to_string(),
+        master_addr: String::new(),
+        partition_capacity_bytes: 64 << 20,
+        max_body_bytes,
+        local_worker_enabled: false,
+        ..Default::default()
+    };
+    let registry = antfs_metric::Registry::new();
+    let srv = StoreServer::start_with(
+        cfg,
+        antfs_blob::StoreConfig {
+            segment_size_bytes: 8 << 20,
+            index_max_inmem_elements: 100_000,
+            io_error_count_to_trigger_shutdown: 0,
+            defer_seal_flush: true,
+        },
+        &registry,
+    )
+    .expect("start store");
+    srv.serve().await.expect("serve store");
+    let http_addr = srv.bound_http_addr().expect("bound http");
+    (srv, http_addr)
+}
+
 /// 起一个真数据节点,可指定分区容量与段大小(写满 → 507 的测试用)。
 async fn start_store_with(
     dir: &std::path::Path,
@@ -1076,4 +1110,38 @@ async fn zero_width_is_rejected_and_plain_windows_slice_raw() {
         got.extend_from_slice(&c.expect("plain range 片"));
     }
     assert_eq!(got.as_slice(), &data[100..(100 + 400 * 1024)]);
+}
+
+/// **store 单笔上限 413 的运行期显式化(2026-10-22)**:片宽/单体宽与 store
+/// `max_body_bytes` 错配时,router 的多数派失败聚合必须带 `body_too_large`
+/// 语义(错误分类 + 副本错误计数),不再落进 ReplicaStatus 大杂烩。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_body_cap_rejection_maps_to_body_too_large() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, grpc) = solo_master(&tmp.path().join("master")).await;
+    let (_sa, addr_a) =
+        start_store_with_body_cap(&tmp.path().join("store-a"), 101, 16 * 1024).await;
+    register_node(&node, 101, &addr_a).await;
+    let pid = create_partition(&node, vec![placement(101)]).await;
+    ensure_replica(&addr_a, pid).await;
+
+    let registry = antfs_metric::Registry::new();
+    let client = Router::connect(client_cfg(&grpc), &registry).await.unwrap();
+
+    // 64 KiB 单笔,超 store 16 KiB 上限:RF=1 → 413 全数 → 债务语义在聚合 detail 里。
+    let err = client
+        .put_auto(bytes::Bytes::from(payload(64 * 1024, 7)))
+        .await
+        .expect_err("store cap must reject");
+    let msg = err.to_string();
+    assert!(msg.contains("body_too_large"), "{msg}");
+    assert_eq!(
+        client
+            .metrics()
+            .put_replica_errors
+            .with_label_values(&["body_too_large"])
+            .get(),
+        1,
+        "副本错误按错误家族计数"
+    );
 }

@@ -116,6 +116,7 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
 | `io` | reqwest 传输层 IO 错误 | 网络拓扑问题;错误带 addr,读侧自动换副本 |
 | `too_large` | 恒切管线容量拒绝(body > `put_bytes_chunk_bytes × MAX_CHUNKS`,一字节未写) | 调用方缩小重试或走流式口(2026-10-21 恒切下沉) |
 | `bad_composed` | 拼装对象读回时描述符/片不一致(上游损坏类) | 响亮上抛不静默(CLAUDE.md §3.3);网关映射 502 类口径 |
+| `body_too_large` | store HTTP 面单笔拒收(413:`body` 超该节点 `store_server.max_body_bytes`,错误带节点地址)。**独立于 `too_large` 家族**:上游全链恒切后见到它的第一嫌疑 = 网关/ router 片宽与 store 上限**错配**(分体 TOML 间无静态交叉校验) | router 侧准多数派失败聚合 `detail` 与 `router_put_replica_errors_total{kind="body_too_large"}`;frontend 直译 413、S3 直译 EntityTooLarge(2026-10-22) |
 | `quorum` | 未收满 W 个 ack | detail 里给出逐类失败计数 |
 | `partition_mismatch` | blobId 自带 partition 与目标不一致 | 拼错了 |
 

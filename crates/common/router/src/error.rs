@@ -115,6 +115,13 @@ pub enum Error {
     #[error("blob of {len} bytes exceeds the chunked-put capacity of {max} bytes")]
     TooLarge { len: u64, max: u64 },
 
+    // store HTTP 面拒收(413):body 超过该节点的 `store_server.max_body_bytes`。
+    // 上游全链恒切后,见到它的第一嫌疑 = **片宽与 store 上限错配**;分体 TOML 之间无静态
+    // 交叉校验,故运行期让错误自带语义(而非落进 ReplicaStatus 大杂烩);devcluster 一体
+    // 配置另有启动期断言,分体部署红线见 store.md / frontend.md 配置行注。
+    #[error("store {addr} rejected body (413): exceeds store max_body_bytes — chunk-width vs store cap mismatch?")]
+    BodyTooLarge { addr: String },
+
     /// 拼装对象读回时描述符/片不一致(上游损坏类,不静默忽略 —— CLAUDE.md §3.3)。
     #[error("bad composed blob: {0}")]
     BadComposed(&'static str),
@@ -144,6 +151,9 @@ impl Error {
             Error::PartitionMismatch { .. } => "partition_mismatch",
             Error::Io(_) => "io",
             Error::TooLarge { .. } => "too_large",
+            // 独立家族名:分体 TOML 错配(片宽 vs store cap)是运维动作,与
+            // 恒切容量拒绝(调用方缩小重试)要一眼可分 —— Quorum detail/指标都靠它。
+            Error::BodyTooLarge { .. } => "body_too_large",
             Error::BadComposed(_) => "bad_composed",
         }
     }

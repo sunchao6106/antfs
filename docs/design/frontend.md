@@ -183,7 +183,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 |---|---|---|---|---|---|
 | `frontend.listen_addr` | String | `127.0.0.1:7400` | 非空 | HTTP 监听地址 | `frontend.http.port` 等 |
 | `frontend.max_body_bytes` | u64 | `4194304`(4 MiB) | ≥1 | **内部分档界**(恒切,2026-10-21:不再是 413 契约线):有声明且 ≤ 此值走"内存整收"单 blob;超过转边收边分片。部署须与 `store_server.max_body_bytes` 对齐 | `frontend.max.json.request.size.bytes` 等(语义不同) |
-| `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | **恒切的单片大小**(片 = 普通 blob 粒度,也是单片驻留内存的读写缓冲);**描述符容量 = 4096 片 × 此值**(公共单文件上限在配置层须 ≤ 它) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层;router 下沉开工单 = upload-zero-spool design §12) |
+| `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | **恒切的单片大小**(片 = 普通 blob 粒度,也是单片驻留内存的读写缓冲);**描述符容量 = 4096 片 × 此值**(公共单文件上限在配置层须 ≤ 它) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层;router 下沉开工单 = upload-zero-spool design §12) — **对齐红线(2026-10-22)**:须 ≤ store 各节点 `store_server.max_body_bytes`(分体部署靠人工 + 运行期 `body_too_large` 显式报警;devcluster 一体装配有断言)|
 | `[upload] max_object_bytes`(顶层公共表) | u64 | `17179869184`(16 GiB) | ≥ 1 且 ≤ 4096 × `frontend.auto_chunk_bytes` | **单文件上传上限**:REST 与 S3 网关共用的契约分界线(`common.toml` 或各网关 TOML 顶层,一处改两边生效);有声明超限读 body 前 413,无声明边收边超、已入库片墓碑回收后 413 | 无 |
 | `frontend.upload_session_wal_dir` | String(路径) | `""` | 空 = 不记账;非空 = 目录可建可写(启动校验,失败拒启) | 边收边分片的**孤儿收账簿目录**(Ambry 会话表 + 定期清扫的本地等价物):begin / 逐片 chunk / commit / abort 全程落 JSONL(逐行 fsync,写线程独占);超时孤儿会话(最后记账 6h 无终态)由清扫任务逐片墓碑 + 核销 | 无 |
 | `frontend.cors_allowed_origins` | Vec\<String\> | `[]` | 各项为非空且非 `*` 的合法 header 值(校验期就拒) | CORS 来源白名单(**空 = 不挂 CORS 层**;不接受 `*`) | `frontend.options.allow.methods` 等 |

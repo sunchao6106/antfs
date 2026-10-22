@@ -443,6 +443,16 @@ async fn start_frontend(args: &DevClusterConfig, grpc_addr: &str) -> Option<Stri
         },
         ..Default::default()
     };
+    // 一体式交叉校验(2026-10-22):store 单笔上限必须覆盖网关/ router 的恒切片宽,
+    // 否则每片 413(分体 TOML 间无静态校验,错配在运行期由 router `body_too_large`
+    // 错误家族显式报,见 router.md 错误表;此断言保一体化装配自身不错位)。
+    let store_single_body_cap: u64 = 16 << 20;
+    assert!(
+        store_single_body_cap >= cfg.auto_chunk_bytes
+            && store_single_body_cap
+                >= antfs_router::RouterConfig::default().put_bytes_chunk_bytes,
+        "devcluster: store max_body_bytes ({store_single_body_cap}) must cover gateway- and router-chunk widths"
+    );
     let registry = antfs_metric::Registry::new();
     // 公共单文件上限走默认 16 GiB(REST/S3 同值的 [upload] 表;devcluster 不单设)。
     let state = match antfs_frontend::server::AppState::from_config(
