@@ -1,23 +1,15 @@
-# upload-zero-spool 规约
+# upload-zero-spool 能力规约
 
-> 裁决生效后即验收契约;变体改选须先改本文。
+> 2026-10-26 自变更 `upload-zero-spool` 归档同步而生;裁决链 ①-⑱(含 B 作废/A 冻结/#17/#18
+> 终局)见 `openspec/changes/archive/2026-10-26-upload-zero-spool/`。
 
-## ADDED Requirements
+## Purpose
 
-### Requirement: 客户端上传压缩零临时盘(B 段)
-router SDK 的 `put_file` 系上传承诺用户侧零中转落盘且压缩覆盖**任意体量**:压缩帧尺寸 ≤ 可配上界(`router.compression_frame_mem_max_bytes`,默认 8 MiB,0 = 关闭内存帧)时 SHALL 以内存帧(`Bytes`)完成并以引用克隆供多副本并传与 507 换分区重试共用;累计超上界时 SHALL 转入两遍流式 —— 第一遍全程计数编码取得真实压缩尺寸并据其做比率判定,判定通过后 SHALL 逐副本流式编码上送且 `Content-Length` 恰为第一遍所数尺寸(编码确定性保证逐字节一致,字节数不符 SHALL 被服务端拒收且不落任何记录);比率判定 SHALL 在任意体量均基于实际编码尺寸而非估计;上传全程(任意体量、任意闸 outcome)SHALL NOT 在客户端本地(含 TMPDIR)创建任何文件;超上界 SHALL NOT 回落"不压缩原文直传"(仅比率不过时可回落原文)。
+上传全链路零暂存与公共上限的验收契约:网关恒切边收边分片(墙③)、S3/REST 同值的单文件上限
+双闸、router 层恒切与透明逻辑读、S3 单笔大直传流式内部 multipart、store PUT 两岔零暂存,
+以及分体蓝图无法静态校验时的运行期错配显形。
 
-#### Scenario: 内存上限内的可压文件
-- **WHEN** put_file 上传可压文件且压缩帧尺寸 ≤ 上界
-- **THEN** 三闸判定与 Bytes 口逐语义一致,临时目录文件数增量为零,读回逻辑等长,监控 outcome=kept
-
-#### Scenario: 超上限转两遍流式(压缩不放弃)
-- **WHEN** 可压文件的压缩帧累计写入超过上界
-- **THEN** 转两遍流式:计数判定过闸、逐副本边压边传,读回逻辑等长、临时目录文件数增量为零,监控 outcome=two_pass
-
-#### Scenario: 两遍确定性与 CL 恰等
-- **WHEN** 同一文件两轮完整传输(含 507 换分区重试)
-- **THEN** 两轮实际传输的帧字节完全一致,声明的 Content-Length 恰等于实际字节数;构造偏差时服务端 400 拒收且库中无半记录
+## Requirements
 
 ### Requirement: S3 网关单文件上限双闸(⑥,2026-10-21)
 S3 网关 SHALL 对 `PutObject` 与 multipart upload 执行与 REST 网关**同一值**的公共单文件上限(`[upload] max_object_bytes`,顶层公共表):PutObject 声明的对象大小(aws-chunked 以 `x-amz-decoded-content-length` 为准)超限 SHALL 在读 body 之前回 413 `EntityTooLarge`;S3 multipart upload 的 CompleteMultipartUpload SHALL 按 manifest 所列各片实际尺寸合计对账,超限 SHALL 回 413 且 session 与 parts 行保持不动(客户端可 abort 或缩减后重发);片单件 ≤ `max_body_bytes` 不受影响;S3 网关的 PutObject/UploadPart 仍 SHALL 零本地临时文件。
@@ -30,20 +22,28 @@ S3 网关 SHALL 对 `PutObject` 与 multipart upload 执行与 REST 网关**同�
 - **WHEN** 两片各 640 KiB(单片 ≤ max_body_bytes=4 MiB)合计 1.25 MiB > 上限 1 MiB,发 CompleteMultipartUpload
 - **THEN** 413 EntityTooLarge;session 保留(ListParts 200),Abort 204,对象不存在(GET 404)
 
-### Requirement: 服务端大对象 PUT 零暂存(A 段)
-store 数据面带 Content-Length 且超过内存直进阈值的 PUT SHALL 经 log 预留区直写落盘而不产生任何暂存文件;大对象专区(lane 段)的 commit SHALL 维持段内 `data_end` 前缀推进语义,小对象直行道的时延形态 SHALL 不受同时在途大对象传输影响;上传中途失败(字节数不符、空闲超时、客户端断开)SHALL 使预留回收(无空洞、`data_end` 不动)且该次写对读者与恢复完全不可见;持久化边界与恢复判定 SHALL 保持"flush 是唯一持久化边界、恢复只认上次 flush 的 data_end";磁盘格式 SHALL 零变更。
+### Requirement: 服务端 PUT 两岔零暂存(#17/#18 终局口径,2026-10-22)
 
-#### Scenario: 大对象全程无暂存文件
-- **WHEN** 100 MiB 带 CL PUT 完成并读回
-- **THEN** 201、读回逐字节一致、(各盘与 staging)tmp 目录内容增量为零
+store 数据面 PUT SHALL 只有两岔:带 `Content-Length` 且超过 `store_server.max_body_bytes`
+SHALL 在读 body 前回 413;其余(带 CL ≤ 上限,以及无 CL 的 chunked 回落)SHALL **内存整收**
+后一次写入 —— 带 CL 时以声明值为缓冲上限且收完核验字节恰等(不符 SHALL 400 且零记录),无 CL
+时以收单上限兜底(超限 413)。SHALL NOT 产生任何中转暂存文件(暂存路径连同 `staging_dir`
+整体退役;mount 期清扫仅为升级部署收历史 `tmp/*.tmp` 残渣);每请求内存上界 SHALL =
+`max_body_bytes`(**默认 5 MiB,盖过 router 默认片宽 4 MiB —— 分体裸默认自洽**,原
+"对齐 axum 2 MiB"口径作废),聚合内存 = 在途请求数 × 上限(在途不受限,与旧小对象路径
+同口径;并发闸被否决,极简形态;A 段 lane/预留区机制冻结不作,重启条件见变更档案)。
 
-#### Scenario: 传输中途断开
-- **WHEN** body 少于 CL 或客户端中途断开
-- **THEN** 400、`data_end` 与索引不动、预留逻辑起点回卷、后续 PUT 复用该区间
+#### Scenario: 片宽级单笔直写零文件
+- **WHEN** 带 CL 3 MiB(片宽 4 MiB、盘上限 8 MiB)的 PUT 完成并读回
+- **THEN** 201、读回逐字节一致、`tmp/` 目录从未被创建
 
-#### Scenario: 大对象在途不拖小对象
-- **WHEN** 大对象慢速传输中并发小对象 PUT
-- **THEN** 小对象 201 的 ack 延迟与无大对象在途的对照组一致(确定性对照,禁 sleep)
+#### Scenario: 断连半截不可见
+- **WHEN** 声明 4 MiB、只发 64 KiB 后断开连接
+- **THEN** 对象不可见(404)、盘上无任何中转文件、库中无半条记录
+
+#### Scenario: 超上限 413
+- **WHEN** 带声明长度超过 `store_server.max_body_bytes`
+- **THEN** 收 body 前回 413、引擎零触动(跨层错配的运行期显形见"单笔上限错配"requirement)
 
 ### Requirement: 网关上传恒切零暂存与公共上限(墙③,④+⑤+⑥+⑦ 裁决)
 frontend 网关的 `POST /blobs` 上传 SHALL NOT 在本地(含 TMPDIR)写入任何文件且 SHALL 恒切(auto_chunk_enabled 废弃,2026-10-21):有声明的 body ≤ `max_body_bytes` 时 SHALL 全程有界内存缓冲且仅在字节数与声明核验一致后才写入;超过 `max_body_bytes` 或无声明长度时 SHALL 边接收边按 `auto_chunk_bytes` 分片逐片入库,传输未达 EOF、字节数与声明不符、片数超限或任一片失败时 SHALL 以墓碑清理由此已入库的全部片并回 400;**公共单文件上限 `[upload] max_object_bytes`(REST 与 S3 网关共用的顶层公共表)超过 SHALL 413**(有声明读 body 前拒,无声明边收边超已入库片墓碑回收后 413);成功 SHALL 以拼装描述符原子发布且对象对外语义(大小/GET/HEAD/拼装)与既有形态一致;**启用 `frontend.upload_session_wal_dir` 后 SHALL 全程记账**(start/逐片 chunk/commit/abort)且超时孤儿会话(最后记账 6 小时无终态)SHALL 由清扫任务逐片墓碑并核销;`GET /blobs` 大对象的既有中转属下载面,不在本契约(维持现状另裁)。
@@ -76,8 +76,6 @@ router SDK SHALL 对超过 `router.put_bytes_chunk_bytes`(默认 4 MiB,64 KiB..=
 - **WHEN** frontend TOML 设 `router.put_bytes_chunk_bytes=64 KiB` 而 `auto_chunk_bytes=4 MiB`
 - **THEN** 启动校验拒绝(网关片将被二次切)
 
-## ADDED Requirements(2026-10-22 追补)
-
 ### Requirement: S3 单笔直传流式内部 multipart
 
 S3 网关 SHALL 接受申报尺寸 > `s3.max_body_bytes` 且 ≤ 共享单文件上限(`[upload] max_object_bytes`)
@@ -94,8 +92,6 @@ complete 级 FULL_OBJECT 校验按 manifest 流式复验、配额、遮蔽丢弃
 #### Scenario: 坏校验声明清场
 - **WHEN** 整对象 checksum 声明值失配
 - **THEN** 400 BadDigest;GET 该对象 404;session 片行零残留(abort 已墓碑全部内部片)
-
-## ADDED Requirements(2026-10-22 追补 II)
 
 ### Requirement: store 单笔上限错配的运行期显式化
 
