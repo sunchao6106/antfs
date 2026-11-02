@@ -278,13 +278,16 @@ impl MetaStore for PgMetaStore {
 
         // 前缀 = 纯字面范围扫(B2,针对 seaweedfs#11737 同族问题):`key >= prefix AND
         // key < 上界` 取代 LIKE —— `_`/`%`/`\` 不再有通配语义,且 (bucket, key) 索引直接收窄。
+        // 键序谓词与排序统一钉死 COLLATE "C"(字节序 = S3 键空间标准语义):glibc 非 C
+        // 排序规则下 '/' 权重高于数字,不钉死则上界失真(本地绿、CI 红)。
         let prefix_pattern = req.prefix.as_deref().unwrap_or("");
         let rows: Vec<PgListRow> = if prefix_pattern.is_empty() {
             sqlx::query_as(
-                "SELECT DISTINCT ON (key) key, size, etag, created_at
+                "SELECT DISTINCT ON (key COLLATE \"C\") key, size, etag, created_at
                  FROM named_objects
-                 WHERE bucket = $1 AND key > $2 AND state = 1 AND deleted_at IS NULL
-                 ORDER BY key, version DESC
+                 WHERE bucket = $1 AND (key COLLATE \"C\") > $2
+                   AND state = 1 AND deleted_at IS NULL
+                 ORDER BY key COLLATE \"C\", version DESC
                  LIMIT $3",
             )
             .bind(&req.bucket)
@@ -296,11 +299,12 @@ impl MetaStore for PgMetaStore {
             match super::prefix_upper_bound(prefix_pattern) {
                 Some(upper) => {
                     sqlx::query_as(
-                        "SELECT DISTINCT ON (key) key, size, etag, created_at
+                        "SELECT DISTINCT ON (key COLLATE \"C\") key, size, etag, created_at
                          FROM named_objects
-                         WHERE bucket = $1 AND key > $2 AND key >= $3 AND key < $4
+                         WHERE bucket = $1 AND (key COLLATE \"C\") > $2
+                           AND (key COLLATE \"C\") >= $3 AND (key COLLATE \"C\") < $4
                            AND state = 1 AND deleted_at IS NULL
-                         ORDER BY key, version DESC
+                         ORDER BY key COLLATE \"C\", version DESC
                          LIMIT $5",
                     )
                     .bind(&req.bucket)
@@ -314,11 +318,12 @@ impl MetaStore for PgMetaStore {
                 // 全串顶格的理论前缀:无上界,仅下界(正确性不受影响)。
                 None => {
                     sqlx::query_as(
-                        "SELECT DISTINCT ON (key) key, size, etag, created_at
+                        "SELECT DISTINCT ON (key COLLATE \"C\") key, size, etag, created_at
                          FROM named_objects
-                         WHERE bucket = $1 AND key > $2 AND key >= $3
+                         WHERE bucket = $1 AND (key COLLATE \"C\") > $2
+                           AND (key COLLATE \"C\") >= $3
                            AND state = 1 AND deleted_at IS NULL
-                         ORDER BY key, version DESC
+                         ORDER BY key COLLATE \"C\", version DESC
                          LIMIT $4",
                     )
                     .bind(&req.bucket)
@@ -918,7 +923,7 @@ impl MetaStore for PgMetaStore {
         opts: ListUploadsOpts,
     ) -> Result<ListUploadsResp> {
         let limit = opts.max_uploads.max(1) as i64 + 1;
-        // 同 list_objects:前缀走字面范围扫(prefix_upper_bound 上界)。
+        // 同 list_objects:前缀字面范围扫 + 键序统一 COLLATE "C"(字节序,理由同前)。
         let prefix_pattern = opts.prefix.as_deref().unwrap_or("");
         let key_marker = opts.key_marker.as_deref().unwrap_or("");
         let id_marker = opts.upload_id_marker.as_deref().unwrap_or("");
@@ -926,8 +931,9 @@ impl MetaStore for PgMetaStore {
         let rows: Vec<(String, String, i64)> = if prefix_pattern.is_empty() {
             sqlx::query_as(
                 "SELECT key, upload_id, created_at FROM multipart_uploads
-                 WHERE bucket = $1 AND (key > $2 OR (key = $3 AND upload_id > $4))
-                 ORDER BY key, upload_id LIMIT $5",
+                 WHERE bucket = $1 AND ((key COLLATE \"C\") > $2
+                   OR ((key COLLATE \"C\") = $3 AND upload_id > $4))
+                 ORDER BY key COLLATE \"C\", upload_id LIMIT $5",
             )
             .bind(bucket)
             .bind(key_marker)
@@ -941,9 +947,11 @@ impl MetaStore for PgMetaStore {
                 Some(upper) => {
                     sqlx::query_as(
                         "SELECT key, upload_id, created_at FROM multipart_uploads
-                         WHERE bucket = $1 AND key >= $2 AND key < $3
-                           AND (key > $4 OR (key = $5 AND upload_id > $6))
-                         ORDER BY key, upload_id LIMIT $7",
+                         WHERE bucket = $1 AND (key COLLATE \"C\") >= $2
+                           AND (key COLLATE \"C\") < $3
+                           AND ((key COLLATE \"C\") > $4
+                             OR ((key COLLATE \"C\") = $5 AND upload_id > $6))
+                         ORDER BY key COLLATE \"C\", upload_id LIMIT $7",
                     )
                     .bind(bucket)
                     .bind(prefix_pattern)
@@ -958,9 +966,10 @@ impl MetaStore for PgMetaStore {
                 None => {
                     sqlx::query_as(
                         "SELECT key, upload_id, created_at FROM multipart_uploads
-                         WHERE bucket = $1 AND key >= $2
-                           AND (key > $3 OR (key = $4 AND upload_id > $5))
-                         ORDER BY key, upload_id LIMIT $6",
+                         WHERE bucket = $1 AND (key COLLATE \"C\") >= $2
+                           AND ((key COLLATE \"C\") > $3
+                             OR ((key COLLATE \"C\") = $4 AND upload_id > $5))
+                         ORDER BY key COLLATE \"C\", upload_id LIMIT $6",
                     )
                     .bind(bucket)
                     .bind(prefix_pattern)

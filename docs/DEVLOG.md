@@ -2715,3 +2715,22 @@ corrupt manifest 退化单收)。
 - **B2 落位注**:`s3.md` 与本步记档;`prefix_upper_bound` 单点实现、pg/mysql 四处查询三形态
   (空前缀/带上界/全顶格)对齐。
 
+### 步 106:CI 红 —— glibc collation 下前缀范围扫失真,PG 键序统一钉死 COLLATE "C"
+
+**现象**:`750b351` 上 CI PG 四败(list_prefix/list_delimiter/uploads_prefix/literal 期望 2
+实测 0),本地(macOS Homebrew PG,libc/ICU 语义近字节序)双绿 —— 假绿。
+**取证**(关键一步:拉 `postgres:16` Debian 容器复刻 CI 环境):glibc `en_US.utf8` 下
+`'logs/01' < 'logs0'` = **false**(`/` 等标点主权重高于数字),按"末字节进一"构造的上界在
+库默认排序规则下成为**空区间** —— 范围扫连一行都不返回,四败全对上。
+**修法**:pg.rs 六个查询形态(两个 list 各三形)的键序谓词(`>`/`>=`/`<`/`=`,含 marker
+分页)与 `ORDER BY`/`DISTINCT ON` 统一显式 `COLLATE "C"`(字节序 = S3 键空间标准语义):
+正确性不再与部署 collation 耦合;翻页谓词与排序同一 collation,单调性自洽。MySQL 不动
+(utf8mb4 默认排序对 ASCII 标点/数字与字节序一致,双端全绿)。代价与运维建议见 s3.md B2 注:
+非 C 库上钉死谓词可能弃用 (bucket, key) 索引序,需索引化就建 C collation 库/列。
+
+## Testing Done
+
+- glibc 复刻容器(Docker `postgres:16`,端口 5433)PG 全套 `--ignored` **46/0**,
+  原 CI 四败逐一转绿;
+- 本地双方言两步 **160/0 ×2**;fmt 净;clippy 0;lib 单测 108/0。
+
