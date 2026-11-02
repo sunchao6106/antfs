@@ -4,7 +4,7 @@
 //! admin 端点同步创建 —— 全部同步等待,不用 `sleep`(CLAUDE.md §5.6)。
 //!
 //! 覆盖:上传(3 MiB,证明不被 body 上限挡掉)/ 下载逐字节一致 / HEAD 元数据 / 删除 / 复活 / TTL /
-//! 分片拼装 / 边界校验(400 / 413)/ 副本故障降级(2 真 + 1 死仍可写可读)/ `/metrics`。
+//! 服务端恒切组合对象 / 边界校验(400 / 413)/ 副本故障降级(2 真 + 1 死仍可写可读)/ `/metrics`。
 //! 指标断言打在 frontend **实际接入的那个 `Registry`** 上(CLAUDE.md §6)。
 
 use std::collections::BTreeMap;
@@ -173,8 +173,17 @@ struct Fixture {
     /// frontend 实际接入的注册表(指标断言用)。
     registry: antfs_metric::Registry,
     http: reqwest::Client,
+    /// frontend 的 SDK 句柄与指标(级联清扫的手动驱动/断言用,见 `delete_cascade_fixture`)。
+    blob_router: std::sync::Arc<antfs_router::Router>,
+    frontend_metrics: std::sync::Arc<antfs_frontend::FrontendMetrics>,
+    /// 级联账本句柄(未启用 = None)。
+    cascade: Option<std::sync::Arc<antfs_frontend::DeleteCascade>>,
+    /// 级联账本目录(启用时;读账本文件做片 id 断言用)。
+    cascade_dir: std::path::PathBuf,
     /// 放在最后:保证数据目录在 master/store 之后才被删。
     _tmp: tempfile::TempDir,
+    /// 级联账本的临时目录(启动较 `_tmp` 先被删也无妨:账测试在夹具生前都读完)。
+    _ledger_tmp: Option<tempfile::TempDir>,
 }
 
 impl Fixture {
@@ -256,6 +265,9 @@ impl Fixture {
         let state = AppState::from_config(&cfg, &upload, &registry)
             .await
             .expect("frontend state");
+        let blob_router = state.router.clone();
+        let frontend_metrics = state.metrics.clone();
+        let cascade = state.delete_cascade.clone();
         let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)
             .await
             .expect("bind frontend");
@@ -276,7 +288,12 @@ impl Fixture {
             frontend: frontend_addr,
             registry,
             http: reqwest::Client::new(),
+            blob_router,
+            frontend_metrics,
+            cascade,
+            cascade_dir: std::path::PathBuf::new(),
             _tmp: tmp,
+            _ledger_tmp: None,
         }
     }
 
@@ -540,100 +557,9 @@ async fn ttl_is_set_at_upload_time_only() {
     assert_eq!(header(&resp, "x-antfs-blob-expiration-ms"), "-1");
 }
 
-// ── 5:分片拼装 ────────────────────────────────────────────────────────────────────────────
-
-/// 把一段数据切成 3 片分别上传(同一 session),`POST /stitch` 提交片 id → 201;
-/// `GET` 拼装结果等于原始数据。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stitch_concatenates_chunks_in_order() {
-    let fx = Fixture::quorum_cluster().await;
-    let session = "session-stitch-test";
-    let parts: Vec<Vec<u8>> = vec![
-        pseudo_random(100 * 1024),
-        pencil(70 * 1024),
-        pseudo_random(33),
-    ];
-    let mut chunk_ids = Vec::new();
-    for part in &parts {
-        let resp = fx
-            .http
-            .post(fx.url("/blobs"))
-            .header("x-antfs-session", session)
-            .body(part.clone())
-            .send()
-            .await
-            .expect("upload chunk");
-        assert_eq!(resp.status().as_u16(), 201, "片就是普通 blob");
-        chunk_ids.push(header(&resp, "x-antfs-blob-id"));
-    }
-
-    let body = serde_json::json!({ "signedChunkIds": chunk_ids });
-    let resp = fx
-        .http
-        .post(fx.url("/stitch"))
-        .header("x-antfs-session", session)
-        .json(&body)
-        .send()
-        .await
-        .expect("stitch request");
-    assert_eq!(resp.status().as_u16(), 201, "拼装必须 201");
-    let stitched = header(&resp, "x-antfs-blob-id");
-    assert_eq!(
-        header(&resp, "location"),
-        format!("/blobs/{stitched}"),
-        "Location 指向拼装结果"
-    );
-
-    let expected: Vec<u8> = parts.concat();
-    assert_eq!(
-        fx.get_ok(&stitched).await,
-        expected,
-        "拼装结果必须等于原始数据"
-    );
-
-    // HEAD 必须与 GET 一致:报**逻辑大小**(各片之和)+ 标记为拼装对象。
-    // (曾报描述符自身那几百字节,导致 "HEAD 785 / GET 3145728" 的错配 —— 已修。)
-    let resp = fx
-        .http
-        .head(fx.url(&format!("/blobs/{stitched}")))
-        .send()
-        .await
-        .expect("head stitched");
-    assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(
-        header(&resp, "x-antfs-blob-size")
-            .parse::<u64>()
-            .expect("number"),
-        expected.len() as u64,
-        "HEAD 的 size 必须是逻辑大小,与 GET 返回的字节数一致"
-    );
-    assert_eq!(header(&resp, "x-antfs-blob-stitched"), "true");
-    assert_eq!(header(&resp, "x-antfs-blob-stitch-chunks"), "3", "三片");
-
-    // 普通对象不受影响:HEAD 报自身大小,且不带 stitched 标记。
-    let plain = fx.upload(&pseudo_random(4096)).await;
-    let resp = fx
-        .http
-        .head(fx.url(&format!("/blobs/{plain}")))
-        .send()
-        .await
-        .expect("head plain");
-    assert_eq!(
-        header(&resp, "x-antfs-blob-size")
-            .parse::<u64>()
-            .expect("number"),
-        4096
-    );
-    assert!(
-        resp.headers().get("x-antfs-blob-stitched").is_none(),
-        "普通对象不带 stitched"
-    );
-}
-
 // ── 6:边界校验 ────────────────────────────────────────────────────────────────────────────
 
-/// 非法 blobId(非 hex / 不是 8 字节)、`/stitch` 缺 session / 空片 / 非法片 id
-/// 一律 400,且 blobId 文案稳定。
+/// 非法 blobId(非 hex / 不是 8 字节)一律 400,且 blobId 文案稳定。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_requests_are_rejected_with_400() {
     let fx = Fixture::quorum_cluster().await;
@@ -662,59 +588,6 @@ async fn bad_requests_are_rejected_with_400() {
             .as_u16(),
         404,
         "HEAD 找不到也必须 404"
-    );
-
-    // /stitch:缺 session。
-    let resp = fx
-        .http
-        .post(fx.url("/stitch"))
-        .json(&serde_json::json!({ "signedChunkIds": [missing_id] }))
-        .send()
-        .await
-        .expect("stitch request");
-    assert_eq!(resp.status().as_u16(), 400, "缺 x-antfs-session 必须 400");
-
-    // /stitch:空片列表(含字段缺失)。
-    for body in [
-        serde_json::json!({ "signedChunkIds": [] }),
-        serde_json::json!({}),
-    ] {
-        let resp = fx
-            .http
-            .post(fx.url("/stitch"))
-            .header("x-antfs-session", "s")
-            .json(&body)
-            .send()
-            .await
-            .expect("stitch request");
-        assert_eq!(resp.status().as_u16(), 400, "空片列表必须 400: {body}");
-    }
-
-    // /stitch:非法片 id。
-    let resp = fx
-        .http
-        .post(fx.url("/stitch"))
-        .header("x-antfs-session", "s")
-        .json(&serde_json::json!({ "signedChunkIds": ["zz"] }))
-        .send()
-        .await
-        .expect("stitch request");
-    assert_eq!(resp.status().as_u16(), 400, "非法片 id 必须 400");
-
-    // /stitch:片可读但不存在 → 400(文案说明是哪个片)。
-    let resp = fx
-        .http
-        .post(fx.url("/stitch"))
-        .header("x-antfs-session", "s")
-        .json(&serde_json::json!({ "signedChunkIds": [missing_id] }))
-        .send()
-        .await
-        .expect("stitch request");
-    assert_eq!(resp.status().as_u16(), 400, "片不可读必须 400");
-    let text = resp.text().await.expect("body");
-    assert!(
-        text.contains(&missing_id) && text.contains("not readable"),
-        "报错必须点明哪个片不可读,实际: {text}"
     );
 }
 
@@ -997,13 +870,19 @@ async fn cors_allows_listed_origins_only() {
         methods.contains("POST") && methods.contains("DELETE"),
         "{methods}"
     );
+    let allowed_headers = resp
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     assert!(
-        resp.headers()
-            .get("access-control-allow-headers")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .contains("x-antfs-session"),
-        "允许的请求头必须含 x-antfs-session"
+        allowed_headers.contains("x-antfs-ttl-ms"),
+        "允许的请求头必须含 x-antfs-ttl-ms: {allowed_headers}"
+    );
+    assert!(
+        !allowed_headers.contains("x-antfs-session"),
+        "客户端会话头已随 /stitch 协议退役: {allowed_headers}"
     );
 }
 
@@ -1081,6 +960,24 @@ async fn auto_chunk_fixture() -> Fixture {
         ..Default::default()
     };
     Fixture::start_with_frontend(cfg, antfs_config::UploadConfig::default(), &[101, 102]).await
+}
+
+/// 级联账本启用的自动分片夹具(256 KiB / 96 KiB 片宽,`sweep_interval = 0`
+/// 禁周期 —— 测试手动驱动一拍清扫,§5.6 不 sleep)。
+async fn delete_cascade_fixture() -> Fixture {
+    let dir = tempfile::tempdir().expect("ledger tempdir");
+    let cfg = FrontendConfig {
+        max_body_bytes: 256 * 1024,
+        auto_chunk_bytes: 96 * 1024,
+        delete_cascade_ledger_dir: dir.path().join("cascade"),
+        delete_cascade_sweep_interval_secs: 0,
+        ..Default::default()
+    };
+    let mut fx =
+        Fixture::start_with_frontend(cfg, antfs_config::UploadConfig::default(), &[101, 102]).await;
+    fx.cascade_dir = dir.path().join("cascade");
+    fx._ledger_tmp = Some(dir);
+    fx
 }
 
 /// 大 body(300 KiB > 256 KiB)一次 POST 搞定:201 + `x-antfs-blob-size` 是**逻辑总量**(不是描述符
@@ -1355,9 +1252,133 @@ fn header_from_raw(raw: &str, name: &str) -> String {
     panic!("响应缺少头 {name}:\n{raw}");
 }
 
+// ── 13.5:删除级联账本(H3,2026-10-26)──────────────────────────────────────────────────
+
+/// 复现 + 修复闭环:删一个 4 片的组合对象 → 账上有 1 行/4 片 → 手动清扫一拍 → 片全体 404、
+/// 账清零、指标落在真 Registry;普通对象删除不入账;幂等二扫无新增。片 404 的证据链
+/// 直接走 fixture 的 SDK 句柄(读账本文件拿片 id,逐个 stat 断 NotFound)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_cascade_tombstones_composed_chunks() {
+    let fx = delete_cascade_fixture().await;
+    let data = pseudo_random(300 * 1024);
+    let blob_id = fx.upload(&data).await; // 96×3+12 = 4 片
+
+    let resp = fx
+        .http
+        .delete(fx.url(&format!("/blobs/{blob_id}")))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(resp.status().as_u16(), 204);
+    assert_eq!(
+        fx.get(&blob_id).await.status().as_u16(),
+        404,
+        "主对象即删即无"
+    );
+
+    let cascade = fx.cascade.as_ref().expect("ledger enabled");
+    assert_eq!(cascade.entries(), 1, "组合对象删除必入账 1 行");
+
+    // 抢在清扫前读账本拿片名单(sweep 会 compact 掉该行)。
+    let text =
+        std::fs::read_to_string(fx.cascade_dir.join("delete-cascade.jsonl")).expect("ledger file");
+    let row: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("one row")).expect("ledger row json");
+    let chunks: Vec<String> = row["c"]
+        .as_array()
+        .expect("chunks")
+        .iter()
+        .map(|v| v.as_str().expect("hex").to_string())
+        .collect();
+    assert_eq!(chunks.len(), 4, "四片皆入账");
+
+    // 一扫:级联 + 幂等(片墓碑 NotFound 亦按成功)。
+    let stats = cascade.sweep(&fx.blob_router, &fx.frontend_metrics).await;
+    assert_eq!(stats.cascaded, 1);
+    assert_eq!(stats.chunks_tombstoned, 4);
+
+    // 片全体死亡(直接对 SDK stat,404 语义)。
+    for hex_id in &chunks {
+        let bytes = hex::decode(hex_id).expect("chunk hex");
+        let key = antfs_router::StoreKey::from_slice(&bytes).expect("chunk key");
+        // 引擎对已删对象 stat 回 200 + deleted(元数据可读语义);两种"死"形态都收。
+        match fx.blob_router.stat(&key).await {
+            Err(antfs_router::Error::NotFound { .. }) => {}
+            Ok(meta) => assert!(meta.deleted, "片必须已墓碑,实际 {meta:?}"),
+            other => panic!("片必须已墓碑(404),实际 {other:?}"),
+        }
+    }
+    assert_eq!(cascade.entries(), 0, "账清零");
+
+    // 指标打在实际接入的 Registry 上(§6)。
+    let dumped = antfs_metric::gather(&fx.registry).expect("gather");
+    assert!(
+        dumped.contains("frontend_delete_cascade_chunk_tombstones_total 4"),
+        "片墓碑计数 4:
+{dumped}"
+    );
+    assert!(
+        dumped.contains("frontend_delete_cascade_entries 0"),
+        "账深度 gauge 归零:
+{dumped}"
+    );
+
+    // 幂等:二扫零新账零新增计数。
+    let stats2 = cascade.sweep(&fx.blob_router, &fx.frontend_metrics).await;
+    assert_eq!((stats2.cascaded, stats2.chunks_tombstoned), (0, 0));
+
+    // 普通对象删除不入不动账。
+    let plain = fx.upload(&pseudo_random(40 * 1024)).await;
+    let resp = fx
+        .http
+        .delete(fx.url(&format!("/blobs/{plain}")))
+        .send()
+        .await
+        .expect("delete plain");
+    assert_eq!(resp.status().as_u16(), 204);
+    assert_eq!(cascade.entries(), 0, "普通对象删除不入级联账");
+}
+
+/// 反向保护:账先于墓票的崩溃窗 / 手工投账 —— 对象还活着时,清扫绝不动它的片
+/// (跳过、留账下一轮),对象照常可读。这是"宁可不级联、绝不误删活对象"的安全序。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_cascade_refuses_to_cascade_alive_objects() {
+    let fx = delete_cascade_fixture().await;
+    let data = pseudo_random(300 * 1024);
+    let blob_id = fx.upload(&data).await;
+
+    // 手工投账(未删除的活对象):证消费侧二次确认。
+    let bytes = hex::decode(&blob_id).expect("id hex");
+    let descriptor = antfs_router::StoreKey::from_slice(&bytes).expect("key");
+    let fake_chunk = antfs_router::StoreKey::from_parts(fx.pid, 0x0bad_f00d);
+    let cascade = fx.cascade.as_ref().expect("ledger enabled");
+    cascade
+        .record(&descriptor, std::slice::from_ref(&fake_chunk))
+        .expect("manual ledger row");
+    assert_eq!(cascade.entries(), 1);
+
+    let stats = cascade.sweep(&fx.blob_router, &fx.frontend_metrics).await;
+    assert_eq!(stats.skipped_alive, 1, "活对象必跳过");
+    assert_eq!(stats.chunks_tombstoned, 0, "一片都不许动");
+    assert_eq!(
+        fx.get_ok(&blob_id).await,
+        data,
+        "活对象读回必须原字节(级联未误伤)"
+    );
+    assert_eq!(cascade.entries(), 1, "行留账下一轮再看");
+
+    let dumped = antfs_metric::gather(&fx.registry).expect("gather");
+    assert!(
+        dumped.contains("frontend_delete_cascade_skips_total 1"),
+        "跳过计数:
+{dumped}"
+    );
+}
+
 // ── 14:位是唯一类型判定(descriptor-drop-magic)──────────────────────────────────────────
 /// 铸一段"无位描述符字节"(普通 PUT 任何 parse 得出的合法结构体 = 无位行的极限情形):
-/// 无位 = 普通对象原字节返回(**不再展开**);有位(stitch 正常流程)才拼装。
+/// 无位 = 普通对象原字节返回(**不再展开**)。有位正例(流式自动分片产物)已由
+/// `big_post_is_auto_chunked_and_transparent` 覆盖(GET 拼装 + HEAD 两头)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn type_dispatch_is_flag_only() {
     let fx = Fixture::quorum_cluster().await;
@@ -1384,45 +1405,6 @@ async fn type_dispatch_is_flag_only() {
         "无位行 HEAD 报原始大小(不读数据体)"
     );
     assert!(head.headers().get("x-antfs-blob-stitched").is_none());
-
-    // 有位(正常 /stitch 流程):拼装照旧,HEAD 报逻辑大小。
-    let session = "flag-only-stitch";
-    let parts: Vec<Vec<u8>> = vec![pseudo_random(64 * 1024), pencil(33)];
-    let mut chunk_ids = Vec::new();
-    for p in &parts {
-        let resp = fx
-            .http
-            .post(fx.url("/blobs"))
-            .header("x-antfs-session", session)
-            .body(p.clone())
-            .send()
-            .await
-            .expect("upload chunk");
-        chunk_ids.push(header(&resp, "x-antfs-blob-id"));
-    }
-    let resp = fx
-        .http
-        .post(fx.url("/stitch"))
-        .header("x-antfs-session", session)
-        .json(&serde_json::json!({ "signedChunkIds": chunk_ids }))
-        .send()
-        .await
-        .expect("stitch");
-    assert_eq!(resp.status().as_u16(), 201);
-    let stitched = header(&resp, "x-antfs-blob-id");
-    assert_eq!(fx.get_ok(&stitched).await, parts.concat(), "有位照常拼装");
-    let head = fx
-        .http
-        .head(fx.url(&format!("/blobs/{stitched}")))
-        .send()
-        .await
-        .expect("head stitched");
-    assert_eq!(
-        header(&head, "x-antfs-blob-size").parse::<u64>().unwrap(),
-        parts.iter().map(|p| p.len()).sum::<usize>() as u64,
-        "有位行 HEAD 仍报逻辑大小"
-    );
-    assert_eq!(header(&head, "x-antfs-blob-stitched"), "true");
 }
 
 /// 铸一段结构合法的描述符字节(与 frontend 写出的同构;片指向本测试里另两个普通 blob)。
@@ -1619,44 +1601,6 @@ async fn medium_declared_upload_is_single_blob() {
         "中档单 blob 不得拼装"
     );
     assert_eq!(fx.get_ok(&id).await, data, "中档读回逐字节一致");
-}
-
-/// ④ 行为五:session 头不合法(含控制字节)时 400 提前于任何片入库(reqwest 客户端侧
-/// 就拒不可打印头,故走裸 socket 真穿到服务端的 `session_of`)。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invalid_session_rejects_before_any_chunk() {
-    let fx = auto_chunk_fixture().await;
-    let mut sock = tokio::net::TcpStream::connect(&fx.frontend)
-        .await
-        .expect("connect frontend");
-    // 超长 session(70,000 > 描述符 u16 域上限 65,535):头字节全合法(hyper 放行),
-    // 服务端 `session_of` 在任何片入库之前 400。
-    let session = "a".repeat(70_000);
-    let head = format!(
-        "POST /blobs HTTP/1.1\r\nHost: {}\r\nx-antfs-session: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        fx.frontend,
-        session,
-        300 * 1024
-    );
-    // session 校验先于读体:只发头 + 半关,响应即 400(避免"早响应 + 未消费请求体"的
-    // 连接 RST 竞态 —— 服务端不欠任何未读字节)。
-    sock.write_all(head.as_bytes()).await.expect("write head");
-    sock.shutdown().await.expect("half-close");
-    let mut out = Vec::new();
-    sock.read_to_end(&mut out)
-        .await
-        .expect("read response to EOF");
-    let raw = String::from_utf8_lossy(&out).to_string();
-    assert!(
-        raw.starts_with("HTTP/1.1 400"),
-        "超长 session 必须在入库前 400,实际:\n{raw}"
-    );
-
-    let dumped = antfs_metric::gather(&fx.registry).expect("gather frontend registry");
-    assert!(
-        !dumped.contains("orphan_deletes_total 1"),
-        "不得有任何孤儿删除尝试(零片入库):\n{dumped}"
-    );
 }
 
 /// ⑥ 收账簿(裁决 2026-10-21「已入库垃圾要删」的承载):启用 `upload_session_wal_dir`

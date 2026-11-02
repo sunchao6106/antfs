@@ -17,13 +17,9 @@ pub async fn delete_objects(st: AppState, bucket: &str, req: Request) -> Result<
 
     let results = st.metastore.delete_objects(bucket, &keys).await?;
 
-    for r in &results {
-        if r.deleted {
-            if let Ok(Some(obj)) = st.metastore.get_object(bucket, &r.key).await {
-                let _ = st.router.delete(&obj.blob_id).await;
-            }
-        }
-    }
+    // blob 侧零随手动作:delete_objects 事务内已把各 key 的主 blob + manifest 片
+    // 全部送 pending_reclaims(H3 级联),GC 每日墓碑化;旧行为"删后再 get_object"
+    // 是死代码且有并发误删新对象的竞态,已随级联一并摘除。
 
     let xml = crate::xml::serialize_delete_result(&results, quiet);
     Ok((StatusCode::OK, [("content-type", "application/xml")], xml).into_response())

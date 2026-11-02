@@ -28,7 +28,6 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
 | `GET` | `/blobs/{blobId}` | — | **200** + 原始字节 | 404(所有副本都没有)/ 400(非法 id)/ 502(分片描述符损坏或片缺失)/ 503(副本不可达) |
 | `HEAD` | `/blobs/{blobId}` | — | **200** + 无 body;头 `x-antfs-blob-size`/`-deleted`/`-expired`/`-expiration-ms`。**拼装对象额外带 `x-antfs-blob-stitched: true` + `x-antfs-blob-stitch-chunks: N`,且 `size` 是各片之和(逻辑大小,与 `GET` 一致)** | 404 / 400 / 503 |
 | `DELETE` | `/blobs/{blobId}` | — | **204**(多数派写墓碑;**删除不可逆**;重复删**幂等**,仍 204) | 404 / 503 / 400 |
-| `POST` | `/stitch` | body `{"signedChunkIds":["<16 hex>",…]}`;头 `x-antfs-session: <opaque>` 必填 | **201** + 同 `POST /blobs` 三个头 | 400(session 缺失/空列表/片数 >4096/非法 id/片不可读) |
 | `GET` | `/metrics` | — | **200** + Prometheus 文本 | — |
 | `GET` | `/healthCheck` | — | **200** + `text/plain` 正文 `GOOD` | — |
 
@@ -49,7 +48,7 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
   从未存在的 key 仍 404(经多数派聚合为 503,既有口径)。
 - **`x-antfs-*` 头命名**:前身沿用 Ambry 的 `x-ambry-*` 头名,2026-10 以 antfs 自有前缀**整体改名**——
   本项目不是 Ambry,头是自己的契约面。改名为不兼容变更(客户端需一次性迁移;开发期项目,不保留旧名别名)。
-  成员:`x-antfs-blob-id` / `x-antfs-blob-size` / `x-antfs-session` / `x-antfs-ttl-ms` /`-blob-deleted` /
+  成员:`x-antfs-blob-id` / `x-antfs-blob-size` / `x-antfs-ttl-ms` /`-blob-deleted` /
   `-blob-expired` / `-blob-expiration-ms` / `-blob-stitched` / `-blob-stitch-chunks`。
 - **不带 account/container**:blobId 64 位无租户位(D7/D8),路径里不放一个"存不下来又不管事"的段;多租户将来落在
   网关层(那时再加)。
@@ -68,39 +67,47 @@ curl / 任意 HTTP 客户端 ──▶ frontend ──内嵌 Client(router SDK)�
   数据面 `PUT ...?expiration_ms=` 原子承接,故 TTL 是**单次多数派写**(`put_file` 家族 2026-10-22 移除)。
   **写入之后没有任何改 TTL 的接口**(不能续期、不能作废、不能永久化)。
 
-## 4. 分片拼装(`POST /stitch`)——**无状态**设计
+## 4. 组合对象(描述符 + 片)——**无状态**设计
 
-Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥),故:
+> **2026-10-26 裁决**:客户端分片协议(`POST /stitch` + 必填头 `x-antfs-session`)整体退役
+> (接口、`x-antfs-session` 启用口径、CORS 白名单同步移除);组合对象的**唯一产径** =
+> `POST /blobs` 服务端恒切(§5)。历史协议的裁决记录见 `openspec/changes/archive/`。
 
-1. **分片上传** = 普通 `POST /blobs`(带同一个 `x-antfs-session`);片列表由**客户端自己记**,服务端不存 session。
-2. **`POST /stitch`**:
-   - 校验 `x-antfs-session` 非空、片列表非空且 ≤ 4096、每个 id 是 16 hex;
-   - 逐片 `stat` 拿尺寸(拿不到 → 400);
-   - 构造**自描述描述符**(小端,经组合写口落位 —— `composed` 类型位随写置上):
-     ```
-     version: u8 = 1
-     chunk_count: u32
-     session_len: u16
-     session: [u8; session_len]
-     × chunk_count: chunk_id(8B) | chunk_size(u64) | expiration_ms(i64)
-     ```
-     描述符上限 1 MiB(超 → 400);片列表**当 blob 存**是刻意的:中心存一份"片→对象"映射就等于引入
-     **每对象元数据**,与 D3 冲突。
-   - 因此 `POST /stitch` 是**幂等性无关**的普通写:201 + `Location: /blobs/{stitchedId}`。
-3. **读 stitched blob**(2026-10-21 读侧下沉后):**网关不再识描述符** —— 走 router 逻辑口
+大对象 = **描述符 + 片**。Ambry 把会话信息编进签名片 id;antfs 无签名体系(无 ACL/密钥),且
+**服务端不在任何地方存"片 → 对象"映射**(中心存一份就等于引入每对象元数据,与 D3 冲突):
+
+1. **描述符格式**(小端,经组合写口落位,`composed` 类型位随写置上;格式本体在 `antfs-descriptor`):
+   ```
+   version: u8 = 1
+   chunk_count: u32
+   session_len: u16        // 格式字段保留(磁盘兼容);协议退役后恒 0
+   session: [u8; session_len]
+   × chunk_count: chunk_id(8B) | chunk_size(u64) | expiration_ms(i64)
+   ```
+   描述符上限 1 MiB(超 → 400)。
+2. **读组合对象**(2026-10-21 读侧下沉):**网关不识描述符** —— 走 router 逻辑口
    (`stat_object` 逻辑大小 / `get_object_stream` 流式拼装 / `get_object_range_stream` 窗口裁片)。
    类型判定(`composed` 位)、描述符解析、覆盖片映射与片完整性核对全在 router(裁决⑩);
    网关只把 router 的错误按 §错误映射表翻译(描述符/片损坏 = `bad_composed` → **502**;
-   预检遇到暂时性传输失败 = **503** 可重试 —— 与旧"一律 502"相比,此漂移记录在案:
-   片不可读属暂时态,503 语义更准)。
-4. **`HEAD` 与 `GET` 对齐(经 `stat_object`)**:置位行逻辑大小 = 各片之和、片数头两只
+   预检遇到暂时性传输失败 = **503** 可重试 —— 片不可读属暂时态,漂移记录在案)。
+3. **`HEAD` 与 `GET` 对齐(经 `stat_object`)**:置位行逻辑大小 = 各片之和、片数头两只
    (`x-antfs-blob-stitched: true` / `x-antfs-blob-stitch-chunks: N`;router 内对描述符做
    ≤1 MiB 有界读,尽力口径 —— 已删/过期退描述符自身 stat);无位行不读数据体、不带两头;
    带 `Range` 时 HEAD 回 **206** 无 body(blob-range-read D3,Ambry 口径)。
-4. **`DELETE` 只删描述符本身,不递归删片**:一次删 N 个对象是危险动作(且片可能被多个 stitched blob 共享);
-    孤儿片靠 `x-antfs-ttl-ms` + store 本地 worker 回收。自动分片(§5)产生的对象**删描述符后同样留下孤儿片**
-    —— 服务端知悉但故意不递归(无法从描述符区分"片是否被共享"是原因之一;描述符现已带 composed 类型位(`blob-composed-flag`),
-    但递归删片仍是危险动作,维持不递归)。
+4. **`DELETE` 级联回收(H3 修复,2026-10-26 落地)**:删除组合对象 = "记账 → 墓描述符"两步
+   同步完成(毫秒级、与片数无关),逐片墓碑由每日后台异步执行:
+   - **同步侧**:`stat` 认组合位 → 裸读描述符(≤ 1 MiB)解析片名单 → 级联账本追加分**fsync**
+     (账先于主墓碑,任何时刻崩溃账都在)→ 墓描述符 → 204。记账/解析失败只 `warn` 降级为
+     "只删描述符"(即旧行为),绝不挡删除。
+   - **异步侧**(`delete_cascade` 模块,周期 = `delete_cascade_sweep_interval_secs`,默认每日):
+     逐行**二次确认** —— `stat` 见描述符确已删(墓碑 200+deleted 或记录不存)才逐片幂等墓碑
+     (NotFound 亦按成功);对象还活着 = 跳过留行下一轮(排查"账先墓碑后"的崩溃窗),
+     滞留超 7 天仍活着则弃行告警(宁可不级联,绝不误删活对象)。
+   - **账本**(`delete-cascade.jsonl`,原子 compact:tmp→fsync→rename+目录 fsync):
+     `frontend.delete_cascade_ledger_dir` 空(默认)= 不级联,退化为旧行为(片靠 TTL 或
+     永久驻留);TTL 对象本可自然过期,级联只是更早回收。S3 模式无此账本 —— metastore 的
+     `delete_object`/`put_object` 遮蔽/`complete` 同事务把 manifest 片全部送
+     `pending_reclaims`,既有每日 GC 消费(见 `s3.md`)。
 
 **相对 Ambry 的偏离(登记)**:无签名片 id、无服务端会话(不做"同 session 才可拼"的服务端强制)、不强制分片大小、
 不递归删片。
@@ -126,12 +133,11 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 - **服务端自动分片(恒切)**(2026-10-21 裁决:`auto_chunk_enabled` 整字段删除,无兼容包袱;`frontend.auto_chunk_bytes` 定片宽,公共 `[upload] max_object_bytes` 定单文件上限):
   `POST /blobs` 的 body(声明或实收)超过 `max_body_bytes` 时:
   1. **决定窗** = `max_body_bytes`:无声明路径 EOF 在窗内 ⇒ 单 blob(核验后写);越窗即转分片模式
-     (buf 自头切片,片边界语义同前)。有声明的大档直接进分片模式且 session 头**先校验**(400 早于
-     任何片入库);声明超公共单文件上限在预检处 413,不读 body(配置校验保证上限 ≤ 4096 × 片宽 = 描述符容量);
+     (buf 自头切片,片边界语义同前)。有声明的大档直接进分片模式;声明超公共单文件上限在预检处
+     413,不读 body(配置校验保证上限 ≤ 4096 × 片宽 = 描述符容量);
   2. 攒满 `auto_chunk_bytes` 即 `put_auto_with_ttl` **一片**(顺序写:并发扇出会把"单片内存"乘以片数
      在途,先不做);片与描述符**同 TTL**,整个逻辑对象一体过期(HEAD 可见 `expired` / `expiration-ms`);
-  3. **EOF 对账**(实收 == 声明)后编**同 `/stitch` 的描述符**(session = 请求带的 `x-antfs-session`,缺省空)
-     也当普通 blob 写入;
+  3. **EOF 对账**(实收 == 声明)后编**描述符**(session 字段恒空,§4)也当普通 blob 写入;
   4. 201 返回**描述符的 blobId** + `x-antfs-blob-size: 逻辑总量`;`GET`/`HEAD` 走 §4 的既有透明拼装,
      客户端不感知分片。
   **中途失败**(断流/超发/欠发/片或描述符写失败):对已 ack 的片逐个写墓碑**尽力回收**(best-effort:删失败
@@ -159,7 +165,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 
 `frontend.cors_allowed_origins` 给出**白名单**才挂 `CorsLayer`(非空时才挂);默认 `[]` = 不挂。
 **不用 `permissive()`**:默认放开跨域的 API 是安全问题。放开的方法 `GET/POST/HEAD/DELETE`,
-允许的请求头 `x-antfs-session` / `x-antfs-ttl-ms` / `content-type`,暴露响应头 `x-antfs-*` 与 `location`,共 **8 项**(`CORS_EXPOSED_HEADERS`)。
+允许的请求头 `x-antfs-ttl-ms` / `content-type`,暴露响应头 `x-antfs-*` 与 `location`(`CORS_EXPOSED_HEADERS`;客户端会话头随 /stitch 协议退役已除名)。
 
 ## 7. 与 Ambry frontend 的对照
 
@@ -169,7 +175,7 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | blobId 谁生成 | frontend 调 router,router **本地随机铸**(partition 从本地 clustermap 随机挑) | **向 master 申请号段**(`GetBlobIds`) |
 | 上传结果 | `Location: <blobId>` | `Location: /blobs/{blobId}` + `x-antfs-blob-id`/`-blob-size` |
 | 鉴权/配额 | `AccountService` + `AmbrySecurityService` + quota | **无**(多租户推后到网关期) |
-| 大对象 | chunked upload + `/stitch`(**签名片 id**;分片在 router 做) | `/stitch`(无签名片 id,描述符自描述)+ **服务端自动分片**(§5,分片在 frontend 做) |
+| 大对象 | chunked upload(**签名片 id**;客户端拼装) | **服务端自动分片**(§5,恒切 + 描述符;客户端分片协议 `/stitch` 已退役) |
 | 元数据/HEAD | `GetBlobInfo`(blob 元数据在 id 内编码 account/container/ttl) | `HEAD /blobs/{id}` → store 的 `.../metadata`(无每对象元数据) |
 | CORS | `frontend.options.allow.methods` 等配置 | `frontend.cors_allowed_origins` 白名单 |
 | 指标 | Dropwizard `FrontendMetrics` | `FrontendMetrics`(Prometheus,见 §9) |
@@ -186,6 +192,8 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend.auto_chunk_bytes` | u64 | `4194304`(4 MiB) | 1..=1073741824(1 GiB) | **恒切的单片大小**(片 = 普通 blob 粒度,也是单片驻留内存的读写缓冲);**描述符容量 = 4096 片 × 此值**(公共单文件上限在配置层须 ≤ 它) | 无(近义的 Ambry `router.max.put.chunk.size.bytes` 在 router 层;router 下沉开工单 = upload-zero-spool design §12) — **对齐红线(2026-10-22)**:须 ≤ store 各节点 `store_server.max_body_bytes`(分体部署靠人工 + 运行期 `body_too_large` 显式报警;devcluster 一体装配有断言)|
 | `[upload] max_object_bytes`(顶层公共表) | u64 | `17179869184`(16 GiB) | ≥ 1 且 ≤ 4096 × `frontend.auto_chunk_bytes` | **单文件上传上限**:REST 与 S3 网关共用的契约分界线(`common.toml` 或各网关 TOML 顶层,一处改两边生效);有声明超限读 body 前 413,无声明边收边超、已入库片墓碑回收后 413 | 无 |
 | `frontend.upload_session_wal_dir` | String(路径) | `""` | 空 = 不记账;非空 = 目录可建可写(启动校验,失败拒启) | 边收边分片的**孤儿收账簿目录**(Ambry 会话表 + 定期清扫的本地等价物):begin / 逐片 chunk / commit / abort 全程落 JSONL(逐行 fsync,写线程独占);超时孤儿会话(最后记账 6h 无终态)由清扫任务逐片墓碑 + 核销 | 无 |
+| `frontend.delete_cascade_ledger_dir` | String(路径) | `""` | 空 = 不级联;非空 = 目录可建可写(启动校验,失败拒启) | 组合对象**删除级联账本**目录(H3):`DELETE` 组合对象先记片名单入账(逐行 fsync、先于主墓碑),后台按周期清扫逐片幂等墓碑;损坏账行告警跳过 | 无 |
+| `frontend.delete_cascade_sweep_interval_secs` | u64 | `86400` | ≥ 0;0 = 只在启动扫一拍、不起周期任务 | 级联清扫周期(秒);一拍内的安全序(二次确认只删已墓描述符的对象)见 §4 第 4 条 | 无 |
 | `frontend.cors_allowed_origins` | Vec\<String\> | `[]` | 各项为非空且非 `*` 的合法 header 值(校验期就拒) | CORS 来源白名单(**空 = 不挂 CORS 层**;不接受 `*`) | `frontend.options.allow.methods` 等 |
 | `frontend.router.master_addr` | String | `127.0.0.1:7101` | 非空 | 内嵌 SDK 的 master 地址(见 [`router.md` §5](./router.md)) | 无 |
 | `frontend.router.cluster_secret` | String | `""` | — | 集群准入密钥 | 无 |
@@ -219,10 +227,15 @@ Ambry 把会话信息编进**签名片 id**;antfs 无签名体系(无 ACL/密钥
 | `frontend_upload_chunk_cleanups_total` | counter | — | 次 | 边收边分片上传失败后**触发**孤儿片回收的事件数(逐片删除尝试数看上行;观测断流后的孤儿压力面) | 无 |
 | `frontend_upload_sweeper_runs_total` | counter | — | 次 | 收账清扫拍数(启用 `upload_session_wal_dir` 后:启动即一拍 + 每 10 分钟;常零命中) | 无 |
 | `frontend_upload_sweeper_tombstones_total` | counter | — | 次 | 清扫器成功发出的孤儿片**墓碑数**(删除失败留待下一拍重试) | 无 |
+| `frontend_delete_cascade_entries` | gauge | — | 行 | 级联账本待处理行数(组合对象数;启用目录后有意义,常 0) | 无 |
+| `frontend_delete_cascade_runs_total` | counter | — | 次 | 级联清扫拍数(启动一拍 + 周期拍) | 无 |
+| `frontend_delete_cascade_chunk_tombstones_total` | counter | — | 次 | 级联实际发出的片墓碑数(幂等;"已不存在"按成功计) | 无 |
+| `frontend_delete_cascade_skips_total` | counter | — | 次 | 二次确认时对象仍活着而跳过的行数(崩溃窗保护,下一轮再看) | 无 |
+| `frontend_delete_cascade_stale_drops_total` | counter | — | 次 | 滞留超 7 天仍活着而被弃的账行数(不级联) | 无 |
 | `frontend_download_total` | counter | `outcome` | 次 | 下载请求数 | `FrontendMetrics.getBlobRequestMetrics` |
 | `frontend_download_bytes_total` | counter | — | 字节 | 下载字节数(成功;拼装对象按描述符里各片长度求和) | 无 |
 | `frontend_delete_total` | counter | `outcome` | 次 | 删除请求数 | `FrontendMetrics.deleteBlobRequestMetrics` |
-| `frontend_mutation_total` | counter | `op`, `outcome` | 次 | `head`/`stitch` 请求数 | `FrontendMetrics.*RequestMetrics` |
+| `frontend_mutation_total` | counter | `op`, `outcome` | 次 | `head` 请求数 | `FrontendMetrics.*RequestMetrics` |
 | `frontend_request_duration_seconds` | histogram | `op` | 秒 | 请求延迟(含取号段与副本扇出) | `FrontendMetrics.*RequestTimeInMs` |
 | `frontend_in_flight_requests` | gauge | `op` | 个 | 在途请求数 | 无 |
 | `frontend_replica_errors_total` | counter | `kind` | 次 | 副本侧失败分类(kind 同 SDK 错误表) | 无 |

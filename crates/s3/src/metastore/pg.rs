@@ -67,10 +67,10 @@ impl MetaStore for PgMetaStore {
 
         // 遮蔽同 key 旧活行(overwrite 语义:旧数据立即可弃)。紧邻 INSERT;
         // 并发 overwrite 自然满足 last-writer-wins(version 单调)。
-        let shadowed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        let shadowed: Vec<(Vec<u8>, i64, Option<String>)> = sqlx::query_as(
             "UPDATE named_objects SET state = 0, deleted_at = $3
              WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL AND version < $4
-             RETURNING blob_id, size",
+             RETURNING blob_id, size, parts_manifest",
         )
         .bind(&req.bucket)
         .bind(&req.key)
@@ -78,7 +78,7 @@ impl MetaStore for PgMetaStore {
         .bind(version)
         .fetch_all(&mut *tx)
         .await?;
-        let shadow_bytes: i64 = shadowed.iter().map(|(_, s)| *s).sum();
+        let shadow_bytes: i64 = shadowed.iter().map(|(_, s, _)| *s).sum();
 
         // 配额守卫,净增量口径(used + 新写 − 遮蔽 ≤ quota;quota=0 不限)。
         let new_size = req.size as i64;
@@ -128,10 +128,15 @@ impl MetaStore for PgMetaStore {
         .bind(stored_kind.as_deref())
         .execute(&mut *tx)
         .await?;
-        let shadowed_ids: Vec<StoreKey> = shadowed
+        // 级联回收:被遮蔽行的 manifest 片一并入账(覆盖 multipart 对象不再泄漏其余片;
+        // 损坏 manifest 退化为只收主 blob,见 manifest_part_ids)。
+        let mut shadowed_ids: Vec<StoreKey> = shadowed
             .iter()
-            .map(|(b, _)| blob_id_from_bytes(b))
+            .map(|(b, _, _)| blob_id_from_bytes(b))
             .collect();
+        for (_, _, manifest) in &shadowed {
+            shadowed_ids.extend(super::manifest_part_ids(manifest.as_deref()));
+        }
         Self::queue_reclaims(&mut tx, &shadowed_ids).await?;
         tx.commit().await?;
 
@@ -139,7 +144,7 @@ impl MetaStore for PgMetaStore {
             version,
             shadowed_blobs: shadowed
                 .into_iter()
-                .map(|(b, _)| blob_id_from_bytes(&b))
+                .map(|(b, _, _)| blob_id_from_bytes(&b))
                 .collect(),
         })
     }
@@ -190,7 +195,7 @@ impl MetaStore for PgMetaStore {
         let now = Self::now_ms();
         // 记账事务:墓碑与 used_bytes 扣减同事务(不变量:used = Σ state=1 行 size)。
         let mut tx = self.pool.begin().await?;
-        let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        let row: Option<(Vec<u8>, i64, Option<String>)> = sqlx::query_as(
             "UPDATE named_objects SET state = 0, deleted_at = $3
              WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL
              AND version = (
@@ -198,18 +203,20 @@ impl MetaStore for PgMetaStore {
                  WHERE bucket = $1 AND key = $2 AND state = 1 AND deleted_at IS NULL
                  ORDER BY version DESC LIMIT 1
              )
-             RETURNING blob_id, size",
+             RETURNING blob_id, size, parts_manifest",
         )
         .bind(bucket)
         .bind(key)
         .bind(now)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((blob_id, _)) = &row {
-            let bid = blob_id_from_bytes(blob_id);
-            Self::queue_reclaims(&mut tx, std::slice::from_ref(&bid)).await?;
+        // 级联回收:主 blob + manifest 全部片同事务入账(GC 每日墓碑化,delete-cascade)。
+        if let Some((blob_id, _, manifest)) = &row {
+            let mut ids = vec![blob_id_from_bytes(blob_id)];
+            ids.extend(super::manifest_part_ids(manifest.as_deref()));
+            Self::queue_reclaims(&mut tx, &ids).await?;
         }
-        if let Some((_, size)) = &row {
+        if let Some((_, size, _)) = &row {
             sqlx::query("UPDATE buckets SET used_bytes = used_bytes - $2 WHERE name = $1")
                 .bind(bucket)
                 .bind(*size)
@@ -217,7 +224,7 @@ impl MetaStore for PgMetaStore {
                 .await?;
         }
         tx.commit().await?;
-        Ok(row.map(|(blob_id, _)| DeletedObject {
+        Ok(row.map(|(blob_id, _, _)| DeletedObject {
             blob_id: blob_id_from_bytes(&blob_id),
             key: key.to_string(),
         }))
@@ -269,26 +276,60 @@ impl MetaStore for PgMetaStore {
             .or(req.start_after.as_deref())
             .unwrap_or("");
 
+        // 前缀 = 纯字面范围扫(B2,针对 seaweedfs#11737 同族问题):`key >= prefix AND
+        // key < 上界` 取代 LIKE —— `_`/`%`/`\` 不再有通配语义,且 (bucket, key) 索引直接收窄。
         let prefix_pattern = req.prefix.as_deref().unwrap_or("");
-        let like_pattern = format!(
-            "{}%",
-            prefix_pattern.replace('%', "\\%").replace('_', "\\_")
-        );
-
-        let rows: Vec<PgListRow> = sqlx::query_as(
-            "SELECT DISTINCT ON (key) key, size, etag, created_at
-             FROM named_objects
-             WHERE bucket = $1 AND key > $2 AND key LIKE $3
-               AND state = 1 AND deleted_at IS NULL
-             ORDER BY key, version DESC
-             LIMIT $4",
-        )
-        .bind(&req.bucket)
-        .bind(start_key)
-        .bind(&like_pattern)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<PgListRow> = if prefix_pattern.is_empty() {
+            sqlx::query_as(
+                "SELECT DISTINCT ON (key) key, size, etag, created_at
+                 FROM named_objects
+                 WHERE bucket = $1 AND key > $2 AND state = 1 AND deleted_at IS NULL
+                 ORDER BY key, version DESC
+                 LIMIT $3",
+            )
+            .bind(&req.bucket)
+            .bind(start_key)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            match super::prefix_upper_bound(prefix_pattern) {
+                Some(upper) => {
+                    sqlx::query_as(
+                        "SELECT DISTINCT ON (key) key, size, etag, created_at
+                         FROM named_objects
+                         WHERE bucket = $1 AND key > $2 AND key >= $3 AND key < $4
+                           AND state = 1 AND deleted_at IS NULL
+                         ORDER BY key, version DESC
+                         LIMIT $5",
+                    )
+                    .bind(&req.bucket)
+                    .bind(start_key)
+                    .bind(prefix_pattern)
+                    .bind(upper)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                // 全串顶格的理论前缀:无上界,仅下界(正确性不受影响)。
+                None => {
+                    sqlx::query_as(
+                        "SELECT DISTINCT ON (key) key, size, etag, created_at
+                         FROM named_objects
+                         WHERE bucket = $1 AND key > $2 AND key >= $3
+                           AND state = 1 AND deleted_at IS NULL
+                         ORDER BY key, version DESC
+                         LIMIT $4",
+                    )
+                    .bind(&req.bucket)
+                    .bind(start_key)
+                    .bind(prefix_pattern)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+            }
+        };
 
         let is_truncated = rows.len() as i64 > req.max_keys as i64;
         let entries_len = (rows.len() as i32).min(req.max_keys);
@@ -877,26 +918,61 @@ impl MetaStore for PgMetaStore {
         opts: ListUploadsOpts,
     ) -> Result<ListUploadsResp> {
         let limit = opts.max_uploads.max(1) as i64 + 1;
+        // 同 list_objects:前缀走字面范围扫(prefix_upper_bound 上界)。
         let prefix_pattern = opts.prefix.as_deref().unwrap_or("");
-        let like_pattern = format!(
-            "{}%",
-            prefix_pattern.replace('%', "\\%").replace('_', "\\_")
-        );
         let key_marker = opts.key_marker.as_deref().unwrap_or("");
         let id_marker = opts.upload_id_marker.as_deref().unwrap_or("");
 
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT key, upload_id, created_at FROM multipart_uploads
-             WHERE bucket = $1 AND key LIKE $2 AND (key > $3 OR (key = $3 AND upload_id > $4))
-             ORDER BY key, upload_id LIMIT $5",
-        )
-        .bind(bucket)
-        .bind(&like_pattern)
-        .bind(key_marker)
-        .bind(id_marker)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String, String, i64)> = if prefix_pattern.is_empty() {
+            sqlx::query_as(
+                "SELECT key, upload_id, created_at FROM multipart_uploads
+                 WHERE bucket = $1 AND (key > $2 OR (key = $3 AND upload_id > $4))
+                 ORDER BY key, upload_id LIMIT $5",
+            )
+            .bind(bucket)
+            .bind(key_marker)
+            .bind(key_marker)
+            .bind(id_marker)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            match super::prefix_upper_bound(prefix_pattern) {
+                Some(upper) => {
+                    sqlx::query_as(
+                        "SELECT key, upload_id, created_at FROM multipart_uploads
+                         WHERE bucket = $1 AND key >= $2 AND key < $3
+                           AND (key > $4 OR (key = $5 AND upload_id > $6))
+                         ORDER BY key, upload_id LIMIT $7",
+                    )
+                    .bind(bucket)
+                    .bind(prefix_pattern)
+                    .bind(upper)
+                    .bind(key_marker)
+                    .bind(key_marker)
+                    .bind(id_marker)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                None => {
+                    sqlx::query_as(
+                        "SELECT key, upload_id, created_at FROM multipart_uploads
+                         WHERE bucket = $1 AND key >= $2
+                           AND (key > $3 OR (key = $4 AND upload_id > $5))
+                         ORDER BY key, upload_id LIMIT $6",
+                    )
+                    .bind(bucket)
+                    .bind(prefix_pattern)
+                    .bind(key_marker)
+                    .bind(key_marker)
+                    .bind(id_marker)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+            }
+        };
 
         let is_truncated = rows.len() as i64 > opts.max_uploads as i64;
         let uploads: Vec<UploadEntry> = rows
@@ -1992,5 +2068,166 @@ mod tests {
         };
         let resp = store.list_multipart_uploads(&bucket, opts).await.unwrap();
         assert_eq!(resp.uploads.len(), 2);
+    }
+
+    /// H3 级联回收(2026-10-26):delete/覆盖把 manifest 全部片一并送 pending_reclaims;
+    /// 损坏 manifest 退化为只收主 blob。
+    #[tokio::test]
+    #[ignore]
+    async fn delete_and_overwrite_cascade_manifest_parts() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = PgMetaStore::new(pool);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let key = format!("key-{}", Uuid::new_v4());
+        let m = |id: u32| StoreKey::from_parts(1, id);
+        let manifest = serde_json::json!([
+            { "blob_id": m(601).as_bytes().to_vec(), "size": 1 },
+            { "blob_id": m(602).as_bytes().to_vec(), "size": 2 },
+        ])
+        .to_string();
+        let mk = |blob: StoreKey, manifest: Option<String>| PutObjectMeta {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            blob_id: blob,
+            size: 3,
+            etag: "e".into(),
+            content_type: None,
+            user_meta: UserMeta::default(),
+            parts_manifest: manifest,
+            sse: None,
+            checksum: None,
+        };
+        // 删除:主 blob + 两片全部入账。
+        let primary = m(600);
+        store
+            .put_object(mk(primary, Some(manifest.clone())))
+            .await
+            .unwrap();
+        store.delete_object(&bucket, &key).await.unwrap();
+        let batch = store.pending_reclaims_batch(50).await.unwrap();
+        for id in [primary, m(601), m(602)] {
+            assert!(batch.contains(&id), "级联缺 {id:?}: {batch:?}");
+        }
+        // 覆盖链:610 覆盖(行已删,新行)→ 611 再覆盖 610(遮蔽级联动 610 及其片);
+        // 611 的 manifest 损坏 → 只收自己。
+        store.put_object(mk(m(610), Some(manifest))).await.unwrap();
+        store
+            .put_object(mk(m(611), Some("not-json".into())))
+            .await
+            .unwrap();
+        store.delete_object(&bucket, &key).await.unwrap();
+        let batch = store.pending_reclaims_batch(50).await.unwrap();
+        assert!(
+            batch.contains(&m(610)) && batch.contains(&m(611)),
+            "{batch:?}"
+        );
+        // 自洁(共享活库不留残留)。
+        let ids = [m(600), m(601), m(602), m(610), m(611)];
+        let _ = store.resolve_pending_reclaims(&ids).await.unwrap();
+    }
+    /// 前缀 = 字面匹配(seaweedfs#11737 同族回归):`_`/`%`/`\` 都不得当通配符;
+    /// multipart 上传列表同口径。范围扫(B2)后语义 = 纯字节序前缀。
+    #[tokio::test]
+    #[ignore]
+    async fn list_prefix_is_literal_not_like_wildcards() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = PgMetaStore::new(pool.clone());
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let keys = [
+            "call_03_KNlHPt", // 目标(`_` 是字面)
+            "callA03_KNlHPt", // `_` 若当通配符即误中
+            "callZ03_KNlHPt", // 同上,另一个"任意单字符"
+            "call_03_K%",     // `%` 在键名里,与含%前缀互试
+            "pre%fix/a",      // 键名含 %
+            "pre\\fix/b",     // 键名含字面反斜杠(旧转义缺口点)
+            "zz/other",
+        ];
+        for (i, k) in keys.iter().enumerate() {
+            let req = PutObjectMeta {
+                bucket: bucket.clone(),
+                key: k.to_string(),
+                blob_id: StoreKey::from_parts(1, 700 + i as u32),
+                size: 1,
+                etag: "e".to_string(),
+                content_type: None,
+                user_meta: UserMeta::default(),
+                parts_manifest: None,
+                sse: None,
+                checksum: None,
+            };
+            store.put_object(req).await.unwrap();
+        }
+        async fn list(
+            store: &impl crate::metastore::MetaStore,
+            bucket: &str,
+            prefix: &str,
+        ) -> crate::metastore::types::ListObjectsResp {
+            store
+                .list_objects(ListObjectsReq {
+                    bucket: bucket.to_string(),
+                    prefix: Some(prefix.to_string()),
+                    delimiter: None,
+                    start_after: None,
+                    continuation_token: None,
+                    max_keys: 1000,
+                })
+                .await
+                .unwrap()
+        }
+
+        // ① 前缀含 `_`:只允许字面 `_03_`(A/Z 变体必须被拒)。
+        let resp = list(&store, &bucket, "call_03_K").await;
+        let got: Vec<&str> = resp.entries.iter().map(|e| e.key.as_str()).collect();
+        assert!(got.contains(&"call_03_KNlHPt"), "字面目标必须在: {got:?}");
+        assert!(
+            got.contains(&"call_03_K%"),
+            "字面 `_03_` 前缀的键都要在: {got:?}"
+        );
+        assert!(
+            !got.contains(&"callA03_KNlHPt") && !got.contains(&"callZ03_KNlHPt"),
+            "下划线绝不当通配符: {got:?}"
+        );
+
+        // ② 前缀含 `%`:只允许字面(`pre%fix/`)。
+        let resp = list(&store, &bucket, "pre%fix").await;
+        assert_eq!(resp.entries.len(), 1, "百分比是字面");
+        assert_eq!(resp.entries[0].key, "pre%fix/a");
+
+        // ③ 前缀含字面反斜杠:只允许字面(旧转义缺口在此形态下曾漏匹配)。
+        let resp = list(&store, &bucket, "pre\\fix").await;
+        assert_eq!(resp.entries.len(), 1, "反斜杠是字面");
+        assert_eq!(resp.entries[0].key, "pre\\fix/b");
+
+        // ④ multipart 上传列表同口径(会话 key 走同一范围扫)。
+        store
+            .create_multipart(&bucket, "up_03_Lang", None, &UserMeta::default())
+            .await
+            .unwrap();
+        store
+            .create_multipart(&bucket, "upX03_Lang", None, &UserMeta::default())
+            .await
+            .unwrap();
+        let ups = store
+            .list_multipart_uploads(
+                &bucket,
+                ListUploadsOpts {
+                    prefix: Some("up_03".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let up_keys: Vec<&str> = ups.uploads.iter().map(|u| u.key.as_str()).collect();
+        assert_eq!(
+            up_keys,
+            vec!["up_03_Lang"],
+            "上传列表前缀同样字面: {up_keys:?}"
+        );
     }
 }

@@ -12,11 +12,13 @@
 //! 不做(见本次任务 Non-goals):account/container、ACL/配额、S3 协议、signed URL、签名 chunk id。
 
 pub mod config;
+pub mod delete_cascade;
 pub mod metrics;
 pub mod range;
 pub mod server;
 pub mod upload_wal;
 
 pub use config::{FrontendConfig, FrontendToml};
+pub use delete_cascade::DeleteCascade;
 pub use metrics::FrontendMetrics;
 pub use server::{build_router, AppState, Error, FrontendError};

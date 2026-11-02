@@ -9,6 +9,48 @@ use crate::error::S3Error;
 
 pub type Result<T> = std::result::Result<T, S3Error>;
 
+/// ListObjects/ListUploads 前缀的**字面上界**:任何以 `prefix` 开头的键都严格小于它
+/// (末位字符进一并截断;逐位顶格到 Unicode 顶 = 无上界)。前缀查询借此做**纯范围扫**
+/// `key >= prefix AND key < upper`,替代 LIKE —— 前缀中获得**字面语义**(`_`/`%`/`\`
+/// 不再碰通配符,对齐 seaweedfs#11737 的教训),范围谓词也让索引直接收窄扫描区间。
+pub(crate) fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(c) = chars.pop() {
+        let mut next = u32::from(c) + 1;
+        while next <= u32::from(char::MAX) && char::from_u32(next).is_none() {
+            // 跳过 UTF-16 代理区等无效码位。
+            next += 1;
+        }
+        if let Some(nc) = char::from_u32(next) {
+            chars.push(nc);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// 级联回收(H3,2026-10-26 裁决):对象行 `parts_manifest` JSON → 全部片 BlobId。
+/// 解析失败(损坏/异构)→ 空集 + warn —— 级联退化为旧行为(只回收主 blob),
+/// 不让一行坏 manifest 阻塞删除/覆盖的主语义。
+pub(crate) fn manifest_part_ids(manifest: Option<&str>) -> Vec<BlobId> {
+    let Some(json) = manifest else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<Vec<ManifestPart>>(json) {
+        Ok(parts) => parts
+            .into_iter()
+            .filter_map(|p| BlobId::from_slice(&p.blob_id))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cascade reclaim: parts_manifest unparseable, primary-only fallback"
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[async_trait]
 pub trait MetaStore: Send + Sync + 'static {
     // Object CRUD
@@ -197,3 +239,35 @@ pub async fn connect(cfg: &MetaStoreConfig) -> std::result::Result<Arc<dyn MetaS
 pub mod cache;
 pub mod mysql;
 pub mod pg;
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_upper_bound;
+
+    /// 字面上界的进位/截断/顶格三态(比直接手写口算更稳的钉子)。
+    #[test]
+    fn prefix_upper_bound_semantics() {
+        assert_eq!(prefix_upper_bound("ab").as_deref(), Some("ac"));
+        assert_eq!(prefix_upper_bound("az").as_deref(), Some("a{"));
+        assert_eq!(prefix_upper_bound("logs/").as_deref(), Some("logs0"));
+        assert_eq!(
+            prefix_upper_bound("call_03_K").as_deref(),
+            Some("call_03_L")
+        );
+        // 代理区跳过:0xFFFF 的下一个有效字符是 U+10000。
+        assert_eq!(
+            prefix_upper_bound("ab\u{FFFF}").as_deref(),
+            Some("ab\u{10000}")
+        );
+        // 逐位顶格:末位顶格即弃位进位("a+顶格" 的上界是 "b" —— 一切 "a…" 都 < "b");
+        // 整串顶格才无上界(调用方退化为仅下界)。
+        assert_eq!(prefix_upper_bound("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(prefix_upper_bound("\u{10FFFF}"), None);
+        // 不变式:任何以 prefix 开头的串都严格小于上界。
+        // 不变式只覆盖真正的前缀延伸(以 prefix 开头者);非延伸串不在上界的义务内。
+        let ub = prefix_upper_bound("abz").expect("上界");
+        for cand in ["abz", "abzz", "abz\u{10FFFF}", "abzz\u{10FFFF}{"] {
+            assert!(cand < ub.as_str(), "{cand} 必须小于上界 {ub}");
+        }
+    }
+}

@@ -41,6 +41,16 @@ pub struct FrontendConfig {
     /// CORS 允许的来源列表;**默认空 = 不挂 CORS 层**(不是"放开所有跨域")。
     /// 需要浏览器直连时才逐个列出。
     pub cors_allowed_origins: Vec<String>,
+    /// 组合对象**删除级联账本**目录(H3 修复,2026-10-26 裁决)。
+    ///
+    /// **空(默认)= 不级联**:删除只墓描述符,片留给 TTL(有 TTL 时)或永久驻留
+    /// (无 TTL 时,即 H3 泄漏现状)—— frontend 无状态立场的默认取舍;
+    /// 非空 = 启动建目录、`DELETE` 组合对象先记片名单入账(fsync 先于主墓碑),
+    /// 此后按 `delete_cascade_sweep_interval_secs` 周期由后台逐片墓碑。
+    pub delete_cascade_ledger_dir: std::path::PathBuf,
+    /// 级联清扫周期(秒)。默认 86400(每日);**0 = 只在启动扫一拍、不起周期任务**
+    /// (测试/排障用;语义对齐 `partition_refresh_secs = 0` 的先例)。
+    pub delete_cascade_sweep_interval_secs: u64,
     /// 内嵌的 router SDK 配置(`[frontend.router]` 子表)。
     pub router: RouterConfig,
 }
@@ -54,6 +64,8 @@ impl Default for FrontendConfig {
             upload_session_wal_dir: std::path::PathBuf::new(),
             auto_chunk_bytes: 4 * 1024 * 1024,
             cors_allowed_origins: Vec::new(),
+            delete_cascade_ledger_dir: std::path::PathBuf::new(),
+            delete_cascade_sweep_interval_secs: 86_400,
             router: RouterConfig::default(),
         }
     }

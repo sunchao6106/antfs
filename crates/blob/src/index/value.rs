@@ -17,9 +17,9 @@ use crate::types::LogOffset;
 /// 该 key 的当前赢家是墓碑(对象已删除,数据体不存在)。
 pub const FLAG_DELETED: u8 = 1 << 0;
 
-/// 该记录是**拼装描述符**(frontend stitch/auto-chunk 写下的组合对象清单,
-/// `s3` 外另一形态)。类型位,不改变数据的存储与读取;仅在网关置信读路径消费
-/// ——此前网关靠 MAGIC 嗅探,普通 blob 撞前缀即失真(`blob-composed-flag`)。
+/// 该记录是**拼装描述符**(router 恒切或 S3 multipart manifest 写下的组合对象清单,
+/// 类型位,不改变数据的存储与读取;仅在网关置信读路径消费
+/// ——此前网关靠 MAGIC 嗅探,普通 blob 撞前缀即失真(`blob-composed-flag`)。位段 1-3 预留(本 change 只启用 4)。
 /// 位段 1-3 预留(本 change 只启用 4)。
 pub const FLAG_COMPOSED: u8 = 1 << 4;
 

@@ -332,7 +332,7 @@ impl Router {
                             chunk_id = %id,
                             expected = r.size,
                             actual = b.len(),
-                            "stitched chunk size mismatch"
+                            "composed chunk size mismatch"
                         );
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -440,7 +440,7 @@ impl Router {
                             chunk_id = %id,
                             expected = r.size,
                             actual = b.len(),
-                            "stitched chunk size mismatch (range)"
+                            "composed chunk size mismatch (range)"
                         );
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,

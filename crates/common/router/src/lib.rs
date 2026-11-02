@@ -660,7 +660,7 @@ impl Router {
     }
 
     /// [`put_with_ttl`](Self::put_with_ttl) 的组合写形态:数据面置 `composed=true`,落库
-    /// 记录带拼装描述符类型位(`POST /stitch` 描述符写口;仲裁语义与 plain 逐字一致)。
+    /// 记录带拼装描述符类型位(仲裁语义与 plain 逐字一致)。
     pub async fn put_composed_with_ttl(
         &self,
         key: StoreKey,

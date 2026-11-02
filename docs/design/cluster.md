@@ -905,7 +905,7 @@ client/frontend: GetBlobIds 向 master 要号段 → 得 P + blobId(partitionId<
 ```
 - **W 由实际副本数实算,不做配置项**(见 `blob-io-end-to-end` D2):RF=3 → 2、RF=1 → 1、RF=5 → 3;
   副本数取**放置全量** ⇒ 掉 1 个节点仍写得进、掉 2 个写不进(少数派不接受写)。
-- 分片(大对象):`POST /stitch` 拼装,描述符当 blob 存(frontend 侧,无状态)。
+- 分片(大对象):服务端恒切(router 层,片轮转散分区)+ 描述符当 blob 存,无状态(客户端拼装协议 `/stitch` 已于 2026-10-26 退役)。
 
 **GET(R=1,不可变红利)**:
 ```

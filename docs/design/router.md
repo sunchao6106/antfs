@@ -241,7 +241,7 @@ key 上)。失败 = 已入库片逐片**尽力墓碑** + 原错误透传;超容�
       该分区条目 + 重拉一次,新列表不同则本次读重试一次(单请求有界);纯 NotFound miss 不
       驱逐。观测 `router_topology_refreshes_total{reason=ttl|evict}`)。
 - [x] ~~`put*` 增加 `expiration_ms` 参数~~ —— **已落地为 `Router::put_with_ttl`**(写入时定 TTL,frontend 的 `x-antfs-ttl-ms` 已是单次原子写)。
-- [ ] 大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)。
+- [x] ~~大对象靠分片 + `frontend` 的 `/stitch`(本 crate 不感知)~~ —— **恒切已下沉本 crate**(`chunked.rs`,2026-10-21:write 超片宽内部切片、读侧透明拼装;客户端拼装协议 `/stitch` 已于 2026-10-26 退役)。
 - [x] ~~上传/下载路径零本地临时盘(读写两侧)~~ —— **读侧已全清**(2026-10-21:网关下载走
       router 逻辑流(`get_object_stream`,裁决⑫);SDK 落盘式读口 `get_file` 已删(裁决⑭);
       `put_file` 家族已整体移除(2026-10-22 裁决,零内部调用方);其压缩帧临时文件更早随压缩移除(⑬)一并消失

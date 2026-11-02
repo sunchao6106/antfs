@@ -7,8 +7,8 @@
 //! 故 `frontend_replica_errors_total` 的 `kind` 取 [`antfs_router::Error::kind`](SDK 的稳定分类)。
 
 use antfs_metric::{
-    counter, counter_vec, gauge_vec, latency_seconds_vec, HistogramVec, IntCounter, IntCounterVec,
-    IntGaugeVec, Registry, Result,
+    counter, counter_vec, gauge, gauge_vec, latency_seconds_vec, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, Registry, Result,
 };
 
 /// op 口径(延迟/在途/变更类指标的 label 真值):一个 HTTP 端点 = 一个 op。
@@ -19,8 +19,6 @@ pub const OP_DOWNLOAD: &str = "download";
 pub const OP_HEAD: &str = "head";
 /// `DELETE /blobs/{blobId}`。
 pub const OP_DELETE: &str = "delete";
-/// `POST /stitch`。
-pub const OP_STITCH: &str = "stitch";
 
 /// 成功口径(所有 `*_total{outcome}` 共用;其余取值是错误分类,见 `Error::outcome`)。
 pub const OUTCOME_OK: &str = "ok";
@@ -53,7 +51,7 @@ pub struct FrontendMetrics {
     pub download_bytes: IntCounter,
     /// 删除请求数(`DELETE /blobs/{blobId}`),label `outcome`。
     pub delete_total: IntCounterVec,
-    /// 其余变更请求数,label `op`(head/stitch)+ `outcome`。
+    /// 其余变更请求数,label `op`(head)+ `outcome`。
     pub mutation_total: IntCounterVec,
     /// 请求延迟(秒),label `op`;覆盖含边界校验早退在内的所有出口。
     pub request_duration: HistogramVec,
@@ -61,6 +59,16 @@ pub struct FrontendMetrics {
     pub in_flight: IntGaugeVec,
     /// router 调用失败数,label `kind`(`antfs_router::Error::kind()` 的稳定分类)。
     pub replica_errors: IntCounterVec,
+    /// 组合对象删除级联:账本待处理行数(delete-cascade)。
+    pub delete_cascade_entries: IntGauge,
+    /// 级联清扫拍数。
+    pub delete_cascade_runs_total: IntCounter,
+    /// 级联实际发出的片墓碑数(含按成功的"已不存在"确认)。
+    pub delete_cascade_chunk_tombstones_total: IntCounter,
+    /// 二次确认时对象仍活着而跳过的行数(崩溃窗保护,下一轮再看)。
+    pub delete_cascade_skips_total: IntCounter,
+    /// 滞留超窗(7 天仍活)被丢弃的账行数。
+    pub delete_cascade_stale_drops_total: IntCounter,
 }
 
 impl FrontendMetrics {
@@ -128,7 +136,7 @@ impl FrontendMetrics {
             mutation_total: counter_vec(
                 registry,
                 "frontend_mutation_total",
-                "head/stitch requests by op and outcome",
+                "head requests by op and outcome",
                 &["op", "outcome"],
             )?,
             request_duration: latency_seconds_vec(
@@ -148,6 +156,31 @@ impl FrontendMetrics {
                 "frontend_replica_errors_total",
                 "failed router (SDK) calls by error kind",
                 &["kind"],
+            )?,
+            delete_cascade_entries: gauge(
+                registry,
+                "frontend_delete_cascade_entries",
+                "pending delete-cascade ledger rows (composed objects awaiting chunk reclamation)",
+            )?,
+            delete_cascade_runs_total: counter(
+                registry,
+                "frontend_delete_cascade_runs_total",
+                "delete-cascade sweeper ticks",
+            )?,
+            delete_cascade_chunk_tombstones_total: counter(
+                registry,
+                "frontend_delete_cascade_chunk_tombstones_total",
+                "chunk tombstones issued by the delete-cascade sweeper (idempotent; missing counts as done)",
+            )?,
+            delete_cascade_skips_total: counter(
+                registry,
+                "frontend_delete_cascade_skips_total",
+                "rows skipped because the descriptor is still alive (crash-window guard)",
+            )?,
+            delete_cascade_stale_drops_total: counter(
+                registry,
+                "frontend_delete_cascade_stale_drops_total",
+                "rows dropped after staying alive past the stale window (no cascade performed)",
             )?,
         })
     }

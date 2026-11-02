@@ -51,9 +51,9 @@ The faithful Rust port of Ambry (architecture and semantics 1:1, with strictly-e
 │ Frontend — REST        │  │ S3 gateway             │            │ PostgreSQL / MySQL  │
 │ · /blobs · TTL · DELETE│  │ · buckets · objects ·  │            │ gateway is stateless│
 │ · auto-chunk > 4 MiB:  │  │   multipart · list     │            └─────────────────────┘
-│   chunks + stitch      │  │ · SigV4 (header ·      │
+│   chunks + composed    │  │ · SigV4 (header ·      │
 │   descriptor (GET/HEAD │  │   presigned) · creds   │
-│   stitch transparently)│  │   admin token          │
+│   re-joined)           │  │   admin token          │
 └───────────┬────────────┘  └───────────┬────────────┘
             │                           │
             └─────────────┬─────────────┘
@@ -83,7 +83,7 @@ The faithful Rust port of Ambry (architecture and semantics 1:1, with strictly-e
         └────────────────────────────────────────┘
 ```
 
-Layered reading: **gateways** (Frontend / S3) are stateless translators — every object id is self-locating (blobId, D3), no per-object metadata inside the cluster; the **Router SDK** is the only place W/R semantics live; the **master** owns topology via built-in Raft (no ZooKeeper); **store nodes** hold the append-only blob engine, where large objects land as ordinary chunks plus a stitch/multipart descriptor that reads back as one logical stream.
+Layered reading: **gateways** (Frontend / S3) are stateless translators — every object id is self-locating (blobId, D3), no per-object metadata inside the cluster; the **Router SDK** is the only place W/R semantics live; the **master** owns topology via built-in Raft (no ZooKeeper); **store nodes** hold the append-only blob engine, where large objects land as ordinary chunks plus a composed/multipart descriptor that reads back as one logical stream.
 
 | Component | Description | Status |
 |---|---|---|

@@ -2090,7 +2090,6 @@ CI 的 2 核 runner 时序放大了撞车概率。这违反了本仓测试纪律
 - 测试面 16 处全改 `*:0` + serve 后取回 —— 端口所有权从"探测再碰运气"变成"bind 即持有",
   竞态窗口**从机制上归零**,不靠时序。锁临界区仅一次赋值(poison 不变量 → into_inner 惯用法)。
 
-## Testing Done
 
 - `cargo test --workspace` 77 套 765/0;clippy 0;fmt 净(见 48dbad2 之上的修复提交)
 - 竞态机理对照:修复前 = probe→close→之后 bind(TOCTOU 窗口,并行测试可双双拿到同一端口);
@@ -2116,7 +2115,6 @@ AlreadyExists → CONFLICT`)与 router 归一层(`classify_err_status → Error:
 **语义红线**(不动):409 **不**计多数派 ack(key 被占 ≠ 本次数据落位);混合失败保守
 Quorum;W/R 算法零改。
 
-## Testing Done
 
 - router lib 单测 17(新增判定矩阵 4 例:全 409/混合/无失败/1ok+409);e2e 13(新增
   `duplicate_keyed_put_surfaces_conflict`:RF=2 首写 2/2 → 重发同 key → 断言
@@ -2174,7 +2172,6 @@ store.md §12.16。
 `Error::NotLeader{detail, leader_addr}`,发号路径自愈:单飞切换 master channel
 (1s 防抖 + Mutex 整体换 client)+ 重试一次。
 
-## Testing Done
 
 - master 11→**12 套 157**:新增 upsert 幂等单测 + 旧快照负向单测;4 个"缺字段可读"
   fixture 补 `master_endpoints`(被测语义是**其余字段**缺省,严 字段另钉);3 处
@@ -2193,7 +2190,6 @@ store.md §12.16。
 (陈旧与 miss 无从判别,保守)。新指标 `router_topology_refreshes_total{reason=ttl|evict}`。
 锁纪律:std 读锁只克隆,不持锁 await(clippy::await_holding_lock)。
 
-## Testing Done
 
 - lib 23(TTL 边界纯语义单测:0=关 / 29s 新鲜 / 31s 过期);e2e 新 1
   `topology_refresh_counts_ttl_and_evict_reasons`(TTL 短旋钮轮询 metric{ttl}≥1;
@@ -2212,7 +2208,6 @@ store.md §12.16。
 (`router_id_prefetch_errors_total`)。副收益:预取响应顺带刷新读拓扑条目
 (`segment_from_response` 复用)。
 
-## Testing Done
 
 - lib 24(新增低水位探针/续段/落空丢弃/无段直插单测);e2e 18(新增
   `id_prefetch_keeps_allocation_fluent_on_tiny_segments`:4 号极小段连续 32 号全成功 +
@@ -2231,7 +2226,6 @@ store.md §12.16。
 判定,与 Bytes 口同义。算法族四臂全接(zstd/gzip/lz4/snappy);lz4 显式 `finish()` 收尾
 (前批截尾教训);snap 无 `finish()` 用 `into_inner()`。
 
-## Testing Done
 
 - router lib 26(新增 `stream_compress_roundtrip_all_algos`:四算法 roundtrip + 熵回落 low_ratio +
   零长 too_small;`stream_compress_io_failure_falls_back`:缺文件 io 回落);
@@ -2252,7 +2246,6 @@ store.md §12.16。
 `s3.metastore.meta_cache_ttl_secs`(默认 30,0=关);观测 `s3_meta_cache_lookups_total
 {kind, result}`。装配:独立二进制 + devcluster 内嵌网关(后者真面默认 30)。
 
-## Testing Done
 
 - antfs-s3 lib **106**(新增 8:命中/负缓存/删凭证失效/建凭证摘负缓存/桶写失效/建桶摘
   负缓存/确定性过期[直构倒拨时刻,无 sleep]/ttl=0 身份原样归还 + 无缓存行为旁证;
@@ -2286,7 +2279,6 @@ store.md §12.16。
   自动落既有审计中间件(登录失败记 `actor=anonymous`);devcluster 内嵌网关保持
   静态面(`auth_db: None`),本地形态不变。
 
-## Testing Done
 
 - antfs-admin lib **83/0 + 2 ignored**(71 + 12 新:argon2 轮转/令牌形状/守卫窗
   裁剪[免 sleep 倒拨,§5.6]/口令域 + 登录发会话过 `/api/me`、错误口令 401、5 败后
@@ -2429,7 +2421,6 @@ TTL 的会话对象、内容=片位表;描述符落正名才发布;清扫器只�
 **门禁**:frontend 11+23;**workspace 77 套 811/0**;clippy 0;fmt 净。零旋钮零配置变更
 (§5.1 不动既有默认);监控 +1(见 frontend.md §9)。
 
-## Testing Done
 
 - `cargo test --workspace`:77 套 811 passed / 0 failed;`cargo clippy --workspace
   --all-targets` 0 告警;`cargo fmt --check` 净;6 轮 rest.rs 并发复跑零 flake(互斥锁后)。
@@ -2463,7 +2454,6 @@ TTL 的会话对象、内容=片位表;描述符落正名才发布;清扫器只�
   与残余)+ §12(router 下沉开工单 = 下批方向,含共存矩阵与任务切分)/ tasks 3c 勾 + 3d 增 /
   spec 网关 requirement 改恒切+公共上限+收账(单行长行 SHALL)+ 新 S3 双闸 requirement。
 
-## Testing Done
 
 - frontend lib **16/0**(4 upload_wal 单测:四类会话判定/崩溃回放 sid 接续/截断尾容忍/瘦身
   = 三轮复跑零 flake)+ e2e rest **24/0**(+1 `wal_records_committed_session`:start+4 片 chunk+commit
@@ -2505,7 +2495,6 @@ S3 Range 接口适配 router 窗口读、一切调整落最新设计文档。
   152→150),随批补齐;本地另有所有者 3 个未推送 docs/格式提交随批一起走 CI。
 - **文档全量**、openspec 双 change 落档、裁决⑨-⑪、D1-D5 定稿、spec delta 三 requirement)。
 
-## Testing Done
 
 - workspace 全量:**78 套 819+**(router 22 lib + 18 e2e:恒切 17MiB 往返/散布两分区/窗口 5-7MiB
   室内恒等/关键 409 冲突三片墓碑计数/宽 0 关态/put_file 流读恒等;frontend 19 lib + 25 rest:
@@ -2537,7 +2526,6 @@ max_body 4 MiB / 都走 router)、put_file 使用场景与恒切可行性、**�
 **动机(白话)**:恒切是 SDK 直连大 Bytes 的最后一道防线;关掉它,单笔 GB 级 body 直怼
 store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该防线不设退出态。
 
-## Testing Done
 
 - antfs-router 22 lib + 18 e2e 全绿(重写测试过);frontend/s3 配置测试绿(见 workspace);
 - `openspec validate upload-zero-spool` 过;待:fmt/clippy/workspace 全套 + CI 双绿。
@@ -2565,7 +2553,6 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
 - 动机:零内部调用方;大文件直传统一收敛到恒切族,"单笔任意大"合法来源只剩
   拉复制整段(engine 内部)。
 
-## Testing Done
 
 - 活库(本机 PG `antfs_s3`):streamed_put 4/4 绿(字节恒等/ETag 复合/ck 头回显/
   **坏 ck 清场 session 片行零残留**/SSE 501 对象不存在);limits 2/2 复跑绿。
@@ -2603,7 +2590,6 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
   逻辑镜像(编辑级核对,无活库条件,报告如实口径)。测试隔离规矩:活库共享库
   不得出现全表级清库(已随注释/DEVLOG 固化)。
 
-## Testing Done
 
 - **CI 复盘补记**:步 100 首推 CI 红 —— `complete_multipart_discards_unlisted_parts`
   的按家清理我清成"列入清单的片",(4,3) 才是 WAL 里那行(**被丢弃者才入账**),下游
@@ -2628,7 +2614,6 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
 (裁决 #16,重启条件三则);staged 路径 / `staging_dir` 去留仍与"内联门槛小补丁"一项
 耦合待所有者裁决。
 
-## Testing Done
 
 - antfs-store 全部测试绿(141/0 lib + 13 测试二进制,含改名岗哨 3 处与断连重写 1 处);
   workspace **79 套 811/0**;clippy 0;fmt 净;`openspec validate` 过。
@@ -2654,4 +2639,79 @@ store(今天仅剩 put_file 与拉复制整段两个合法来源)。禁 0 = 该�
 上限 —— 在途不受限与旧小对象路径同口径。曾提议的"内联门槛旋钮/在写并发闸"被所有者否决(极简
 形态);若未来上限调大或出现直连大单笔形态,重启评估(与 A 段冻结重启条件同轨)。
 配齐裁决 #16(B/A 封账)、#17(裸默认自洽)同一批记档。
+
+### 步 103:客户端分片协议 `/stitch` 整体退役(2026-10-26 裁决)
+
+**动因**:服务端恒切(墙③)落地后,`POST /stitch` + 必填头 `x-antfs-session` 的"客户端分片
+拼装"协议只剩断点续传一个残余价值,却是缺陷温床(删除不级联的"片可能共享"论据、TTL 倒挂
+清单永不过期、串行 stat 4096 次、无会话归属校验)且与 S3 模式的服务端权威会话路线相悖。
+所有者裁决:接口砍掉。
+
+**移除面**(`/stitch` 路由 + handler + `StitchRequest`/`stitch_inner` + `session_of` +
+`HEADER_SESSION` + `OP_STITCH` + CORS 白名单除名 + 模块/文档注释口径):组合对象唯一产径 =
+`POST /blobs` 服务端恒切;描述符 session 字段**保留但恒空**(磁盘格式零变更,§3.4);
+server `x-antfs-session` 口径退役;WAL/收账簿不受影响(sid 本就是服务端 `begin` 自铸)。
+测试定向裁 3:`stitch_concatenates_chunks_in_order`、`invalid_session_rejects_before_any_chunk`、
+`session_validation_for_auto_chunk`(有位正例由流式自动分片测覆盖)。
+
+**连带记档**:①主规格 `blob-composed-flag`、`frontend.md` §4 重写为"组合对象机制";
+②原"DELETE 不级联"的历史论据随协议退役消失(H3 级联回收方向另行立项);③CLAUDE.md §3.4
+记档所有者裁决:无线上部署 ⇒ 磁盘格式变更**无新老兼容约束**(评审中"新加字段踩兼容红线"
+论据撤销;首个线上部署前回收)。
+④顺手修 cf0189c 带入的主规格瑕疵:第 6 条 requirement 多行正文被 openspec 解析器在
+"反引号+中文引号"边界截断丢 SHALL → 并单行,`spec/upload-zero-spool` 通过 validate。
+
+
+- cargo fmt 净;clippy --workspace --all-targets 0 告警;
+- workspace **79 套 808/0**(811−3 = 定向删除的 3 测试,无意外伤亡;frontend lib 18 +
+  e2e 23、router 22+17 全绿);
+- 残留扫尾:全仓 grep 无 `/stitch` 路由/头引用;保留三类合法残留 = 历史裁决记注(含
+  spec 退役记注、descriptor 模术语括注、s3.md 自家否决档)、`x-antfs-blob-stitched` 响应头
+  事实族(自动分片产物同样携带)、blob/cluster/router 旧"stitch/auto-chunks 生产者集合"注
+  已统一改写为恒切口径。
+- `openspec validate --all`:spec 面全部通过;change 面 10 项为**既有在途变更的既往状态**
+  (HEAD 基线同为 11 项失败,本批零新增;未纳入本批范围,不代改)。
+
+### 步 104:H3 删除级联回收落地(S3 事务级联 + REST 级联账本)
+
+**双模式收口"删除即泄漏"(组合对象的片无墓碑、压实永不收):**
+- **S3**:三处同事务级联 —— `delete_object` / `put_object` 遮蔽 / `complete` 复用的 `put_object`,
+  带出 `parts_manifest` → `manifest_part_ids` 解析 → 连主 blob 全送 `pending_reclaims`
+  (ON CONFLICT 幂等),既有 GC 每日消化;附带摘除 `batch.rs`"删后再读"死代码与
+  并发误删竞态;PG/MySQL 对称实现。
+- **REST**:新 `delete_cascade` 模块(本地 JSONL 账本)。`DELETE` = 记账(逐行 fsync,
+  **先于**主墓:任何时刻崩溃账都在)→ 墓描述符 → 204,毫秒级与片数无关;后台周期清扫
+  **二次确认**(描述符已死才逐片幂等墓;活着跳过、滞留超 7 天弃行 —— 宁可不级联,
+  绝不误删活对象),原子 compact(tmp→fsync→rename + 目录 fsync)。新配置 2 项
+  (ledger 目录默认空 = 关,对齐 WAL 先例;清扫周期默认 86400s,0 = 启动一拍)、
+  新指标 5 项;`FrontendError::Cascade` 启动校验;复用 `composed` 位,磁盘格式零变更。
+
+**测试**(复现在先):e2e —— 删 4 片组合对象 → 账 1 行(4 片)→ 手动一扫 → 片全体
+stat=deleted/404、账清零、指标落真 Registry、幂等二扫零新增、普通对象删除不入账;
+反向 —— 活对象投账绝不级联(读回原字节)。metastore —— PG/MySQL 各一测(删/覆盖链/
+corrupt manifest 退化单收)。
+
+
+- fmt 净;clippy workspace 0;frontend **25 e2e + 21 lib** 全绿(新增 2 e2e;
+  `delete_cascade` 单测 3:往返持久化/坏行容忍/compact 原子重写);
+- 活库复刻 CI 两步:PG+MySQL 串行 `-- --ignored --test-threads=1` **15 套 158/0**
+  (156 + 2 新级联测;MySQL 方言同跑)。
+
+### 步 105:ListObjects/ListUploads 前缀字面化——范围扫替代 LIKE(防 11737 同族)
+
+**动因**(seaweedfs#11737 教训):前缀拼 `LIKE` 的路径迟早踩方言转义坑(彼处 `_`/`%` 未转义
+→ 结果错 + 40× 扫描退化;我处虽已转义 `%`/`_` 但 `\` 缺口与"第一页无 prefix 下界"同族)。
+**改法**:`key >= prefix AND key < prefix_upper_bound`(末位字符进一截断、跳过无效码位;
+全顶格退化为仅下界)—— 字面语义不再依赖任何转义,`(bucket, key)` 索引直接收窄;marker
+分页谓词顺带改成连续编号占位(消 `$N` 重复出现与 sqlx 对位的模糊性)。
+**测试先行**:pg/mysql 各一 `#[ignore]` 活库回归 —— 干扰键矩阵(`callA03/callZ03` 顶 `_` 槽、
+`pre%fix`、`pre\\fix` 字面反斜杠)断言只匹配字面前缀;multipart 上传列表同口径。
+
+## Testing Done
+
+- 活库复刻 CI 两步:PG+MySQL `-- --ignored --test-threads=1` **双双 160/0**
+  (158+2 新字面化回归; PG 侧修后 uploads 既有 prefix 测试亦复绿);
+- fmt 净;clippy 0;workspace 79 套 **813/0**(新测试为 `#[ignore]` 活库岗哨,不计默认面);
+- **B2 落位注**:`s3.md` 与本步记档;`prefix_upper_bound` 单点实现、pg/mysql 四处查询三形态
+  (空前缀/带上界/全顶格)对齐。
 

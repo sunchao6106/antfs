@@ -5,8 +5,9 @@
 //! 也不落每对象元数据(D3:无中心每对象元数据)—— 故服务**无状态、可水平扩展**。
 //!
 //! 两条与"无状态"直接相关的设计:
-//! - **分片拼装(`POST /stitch`)不用服务端 session 表**:拼装关系写进一个**描述符 blob**
-//!   (见 [`encode_descriptor`]),片本身是普通 blob,`GET` 读到描述符即逐片流式拼装;
+//! - **组合对象无服务端会话表**:大对象 = "描述符 + 片"(见 [`encode_descriptor`]),片是普通
+//!   blob,`GET` 读到描述符即逐片流式拼装(客户端分片协议 `POST /stitch` + `x-antfs-session`
+//!   已于 2026-10-26 退役,组合对象唯一产径 = 服务端恒切);
 //! - **上传零本地临时盘(④边收边分片,upload-zero-spool 2026-10-21)**:内存决定窗(=
 //!   `max_body_bytes`)+ 流式分片直入集群,内存不随对象大小涨(CLAUDE.md §5.3)且全程
 //!   不写任何本地文件;代价 = 网关崩溃窗可能留下无人认领的孤儿片(所有者裁决 ④ 已接受,
@@ -27,7 +28,6 @@ use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
-use serde::Deserialize;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use antfs_metric::IntCounterVec;
@@ -36,14 +36,10 @@ use antfs_router::{
 };
 
 use crate::config::FrontendConfig;
-use crate::metrics::{
-    FrontendMetrics, OP_DELETE, OP_DOWNLOAD, OP_HEAD, OP_STITCH, OP_UPLOAD, OUTCOME_OK,
-};
+use crate::metrics::{FrontendMetrics, OP_DELETE, OP_DOWNLOAD, OP_HEAD, OP_UPLOAD, OUTCOME_OK};
 
 // ── 请求/响应头(`x-antfs-*` 契约;前身沿用 Ambry 的 `x-ambry-*`,2026-10 整体改名)──────────────
 
-/// `x-antfs-session`:分片上传的会话标识(客户端生成;片就是普通 blob,frontend 只把它记进描述符)。
-const HEADER_SESSION: HeaderName = HeaderName::from_static("x-antfs-session");
 /// `x-antfs-ttl-ms`:上传时可选带的过期时刻(epoch 毫秒)。
 const HEADER_TTL_MS: HeaderName = HeaderName::from_static("x-antfs-ttl-ms");
 /// `x-antfs-blob-id`:blobId 的 16 位 hex。
@@ -70,8 +66,8 @@ const HEADER_BLOB_STITCH_CHUNKS: HeaderName = HeaderName::from_static("x-antfs-b
 /// 内存上界 = 在途请求数 × 该值(1 MiB)。与 `store` 侧的同名阈值同因(见 `crates/store/src/server.rs`)。
 const INLINE_BODY_MAX: u64 = 1024 * 1024;
 
-/// 跨域时允许的请求头(仅本接口真正用到的三个)。
-const CORS_ALLOWED_HEADERS: [HeaderName; 3] = [header::CONTENT_TYPE, HEADER_SESSION, HEADER_TTL_MS];
+/// 跨域时允许的请求头(仅本接口真正用到的两个)。
+const CORS_ALLOWED_HEADERS: [HeaderName; 2] = [header::CONTENT_TYPE, HEADER_TTL_MS];
 /// 跨域时暴露给浏览器的响应头(全部 `x-antfs-*` + `Location`)。
 const CORS_EXPOSED_HEADERS: [HeaderName; 8] = [
     header::LOCATION,
@@ -98,7 +94,7 @@ const MAX_CHUNKS: usize = antfs_descriptor::MAX_CHUNKS;
 /// 映射规则集中在本类型的 [`Error::status`](唯一真值),handler 里不得另判。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// 调用方请求非法(blobId 格式、缺参数、片数越界、session 过长…)。
+    /// 调用方请求非法(blobId 格式、缺参数、片数越界…)。
     #[error("{0}")]
     Invalid(String),
 
@@ -241,6 +237,10 @@ pub struct AppState {
     pub cors_allowed_origins: Vec<String>,
     /// 孤儿收账簿(`None` = 未启用,④ 崩溃窗孤儿无兜底;启用后有清扫任务,见 [`upload_wal`])。
     pub upload_wal: Option<Arc<crate::upload_wal::UploadWal>>,
+    /// 组合对象删除级联账本(`None` = 未启用,删除只墓描述符 = H3 泄漏现状;启用后
+    /// `DELETE` 先记账(fsync 先于主墓碑)、后台周期逐片墓碑)。`pub`:测试夹具需手动
+    /// 驱动一拍清扫做确定性断言(§5.6 不 sleep),不暴露任何写入原语。
+    pub delete_cascade: Option<Arc<crate::delete_cascade::DeleteCascade>>,
 }
 
 /// frontend 装配错误:router 连不上 / 收账簿目录不可用 / 指标注册失败 —— **启动即失败**,
@@ -249,6 +249,8 @@ pub struct AppState {
 pub enum FrontendError {
     Router(RouterError),
     Wal(std::io::Error),
+    /// 级联账本目录不可用(启动即失败,不静默降级:同 WAL 的取舍)。
+    Cascade(std::io::Error),
     Metrics(String),
 }
 
@@ -263,6 +265,7 @@ impl std::fmt::Display for FrontendError {
         match self {
             FrontendError::Router(e) => write!(f, "router connect: {e}"),
             FrontendError::Wal(e) => write!(f, "upload session wal: {e}"),
+            FrontendError::Cascade(e) => write!(f, "delete cascade ledger: {e}"),
             FrontendError::Metrics(e) => write!(f, "metrics register: {e}"),
         }
     }
@@ -273,6 +276,7 @@ impl std::error::Error for FrontendError {
         match self {
             FrontendError::Router(e) => Some(e),
             FrontendError::Wal(e) => Some(e),
+            FrontendError::Cascade(e) => Some(e),
             FrontendError::Metrics(_) => None,
         }
     }
@@ -299,6 +303,22 @@ impl AppState {
             spawn_upload_sweeper(wal.clone(), router.clone(), metrics.clone());
             Some(wal)
         };
+        let delete_cascade = if cfg.delete_cascade_ledger_dir.as_os_str().is_empty() {
+            None
+        } else {
+            let ledger = Arc::new(
+                crate::delete_cascade::DeleteCascade::open(cfg.delete_cascade_ledger_dir.clone())
+                    .map_err(FrontendError::Cascade)?,
+            );
+            metrics.delete_cascade_entries.set(ledger.entries() as i64);
+            spawn_delete_cascade_sweeper(
+                ledger.clone(),
+                router.clone(),
+                metrics.clone(),
+                cfg.delete_cascade_sweep_interval_secs,
+            );
+            Some(ledger)
+        };
         Ok(AppState {
             router,
             metrics,
@@ -308,6 +328,7 @@ impl AppState {
             auto_chunk_bytes: cfg.auto_chunk_bytes,
             cors_allowed_origins: cfg.cors_allowed_origins.clone(),
             upload_wal,
+            delete_cascade,
         })
     }
 }
@@ -356,6 +377,28 @@ async fn sweep_uploads(
 
 /// 清扫任务:`interval` 首拍立即(= 启动即扫),此后每 [`upload_wal::SWEEP_INTERVAL_SECS`] 一拍;
 /// 进程退出随运行时消亡。
+/// 级联账本清扫:`interval_secs = 0` → 只扫启动一拍即止(测试/排障,对齐
+/// `partition_refresh_secs = 0` 先例);否则 tokio interval 首拍即时 + 周期拍。
+/// 一拍内的安全序(二次确认只删已墓碑对象)见 `delete_cascade` 模块头。
+fn spawn_delete_cascade_sweeper(
+    ledger: Arc<crate::delete_cascade::DeleteCascade>,
+    router: Arc<BlobRouter>,
+    metrics: Arc<FrontendMetrics>,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        let _ = ledger.sweep(&router, &metrics).await; // 启动一拍(消化重启前的残留账)
+        if interval_secs == 0 {
+            return;
+        }
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            tick.tick().await;
+            let _ = ledger.sweep(&router, &metrics).await;
+        }
+    });
+}
+
 fn spawn_upload_sweeper(
     wal: Arc<crate::upload_wal::UploadWal>,
     router: Arc<BlobRouter>,
@@ -372,12 +415,11 @@ fn spawn_upload_sweeper(
     });
 }
 
-/// 建路由:`/blobs*` 与 `/stitch` 是对象接口,`/metrics` 是 Prometheus 抓取口(无鉴权,抓取惯例),
+/// 建路由:`/blobs*` 是对象接口,`/metrics` 是 Prometheus 抓取口(无鉴权,抓取惯例),
 /// `/healthCheck` 是进程探活(无鉴权,恒 200,见 [`health_check`])。
 ///
 /// body 上限**分路由挂**:`/blobs` 开自动分片后上限放大到分片总量上限(裸字节体由 handler
-/// 边收边计数,`DefaultBodyLimit` 只是流式读的兜底);`/stitch` 的 JSON 体重持 `max_body_bytes`
-/// (无分片路径,放大它只是让恶意请求能白写更多信息)。
+/// 边收边计数,`DefaultBodyLimit` 只是流式读的兜底)。
 pub fn build_router(state: AppState) -> Router {
     // `/blobs` 的兜底字节上限 = 公共单文件上限(恒切;裸体由 handler 边收边计数)。
     let blobs_limit = state.max_object_bytes;
@@ -389,10 +431,6 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/blobs/{blob_id}",
             get(get_blob).head(head_blob).delete(delete_blob),
-        )
-        .route(
-            "/stitch",
-            post(stitch).layer(DefaultBodyLimit::max(body_limit(state.max_body_bytes))),
         )
         .route("/metrics", get(get_metrics))
         .route("/healthCheck", get(health_check))
@@ -429,9 +467,8 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 
 /// `POST /blobs`:body = 裸 blob 字节 → 201 + `Location` / `x-antfs-blob-id` / `x-antfs-blob-size`。
 ///
-/// 分片上传的**片就是普通 blob**(带 `x-antfs-session` 也不改变写入路径),片清单由客户端自己记
-/// —— frontend 无状态(D3)。可选头 `x-antfs-ttl-ms` 见 [`upload`]。
-/// body 超过 `max_body_bytes` 且开启自动分片时,切片+描述符路径见 [`stream_upload`]。
+/// frontend 无状态(D3):大对象由服务端恒切成"片 + 描述符"(唯一产径),不设客户端分片协议。
+/// 可选头 `x-antfs-ttl-ms` 见 [`upload`];body 超过 `max_body_bytes` 走 [`stream_upload`]。
 async fn post_blob(State(st): State<AppState>, req: Request) -> Response {
     let _timer = RequestTimer::start(&st.metrics, OP_UPLOAD);
     match upload(&st, req).await {
@@ -484,8 +521,6 @@ struct Uploaded {
 async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
     // 先解析 TTL 头:非法立即 400,不白读一遍 body。
     let expiration_ms = ttl_header(req.headers())?.unwrap_or(NO_EXPIRATION);
-    // session 只有走分片路径才会写进描述符;提前取值(之后 req 被 into_body 消费)。
-    let session = req.headers().get(HEADER_SESSION).cloned();
     let declared = content_length(&req);
     // 该路径收得下的总量:关自动分片 = `max_body_bytes`(超 → 413,旧契约);开 = 分片总量上限。
     // 恒切契约的单文件上限 = 公共值([upload] 表,REST 与 S3 同一处);声明超限在读体前 413。
@@ -543,28 +578,9 @@ async fn upload(st: &AppState, req: Request) -> Result<Uploaded, Error> {
             }
         }
         // 大档(声明 > max)或无声明长度:恒切(④)边收边分片 —— 零本地文件。
-        _ => stream_upload(st, req.into_body(), declared, expiration_ms, session).await?,
+        _ => stream_upload(st, req.into_body(), declared, expiration_ms).await?,
     };
     Ok(result)
-}
-
-/// 分片路径的 session 头口径(与 `/stitch` 一致):给了就必须能作 header 文本读出、长度 ≤ 65535
-/// (描述符的 u16 长度域)。单 blob 路径不看这个头(分片上传的片就是普通 blob)。
-fn session_of(raw: Option<HeaderValue>) -> Result<Option<String>, Error> {
-    let raw = match raw {
-        None => return Ok(None),
-        Some(v) => v,
-    };
-    let text = raw
-        .to_str()
-        .map_err(|_| Error::Invalid("x-antfs-session must be valid text".into()))?
-        .to_string();
-    if text.len() > u16::MAX as usize {
-        return Err(Error::Invalid(
-            "x-antfs-session must be at most 65535 bytes".into(),
-        ));
-    }
-    Ok(Some(text))
 }
 
 /// 大 body / 无声明长度的流式上传(④ 边收边分片,upload-zero-spool):**内存决定窗** =
@@ -585,17 +601,12 @@ async fn stream_upload(
     body: Body,
     declared: Option<u64>,
     expiration_ms: i64,
-    session: Option<HeaderValue>,
 ) -> Result<Uploaded, Error> {
-    // 声明即大档:session 头校验在任何片入库之前(与旧路径同一 400 位点);自适应路径在转档时校验。
     // 孤儿收账簿(未配置 = None,语义 = ④ 无兜底):begin → 逐片 chunk → 描述符 commit → 失败 abort。
     let wal = st.upload_wal.clone();
     let mut tracked: Option<u64> = None;
-    let mut session_raw = session;
-    let mut session_val: Option<String> = None;
     let mut chunked = declared.map(|d| d > st.max_body_bytes).unwrap_or(false);
     if chunked {
-        session_val = session_of(session_raw.take())?;
         if let Some(w) = &wal {
             tracked = Some(w.begin(crate::upload_wal::now_ms()).await);
         }
@@ -638,10 +649,6 @@ async fn stream_upload(
                     }
                     // 越窗 ⇒ 转分片模式(buf 自头部切片,与既有片边界语义一致)。
                     chunked = true;
-                    match session_of(session_raw.take()) {
-                        Ok(s) => session_val = s,
-                        Err(e) => break Some(e),
-                    }
                     if let Some(w) = &wal {
                         tracked = Some(w.begin(crate::upload_wal::now_ms()).await);
                     }
@@ -764,7 +771,8 @@ async fn stream_upload(
         }
     }
     // 描述符与片同 TTL:整个逻辑对象一起过期(与单 blob 的 TTL 读行为对称)。
-    let descriptor = encode_descriptor(session_val.as_deref().unwrap_or("").as_bytes(), &chunks)?;
+    // 描述符 session 字段恒空(客户端会话协议已退役;字段保留 = 磁盘格式不变)。
+    let descriptor = encode_descriptor(&[], &chunks)?;
     match st
         .router
         .put_auto_composed_with_ttl(Bytes::from(descriptor), expiration_ms)
@@ -937,6 +945,11 @@ async fn delete_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<Str
     let _timer = RequestTimer::start(&st.metrics, OP_DELETE);
     let result = async {
         let key = parse_blob_id(&blob_id)?;
+        // H3 级联:组合对象先记片名单入账(fsync),再墓状主描述符 —— 顺序即持久化纪律,
+        // 崩溃窗由消费侧二次确认兜底;记账失败只降级为不级联,不挡删除本身。
+        if let Some(cascade) = st.delete_cascade.as_ref() {
+            record_cascade_chunks(&st, cascade, key).await;
+        }
         st.router.delete(&key).await?;
         Ok(())
     }
@@ -956,88 +969,59 @@ async fn delete_blob(State(st): State<AppState>, AxumPath(blob_id): AxumPath<Str
     }
 }
 
-/// `POST /stitch` 的请求体。
-#[derive(Deserialize)]
-struct StitchRequest {
-    /// 片的 blobId 列表(16 hex 一个),顺序即拼装顺序。
-    /// `default`:字段缺失按空列表处理 → 统一走"片数 0 → 400"(而不是 axum 抽取器的 422)。
-    #[serde(rename = "signedChunkIds", default)]
-    signed_chunk_ids: Vec<String>,
-}
-
-/// `POST /stitch`:把已上传的片拼成一个对象 → 201(头同 `POST /blobs`)。
-///
-/// **无状态**:不建 session 表,拼装关系写进一个描述符 blob(片本身是普通 blob),
-/// `GET` 读到该描述符即逐片取回并流式拼装。
-///
-/// body 由本 handler 自己解析(而非 `Json` 抽取器):JSON 语法错误也要按契约回 400(不是 422)。
-async fn stitch(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let _timer = RequestTimer::start(&st.metrics, OP_STITCH);
-    let result = async {
-        let req: StitchRequest = serde_json::from_slice(&body)
-            .map_err(|e| Error::Invalid(format!("invalid JSON body: {e}")))?;
-        stitch_inner(&st, &headers, req).await
+/// 组合对象级联记账(尽力):stat 确认组合位 → 裸读描述符(≤ 1 MiB 有界)解析片名单
+/// → 账本 `record`(带 fsync)。任何一步失败只 `warn` 降级 —— 删除本身绝不被级联挡住。
+async fn record_cascade_chunks(
+    st: &AppState,
+    cascade: &Arc<crate::delete_cascade::DeleteCascade>,
+    descriptor: StoreKey,
+) {
+    let composed = match st.router.stat(&descriptor).await {
+        Ok(meta) => meta.composed && !meta.deleted && !meta.expired,
+        Err(_) => false,
+    };
+    if !composed {
+        return;
     }
-    .await;
-    match result {
-        Ok((key, len)) => {
-            st.metrics
-                .mutation_total
-                .with_label_values(&[OP_STITCH, OUTCOME_OK])
-                .inc();
-            // 同 `post_blob`:每请求细节走 debug,避免压测时刷屏。
-            tracing::debug!(
-                blob_id = %hex::encode(key.as_bytes()),
-                size = len,
-                "stitched blob stored"
+    let body = match st.router.get_blob(&descriptor).await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(
+                blob_id = %hex::encode(descriptor.as_bytes()),
+                error = %e,
+                "delete-cascade: descriptor unreadable, primary-only tombstone"
             );
-            created_response(key, len)
+            return;
+        }
+    };
+    let chunks: Vec<StoreKey> = match antfs_descriptor::parse(&body) {
+        Ok(refs) => refs
+            .iter()
+            .filter_map(|r| StoreKey::from_slice(&r.id))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                blob_id = %hex::encode(descriptor.as_bytes()),
+                error = %e,
+                "delete-cascade: descriptor unparseable, primary-only tombstone"
+            );
+            return;
+        }
+    };
+    match cascade.record(&descriptor, &chunks) {
+        Ok(()) => {
+            st.metrics
+                .delete_cascade_entries
+                .set(cascade.entries() as i64);
         }
         Err(e) => {
-            fail(&st.metrics, &st.metrics.mutation_total, &[OP_STITCH], &e);
-            e.into_response()
+            tracing::warn!(
+                blob_id = %hex::encode(descriptor.as_bytes()),
+                error = %e,
+                "delete-cascade: ledger record failed, primary-only tombstone"
+            );
         }
     }
-}
-
-async fn stitch_inner(
-    st: &AppState,
-    headers: &HeaderMap,
-    body: StitchRequest,
-) -> Result<(StoreKey, u64), Error> {
-    // session 必填(客户端侧的分片上传会话标识);frontend 只把它写进描述符,不建表、不校验其内容。
-    let session = headers
-        .get(HEADER_SESSION)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Invalid("missing header x-antfs-session".into()))?;
-    if body.signed_chunk_ids.is_empty() || body.signed_chunk_ids.len() > MAX_CHUNKS {
-        return Err(Error::Invalid(format!(
-            "signedChunkIds must have 1..={MAX_CHUNKS} entries"
-        )));
-    }
-    let mut chunks = Vec::with_capacity(body.signed_chunk_ids.len());
-    for id in &body.signed_chunk_ids {
-        let key = parse_blob_id(id)
-            .map_err(|_| Error::Invalid(format!("chunk {id}: {BLOB_ID_INVALID}")))?;
-        // 提交时校验每个片可读,并记下它的长度/过期时刻(读路径据此核对,见 `fetch_chunk`)。
-        let meta = st
-            .router
-            .stat(&key)
-            .await
-            .map_err(|e| Error::Invalid(format!("chunk {id} is not readable: {e}")))?;
-        chunks.push(DescriptorChunk {
-            id: key,
-            size: meta.size,
-            expiration_ms: meta.expiration_ms,
-        });
-    }
-    let descriptor = encode_descriptor(session.as_bytes(), &chunks)?;
-    let len = descriptor.len() as u64;
-    // 描述符以组合位落库:读侧 stat 报 composed,位是唯一类型判定。
-    let key = st.router.allocate_one().await?;
-    st.router.put_composed(key, Bytes::from(descriptor)).await?;
-    Ok((key, len))
 }
 
 /// `GET /metrics`:Prometheus 文本(抓取口,无鉴权)。
@@ -1413,23 +1397,5 @@ mod tests {
         assert_eq!(MAX_CHUNKS as u64 * chunk, 16 * 1024 * 1024 * 1024);
         // 配置上限内的单片,乘积必须在 u64 内(校验层防溢出的回归护栏)。
         assert!(MAX_CHUNKS as u64 * crate::config::AUTO_CHUNK_MAX_ALLOWED_BYTES < u64::MAX);
-    }
-
-    /// 分片路径的 session 头:缺省/正常通过;非文本、超 65535 都必须 400(且不往集群写任何片)。
-    #[test]
-    fn session_validation_for_auto_chunk() {
-        assert_eq!(session_of(None).unwrap(), None);
-        assert_eq!(
-            session_of(HeaderValue::from_str("sess-abc").ok()).unwrap(),
-            Some("sess-abc".to_string())
-        );
-
-        let err =
-            session_of(HeaderValue::from_bytes(&[0xff, 0xfe]).ok()).expect_err("非文本必须拒");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-
-        let long = "x".repeat(u16::MAX as usize + 1);
-        let err = session_of(HeaderValue::from_str(&long).ok()).expect_err("超长必须拒");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -67,8 +67,8 @@ impl MetaStore for MysqlMetaStore {
 
         // MySQL 无 RETURNING,两步:先圈定将被遮蔽的 blob_id + size,再同条件 UPDATE。
         // 两步间隙的并发遮蔽使记账偏保守(竞态口径见 change 的 design.md)。
-        let shadowed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-            "SELECT blob_id, size FROM named_objects
+        let shadowed: Vec<(Vec<u8>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT blob_id, size, parts_manifest FROM named_objects
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL AND version < ?",
         )
         .bind(&req.bucket)
@@ -76,7 +76,7 @@ impl MetaStore for MysqlMetaStore {
         .bind(version)
         .fetch_all(&mut *tx)
         .await?;
-        let shadow_bytes: i64 = shadowed.iter().map(|(_, s)| *s).sum();
+        let shadow_bytes: i64 = shadowed.iter().map(|(_, s, _)| *s).sum();
 
         // 锁序铁律(与 PG 版唯一不同之处,InnoDB 特有):守卫的 buckets 行锁必须是本事务
         // 拿到的**第一把写锁**。named_objects 的 UPDATE/INSERT 在 RR 下会取 next-key/插入
@@ -143,10 +143,15 @@ impl MetaStore for MysqlMetaStore {
         .bind(stored_kind.as_deref())
         .execute(&mut *tx)
         .await?;
-        let shadowed_ids: Vec<StoreKey> = shadowed
+        // 级联回收:被遮蔽行的 manifest 片一并入账(PG 版同语义;两步读的间隙竞态
+        // 只会让级联偏保守,不漏片)。
+        let mut shadowed_ids: Vec<StoreKey> = shadowed
             .iter()
-            .map(|(b, _)| blob_id_from_bytes(b))
+            .map(|(b, _, _)| blob_id_from_bytes(b))
             .collect();
+        for (_, _, manifest) in &shadowed {
+            shadowed_ids.extend(super::manifest_part_ids(manifest.as_deref()));
+        }
         Self::queue_reclaims(&mut tx, &shadowed_ids).await?;
         tx.commit().await?;
 
@@ -154,7 +159,7 @@ impl MetaStore for MysqlMetaStore {
             version,
             shadowed_blobs: shadowed
                 .into_iter()
-                .map(|(b, _)| blob_id_from_bytes(&b))
+                .map(|(b, _, _)| blob_id_from_bytes(&b))
                 .collect(),
         })
     }
@@ -209,8 +214,8 @@ impl MetaStore for MysqlMetaStore {
         // MySQL has no `UPDATE ... RETURNING`; select the current latest version, its
         // blob_id and size first, then soft-delete exactly that version.
         let mut tx = self.pool.begin().await?;
-        let latest: Option<(i64, Vec<u8>, i64)> = sqlx::query_as(
-            "SELECT version, blob_id, size FROM named_objects
+        let latest: Option<(i64, Vec<u8>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT version, blob_id, size, parts_manifest FROM named_objects
              WHERE bucket = ? AND `key` = ? AND state = 1 AND deleted_at IS NULL
              ORDER BY version DESC LIMIT 1",
         )
@@ -218,7 +223,7 @@ impl MetaStore for MysqlMetaStore {
         .bind(key)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((version, blob_id, size)) = latest else {
+        let Some((version, blob_id, size, manifest)) = latest else {
             tx.commit().await?;
             return Ok(None);
         };
@@ -242,8 +247,10 @@ impl MetaStore for MysqlMetaStore {
             .bind(bucket)
             .execute(&mut *tx)
             .await?;
-        let bid = blob_id_from_bytes(&blob_id);
-        Self::queue_reclaims(&mut tx, std::slice::from_ref(&bid)).await?;
+        // 级联回收:主 blob + manifest 全部片同事务入账(GC 每日墓碑化,delete-cascade)。
+        let mut ids = vec![blob_id_from_bytes(&blob_id)];
+        ids.extend(super::manifest_part_ids(manifest.as_deref()));
+        Self::queue_reclaims(&mut tx, &ids).await?;
         tx.commit().await?;
 
         Ok(Some(DeletedObject {
@@ -298,34 +305,80 @@ impl MetaStore for MysqlMetaStore {
             .or(req.start_after.as_deref())
             .unwrap_or("");
 
+        // 前缀 = 纯字面范围扫(B2,seaweedfs#11737 同族防御):`key >= prefix AND key < 上界`
+        // 取代 LIKE —— `_`/`%`/`\` 不再有通配语义,范围谓词可被 (bucket, key) 索引收窄。
         let prefix_pattern = req.prefix.as_deref().unwrap_or("");
-        let like_pattern = format!(
-            "{}%",
-            prefix_pattern.replace('%', "\\%").replace('_', "\\_")
-        );
-
         // MySQL has no `DISTINCT ON`; join each key against its latest version via a
         // grouped subquery, mirroring the PostgreSQL `DISTINCT ON (key) ... ORDER BY key, version DESC`.
-        let rows: Vec<MysqlListRow> = sqlx::query_as(
-            "SELECT n.`key`, n.size, n.etag, n.created_at
-             FROM named_objects n
-             JOIN (
-                 SELECT bucket, `key` AS k, MAX(version) AS max_version
-                 FROM named_objects
-                 WHERE bucket = ? AND `key` > ? AND `key` LIKE ?
-                   AND state = 1 AND deleted_at IS NULL
-                 GROUP BY bucket, `key`
-             ) latest ON n.bucket = latest.bucket AND n.`key` = latest.k AND n.version = latest.max_version
-             WHERE n.state = 1 AND n.deleted_at IS NULL
-             ORDER BY n.`key`
-             LIMIT ?",
-        )
-        .bind(&req.bucket)
-        .bind(start_key)
-        .bind(&like_pattern)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<MysqlListRow> = if prefix_pattern.is_empty() {
+            sqlx::query_as(
+                "SELECT n.`key`, n.size, n.etag, n.created_at
+                 FROM named_objects n
+                 JOIN (
+                     SELECT bucket, `key` AS k, MAX(version) AS max_version
+                     FROM named_objects
+                     WHERE bucket = ? AND `key` > ? AND state = 1 AND deleted_at IS NULL
+                     GROUP BY bucket, `key`
+                 ) latest ON n.bucket = latest.bucket AND n.`key` = latest.k AND n.version = latest.max_version
+                 WHERE n.state = 1 AND n.deleted_at IS NULL
+                 ORDER BY n.`key`
+                 LIMIT ?",
+            )
+            .bind(&req.bucket)
+            .bind(start_key)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            match super::prefix_upper_bound(prefix_pattern) {
+                Some(upper) => {
+                    sqlx::query_as(
+                        "SELECT n.`key`, n.size, n.etag, n.created_at
+                         FROM named_objects n
+                         JOIN (
+                             SELECT bucket, `key` AS k, MAX(version) AS max_version
+                             FROM named_objects
+                             WHERE bucket = ? AND `key` > ? AND `key` >= ? AND `key` < ?
+                               AND state = 1 AND deleted_at IS NULL
+                             GROUP BY bucket, `key`
+                         ) latest ON n.bucket = latest.bucket AND n.`key` = latest.k AND n.version = latest.max_version
+                         WHERE n.state = 1 AND n.deleted_at IS NULL
+                         ORDER BY n.`key`
+                         LIMIT ?",
+                    )
+                    .bind(&req.bucket)
+                    .bind(start_key)
+                    .bind(prefix_pattern)
+                    .bind(upper)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                // 全串顶格的理论前缀:无上界,仅下界(正确性不受影响)。
+                None => {
+                    sqlx::query_as(
+                        "SELECT n.`key`, n.size, n.etag, n.created_at
+                         FROM named_objects n
+                         JOIN (
+                             SELECT bucket, `key` AS k, MAX(version) AS max_version
+                             FROM named_objects
+                             WHERE bucket = ? AND `key` > ? AND `key` >= ?
+                               AND state = 1 AND deleted_at IS NULL
+                             GROUP BY bucket, `key`
+                         ) latest ON n.bucket = latest.bucket AND n.`key` = latest.k AND n.version = latest.max_version
+                         WHERE n.state = 1 AND n.deleted_at IS NULL
+                         ORDER BY n.`key`
+                         LIMIT ?",
+                    )
+                    .bind(&req.bucket)
+                    .bind(start_key)
+                    .bind(prefix_pattern)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+            }
+        };
 
         let is_truncated = rows.len() as i64 > req.max_keys as i64;
         let entries_len = (rows.len() as i32).min(req.max_keys);
@@ -913,27 +966,61 @@ impl MetaStore for MysqlMetaStore {
         opts: ListUploadsOpts,
     ) -> Result<ListUploadsResp> {
         let limit = opts.max_uploads.max(1) as i64 + 1;
+        // 同 list_objects:前缀走字面范围扫(prefix_upper_bound 上界)。
         let prefix_pattern = opts.prefix.as_deref().unwrap_or("");
-        let like_pattern = format!(
-            "{}%",
-            prefix_pattern.replace('%', "\\%").replace('_', "\\_")
-        );
         let key_marker = opts.key_marker.as_deref().unwrap_or("");
         let id_marker = opts.upload_id_marker.as_deref().unwrap_or("");
 
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT `key`, upload_id, created_at FROM multipart_uploads
-             WHERE bucket = ? AND `key` LIKE ? AND (`key` > ? OR (`key` = ? AND upload_id > ?))
-             ORDER BY `key`, upload_id LIMIT ?",
-        )
-        .bind(bucket)
-        .bind(&like_pattern)
-        .bind(key_marker)
-        .bind(key_marker)
-        .bind(id_marker)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String, String, i64)> = if prefix_pattern.is_empty() {
+            sqlx::query_as(
+                "SELECT `key`, upload_id, created_at FROM multipart_uploads
+                 WHERE bucket = ? AND (`key` > ? OR (`key` = ? AND upload_id > ?))
+                 ORDER BY `key`, upload_id LIMIT ?",
+            )
+            .bind(bucket)
+            .bind(key_marker)
+            .bind(key_marker)
+            .bind(id_marker)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            match super::prefix_upper_bound(prefix_pattern) {
+                Some(upper) => {
+                    sqlx::query_as(
+                        "SELECT `key`, upload_id, created_at FROM multipart_uploads
+                         WHERE bucket = ? AND `key` >= ? AND `key` < ?
+                           AND (`key` > ? OR (`key` = ? AND upload_id > ?))
+                         ORDER BY `key`, upload_id LIMIT ?",
+                    )
+                    .bind(bucket)
+                    .bind(prefix_pattern)
+                    .bind(upper)
+                    .bind(key_marker)
+                    .bind(key_marker)
+                    .bind(id_marker)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                None => {
+                    sqlx::query_as(
+                        "SELECT `key`, upload_id, created_at FROM multipart_uploads
+                         WHERE bucket = ? AND `key` >= ?
+                           AND (`key` > ? OR (`key` = ? AND upload_id > ?))
+                         ORDER BY `key`, upload_id LIMIT ?",
+                    )
+                    .bind(bucket)
+                    .bind(prefix_pattern)
+                    .bind(key_marker)
+                    .bind(key_marker)
+                    .bind(id_marker)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+            }
+        };
 
         let is_truncated = rows.len() as i64 > opts.max_uploads as i64;
         let uploads: Vec<UploadEntry> = rows
@@ -2032,5 +2119,166 @@ mod tests {
         };
         let resp = store.list_multipart_uploads(&bucket, opts).await.unwrap();
         assert_eq!(resp.uploads.len(), 2);
+    }
+
+    /// H3 级联回收(2026-10-26):delete/覆盖把 manifest 全部片一并送 pending_reclaims;
+    /// 损坏 manifest 退化为只收主 blob。
+    #[tokio::test]
+    #[ignore]
+    async fn delete_and_overwrite_cascade_manifest_parts() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = MysqlMetaStore::new(pool);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let key = format!("key-{}", Uuid::new_v4());
+        let m = |id: u32| StoreKey::from_parts(1, id);
+        let manifest = serde_json::json!([
+            { "blob_id": m(601).as_bytes().to_vec(), "size": 1 },
+            { "blob_id": m(602).as_bytes().to_vec(), "size": 2 },
+        ])
+        .to_string();
+        let mk = |blob: StoreKey, manifest: Option<String>| PutObjectMeta {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            blob_id: blob,
+            size: 3,
+            etag: "e".into(),
+            content_type: None,
+            user_meta: UserMeta::default(),
+            parts_manifest: manifest,
+            sse: None,
+            checksum: None,
+        };
+        // 删除:主 blob + 两片全部入账。
+        let primary = m(600);
+        store
+            .put_object(mk(primary, Some(manifest.clone())))
+            .await
+            .unwrap();
+        store.delete_object(&bucket, &key).await.unwrap();
+        let batch = store.pending_reclaims_batch(50).await.unwrap();
+        for id in [primary, m(601), m(602)] {
+            assert!(batch.contains(&id), "级联缺 {id:?}: {batch:?}");
+        }
+        // 覆盖链:610 覆盖(行已删,新行)→ 611 再覆盖 610(遮蔽级联动 610 及其片);
+        // 611 的 manifest 损坏 → 只收自己。
+        store.put_object(mk(m(610), Some(manifest))).await.unwrap();
+        store
+            .put_object(mk(m(611), Some("not-json".into())))
+            .await
+            .unwrap();
+        store.delete_object(&bucket, &key).await.unwrap();
+        let batch = store.pending_reclaims_batch(50).await.unwrap();
+        assert!(
+            batch.contains(&m(610)) && batch.contains(&m(611)),
+            "{batch:?}"
+        );
+        // 自洁(共享活库不留残留)。
+        let ids = [m(600), m(601), m(602), m(610), m(611)];
+        let _ = store.resolve_pending_reclaims(&ids).await.unwrap();
+    }
+    /// 前缀 = 字面匹配(seaweedfs#11737 同族回归):`_`/`%`/`\` 都不得当通配符;
+    /// multipart 上传列表同口径。范围扫(B2)后语义 = 纯字节序前缀。
+    #[tokio::test]
+    #[ignore]
+    async fn list_prefix_is_literal_not_like_wildcards() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let store = MysqlMetaStore::new(pool.clone());
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        store.create_bucket(&bucket, "owner").await.unwrap();
+        let keys = [
+            "call_03_KNlHPt", // 目标(`_` 是字面)
+            "callA03_KNlHPt", // `_` 若当通配符即误中
+            "callZ03_KNlHPt", // 同上,另一个"任意单字符"
+            "call_03_K%",     // `%` 在键名里,与含%前缀互试
+            "pre%fix/a",      // 键名含 %
+            "pre\\fix/b",     // 键名含字面反斜杠(旧转义缺口点)
+            "zz/other",
+        ];
+        for (i, k) in keys.iter().enumerate() {
+            let req = PutObjectMeta {
+                bucket: bucket.clone(),
+                key: k.to_string(),
+                blob_id: StoreKey::from_parts(1, 700 + i as u32),
+                size: 1,
+                etag: "e".to_string(),
+                content_type: None,
+                user_meta: UserMeta::default(),
+                parts_manifest: None,
+                sse: None,
+                checksum: None,
+            };
+            store.put_object(req).await.unwrap();
+        }
+        async fn list(
+            store: &impl crate::metastore::MetaStore,
+            bucket: &str,
+            prefix: &str,
+        ) -> crate::metastore::types::ListObjectsResp {
+            store
+                .list_objects(ListObjectsReq {
+                    bucket: bucket.to_string(),
+                    prefix: Some(prefix.to_string()),
+                    delimiter: None,
+                    start_after: None,
+                    continuation_token: None,
+                    max_keys: 1000,
+                })
+                .await
+                .unwrap()
+        }
+
+        // ① 前缀含 `_`:只允许字面 `_03_`(A/Z 变体必须被拒)。
+        let resp = list(&store, &bucket, "call_03_K").await;
+        let got: Vec<&str> = resp.entries.iter().map(|e| e.key.as_str()).collect();
+        assert!(got.contains(&"call_03_KNlHPt"), "字面目标必须在: {got:?}");
+        assert!(
+            got.contains(&"call_03_K%"),
+            "字面 `_03_` 前缀的键都要在: {got:?}"
+        );
+        assert!(
+            !got.contains(&"callA03_KNlHPt") && !got.contains(&"callZ03_KNlHPt"),
+            "下划线绝不当通配符: {got:?}"
+        );
+
+        // ② 前缀含 `%`:只允许字面(`pre%fix/`)。
+        let resp = list(&store, &bucket, "pre%fix").await;
+        assert_eq!(resp.entries.len(), 1, "百分比是字面");
+        assert_eq!(resp.entries[0].key, "pre%fix/a");
+
+        // ③ 前缀含字面反斜杠:只允许字面(旧转义缺口在此形态下曾漏匹配)。
+        let resp = list(&store, &bucket, "pre\\fix").await;
+        assert_eq!(resp.entries.len(), 1, "反斜杠是字面");
+        assert_eq!(resp.entries[0].key, "pre\\fix/b");
+
+        // ④ multipart 上传列表同口径(会话 key 走同一范围扫)。
+        store
+            .create_multipart(&bucket, "up_03_Lang", None, &UserMeta::default())
+            .await
+            .unwrap();
+        store
+            .create_multipart(&bucket, "upX03_Lang", None, &UserMeta::default())
+            .await
+            .unwrap();
+        let ups = store
+            .list_multipart_uploads(
+                &bucket,
+                ListUploadsOpts {
+                    prefix: Some("up_03".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let up_keys: Vec<&str> = ups.uploads.iter().map(|u| u.key.as_str()).collect();
+        assert_eq!(
+            up_keys,
+            vec!["up_03_Lang"],
+            "上传列表前缀同样字面: {up_keys:?}"
+        );
     }
 }

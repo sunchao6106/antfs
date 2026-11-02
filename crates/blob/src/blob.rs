@@ -1016,7 +1016,7 @@ impl BlobStore {
 
     /// 写入一个**拼装描述符** blob:语义与 [`put_ttl`](Self::put_ttl) 完全一致,唯记录与
     /// 索引的 `flags` 置类型位 —— `stat` 据此报 `composed`(网关置信读依据;数据面
-    /// `?composed=true` 分派到此,前端 stitch/auto-chunk 描述符经它写入)。
+    /// `?composed=true` / router 恒切描述符写均分派到此,是组合对象唯一写入口径)。
     pub fn put_composed_ttl(&self, key: StoreKey, data: &[u8], expiration_ms: i64) -> Result<()> {
         if !self.is_available() {
             return Err(Error::Unavailable);

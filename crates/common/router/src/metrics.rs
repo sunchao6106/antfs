@@ -94,7 +94,7 @@ impl RouterMetrics {
             get_chunked_total: counter(
                 registry,
                 "router_get_chunked_total",
-                "logical objects re-assembled from stitch chunks on read",
+                "logical objects re-assembled from composed chunks on read",
             )?,
             topology_refreshes: counter_vec(
                 registry,
